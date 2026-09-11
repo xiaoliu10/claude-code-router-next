@@ -12,6 +12,9 @@ export const PRESETS_DIR = path.join(HOME_DIR, "presets");
 
 export const PID_FILE = path.join(HOME_DIR, '.claude-code-router.pid');
 
+// Default HTTP port the CCR server listens on when config.PORT is unset.
+export const CCR_DEFAULT_PORT = 3456;
+
 // Managed clients can attach this header when they have a reliable project
 // identity but no Claude Code-compatible session metadata. The router validates
 // the value against the stored project config before using it.

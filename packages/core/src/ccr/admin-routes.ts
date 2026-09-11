@@ -17,6 +17,7 @@ import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
 import { getHealthStore } from "../services/provider-health";
 import { reconcileHealthStore, clearProviderHealth } from "./health-reconcile";
 import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
+import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
 import { fileURLToPath } from "url";
 import fastifyStatic from "@fastify/static";
@@ -281,6 +282,15 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     if (backupPath) {
       console.log(`Backed up existing configuration file to ${backupPath}`);
     }
+
+    // Preset the self-referential "ccr" provider (unless deleted/tombstoned),
+    // and record the tombstone when a save drops the managed provider, so a
+    // UI deletion is never resurrected by a later save or restart.
+    let previousConfig: any = null;
+    try {
+      previousConfig = await readConfigFile();
+    } catch {}
+    const selfProviderResult = ensureCcrSelfProvider(newConfig, previousConfig);
 
     await writeConfigFile(newConfig);
     let projectTakeoverSync: Awaited<ReturnType<typeof syncGlobalProjectTakeovers>> | undefined;

@@ -26,9 +26,10 @@ import {
   CONFIG_FILE,
   HOME_DIR,
   listPresets,
+  ensureCcrSelfProvider,
 } from "@wengine-ai/claude-code-router-shared";
 import { initializeClaudeConfig } from "./claude-config-init";
-import { initDir, initConfig } from "./config";
+import { initDir, initConfig, writeConfigFile } from "./config";
 import { startPinoLogRetention } from "./pino-retention";
 import { registerPluginsFromConfig } from "./plugin-registration";
 import { registerAdminRoutes } from "./admin-routes";
@@ -46,6 +47,15 @@ export async function createCcrServer(options: CcrRunOptions = {}) {
   await initializeClaudeConfig();
   await initDir();
   const config = await initConfig();
+
+  // Preset the self-referential "ccr" provider for clients that configure a
+  // custom endpoint directly (no takeover). Idempotent; a persisted tombstone
+  // (user deleted it) keeps it away for good.
+  const selfProviderResult = ensureCcrSelfProvider(config);
+  if (selfProviderResult.changed) {
+    await writeConfigFile(config);
+    console.log("ℹ️  Added the preset \"ccr\" provider pointing at this server (delete it in the UI to remove it for good).");
+  }
 
   // Check if Providers is configured
   const providers = config.Providers || config.providers || [];
