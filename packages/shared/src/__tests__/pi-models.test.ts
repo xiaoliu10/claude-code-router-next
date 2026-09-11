@@ -227,3 +227,30 @@ describe("Pi managed models", () => {
     expect(providers[getPiProjectProviderName(otherProject)]).toBeDefined();
   });
 });
+
+describe("Pi project provider naming", () => {
+  it("embeds a readable project slug plus a unique hash", () => {
+    const name = getPiProjectProviderName("/Users/jason/projects/wengine/model-benchmark");
+    expect(name).toMatch(/^ccr-project-model-benchmark-[0-9a-f]{12}$/);
+  });
+
+  it("is stable for the same path and distinct for same-basename projects", () => {
+    const a1 = getPiProjectProviderName("/repos/one/api");
+    const a2 = getPiProjectProviderName("/repos/one/api");
+    const b = getPiProjectProviderName("/repos/two/api");
+    expect(a1).toBe(a2);
+    expect(a1).not.toBe(b);
+    // Both share the readable slug; only the hash differs.
+    expect(a1.startsWith("ccr-project-api-")).toBe(true);
+    expect(b.startsWith("ccr-project-api-")).toBe(true);
+  });
+
+  it("sanitizes basenames with non-ascii or special characters", () => {
+    const name = getPiProjectProviderName("/tmp/工作 目录.v2");
+    expect(name).toMatch(/^ccr-project-v2-[0-9a-f]{12}$/);
+  });
+
+  it("keeps the ccr-project- prefix so pre-slug hash-only names stay recognized", () => {
+    expect(getPiProjectProviderName("/a/b")).toMatch(/^ccr-project-/);
+  });
+});
