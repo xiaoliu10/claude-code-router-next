@@ -10,6 +10,7 @@ import {
   AnthropicChatRequest,
   ConversionOptions,
 } from "../types/llm";
+import { getThinkBudget } from "./thinking";
 
 // Simple logger function
 function log(...args: any[]) {
@@ -768,6 +769,23 @@ export function convertToAnthropic(
     temperature: request.temperature,
     stream: request.stream,
   };
+
+  // Restore the Anthropic thinking block from unified reasoning. Claude Code
+  // and other Anthropic clients send thinking on every request; without this
+  // mapping the param was silently dropped on Anthropic-endpoint providers,
+  // losing both the client's explicit level and the defaultthinking
+  // transformer's provider-level default. budget_tokens must stay below
+  // max_tokens, so clamp; skip entirely when there is no room for the
+  // 1024-token minimum.
+  if (request.reasoning?.enabled) {
+    const rawBudget =
+      request.reasoning.max_tokens ||
+      getThinkBudget(request.reasoning.effort || "medium");
+    const budget = Math.min(rawBudget, (result.max_tokens as number) - 1024);
+    if (budget >= 1024) {
+      result.thinking = { type: "enabled", budget_tokens: budget };
+    }
+  }
 
   if (systemBlocks.length > 0) {
     const hasCacheControl = systemBlocks.some((block) => block?.cache_control);

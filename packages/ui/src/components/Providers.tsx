@@ -1133,6 +1133,40 @@ export function Providers() {
                   </div>
                 )}
               </div>
+              {/* Default thinking level */}
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5">
+                  <Label htmlFor="default_thinking_level" className="text-sm font-medium">
+                    {t("providers.default_thinking_level")}
+                  </Label>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <HelpCircle className="h-3.5 w-3.5 text-gray-400 cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent side="top" className="max-w-xs text-xs">
+                        {t("providers.default_thinking_level_tooltip")}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+                <Select
+                  value={editingProvider.default_thinking_level || 'none'}
+                  onValueChange={(val) =>
+                    handleProviderChange(editingProviderIndex, 'default_thinking_level', val === 'none' ? '' : val)
+                  }
+                >
+                  <SelectTrigger id="default_thinking_level">
+                    <SelectValue placeholder={t("providers.default_thinking_level_none")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">{t("providers.default_thinking_level_none")}</SelectItem>
+                    <SelectItem value="low">{t("providers.default_thinking_level_low")}</SelectItem>
+                    <SelectItem value="medium">{t("providers.default_thinking_level_medium")}</SelectItem>
+                    <SelectItem value="high">{t("providers.default_thinking_level_high")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
               <div className="space-y-2">
                 <Label htmlFor="models">{t("providers.models")}</Label>
                 <div className="space-y-2">

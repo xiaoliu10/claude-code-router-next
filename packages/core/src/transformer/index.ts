@@ -21,6 +21,7 @@ import { OpenAIResponsesTransformer } from "./openai.responses.transformer";
 import { ForceReasoningTransformer } from "./forcereasoning.transformer"
 import { KimiTransformer } from "./kimi.transformer"
 import { OpenCodeTransformer } from "./opencode.transformer"
+import { DefaultThinkingTransformer } from "./defaultthinking.transformer"
 
 export default {
   AnthropicTransformer,
@@ -45,5 +46,6 @@ export default {
   OpenAIResponsesTransformer,
   ForceReasoningTransformer,
   KimiTransformer,
-  OpenCodeTransformer
+  OpenCodeTransformer,
+  DefaultThinkingTransformer
 };

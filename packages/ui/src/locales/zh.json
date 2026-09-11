@@ -174,7 +174,13 @@
     "proxy_tooltip_no_url": "请先在通用设置中配置代理地址",
     "proxy_tooltip_on": "代理已开启",
     "proxy_tooltip_off": "直连（未启用代理）",
-    "edit_parameter": "编辑参数"
+    "edit_parameter": "编辑参数",
+    "default_thinking_level": "默认思考等级",
+    "default_thinking_level_tooltip": "客户端请求未携带思考配置时注入的默认思考等级，按供应商端点类型自动转换：Anthropic /v1/messages → thinking.budget_tokens；OpenAI /v1/responses → reasoning.effort；OpenAI 兼容 /v1/chat/completions → reasoning_effort。客户端显式设置的思考等级始终优先。",
+    "default_thinking_level_none": "不注入（跟随客户端）",
+    "default_thinking_level_low": "low",
+    "default_thinking_level_medium": "medium",
+    "default_thinking_level_high": "high"
   },
   "router": {
     "title": "路由",

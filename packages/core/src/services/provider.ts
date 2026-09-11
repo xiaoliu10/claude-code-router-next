@@ -83,6 +83,20 @@ export class ProviderService {
           })
         }
 
+        // Provider-level default thinking level: prepend the transformer so
+        // it runs before any body-converting transformer in the use chain and
+        // its unified reasoning is visible to them.
+        const defaultThinkingLevel = (providerConfig as any).default_thinking_level;
+        if (defaultThinkingLevel) {
+          const DefaultThinkingConstructor = this.transformerService.getTransformer("defaultthinking");
+          if (DefaultThinkingConstructor) {
+            const instance = new (DefaultThinkingConstructor as TransformerConstructor)({ level: defaultThinkingLevel });
+            transformer.use = [instance, ...(transformer.use || [])];
+          } else {
+            this.logger.warn(`default_thinking_level set on ${providerConfig.name} but defaultthinking transformer is not registered`);
+          }
+        }
+
         this.registerProvider({
           name: providerConfig.name,
           baseUrl: providerConfig.api_base_url,
