@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2405] - 2026-09-12
+
+### Added
+
+- **供应商级默认思考等级（`default_thinking_level`）**: 客户端请求未携带任何思考配置时，按供应商配置的默认思考等级（low/medium/high）注入，并根据端点类型自动转换为原生参数——Anthropic `/v1/messages` 走 `thinking.budget_tokens`（按等级映射预算并 clamp 在 max_tokens 之下）、OpenAI `/v1/responses` 走 `reasoning.effort`、OpenAI 兼容 `/v1/chat/completions` 走 `reasoning_effort`；客户端显式设置的思考等级（含显式关闭）始终优先。UI 供应商卡片新增「默认思考等级」下拉（中英文）。附带修复：`convertToAnthropic` 现在把 unified reasoning 映射回 Anthropic thinking 块，此前客户端显式开启的 thinking 在 Anthropic 端点供应商上被静默丢弃。core 280 项测试通过（含 defaultthinking 11 项）。
+- **预置自引用 `ccr` 供应商（免接管模式）**: ZCode 等支持直接配置 API 端点的客户端不再需要接管配置——CCR 启动与每次全量配置保存时确保存在预置 `ccr` 供应商（指向自身 `/v1/messages`，模型为 ccr-opus/sonnet/haiku family aliases，标记 `ccr_managed: true`），客户端把端点指到 CCR、填 APIKEY、选 family alias 即可走完整 family 路由。已有同名供应商（含用户自建）一律不碰；通过配置保存删除该供应商会自动记录 tombstone（`CCR_SELF_PROVIDER_DELETED`），之后保存/重启都不复活。已用隔离实例端到端验证：启动注入 → 回环请求路由 → 保存删除记 tombstone → 重启不复活（shared 38 项测试，含 self-provider 6 项）。
+
+### Changed
+
+- **pi 项目 provider 命名可读化**: pi 项目接管 provider 从 `ccr-project-<hash>` 改为 `ccr-project-<项目名slug>-<hash>`（如 `ccr-project-model-benchmark-0c969bce85c5`），pi 模型选择器一眼可辨所属项目；slug 取项目目录 basename 清洗（40 字符内），hash 为完整路径 sha256 前 12 位，同 basename 项目不冲突；旧格式名字依然被识别，无需迁移（服务端靠 `x-ccr-project` 头识别项目，provider 名只是客户端侧键名）。
+
 ## [2.3.2404] - 2026-09-08
 
 ### Fixed
