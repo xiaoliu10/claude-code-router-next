@@ -18,6 +18,9 @@ export interface Provider {
   quota_token?: string;
   // Optional SEC_TOKEN used to query Aliyun MaaS Token Plan quota usage.
   quota_sec_token?: string;
+  // Thinking level injected when the client sends no thinking config
+  // ("low" | "medium" | "high"; unset/empty = follow the client).
+  default_thinking_level?: string;
   // Allow for additional custom fields
   [key: string]: any;
 }

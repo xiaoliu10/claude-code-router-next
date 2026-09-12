@@ -1439,13 +1439,34 @@ function ensurePiCcrProvider(
   return { defaultModel };
 }
 
-/** Stable provider id used by one Pi project takeover. */
+/**
+ * Stable provider id used by one Pi project takeover.
+ *
+ * Format: `ccr-project-<slug>-<hash>` where <slug> is a readable form of the
+ * project's directory basename (lowercased, non-[a-z0-9-] collapsed, 40 chars
+ * max) and <hash> is a 12-hex-char sha256 prefix of the full project path for
+ * uniqueness when two projects share a basename. The name stays stable per
+ * path, so takeover enable/refresh is idempotent and pi's model selector shows
+ * which project a provider belongs to. Names that predate the slug (bare
+ * `ccr-project-<hash>`) still match isPiProjectProviderName below and keep
+ * working without migration — the server identifies the project by the
+ * x-ccr-project header, not by this name.
+ */
 export function getPiProjectProviderName(projectPath: string): string {
+  const slug = path
+    .basename(projectPath)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
   const digest = createHash("sha256")
     .update(getClaudeProjectId(projectPath))
     .digest("hex")
-    .slice(0, 16);
-  return `${PI_PROJECT_PROVIDER_PREFIX}${digest}`;
+    .slice(0, 12);
+  return slug
+    ? `${PI_PROJECT_PROVIDER_PREFIX}${slug}-${digest}`
+    : `${PI_PROJECT_PROVIDER_PREFIX}${digest}`;
 }
 
 function isPiProjectProviderName(value: unknown): value is string {

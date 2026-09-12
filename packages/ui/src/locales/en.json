@@ -174,7 +174,13 @@
     "proxy_tooltip_no_url": "Configure a proxy URL in General settings first",
     "proxy_tooltip_on": "Proxy enabled",
     "proxy_tooltip_off": "Direct (proxy disabled)",
-    "edit_parameter": "Edit parameter"
+    "edit_parameter": "Edit parameter",
+    "default_thinking_level": "Default thinking level",
+    "default_thinking_level_tooltip": "Injected when the client request carries no thinking config, auto-converted per endpoint type: Anthropic /v1/messages → thinking.budget_tokens; OpenAI /v1/responses → reasoning.effort; OpenAI-compatible /v1/chat/completions → reasoning_effort. A client-set level always wins.",
+    "default_thinking_level_none": "None (follow client)",
+    "default_thinking_level_low": "low",
+    "default_thinking_level_medium": "medium",
+    "default_thinking_level_high": "high"
   },
   "router": {
     "title": "Router",
