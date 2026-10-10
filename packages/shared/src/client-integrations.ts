@@ -1427,7 +1427,15 @@ function ensurePiCcrProvider(
 
   const models = readJsonObject(paths.models);
   if (!isObject(models.providers)) models.providers = {};
+  // Preserve user/external edits on the provider entry (Desktop writes
+  // `modelOverrides` for contextWindow/maxTokens/thinkingLevelMap edits; other
+  // tools may add their own keys). Replacing the whole object silently wiped
+  // them on every takeover refresh. Managed fields below still win.
+  const existingProvider = isObject(models.providers[providerName])
+    ? models.providers[providerName]
+    : {};
   models.providers[providerName] = {
+    ...existingProvider,
     name: "Claude Code Router",
     baseUrl: getCcrBaseUrl(config),
     api: PI_ANTHROPIC_API,
