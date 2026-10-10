@@ -37,6 +37,10 @@ function readJson(filePath: string): any {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
 
+function writeJson(filePath: string, doc: any): void {
+  writeFileSync(filePath, JSON.stringify(doc, null, 2));
+}
+
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
@@ -153,6 +157,42 @@ describe("Pi managed models", () => {
       headers: {
         [CCR_PROJECT_HEADER]: getClaudeProjectId(projectDir),
       },
+    });
+  });
+
+  it("preserves Desktop modelOverrides across takeover refresh", () => {
+    // Desktop (pi-desktop) writes model modelOverrides (contextWindow/maxTokens
+    // edits from its model page) into the provider entry. The managed refresh
+    // must keep them instead of regenerating the provider from scratch.
+    const { piDir, projectDir } = createFixture();
+    const config = {
+      APIKEY: "test-key",
+      PORT: 4567,
+      Router: { default: "provider,project-model" },
+      Clients: { pi: { configPath: piDir } },
+    };
+
+    applyPiProjectTakeover(projectDir, config);
+
+    const providerName = getPiProjectProviderName(projectDir);
+    const modelsPath = join(piDir, "models.json");
+    const doc = readJson(modelsPath);
+    doc.providers[providerName].modelOverrides = {
+      "ccr-opus": { contextWindow: 200000, maxTokens: 32000 },
+    };
+    writeJson(modelsPath, doc);
+
+    // Simulate a later takeover refresh (server restart / config change).
+    applyPiProjectTakeover(projectDir, config);
+
+    const provider = readJson(modelsPath).providers[providerName];
+    expect(provider.modelOverrides).toEqual({
+      "ccr-opus": { contextWindow: 200000, maxTokens: 32000 },
+    });
+    // Managed fields still win.
+    expect(provider).toMatchObject({
+      baseUrl: "http://127.0.0.1:4567",
+      name: "Claude Code Router",
     });
   });
 
