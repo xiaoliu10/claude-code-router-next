@@ -232,6 +232,9 @@ export interface LLMProvider {
   wakeupEnabled?: boolean;
   wakeupTime?: string;
   wakeupModel?: string;
+  /** Set for CCR-managed built-in providers (e.g. WorkBuddy) so the data plane
+   *  can lock their fixed upstream URL and inject their own auth headers. */
+  workbuddyManaged?: boolean;
 }
 
 export type RegisterProviderRequest = LLMProvider;

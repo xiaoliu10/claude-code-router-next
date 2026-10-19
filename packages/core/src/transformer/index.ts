@@ -23,6 +23,7 @@ import { KimiTransformer } from "./kimi.transformer"
 import { OpenCodeTransformer } from "./opencode.transformer"
 import { DefaultThinkingTransformer } from "./defaultthinking.transformer"
 import { AmdTransformer } from "./amd.transformer"
+import { WorkBuddyTransformer } from "./workbuddy.transformer"
 
 export default {
   AnthropicTransformer,
@@ -49,5 +50,6 @@ export default {
   KimiTransformer,
   OpenCodeTransformer,
   DefaultThinkingTransformer,
-  AmdTransformer
+  AmdTransformer,
+  WorkBuddyTransformer
 };

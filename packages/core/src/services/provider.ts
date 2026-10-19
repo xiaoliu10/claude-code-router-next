@@ -101,6 +101,10 @@ export class ProviderService {
           name: providerConfig.name,
           baseUrl: providerConfig.api_base_url,
           apiKey: providerConfig.api_key,
+          // Managed built-in providers (e.g. WorkBuddy) carry their flag so the
+          // data plane can lock their upstream URL and headers.
+          workbuddyManaged: (providerConfig as any).workbuddyManaged === true ||
+            ((providerConfig as any).ccr_managed === true && providerConfig.name === "workbuddy"),
           models: providerConfig.models || [],
           quotaToken: (providerConfig as any).quota_token,
           quotaSecToken: (providerConfig as any).quota_sec_token,

@@ -16,6 +16,7 @@ import { resolveProviderProxyUrl, findInvalidProxyUrls } from "../services/proxy
 import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
 import { getHealthStore } from "../services/provider-health";
 import { reconcileHealthStore, clearProviderHealth } from "./health-reconcile";
+import { WorkBuddyAuthService } from "../services/workbuddy-auth";
 import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
 import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
@@ -894,6 +895,148 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     } catch (error: any) {
       console.error("Failed to probe all providers:", error);
       reply.status(500).send({ error: error.message || "Failed to probe all providers" });
+    }
+  });
+
+  // ========== WorkBuddy built-in provider management API ==========
+  // All four routes are explicit user actions. They never read the WorkBuddy
+  // desktop login file except POST /import, and they never expose a token.
+
+  /**
+   * Local-origin guard for WorkBuddy management endpoints. A remote non-loopback
+   * caller must not be able to trigger a local file read or a config mutation,
+   * even when CCR APIKEY is configured (the key authorizes inference traffic,
+   * not privileged local operations). Originless local CLI requests are allowed.
+   */
+  function assertLocalWorkBuddyRequest(req: any): void {
+    const ip = req.ip || (req as any).connection?.remoteAddress || "";
+    const isLoopback = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+    if (isLoopback && !req.headers?.origin) return;
+    const origin = req.headers?.origin;
+    if (typeof origin !== "string" || !origin) {
+      if (isLoopback) return;
+      const err: any = new Error("workbuddy_unauthorized");
+      err.statusCode = 403;
+      throw err;
+    }
+    let host = "";
+    try {
+      host = new URL(origin).host;
+    } catch {
+      const err: any = new Error("workbuddy_unauthorized");
+      err.statusCode = 403;
+      throw err;
+    }
+    const port = config.PORT || 3456;
+    const allowed = new Set<string>([
+      `127.0.0.1:${port}`,
+      `localhost:${port}`,
+      `[::1]:${port}`,
+    ]);
+    const forwarded = String(req.headers?.["x-forwarded-host"] || "").split(",")[0].trim();
+    if (forwarded) allowed.add(forwarded);
+    if (!allowed.has(host)) {
+      const err: any = new Error("workbuddy_unauthorized");
+      err.statusCode = 403;
+      throw err;
+    }
+  }
+
+  function workBuddyService(): WorkBuddyAuthService | undefined {
+    return (_app as any)._server?.workBuddyAuthService as WorkBuddyAuthService | undefined;
+  }
+
+  function requireWorkBuddyService(): WorkBuddyAuthService {
+    const service = workBuddyService();
+    if (!service) throw new Error("WorkBuddy 服务未初始化");
+    return service;
+  }
+
+  _app.get("/api/workbuddy/status", async (req: any, reply: any) => {
+    try {
+      assertLocalWorkBuddyRequest(req);
+      return await requireWorkBuddyService().getStatus();
+    } catch (error: any) {
+      if (error?.statusCode === 403) {
+        reply.status(403);
+        return { error: "workbuddy_unauthorized" };
+      }
+      console.error("Failed to get WorkBuddy status:", error);
+      reply.status(500);
+      return { error: "workbuddy_status_failed" };
+    }
+  });
+
+  _app.post("/api/workbuddy/import", async (req: any, reply: any) => {
+    try {
+      assertLocalWorkBuddyRequest(req);
+      const result = await requireWorkBuddyService().importFromLocalDesktop();
+      if (!result.success && result.error === "workbuddy_name_conflict") {
+        reply.status(409);
+        return { success: false, error: "workbuddy_name_conflict", message: result.message };
+      }
+      if (!result.success) {
+        reply.status(422);
+        return {
+          success: false,
+          reason: result.reason || "source_invalid",
+          message: result.message || "WorkBuddy 导入失败；未改动任何文件",
+          modelsUnchanged: true,
+        };
+      }
+      return result;
+    } catch (error: any) {
+      if (error?.statusCode === 403) {
+        reply.status(403);
+        return { error: "workbuddy_unauthorized" };
+      }
+      console.error("Failed to import WorkBuddy login:", error);
+      reply.status(500);
+      return { error: "workbuddy_import_failed" };
+    }
+  });
+
+  _app.post("/api/workbuddy/sync", async (req: any, reply: any) => {
+    try {
+      assertLocalWorkBuddyRequest(req);
+      const result = await requireWorkBuddyService().syncModels();
+      if (!result.success && result.error === "workbuddy_not_connected") {
+        reply.status(409);
+        return { success: false, error: "workbuddy_not_connected", message: result.message };
+      }
+      if (!result.success) {
+        reply.status(422);
+        return {
+          success: false,
+          reason: result.reason || "models_fetch_failed",
+          message: result.message || "WorkBuddy 模型同步失败；保留原模型列表",
+          modelsUnchanged: true,
+        };
+      }
+      return result;
+    } catch (error: any) {
+      if (error?.statusCode === 403) {
+        reply.status(403);
+        return { error: "workbuddy_unauthorized" };
+      }
+      console.error("Failed to sync WorkBuddy models:", error);
+      reply.status(500);
+      return { error: "workbuddy_sync_failed" };
+    }
+  });
+
+  _app.post("/api/workbuddy/disconnect", async (req: any, reply: any) => {
+    try {
+      assertLocalWorkBuddyRequest(req);
+      return await requireWorkBuddyService().disconnect();
+    } catch (error: any) {
+      if (error?.statusCode === 403) {
+        reply.status(403);
+        return { error: "workbuddy_unauthorized" };
+      }
+      console.error("Failed to disconnect WorkBuddy:", error);
+      reply.status(500);
+      return { error: "workbuddy_disconnect_failed" };
     }
   });
 

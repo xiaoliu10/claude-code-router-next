@@ -7,6 +7,7 @@ import {
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
+import { WORKBUDDY_CHAT_URL, classifyWorkBuddyError, isWorkBuddyRuntime } from "../services/workbuddy";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -553,10 +554,20 @@ async function handleFallback(
     (error?.message && isRateLimitError(error.message));
 
   if (originalProvider && originalModel) {
-    // Use markRateLimited for rate-limit errors instead of recordFailure
-    // so the model is immediately isolated (bypassing the 3-failure threshold)
-    // and auto-recovers after a cooldown period.
-    if (isRateLimit) {
+    // WorkBuddy upstream errors carry their own classification and cooldown:
+    // a 6004 rate limit is per provider+model (not the whole account), and a
+    // 11140 account restriction is terminal for hours so it must not be retried
+    // on every request.
+    if (error?.workbuddy && (error.code === "rate_limit" || error.code === "insufficient_quota")) {
+      healthStore.markRateLimited(originalProvider, originalModel, error.cooldownSeconds ?? 900, error.message);
+      req.log.warn(`WorkBuddy model ${originalProvider},${originalModel} cooled down for ${error.cooldownSeconds ?? 900}s (${error.code})`);
+    } else if (error?.workbuddy && error.code === "workbuddy_account_restricted") {
+      healthStore.forceOpen(originalProvider, originalModel, error.message);
+      req.log.warn(`WorkBuddy account restricted; ${originalProvider},${originalModel} parked for ${error.cooldownSeconds ?? 7200}s`);
+    } else if (isRateLimit) {
+      // Use markRateLimited for rate-limit errors instead of recordFailure
+      // so the model is immediately isolated (bypassing the 3-failure threshold)
+      // and auto-recovers after a cooldown period.
       healthStore.markRateLimited(originalProvider, originalModel, 120, error?.message);
       req.log.warn(`Primary model ${originalProvider},${originalModel} rate-limited, will try fallbacks`);
     } else {
@@ -1064,6 +1075,18 @@ async function sendRequestToProvider(
   transformer: any,
   context: any
 ) {
+  // Managed WorkBuddy providers must always talk to the fixed HTTPS upstream.
+  // The transformer auth() hook returns a config.url, but the URL is computed
+  // above before the hook runs, so a config-supplied base_url could otherwise
+  // win. Re-lock the URL for the managed provider immediately before the send.
+  const workbuddyManaged = isWorkBuddyRuntime(provider);
+  if (workbuddyManaged) {
+    const fixed = new URL(WORKBUDDY_CHAT_URL);
+    if (fixed.protocol !== "https:") throw new Error("WorkBuddy 上游地址不合法");
+    config.url = fixed.toString();
+    // Never follow a redirect away from the fixed origin.
+    config.redirect = "error";
+  }
   const url = config.url || new URL(provider.baseUrl);
 
   // Apply timeout from config
@@ -1142,6 +1165,20 @@ async function sendRequestToProvider(
   // Handle request errors
   if (!response.ok) {
     const errorText = await response.text();
+    // WorkBuddy managed providers: classify and redact the upstream body here,
+    // BEFORE any log or client-facing error is built. A raw WorkBuddy envelope
+    // must never reach the log stream, and a WorkBuddy access token must never
+    // be recoverable from an error message.
+    if (isWorkBuddyRuntime(provider)) {
+      const wbError = classifyWorkBuddyError(response.status, errorText);
+      fastify.log.error(
+        `[provider_response_error] WorkBuddy provider(${provider.name},${requestBody.model}: ${response.status}) code=${(wbError as any).upstreamCode ?? "n/a"} kind=${wbError.code}`
+      );
+      (wbError as any).isRateLimit = wbError.code === "rate_limit";
+      (wbError as any).workbuddy = true;
+      (wbError as any).cooldownSeconds = (wbError as any).cooldownSeconds;
+      throw wbError;
+    }
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
     );
@@ -1194,6 +1231,15 @@ async function sendRequestToProvider(
             (typeof bodyJson.error === 'object' && Object.keys(bodyJson.error).length > 0);
 
           if (hasRealError) {
+            if (isWorkBuddyRuntime(provider)) {
+              const wbError = classifyWorkBuddyError(response.status, bodyText);
+              fastify.log.error(
+                `[provider_response_error] WorkBuddy hidden error from provider(${provider.name},${requestBody.model}: ${response.status}) code=${(wbError as any).upstreamCode ?? "n/a"} kind=${wbError.code}`
+              );
+              (wbError as any).isRateLimit = wbError.code === "rate_limit";
+              (wbError as any).workbuddy = true;
+              throw wbError;
+            }
             fastify.log.error(
               `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
             );
