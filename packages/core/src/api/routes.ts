@@ -297,15 +297,20 @@ async function handleTransformerEndpoint(
       normalizeResponsesBody(body);
     }
 
+    // One shared transformer context per request. Provider transformers stash
+    // request-phase state on it (e.g. the WorkBuddy tool-name map and the
+    // client's original stream flag) that the response-phase transformers of
+    // the SAME request must see; building a fresh object per phase silently
+    // drops that state.
+    const transformerContext: any = { req, isCodexOnMessagesEndpoint };
+
     // Process request transformer chain
     const { requestBody, config, bypass } = await processRequestTransformers(
       body,
       provider,
       transformer,
       req.headers,
-      {
-        req,
-      }
+      transformerContext
     );
 
     // Hoist system messages to the front of the messages array and dedupe exact
@@ -345,9 +350,7 @@ async function handleTransformerEndpoint(
       fastify,
       bypass,
       transformer,
-      {
-        req,
-      }
+      transformerContext
     );
 
     // Capture rate limit headers from upstream response
@@ -364,10 +367,7 @@ async function handleTransformerEndpoint(
       provider,
       transformer,
       bypass,
-      {
-        req,
-        isCodexOnMessagesEndpoint,
-      }
+      transformerContext
     );
 
     finalResponse = await validateStreamingResponse(body, finalResponse, provider.name || providerName);
@@ -740,13 +740,21 @@ async function handleFallback(
 
           const provider = configuredFallback.provider;
 
+          // One shared transformer context per fallback attempt (same reason
+          // as the primary path): request-phase state must reach the
+          // response-phase transformers of the same attempt.
+          const fbContext: any = {
+            req: newReq,
+            isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
+          };
+
           // Process request transformer chain
           const { requestBody, config, bypass } = await processRequestTransformers(
             newBody,
             provider,
             transformer,
             req.headers,
-            { req: newReq }
+            fbContext
           );
 
           // Send request to LLM provider
@@ -757,7 +765,7 @@ async function handleFallback(
             fastify,
             bypass,
             transformer,
-            { req: newReq }
+            fbContext
           );
 
           // Capture rate limit headers from upstream response
@@ -775,10 +783,7 @@ async function handleFallback(
             provider,
             transformer,
             bypass,
-            {
-              req: newReq,
-              isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
-            }
+            fbContext
           );
           finalResponse = await validateStreamingResponse(newBody, finalResponse, fbProviderName);
 

@@ -125,6 +125,120 @@ describe("WorkBuddy transformer request quirks", () => {
     const json = await out.json();
     expect(json.choices[0].message.tool_calls[0].function.name).toBe("read.file");
   });
+
+  it("forces upstream stream:true and records the client's original intent", async () => {
+    const { transformer } = await harness();
+
+    const ctxNonStream: any = { req: { body: { stream: false } } };
+    const outNonStream = (await transformer.transformRequestIn({ ...baseRequest(), stream: false } as any, {} as any, ctxNonStream)).body;
+    expect(outNonStream.stream).toBe(true);
+    expect(ctxNonStream.workbuddyClientStream).toBe(false);
+    expect(ctxNonStream.workbuddyUpstreamStream).toBe(true);
+
+    const ctxStream: any = { req: { body: { stream: true } } };
+    const outStream = (await transformer.transformRequestIn({ ...baseRequest(), stream: true } as any, {} as any, ctxStream)).body;
+    expect(outStream.stream).toBe(true);
+    expect(ctxStream.workbuddyClientStream).toBe(true);
+
+    // No req context (direct unit call): falls back to the unified body's flag.
+    const ctxBare: any = {};
+    await transformer.transformRequestIn({ ...baseRequest(), stream: true } as any, {} as any, ctxBare);
+    expect(ctxBare.workbuddyClientStream).toBe(true);
+  });
+});
+
+describe("WorkBuddy non-stream aggregation (contract §13 Q1)", () => {
+  const sse = (chunks: string[]) => {
+    const encoder = new TextEncoder();
+    let i = 0;
+    return new Response(new ReadableStream<Uint8Array>({
+      pull(c) { if (i === chunks.length) c.close(); else c.enqueue(encoder.encode(chunks[i++])); },
+    }), { headers: { "Content-Type": "text/event-stream" } });
+  };
+
+  it("aggregates SSE into one chat.completion JSON for a non-stream client", async () => {
+    const { transformer } = await harness();
+    const context: any = {};
+    await transformer.transformRequestIn({ ...baseRequest(), stream: false } as any, {} as any, context);
+    const body = [
+      "data: {\"id\":\"c1\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n",
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"，world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+      "data: [DONE]\n\n",
+    ];
+    const out = await transformer.transformResponseOut(sse(body), context);
+    expect(out.headers.get("Content-Type")).toBe("application/json");
+    const json = await out.json();
+    expect(json.object).toBe("chat.completion");
+    expect(json.id).toBe("c1");
+    expect(json.model).toBe("glm-5.3");
+    expect(json.choices[0].message.role).toBe("assistant");
+    expect(json.choices[0].message.content).toBe("你好，world");
+    expect(json.choices[0].finish_reason).toBe("stop");
+    expect(json.usage.total_tokens).toBe(5);
+    expect(JSON.stringify(json)).not.toContain("data:");
+  });
+
+  it("re-assembles fragmented tool_calls and restores the client's original names", async () => {
+    const { transformer } = await harness();
+    const context: any = {};
+    await transformer.transformRequestIn({ ...baseRequest(), stream: false } as any, {} as any, context);
+    const body = [
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n",
+      "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+      "data: [DONE]\n\n",
+    ];
+    const out = await transformer.transformResponseOut(sse(body), context);
+    const json = await out.json();
+    const call = json.choices[0].message.tool_calls[0];
+    expect(call.id).toBe("call_1");
+    expect(call.function.name).toBe("read.file");
+    expect(call.function.arguments).toBe("{\"a\":1}");
+    expect(json.choices[0].finish_reason).toBe("tool_calls");
+  });
+
+  it("throws a classified error on an upstream error chunk instead of truncating", async () => {
+    const { transformer } = await harness();
+    const context: any = {};
+    await transformer.transformRequestIn({ ...baseRequest(), stream: false } as any, {} as any, context);
+    const body = [
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+      "data: {\"error\":{\"code\":11140,\"msg\":\"account has been restricted due to unusual activity\"}}\n\n",
+    ];
+    await expect(transformer.transformResponseOut(sse(body), context))
+      .rejects.toMatchObject({ code: "workbuddy_account_restricted", statusCode: 400 });
+  });
+
+  it("throws on a data-less stream so fallback engages instead of an empty completion", async () => {
+    const { transformer } = await harness();
+    const context: any = {};
+    await transformer.transformRequestIn({ ...baseRequest(), stream: false } as any, {} as any, context);
+    await expect(transformer.transformResponseOut(sse([": ping\n\n", "data: [DONE]\n\n"]), context))
+      .rejects.toMatchObject({ workbuddy: true });
+  });
+
+  it("passes SSE through untouched for a stream client", async () => {
+    const { transformer } = await harness();
+    const context: any = {};
+    await transformer.transformRequestIn({ ...baseRequest(), stream: true } as any, {} as any, context);
+    const body = [
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+      "data: [DONE]\n\n",
+    ];
+    const out = await transformer.transformResponseOut(sse(body), context);
+    expect(await out.text()).toBe(body.join(""));
+  });
+
+  it("keeps stream passthrough when the request phase never ran (hand-built context)", async () => {
+    const { transformer } = await harness();
+    const body = [
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+      "data: [DONE]\n\n",
+    ];
+    const out = await transformer.transformResponseOut(sse(body), {});
+    expect(await out.text()).toBe(body.join(""));
+  });
 });
 
 describe("WorkBuddy transformer auth hook", () => {
@@ -174,7 +288,8 @@ describe("WorkBuddy SSE rewriting", () => {
   it("passes comments, [DONE], usage-only and malformed lines through verbatim", async () => {
     const { transformer } = await harness();
     const context: any = {};
-    await transformer.transformRequestIn(baseRequest() as any, {} as any, context);
+    // A stream client: the SSE body must pass through untouched.
+    await transformer.transformRequestIn({ ...baseRequest(), stream: true } as any, {} as any, context);
     const body = [
       ": keep-alive ping\n",
       "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n",
@@ -192,7 +307,7 @@ describe("WorkBuddy SSE rewriting", () => {
   it("restores tool names across argument fragments", async () => {
     const { transformer } = await harness();
     const context: any = {};
-    await transformer.transformRequestIn(baseRequest() as any, {} as any, context);
+    await transformer.transformRequestIn({ ...baseRequest(), stream: true } as any, {} as any, context);
     const body = [
       "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\"}}]}}]}\n\n",
       "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n",
@@ -211,7 +326,7 @@ describe("WorkBuddy SSE rewriting", () => {
   it("preserves CRLF line endings and split multi-byte UTF-8", async () => {
     const { transformer } = await harness();
     const context: any = {};
-    await transformer.transformRequestIn(baseRequest() as any, {} as any, context);
+    await transformer.transformRequestIn({ ...baseRequest(), stream: true } as any, {} as any, context);
     const encoder = new TextEncoder();
     const chunk1 = encoder.encode("data: {\"choices\":[{\"delta\":{\"content\":\"中文\"");
     const chunk2 = encoder.encode("}}]}\r\n\r\n");

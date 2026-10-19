@@ -180,6 +180,81 @@ describe("WorkBuddy data plane (isolated mocks)", () => {
     expect(init.redirect).toBe("error");
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it("aggregates upstream SSE into JSON for a non-stream client (real pipeline)", async () => {
+    const serverRuntime = await buildProviderServer([{
+      name: "workbuddy", api_base_url: CHAT_URL, api_key: "ccr-managed-workbuddy",
+      models: ["glm-5.3"], transformer: { use: ["workbuddy"] }, ccr_managed: true,
+    }]);
+    const { store, dir } = serverRuntime;
+    await store.save(CRED);
+    const fetchMock = vi.fn(async () => sseResponse([
+      "data: {\"id\":\"c1\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n",
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+      "data: [DONE]\n\n",
+    ]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await serverRuntime.server.app.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: { model: "workbuddy,glm-5.3", messages: [{ role: "user", content: "hi" }], stream: false },
+    });
+
+    expect(res.statusCode).toBe(200);
+    // Contract §13 Q1: the upstream is always asked for a stream...
+    const sent = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    expect(sent.stream).toBe(true);
+    // ...but the non-stream client receives ONE aggregated JSON completion,
+    // never raw SSE.
+    expect(res.headers["content-type"]).toContain("application/json");
+    const json = res.json();
+    expect(json.object).toBe("chat.completion");
+    expect(json.choices[0].message.content).toBe("你好 world");
+    expect(json.usage.total_tokens).toBe(5);
+    expect(res.body).not.toContain("data:");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("restores client tool names end-to-end (shared transformer context)", async () => {
+    const serverRuntime = await buildProviderServer([{
+      name: "workbuddy", api_base_url: CHAT_URL, api_key: "ccr-managed-workbuddy",
+      models: ["glm-5.3"], transformer: { use: ["workbuddy"] }, ccr_managed: true,
+    }]);
+    const { store, dir } = serverRuntime;
+    await store.save(CRED);
+    const fetchMock = vi.fn(async () => sseResponse([
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"p\\\":1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+      "data: [DONE]\n\n",
+    ]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await serverRuntime.server.app.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        model: "workbuddy,glm-5.3",
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+        tools: [{ type: "function", function: { name: "read.file", description: "r", parameters: { type: "object", properties: {} } } }],
+        tool_choice: { type: "function", function: { name: "read.file" } },
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    // The upstream saw the SAFE (renamed) tool...
+    const sent = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    expect(sent.tools[0].function.name).toBe("read_file");
+    expect(sent.tool_choice).toBe("read_file");
+    // ...and the client gets its ORIGINAL name back in the aggregated JSON —
+    // only possible when the request- and response-phase transformers of one
+    // request share a single context object.
+    const json = res.json();
+    expect(json.choices[0].message.tool_calls[0].function.name).toBe("read.file");
+    expect(json.choices[0].message.tool_calls[0].function.arguments).toBe("{\"p\":1}");
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 describe("WorkBuddy admin API (isolated mocks)", () => {
@@ -360,5 +435,73 @@ describe("WorkBuddy admin API (isolated mocks)", () => {
       headers: { origin: "http://127.0.0.1:3456" },
     });
     expect(res.statusCode).toBe(200);
+  });
+
+  it("rejects a remote caller that spoofs X-Forwarded-Host to match its Origin", async () => {
+    const config = { PORT: 3456, APIKEY: "secret", Providers: [], Router: {} };
+    const { server } = await build(config, null);
+    stubConfig(config);
+    const res = await server.app.inject({
+      method: "GET",
+      url: "/api/workbuddy/status",
+      remoteAddress: "203.0.113.9",
+      headers: { origin: "http://evil.example:3456", "x-forwarded-host": "evil.example:3456" },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "workbuddy_unauthorized" });
+  });
+
+  it("rejects a remote caller that spoofs a loopback Origin", async () => {
+    const config = { PORT: 3456, APIKEY: "secret", Providers: [], Router: {} };
+    const { server } = await build(config, null);
+    stubConfig(config);
+    const res = await server.app.inject({
+      method: "POST",
+      url: "/api/workbuddy/import",
+      remoteAddress: "10.1.2.3",
+      headers: { origin: "http://127.0.0.1:3456" },
+      payload: {},
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "workbuddy_unauthorized" });
+  });
+
+  it("re-locks a managed WorkBuddy entry rewritten by a generic config save", async () => {
+    const config = {
+      PORT: 3456, APIKEY: "secret",
+      Providers: [
+        { name: "workbuddy", ccr_managed: true, workbuddy_kind: "workbuddy", api_base_url: CHAT_URL, api_key: "ccr-managed-workbuddy", models: ["glm-5.3"], transformer: { use: ["workbuddy"] }, enabled: true },
+        { name: "other", api_base_url: "https://x/v1", api_key: "k", models: ["m"] },
+      ],
+      Router: { default: "other,m" },
+    };
+    const { server } = await build(config, null);
+    stubConfig(config);
+    // POST /api/config reads the previous config through readConfigFile.
+    vi.spyOn(configModule, "readConfigFile").mockResolvedValue(JSON.parse(JSON.stringify(config)));
+
+    const hostile = JSON.parse(JSON.stringify(config));
+    hostile.Providers[0].api_base_url = "https://evil.example/v1/chat/completions";
+    hostile.Providers[0].api_key = "attacker-value";
+    hostile.Providers[0].transformer = { use: ["openai"] };
+    hostile.Providers[0].ccr_managed = false;
+
+    const res = await server.app.inject({
+      method: "POST",
+      url: "/api/config",
+      remoteAddress: "127.0.0.1",
+      payload: hostile,
+    });
+    expect(res.statusCode).toBe(200);
+
+    // The persisted managed entry is re-locked to the fixed identity.
+    const managed: any = config.Providers.find((p: any) => p.name === "workbuddy");
+    expect(managed.api_base_url).toBe(CHAT_URL);
+    expect(managed.api_key).toBe("ccr-managed-workbuddy");
+    expect(managed.transformer).toEqual({ use: ["workbuddy"] });
+    expect(managed.ccr_managed).toBe(true);
+    // Router untouched; ordinary providers untouched.
+    expect(config.Router).toEqual({ default: "other,m" });
+    expect(config.Providers.find((p: any) => p.name === "other")).toMatchObject({ api_base_url: "https://x/v1", api_key: "k" });
   });
 });

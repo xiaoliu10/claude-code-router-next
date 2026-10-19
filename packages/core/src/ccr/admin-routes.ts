@@ -17,6 +17,7 @@ import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
 import { getHealthStore } from "../services/provider-health";
 import { reconcileHealthStore, clearProviderHealth } from "./health-reconcile";
 import { WorkBuddyAuthService } from "../services/workbuddy-auth";
+import { protectWorkBuddyConfig } from "../services/workbuddy";
 import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
 import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
@@ -293,6 +294,12 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       previousConfig = await readConfigFile();
     } catch {}
     const selfProviderResult = ensureCcrSelfProvider(newConfig, previousConfig);
+
+    // Re-lock the managed WorkBuddy entry (contract D7): a generic config save
+    // — UI, CLI, preset apply — must not be able to rewrite its upstream URL,
+    // marker api_key or transformer list. protectWorkBuddyConfig only touches
+    // providers named "workbuddy" and never modifies Router.
+    protectWorkBuddyConfig(newConfig, previousConfig);
 
     await writeConfigFile(newConfig);
     let projectTakeoverSync: Awaited<ReturnType<typeof syncGlobalProjectTakeovers>> | undefined;
@@ -903,43 +910,46 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
   // desktop login file except POST /import, and they never expose a token.
 
   /**
-   * Local-origin guard for WorkBuddy management endpoints. A remote non-loopback
-   * caller must not be able to trigger a local file read or a config mutation,
-   * even when CCR APIKEY is configured (the key authorizes inference traffic,
-   * not privileged local operations). Originless local CLI requests are allowed.
+   * Local-only guard for WorkBuddy management endpoints. These routes read a
+   * local login file and mutate config, so the SOCKET address is the only
+   * trustworthy identity: a non-loopback caller is rejected regardless of any
+   * header it can spoof (Origin and X-Forwarded-Host are attacker-controlled
+   * and must never widen the allowlist). For loopback callers an Origin
+   * header, when present, must still match our own UI origin — that is what
+   * stops a malicious page in a local browser (DNS rebinding / CSRF) from
+   * driving the management API through the victim's own loopback socket.
+   * Originless loopback requests (local CLI/tooling) are allowed.
    */
   function assertLocalWorkBuddyRequest(req: any): void {
-    const ip = req.ip || (req as any).connection?.remoteAddress || "";
-    const isLoopback = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
-    if (isLoopback && !req.headers?.origin) return;
-    const origin = req.headers?.origin;
-    if (typeof origin !== "string" || !origin) {
-      if (isLoopback) return;
+    const deny = (): never => {
       const err: any = new Error("workbuddy_unauthorized");
       err.statusCode = 403;
       throw err;
-    }
+    };
+    const ip = req.ip || (req as any).connection?.remoteAddress || "";
+    const isLoopback = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+    if (!isLoopback) deny();
+    const origin = req.headers?.origin;
+    if (typeof origin !== "string" || !origin) return;
     let host = "";
     try {
       host = new URL(origin).host;
     } catch {
-      const err: any = new Error("workbuddy_unauthorized");
-      err.statusCode = 403;
-      throw err;
+      deny();
     }
-    const port = config.PORT || 3456;
+    // Prefer the real listening port (PORT:0 / ephemeral deployments); fall
+    // back to the configured port when the server is not listening (tests
+    // drive the app through inject() without a socket).
+    const address: any = (_app as any).server?.address?.();
+    const port = typeof address?.port === "number" && address.port > 0
+      ? address.port
+      : (config.PORT || 3456);
     const allowed = new Set<string>([
       `127.0.0.1:${port}`,
       `localhost:${port}`,
       `[::1]:${port}`,
     ]);
-    const forwarded = String(req.headers?.["x-forwarded-host"] || "").split(",")[0].trim();
-    if (forwarded) allowed.add(forwarded);
-    if (!allowed.has(host)) {
-      const err: any = new Error("workbuddy_unauthorized");
-      err.statusCode = 403;
-      throw err;
-    }
+    if (!allowed.has(host)) deny();
   }
 
   function workBuddyService(): WorkBuddyAuthService | undefined {

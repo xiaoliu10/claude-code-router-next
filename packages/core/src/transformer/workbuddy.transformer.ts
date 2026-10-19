@@ -94,6 +94,21 @@ export class WorkBuddyTransformer implements Transformer {
   ): Promise<any> {
     const body: any = JSON.parse(JSON.stringify(request));
 
+    // Contract §13 Q1: the WorkBuddy upstream is only guaranteed to speak SSE
+    // (protocol source: "Non-stream chat request is currently not supported").
+    // Always request a stream upstream and remember what the CLIENT asked for,
+    // so transformResponseOut can aggregate back into one JSON completion for
+    // non-stream clients instead of leaking raw SSE to them. The client's
+    // original flag lives on req.body (normalized to a boolean by the server
+    // preHandler); fall back to the unified body for direct/unit-test calls.
+    if (context) {
+      const rawClientStream = context.req?.body?.stream;
+      context.workbuddyClientStream =
+        rawClientStream !== undefined ? rawClientStream === true : (request as any)?.stream === true;
+      context.workbuddyUpstreamStream = true; // set unconditionally: body.stream is forced to true below
+    }
+    body.stream = true;
+
     // max_completion_tokens → max_tokens (existing max_tokens wins), field dropped.
     if (body.max_completion_tokens !== undefined) {
       if (body.max_tokens === undefined) body.max_tokens = body.max_completion_tokens;
@@ -175,11 +190,11 @@ export class WorkBuddyTransformer implements Transformer {
         const headers = new Headers(response.headers);
         if (peeked.isSSE) headers.set("Content-Type", "text/event-stream");
         response = new Response(peeked.body, { status: response.status, statusText: response.statusText, headers });
-        if (peeked.isSSE) return this.rewriteStream(response, names);
+        if (peeked.isSSE) return this.dispatchSSE(response, names, context);
       } else {
         const drained = await readBodyForSSE(response);
         response = drained.response;
-        if (drained.isSSE) return this.rewriteStream(response, names);
+        if (drained.isSSE) return this.dispatchSSE(response, names, context);
       }
       // Read the body as text and always hand back a FRESH response: the
       // original body is consumed here, and routes.ts / the endpoint converter
@@ -198,9 +213,115 @@ export class WorkBuddyTransformer implements Transformer {
 
     if (contentType.includes("stream") || contentType.includes("event-stream")) {
       if (!response.body) return response;
-      return this.rewriteStream(response, names);
+      return this.dispatchSSE(response, names, context);
     }
     return response;
+  }
+
+  /**
+   * Route an SSE upstream response by what the CLIENT asked for: a stream
+   * client gets the tool-name-restored stream; a non-stream client gets one
+   * aggregated chat.completion JSON body (contract §13 Q1 — raw SSE must never
+   * leak to a non-stream client). Absent the request-phase flag (direct unit
+   * calls without transformRequestIn) the stream passes through unchanged.
+   */
+  private async dispatchSSE(
+    response: Response,
+    names: Map<string, string> | undefined,
+    context?: TransformerContext
+  ): Promise<Response> {
+    // Only aggregate when the request phase recorded BOTH facts: the client
+    // asked for non-stream AND the upstream request was actually forced to
+    // stream. A hand-built context (unit tests, or any future caller that skips
+    // transformRequestIn) must keep the existing stream passthrough rather than
+    // silently collapsing a real stream into one buffered JSON body.
+    const clientWantsJson =
+      context?.workbuddyClientStream === false && context?.workbuddyUpstreamStream === true;
+    if (!clientWantsJson) return this.rewriteStream(response, names);
+    const aggregated = await this.aggregateSSE(response, names);
+    return new Response(JSON.stringify(aggregated), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  /**
+   * Aggregate an OpenAI-style SSE stream into a single chat.completion body:
+   * content/reasoning fragments are joined, tool_call fragments re-assembled
+   * by index, the last usage object wins, and an upstream error chunk (or a
+   * data-less stream) becomes a classified error so fallback engages instead
+   * of the client receiving a truncated/empty completion.
+   */
+  private async aggregateSSE(response: Response, names?: Map<string, string>): Promise<any> {
+    const text = await response.text();
+    let id: string | undefined;
+    let created: number | undefined;
+    let model: string | undefined;
+    let finishReason: string | null = null;
+    let usage: any;
+    let sawData = false;
+    let errorChunk: any = null;
+    const content: string[] = [];
+    const reasoning: string[] = [];
+    const toolCalls = new Map<number, any>();
+
+    for (const line of text.split(/\r\n|\r|\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      const chunk = this.parseOrNull(payload);
+      if (chunk === null) continue;
+      sawData = true;
+      if (chunk.error) { errorChunk = chunk; continue; }
+      if (chunk.id) id = chunk.id;
+      if (chunk.created) created = chunk.created;
+      if (chunk.model) model = chunk.model;
+      if (chunk.usage) usage = chunk.usage;
+      const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+      if (!choice) continue;
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+      const delta = choice.delta ?? {};
+      if (typeof delta.content === "string") content.push(delta.content);
+      if (typeof delta.reasoning_content === "string") reasoning.push(delta.reasoning_content);
+      for (const tc of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+        const idx = typeof tc?.index === "number" ? tc.index : 0;
+        let acc = toolCalls.get(idx);
+        if (!acc) {
+          acc = { type: "function", function: { arguments: "" } };
+          toolCalls.set(idx, acc);
+        }
+        if (tc?.id) acc.id = tc.id;
+        if (tc?.type) acc.type = tc.type;
+        if (typeof tc?.function?.name === "string") acc.function.name = (acc.function.name ?? "") + tc.function.name;
+        if (typeof tc?.function?.arguments === "string") acc.function.arguments += tc.function.arguments;
+      }
+    }
+
+    if (errorChunk || finishReason === "error") {
+      throw classifyWorkBuddyError(response.status, JSON.stringify(errorChunk ?? { msg: "workbuddy stream error" }));
+    }
+    if (!sawData) {
+      // Mirror validateStreamingResponse's empty-stream protection: a data-less
+      // upstream must trigger fallback, not a silent empty completion.
+      throw classifyWorkBuddyError(response.status, JSON.stringify({ msg: "empty workbuddy stream" }));
+    }
+
+    const message: any = { role: "assistant", content: content.join("") };
+    if (reasoning.length) message.reasoning_content = reasoning.join("");
+    if (toolCalls.size) {
+      message.tool_calls = [...toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([, tc]) => tc);
+    }
+    const completion: any = {
+      id: id ?? `chatcmpl-workbuddy-${Date.now()}`,
+      object: "chat.completion",
+      created: created ?? Math.floor(Date.now() / 1000),
+      model: model ?? "workbuddy",
+      choices: [{ index: 0, message, finish_reason: finishReason ?? "stop" }],
+    };
+    if (usage) completion.usage = usage;
+    this.restoreNames(completion, names);
+    return completion;
   }
 
   private parseOrNull(text: string): any {
