@@ -1,6 +1,6 @@
 # WorkBuddy 内置供应商调研与首期设计
 
-> 日期：2026-10-19；状态：内部摸底完成，外部协议待验证。
+> 日期：2026-10-19；状态：调研与契约完成，首期实现中；真实账号尚未验证。
 > 意图：在 CCR 配置页管理订阅代理来源，将 WorkBuddy 作为普通可路由供应商，自动发现/注册模型，无需用户安装额外插件。
 > 约束：保留现有 HTTP provider/transformer 管线和普通供应商行为；不重启真实服务、不自动读取/外传用户真实凭据；独立分支 PR，未经授权不合并/发布。
 
@@ -68,7 +68,7 @@ Web UI Providers → POST /api/config → config.json → ConfigService.reload
 完整契约（配置形状、0600 私有凭证文件、状态枚举、4 个管理端点的精确请求/响应、
 transformer header/URL 注入点、文件所有权划分、测试矩阵、安全红线、验收口径）见：
 
-- 仓库内本文档只做索引；**权威契约在 `/tmp/ccr-workbuddy-research/design-contract.md`**。
+- 完整持久化契约：`docs/design/workbuddy-provider-contract.md`。其中第 13 节父代理裁决优先于前文冲突项；`/tmp/ccr-workbuddy-research/` 只保存本次工具证据，不作为交付依赖。
 
 实现分工：后端 `/tmp/ccr-workbuddy-backend`，UI `/tmp/ccr-workbuddy-frontend`（两者均不得互改对方文件）。
 
