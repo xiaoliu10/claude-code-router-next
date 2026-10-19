@@ -930,10 +930,14 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     const isLoopback = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
     if (!isLoopback) deny();
     const origin = req.headers?.origin;
-    if (typeof origin !== "string" || !origin) return;
     let host = "";
     try {
-      host = new URL(origin).host;
+      if (origin !== undefined && origin !== "") {
+        if (typeof origin !== "string") deny();
+        const parsed = new URL(origin);
+        if (!["http:", "https:"].includes(parsed.protocol)) deny();
+        host = parsed.host;
+      }
     } catch {
       deny();
     }
@@ -949,7 +953,10 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       `localhost:${port}`,
       `[::1]:${port}`,
     ]);
-    if (!allowed.has(host)) deny();
+    // Also pin Host for originless GETs (browsers omit Origin on same-origin GET).
+    const authority = req.headers?.host;
+    if (typeof authority === "string" && !allowed.has(authority)) deny();
+    if (host && !allowed.has(host)) deny();
   }
 
   function workBuddyService(): WorkBuddyAuthService | undefined {
@@ -977,13 +984,28 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     }
   });
 
+  _app.get("/api/workbuddy/usage", async (req: any, reply: any) => {
+    try {
+      assertLocalWorkBuddyRequest(req);
+      return { usage: await requireWorkBuddyService().getUsage() };
+    } catch (error: any) {
+      if (error?.statusCode === 403) { reply.status(403); return { error: "workbuddy_unauthorized" }; }
+      return { usage: null };
+    }
+  });
+
   _app.post("/api/workbuddy/import", async (req: any, reply: any) => {
     try {
       assertLocalWorkBuddyRequest(req);
-      const result = await requireWorkBuddyService().importFromLocalDesktop();
-      if (!result.success && result.error === "workbuddy_name_conflict") {
+      const site = (req.body as any)?.site ?? "workbuddy";
+      if (site !== "workbuddy" && site !== "workbuddy-ai") {
+        reply.status(422);
+        return { success: false, reason: "source_invalid", modelsUnchanged: true };
+      }
+      const result = await requireWorkBuddyService().importFromLocalDesktop(site);
+      if (!result.success && (result.error === "workbuddy_name_conflict" || result.error === "workbuddy_site_conflict")) {
         reply.status(409);
-        return { success: false, error: "workbuddy_name_conflict", message: result.message };
+        return { success: false, error: result.error, message: result.message };
       }
       if (!result.success) {
         reply.status(422);

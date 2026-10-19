@@ -1,4 +1,4 @@
-import { ProxyAgent } from "undici";
+import { Agent, ProxyAgent } from "undici";
 import type { ConfigService } from "./config";
 
 export interface ProxyAwareProvider {
@@ -80,6 +80,13 @@ export function findInvalidProxyUrls(
 }
 
 const proxyDispatchers = new Map<string, ProxyAgent>();
+let directDispatcher: Agent | undefined;
+
+/** A process-wide direct dispatcher, used by fixed-origin providers that must ignore configured proxies. */
+export function getDirectDispatcher(): Agent {
+  if (!directDispatcher) directDispatcher = new Agent({ connect: { timeout: 15_000 } });
+  return directDispatcher;
+}
 
 /**
  * Resolve the configured proxy URL using the compatibility key priority.

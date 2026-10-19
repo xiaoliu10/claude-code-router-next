@@ -16,12 +16,14 @@ import {
   protectWorkBuddyConfig,
   validDomain,
   workBuddyDesktopPath,
+  workBuddySite,
   type WorkBuddyCredential,
 } from "../services/workbuddy";
 
 const CRED: WorkBuddyCredential = {
   version: 1,
   kind: "workbuddy",
+  tokenType: "",
   uid: "u-1",
   displayName: "Nick",
   domain: "",
@@ -34,7 +36,7 @@ const CRED: WorkBuddyCredential = {
 
 const source = (extra: Record<string, any> = {}) => JSON.stringify({
   account: { uid: "u-1", nickname: "Nick", enterpriseId: "ent-1" },
-  auth: { accessToken: "a", refreshToken: "r", expiresAt: 0, ...extra },
+  auth: { accessToken: "a", refreshToken: "r", expiresAt: 0, refreshExpiresAt: 9999999999999, tokenType: "Bearer", ...extra },
 });
 
 describe("WorkBuddy constants", () => {
@@ -49,14 +51,16 @@ describe("WorkBuddy constants", () => {
   });
 
   it("derives the desktop login path per platform, with no client-controlled input", () => {
-    expect(workBuddyDesktopPath("darwin", "/Users/x")).toBe("/Users/x/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
-    expect(workBuddyDesktopPath("win32", "C:\\Users\\x")).toBe("C:\\Users\\x/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
-    expect(workBuddyDesktopPath("linux", "/home/x")).toBe("/home/x/.local/share/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
+    const CN = workBuddySite("workbuddy"), AI = workBuddySite("workbuddy-ai");
+    expect(workBuddyDesktopPath(CN, "darwin", "/Users/x")).toBe("/Users/x/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
+    expect(workBuddyDesktopPath(AI, "darwin", "/Users/x")).toBe("/Users/x/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info");
+    expect(workBuddyDesktopPath(CN, "win32", "C:\\Users\\x")).toBe("C:\\Users\\x/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
+    expect(workBuddyDesktopPath(CN, "linux", "/home/x")).toBe("/home/x/.local/share/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
   });
 });
 
 describe("workbuddy source parsing", () => {
-  it("accepts a plain desktop login and drops the unused refresh token", () => {
+  it("accepts a plain desktop login and drops unused refresh secrets", () => {
     const parsed = parseWorkBuddySource(source({ expiresIn: 600 }), 1000);
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
@@ -65,7 +69,10 @@ describe("workbuddy source parsing", () => {
     expect(parsed.credential.uid).toBe("u-1");
     expect(parsed.credential.displayName).toBe("Nick");
     expect(parsed.credential.enterpriseId).toBe("ent-1");
+    // Stored for diagnostics; no request path may spend them (contract §14.3).
     expect((parsed.credential as any).refreshToken).toBeUndefined();
+    expect((parsed.credential as any).refreshExpiresAt).toBeUndefined();
+    expect(parsed.credential.tokenType).toBe("Bearer");
   });
 
   it("normalizes expiresAt ms over expiresIn seconds", () => {
@@ -83,23 +90,23 @@ describe("workbuddy source parsing", () => {
       account: { uid: "u-1" },
       auth: { accessToken: { $wbEncrypted: 1, envelope: "x" } },
     }), 1000);
-    expect(parsed).toEqual({ ok: false, reason: "sealed" });
+    expect(parsed).toEqual({ ok: false, reason: "sealed", site: "workbuddy" });
   });
 
   it("refuses malformed payloads and missing uid", () => {
-    expect(parseWorkBuddySource("not json", 1000)).toEqual({ ok: false, reason: "source_invalid" });
-    expect(parseWorkBuddySource(JSON.stringify({ account: {}, auth: { accessToken: "a" } }), 1000)).toEqual({ ok: false, reason: "source_invalid" });
-    expect(parseWorkBuddySource(source({ accessToken: 42 }), 1000)).toEqual({ ok: false, reason: "source_invalid" });
-    expect(parseWorkBuddySource(JSON.stringify({ account: { uid: "u-1", enterpriseId: 1 }, auth: { accessToken: "a" } }), 1000)).toEqual({ ok: false, reason: "source_invalid" });
+    expect(parseWorkBuddySource("not json", 1000)).toEqual({ ok: false, reason: "source_invalid", site: "workbuddy" });
+    expect(parseWorkBuddySource(JSON.stringify({ account: {}, auth: { accessToken: "a" } }), 1000)).toEqual({ ok: false, reason: "source_invalid", site: "workbuddy" });
+    expect(parseWorkBuddySource(source({ accessToken: 42 }), 1000)).toEqual({ ok: false, reason: "source_invalid", site: "workbuddy" });
+    expect(parseWorkBuddySource(JSON.stringify({ account: { uid: "u-1", enterpriseId: 1 }, auth: { accessToken: "a" } }), 1000)).toEqual({ ok: false, reason: "source_invalid", site: "workbuddy" });
   });
 
   it("refuses a non-string phone number but falls back to uid for a nickname", () => {
-    expect(parseWorkBuddySource(JSON.stringify({ account: { uid: "u-1", phoneNumber: 42 }, auth: { accessToken: "a" } }), 1000)).toEqual({ ok: false, reason: "source_invalid" });
+    expect(parseWorkBuddySource(JSON.stringify({ account: { uid: "u-1", phoneNumber: 42 }, auth: { accessToken: "a" } }), 1000)).toEqual({ ok: false, reason: "source_invalid", site: "workbuddy" });
   });
 
   it("refuses control characters in the optional nickname", () => {
     const parsed = parseWorkBuddySource(JSON.stringify({ account: { uid: "u-1", nickname: "n\r\nX-Evil: 1" }, auth: { accessToken: "a" } }), 1000);
-    expect(parsed).toEqual({ ok: false, reason: "source_invalid" });
+    expect(parsed).toEqual({ ok: false, reason: "source_invalid", site: "workbuddy" });
   });
 
   it("rejects header-injecting CRLF in domain/uid", () => {
@@ -111,15 +118,19 @@ describe("workbuddy source parsing", () => {
     expect(parseWorkBuddySource(JSON.stringify({
       account: { uid: "u-1" },
       auth: { accessToken: "a", pad: "x".repeat(1024 * 1024) },
-    }), 1000)).toEqual({ ok: false, reason: "source_invalid" });
+    }), 1000)).toEqual({ ok: false, reason: "source_invalid", site: "workbuddy" });
   });
 
   it("only accepts known CN domains as a header value", () => {
-    expect(validDomain("copilot.tencent.com")).toBe("copilot.tencent.com");
-    expect(validDomain("www.codebuddy.cn")).toBe("www.codebuddy.cn");
-    expect(validDomain(undefined)).toBe("copilot.tencent.com");
-    expect(() => validDomain("evil.example.com")).toThrow();
-    expect(() => validDomain("copilot.tencent.com/../../other")).toThrow();
+    expect(validDomain("copilot.tencent.com", workBuddySite("workbuddy"))).toBe("copilot.tencent.com");
+    expect(validDomain("www.codebuddy.cn", workBuddySite("workbuddy"))).toBe("www.codebuddy.cn");
+    expect(validDomain(undefined, workBuddySite("workbuddy"))).toBe("copilot.tencent.com");
+    expect(() => validDomain("evil.example.com", workBuddySite("workbuddy"))).toThrow();
+    expect(() => validDomain("copilot.tencent.com/../../other", workBuddySite("workbuddy"))).toThrow();
+    // Per-site allowlist: a CN domain is not valid for the international build.
+    expect(validDomain("www.workbuddy.ai", workBuddySite("workbuddy-ai"))).toBe("www.workbuddy.ai");
+    expect(validDomain(undefined, workBuddySite("workbuddy-ai"))).toBe("www.workbuddy.ai");
+    expect(() => validDomain("copilot.tencent.com", workBuddySite("workbuddy-ai"))).toThrow();
   });
 });
 
@@ -187,7 +198,7 @@ describe("conversation ids", () => {
 
   it("omits ids when nothing is signable", () => {
     expect(conversationHeaders({ messages: [] })["X-Conversation-ID"]).toBeUndefined();
-    expect(conversationHeaders({ messages: [{ role: "user", content: "" }] })["X-Conversation-Request-ID"]).toBeUndefined();
+    expect(conversationHeaders({ messages: [{ role: "user", content: "" }] })["X-Conversation-Request-ID"]).toMatch(/^[0-9a-f]{32}$/);
   });
 });
 

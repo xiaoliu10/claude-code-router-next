@@ -7,7 +7,7 @@ import {
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
-import { WORKBUDDY_CHAT_URL, classifyWorkBuddyError, isWorkBuddyRuntime } from "../services/workbuddy";
+import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl } from "../services/workbuddy";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -33,7 +33,7 @@ import {
   readBodyForSSE,
 } from "../transformer/response-body";
 import { router, findProviderModel, ProjectRoutingError } from "@/utils/router";
-import { resolveProviderProxyUrl } from "@/services/proxy";
+import { resolveProviderProxyUrl, getDirectDispatcher } from "@/services/proxy";
 
 // Matches the CCR model-family aliases that CCR injects into managed clients
 // (e.g. "ccr-opus", "ccr-sonnet[1m]"). Codex sends one of these as a bare model
@@ -391,7 +391,9 @@ async function handleTransformerEndpoint(
     // Double-check: retry the same model once before falling back.
     // Transient provider errors (network jitter, momentary overload, empty SSE)
     // often resolve on a second attempt, avoiding unnecessary model switches.
-    if (!(req as any).__retryAttempted) {
+    // Only the terminal WorkBuddy reauth class is excluded: every other WorkBuddy
+    // error (rate limit, 5xx, empty stream) keeps its one same-model retry.
+    if (!(req as any).__retryAttempted && error?.code !== "workbuddy_reauth") {
       (req as any).__retryAttempted = true;
       try {
         return await handleTransformerEndpoint(req, reply, fastify, transformer);
@@ -673,6 +675,11 @@ async function handleFallback(
     return null;
   }
 
+  // Reauthentication failures are account-wide and terminal: probing fallback models
+  // cannot renew the WorkBuddy sign-in and would multiply a rejected large request.
+  const terminalWorkBuddyReauth = error?.workbuddy === true && error?.nonRetryable === true && error.code === "workbuddy_reauth";
+  if (terminalWorkBuddyReauth) return null;
+
   const totalFallbacks = fallbackStages.reduce((total, stage) => total + stage.models.length, 0);
   req.log.warn(`Request failed for ${scenarioType}, trying ${totalFallbacks} fallback models across ${fallbackStages.length} fallback stage(s)`);
 
@@ -833,6 +840,8 @@ async function handleFallback(
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
           fallbackError = error;
+          // Only the terminal reauth class skips a fallback model's second attempt.
+          if (error?.code === "workbuddy_reauth") break;
           if (attempt === 1) {
             req.log.warn(`Fallback model ${fbProviderName},${fbModel} failed, retrying once: ${error.message}`);
             continue;
@@ -1071,6 +1080,17 @@ function isCodexClient(req: any): boolean {
  * Send request to LLM provider
  * Handle authentication, build request config, send request and handle errors
  */
+/**
+ * WorkBuddy's front door resets the connection once a refused sign-in's request body passes
+ * EDGE_READS bytes (measured on both builds, magpie P:L1152-1160). Above that size a bare
+ * ECONNRESET says nothing about the cause, so the send failure is probed instead of guessed.
+ */
+const WORKBUDDY_EDGE_READS = 2 * 1024 * 1024;
+function exceedsWorkBuddyEdgeReads(body: any): boolean {
+  try { return Buffer.byteLength(JSON.stringify(body ?? {})) > WORKBUDDY_EDGE_READS; }
+  catch { return false; }
+}
+
 async function sendRequestToProvider(
   requestBody: any,
   config: any,
@@ -1086,11 +1106,17 @@ async function sendRequestToProvider(
   // win. Re-lock the URL for the managed provider immediately before the send.
   const workbuddyManaged = isWorkBuddyRuntime(provider);
   if (workbuddyManaged) {
-    const fixed = new URL(WORKBUDDY_CHAT_URL);
+    const service = getWorkBuddyAuthService();
+    const credential = config.workbuddyCredential ?? await service?.currentCredential();
+    if (!credential) throw new Error("WorkBuddy 未导入登录态，请先在管理页导入");
+    config.workbuddyCredential = credential;
+    const fixed = new URL(workBuddyChatUrl(workBuddySite(credential.kind)));
     if (fixed.protocol !== "https:") throw new Error("WorkBuddy 上游地址不合法");
     config.url = fixed.toString();
     // Never follow a redirect away from the fixed origin.
     config.redirect = "error";
+    // Fixed WorkBuddy origins must ignore configured CCR/proxy environment routing.
+    config.dispatcher = getDirectDispatcher();
   }
   const url = config.url || new URL(provider.baseUrl);
 
@@ -1133,6 +1159,13 @@ async function sendRequestToProvider(
     ...(config?.headers || {}),
   };
 
+  if (workbuddyManaged) {
+    // A single credential snapshot supplies BOTH destination and auth, never config URL/key.
+    for (const key of Object.keys(requestHeaders)) {
+      if (["authorization", "x-api-key", "host", "x-user-id", "x-domain", "x-enterprise-id", "x-tenant-id"].includes(key.toLowerCase())) delete requestHeaders[key];
+    }
+    Object.assign(requestHeaders, credentialHeaders(config.workbuddyCredential));
+  }
   stampUpstreamSessionId(requestHeaders, context?.req);
 
   for (const key in requestHeaders) {
@@ -1155,17 +1188,32 @@ async function sendRequestToProvider(
     });
   }
 
-  const response = await sendUnifiedRequest(
-    url,
-    requestBody,
-    {
-      ...config,
-      headers: JSON.parse(JSON.stringify(requestHeaders)),
-      httpsProxy: resolveProviderProxyUrl(fastify.configService, provider),
-    },
-    context,
-    fastify.log
-  );
+  let response: Response;
+  try {
+    response = await sendUnifiedRequest(
+      url,
+      requestBody,
+      {
+        ...config,
+        headers: JSON.parse(JSON.stringify(requestHeaders)),
+        httpsProxy: workbuddyManaged ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
+      },
+      context,
+      fastify.log
+    );
+  } catch (sendError: any) {
+    // WorkBuddy's front door (APISIX) reads only the first EDGE_READS bytes of a request
+    // whose sign-in it refuses, then resets the connection: a big Claude Code request on a
+    // stale token fails as a bare ECONNRESET with no diagnostic (contract §14.3b). Probe the
+    // billing API once with a tiny request to tell "sign-in expired" from a real network
+    // fault; the original request is never re-sent.
+    if (workbuddyManaged && exceedsWorkBuddyEdgeReads(requestBody)) {
+      const reauth = sendError?.workbuddy !== true && !["AbortError", "TimeoutError"].includes(sendError?.name)
+        ? await getWorkBuddyAuthService()?.diagnoseReset(config.workbuddyCredential) : null;
+      if (reauth) throw reauth;
+    }
+    throw sendError;
+  }
 
   // Handle request errors
   if (!response.ok) {
@@ -1229,6 +1277,7 @@ async function sendRequestToProvider(
         }
         const bodyJson = JSON.parse(bodyText);
         // Check if the response contains an error object
+        if (workbuddyManaged && Number(bodyJson?.code) > 0) throw classifyWorkBuddyError(response.status, bodyJson);
         if (bodyJson && typeof bodyJson === 'object' && bodyJson.error) {
           // If error is null or explicitly empty, it might not be a real error
           const hasRealError =
@@ -1266,6 +1315,7 @@ async function sendRequestToProvider(
         // invalid response. Throw to trigger fallback instead of forwarding
         // the empty response to the client, which would cause a different error.
         if (e instanceof SyntaxError) {
+          if (workbuddyManaged) throw classifyWorkBuddyError(response.status, {});
           fastify.log.warn(
             `[provider_response_error] Empty or malformed JSON response from provider(${provider.name},${requestBody.model}: 200): "${bodyText}"`
           );

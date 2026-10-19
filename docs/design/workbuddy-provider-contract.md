@@ -14,13 +14,14 @@
 | # | 决策 | 状态 |
 |---|---|---|
 | D1 | 上游是 **OpenAI Chat Completions**（`/v2/chat/completions`），不是 Anthropic `/messages`。CCR 复用现有 Anthropic→Unified→OpenAI 管线，WorkBuddy 只做 Unified→OpenAI 的 quirk 层 + 固定 header/URL | 锁定 |
-| D2 | 首期**只做 CN 站** `https://copilot.tencent.com`。国际 `https://www.workbuddy.ai` 只在类型层留 site 概念，**不暴露入口**（GLM 图像能力反证 + 无区域/跨站证据） | 锁定 |
+| D2 | ~~首期**只做 CN 站** `https://copilot.tencent.com`~~ → **双站支持**：CN `https://copilot.tencent.com` + 国际 `https://www.workbuddy.ai`。站点由**导入的登录文件自动判定**（`workbuddy-desktop.info` = CN，`workbuddy-desktop-ai.info` = 国际），一次只连一个站（单 provider + 单凭证文件），切换需断开重导 | 锁定（§14 修订） |
 | D3 | 凭证来源**只做"用户显式导入本机 WorkBuddy 登录"**，固定平台路径、只读、只接受明文 token。**不做浏览器登录 flow**（上游 authUrl host 白名单未取证，照抄插件"只查 https"不安全） | 锁定 |
 | D4 | token 落 **CCR 私有 0600 文件**（`$CCR_CONFIG_DIR/workbuddy-credentials.json`），**不进 `config.json`、不进 `/api/config` 响应、不进浏览器** | 锁定 |
 | D5 | 模型发现 = `GET /v3/config` 取 `agents[name=="cli"].models`，join `data.models` 元信息；**无静态兜底列表**，失败/空列表保留旧 models | 锁定 |
 | D6 | **不动 Router**：导入/同步/断开都不改 `config.Router`、不自动设默认路由 | 锁定 |
 | D7 | 普通 provider 编辑对话框不得把 WorkBuddy 托管 provider 变成"API key 输入框"或可改外网目标 | 锁定 |
-| D8 | 首期**不做自有 refresh**（不花共享 refresh token），访问 token 每次请求从 CCR 私有副本读取；到期/未登录由 UI 提示重新导入 | 锁定 |
+| D8 | **不实现自有 refresh**，不保存或花费 refreshToken；临期只读同站同账号桌面文件，较新 accessToken 仅驻内存；status 不读源文件 | 用户锁定（§14.3） |
+| D11 | **不做自动签到**：调研确认 magpie WorkBuddy 插件无任何 checkin/签到功能；WorkBuddy 免费额度是服务端每日自动发放的 slice package（`DAILY_CODE`，每天 0 点重置），无需客户端动作 | 锁定（§14 新增） |
 | D9 | 不做 FLAGGED prompt 重写（对抗性适配，ban risk）；识别 `unapproved channel` 后给可执行错误 | 锁定 |
 | D10 | 外部插件安装 / 额外网关进程 / Magpie 依赖：**零** | 锁定 |
 
@@ -29,7 +30,7 @@
 | 方案 | 结论 |
 |---|---|
 | **A. CCR 内置直连（本契约）** | 复用 credential service + transformer + 既有 admin/provider 持久化。零新进程、零插件安装。工作量集中在 transformer、admin 导入/同步 API、UI 管理入口。**采纳为首期** |
-| B. 外挂 Magpie 独立进程 | 协议最全（签到/积分/账号池），但违反"no extra gateway process"，且需额外管进程生命周期与端口。**不选** |
+| B. 外挂 Magpie 独立进程 | 协议最全（模型发现/用量/企业版/刷新），但违反"no extra gateway process"，且需额外管进程生命周期与端口。**不选** |
 | C. 官方公开 API | 本次检索**未找到** WorkBuddy/CodeBuddy 面向第三方订阅桥接的公开 API 文档（无一手证据）。在拿到官方文档前不假设存在。**不选** |
 
 ---
@@ -771,3 +772,107 @@ const isManagedWorkBuddy = editingProvider?.name === "workbuddy" && editingProvi
 - Transformer 不注册已有 /v1/chat/completions 的重复 endPoint；认证和 quirk 接入已有 HTTP 管线，在 before-error-logging 处脱敏，不能只依赖响应转换器事后修补。
 - 隐私文案不能写 token 不外传（上游认证需要发送腾讯）；应精确写不回传浏览器、不写普通配置、只发送固定可信 WorkBuddy 数据面。
 - 已知新版 encrypted desktop 登录态不支持导入；不绕过加密，不用静态模型假装连接成功，不做客户端身份 prompt 改写。
+
+---
+
+## 14. 双站支持与功能对齐（2026-10-19 修订，优先于 D2/D8）
+
+> 触发：用户要求"支持国际版账号、对齐 magpie 功能"。本节所有论断均有 magpie pin 的行号证据；
+> 凡标注"未证实"的，不得在实现或 PR 中当作事实。**自动签到经调研确认不存在，不做（D11）。**
+
+### 14.1 站点定义（证据：P:L62-84 `SITES`）
+
+| 字段 | CN (`workbuddy`) | 国际 (`workbuddy-ai`) |
+|---|---|---|
+| endpoint | `https://copilot.tencent.com` | `https://www.workbuddy.ai` |
+| desktop 登录文件名 | `workbuddy-desktop.info` | `workbuddy-desktop-ai.info` |
+| 模型集 | `CN_MODELS`（glm/kimi/deepseek/minimax/hy） | `AI_MODELS`（gpt/gemini/glm/kimi/hy/minimax + `default/fast/balanced/primary/deep-model` 别名） |
+| 图片能力 | glm-5.3-flash 等支持 | **`noImages: /^glm-/`**：国际站 GLM 模型配置说支持图片但服务端会丢掉（P:L86-101） |
+| 额外 header | 无 | `X-Agent-Type: main`（P:L281-282） |
+| domain 白名单 | `copilot.tencent.com`、`www.codebuddy.cn` | `www.workbuddy.ai`、`www.codebuddy.ai`（仅 X-Domain 值；请求 origin 固定为 www.workbuddy.ai） |
+
+**站点选择**：管理页显式选择 CN / 国际站；POST import 只接受两个固定 site enum，缺省 CN。
+只读取所选站点固定文件，不扫描另一站，不接受路径/任意 URL；两站都登录时也能明确选择国际站。
+文件内容 shape 一致（P:L1043-1069 `readDesktop` 对两个站点同一套解析）；真实账号格式仍待用户验证。
+
+**一次一站**：凭证文件仍是单个 `workbuddy-credentials.json`，`kind` 从 `"workbuddy"` 扩为
+`"workbuddy" | "workbuddy-ai"`；provider name 仍固定 `"workbuddy"`（路由 id 不变，用户 Router 不受影响）。
+切换站点 = 断开当前站 → 重新导入（显式动作，不做静默切换）。
+
+### 14.2 凭证字段（证据：P:L1043-1069）
+
+只保存 accessToken、expiresAt、kind、uid、enterpriseId、domain、tokenType 和导入时间。
+**不保存 refreshToken/refreshExpiresAt**：按用户裁决不调用刷新接口，无需增加闲置秘密。旧凭证无新字段仍可读。
+tokenType 不参与鉴权拼接（始终 Bearer）。
+
+### 14.3 Token 续期：**按需重读桌面文件**（2026-10-19 用户裁决，覆盖 D8 早前修订）
+
+**裁决：不实现自有 refresh，不花 refreshToken。** 理由（证据：P:L1081-1084、`:1098-1110`、`workbuddy-README.md:55-57`）：
+上游 refresh 回复会**轮换** refreshToken，而我们不写回桌面文件 → 用户的 WorkBuddy 桌面端将持有已花掉的
+refresh token；插件用「内存持有、绝不写回」规避，且加了 `h.expires >= d.expires` 偏好（应用自己续过就用它的）。
+该规避能把频率降到很低但**不能消除**风险，且是否真会把桌面端登出在上游是「推断、未证实」。
+CCR 选择零风险路径：**不保存、不使用 refreshToken 于任何请求路径**。
+
+**实现规则**：
+1. 仅保存 accessToken 与必要元信息；refreshToken/refreshExpiresAt 丢弃，任何请求路径不得调用 `/v2/plugin/auth/token/refresh`。
+2. 凭证里的 `accessToken`/`expiresAt` 是**快照**。当快照 `expiresAt - now <= 300_000`（magpie `LEAD_MS`）或已过期时，
+   `currentCredential()` **重新只读桌面登录文件**（固定路径、`O_NOFOLLOW`、1 MiB 上限、只读）：若文件里的 token 更新
+   （`expiresAt` 更晚）则**仅在内存中**替换本次请求用的凭证，**不写回 CCR 私有凭证文件**（避免把应用轮换中的 token 固化）。
+3. 重读失败/文件没有更新 → 用原快照继续（上游会给 401，走既有分类错误提示重新导入）。
+4. 这条放宽了 §13「只有 import 才读源文件」——**但仅限访问 token 临期/已过期时**，且仍是固定路径只读，不构成新的读取面。
+   `getStatus()` 仍然**不读**源文件（§13 不变）。
+5. 按站点+uid+enterpriseId+导入代际+访问 token 摘要做单飞与 60s 有界缓存，避免换账号/重新导入后复用旧凭证；重读结果必须匹配同站点、uid、enterpriseId。status 可读当前代际已使用的内存快照，但不读源文件。
+
+### 14.3b EDGE_READS 诊断（用户 2026-10-19 选中；证据：P:L1152-1160）
+
+上游前置（APISIX，两站一致）对**被拒的登录态**只读请求体前 **2 MiB**（`EDGE_READS`）：超过即**直接 Reset 连接**，
+客户端只看到 `ECONNRESET`，没有任何诊断。实测：2 097 152 字节 → 401；2 097 153 字节 → reset；有效 token 下 20 MB 正常。
+
+**实现规则**：
+1. 仅对 managed WorkBuddy provider：当上游请求失败且**不是**已分类的 WorkBuddy 错误时，若请求体字节数 > 2 MiB，
+   用一次**小型** billing 请求（`POST {endpoint}/billing/meter/get-user-resource-summary`，body `{}`）确认登录态：
+   - 401 → 抛分类错误「WorkBuddy 登录态已失效，请重新导入（大请求会被上游直接断开，故先探测）」，
+     `code: "workbuddy_reauth"`、`nonRetryable: true`。
+   - 非 401 → 原错误原样抛出（确实是网络/上游问题，不伪装成登录态问题）。
+2. 探测本身 `redirect: "error"` + 固定 origin；**不得**重发原请求。
+3. 探测结果按凭证代际缓存 60s（有界），并发单飞；响应体释放，15s 超时。不能跨站/账号复用。大型失败请求不因探测而重复发送；非 401 保留原错误分类。
+
+### 14.3c 两个已确认缺陷修复（用户 2026-10-19 选中；证据：P:L1075、`:447-451`）
+
+1. **sealed 检测过严**：我们用 `=== 1` 判定 `$wbEncrypted`，插件用**真值**判定（`:1075`）。
+   `{$wbEncrypted: "1"}` 或其它真值会被我们判成 `source_invalid`（文案「无法解析」）而非 `sealed`（文案「5.6+ 已加密」）。
+   → 改为真值判定（`!!a?.accessToken?.$wbEncrypted`）。
+2. **`X-Conversation-Request-ID` 缺失**：插件在 turn key 为空时也发一个**新随机** hex（`:447-451`）；我们不发，
+   导致该请求在 WorkBuddy 用量明细里归属不到任何 turn。
+   → turn key 为空时补 `randomBytes(16).toString("hex")`（32hex，与 message id 同格式）。
+
+   附带（同一处比对发现，低优先，首期不动）：我们的 11140/14018 文本正则缺少插件的 `(?![\d.])` 数字边界保护；
+   且我们匹配了插件从未提及的 `11150`。记录备查。
+### 14.4 用量/额度查询（可选展示，证据：P:L1139-1210 `meter`、L1228-1260）
+
+- `POST {endpoint}/billing/meter/get-user-resource-summary` → `usageOf`：plan（Pro/Free）+ Credits 窗口（used/limit）。
+- `POST {endpoint}/billing/meter/get-enterprise-user-usage` → 企业账号额度（个人账号返回空）。
+- 请求体 `{}`；header 与 chat 同套 + `X-Product: SaaS`。
+- **仅用于管理页只读展示**，不参与路由决策；失败静默（不弹错、不影响连接状态）。
+- 不做 packages/price 明细（P:L1281-1360 需要 `PackageCodes` 硬编码商品码列表，脆且无用户价值）。
+
+### 14.5 图片能力（证据：P:L86-101 `textOnly`）
+
+- 国际站 GLM 模型（`/^glm-/`）：即使 `/v3/config` 说 `supportsImages: true`，请求带图片也会被服务端丢弃并回一条
+  "[System reminder: the current model does not support images...]"。
+- 实现：**不主动剥图片**（保持请求忠实），但在管理页模型列表对该组合标注"国际站 GLM 模型实际不支持图片"，
+  避免用户困惑。这与 magpie 的做法一致（magpie 是让"图片描述模型"代读，CCR 无此设施，故只提示）。
+
+### 14.6 待确认项（实现前必须由父代理/用户确认，或标注未证实）
+
+1. 不调用 refresh 接口，因此不依赖 desktop refresh token 在真实上游的可用性；仅按需重读同站同账号的较新 accessToken。
+2. 国际站 desktop 登录文件的真实存在性与 shape：证据只有插件的 `desktopFile(site)` 拼接逻辑，
+   **未读真实文件**。导入失败时错误文案需同时覆盖"未登录/已加密/文件不存在"三种。
+3. 国际站 `X-Agent-Type: main` 是否为硬要求（P:L281-282 只在 `site.ai` 时设置）——照发，未证实缺失后果。
+
+### 14.7 明确不做
+
+- 自动签到 / 积分任务（D11：不存在该功能）。
+- 浏览器登录 flow（D3 不变）。
+- packages/price 商品码明细（§14.4）。
+- 账号池 / 多账号轮换（B 方案已否）。

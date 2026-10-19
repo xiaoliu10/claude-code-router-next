@@ -22,11 +22,10 @@ import { UnifiedChatRequest } from "@/types/llm";
 import { Transformer, TransformerContext } from "@/types/transformer";
 import { peekBodyForSSE, readBodyForSSE } from "./response-body";
 import type { WorkBuddyAuthService } from "@/services/workbuddy-auth";
-import { WORKBUDDY_CHAT_ORIGIN, WORKBUDDY_CHAT_URL } from "@/services/workbuddy";
+import { workBuddyChatUrl, workBuddySite, credentialHeaders } from "@/services/workbuddy";
 import { classifyWorkBuddyError, conversationHeaders, getWorkBuddyAuthService } from "@/services/workbuddy";
 
 const NAME_OK = /^[A-Za-z0-9_-]+$/;
-const UPSTREAM_ORIGIN = new URL(WORKBUDDY_CHAT_ORIGIN).origin;
 /** Max body size we are willing to rewrite in memory. */
 const MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 
@@ -72,12 +71,12 @@ export class WorkBuddyTransformer implements Transformer {
    * Authorization written here overrides the marker api_key.
    */
   async auth(request: any, provider: any): Promise<any> {
-    const headers = await this.resolveAuthService().buildChatHeaders(provider, request);
-    // Belt and braces: never send the marker or a config-supplied URL upstream.
-    const url = new URL(WORKBUDDY_CHAT_URL);
-    if (url.origin !== UPSTREAM_ORIGIN || url.protocol !== "https:") {
-      throw new Error("WorkBuddy 上游地址不合法");
-    }
+    const service = this.resolveAuthService();
+    const credential = await service.currentCredential();
+    const url = new URL(workBuddyChatUrl(workBuddySite(credential?.kind ?? "workbuddy")));
+    if (url.protocol !== "https:") throw new Error("WorkBuddy 上游地址不合法");
+    if (!credential) throw new Error("WorkBuddy 未导入登录态，请先在管理页导入");
+    const headers = { ...credentialHeaders(credential), ...conversationHeaders(request) };
     return {
       body: request,
       config: {
@@ -104,7 +103,7 @@ export class WorkBuddyTransformer implements Transformer {
     if (context) {
       const rawClientStream = context.req?.body?.stream;
       context.workbuddyClientStream =
-        rawClientStream !== undefined ? rawClientStream === true : (request as any)?.stream === true;
+        rawClientStream !== undefined ? !!rawClientStream : !!(request as any)?.stream;
       context.workbuddyUpstreamStream = true; // set unconditionally: body.stream is forced to true below
     }
     body.stream = true;
@@ -125,7 +124,7 @@ export class WorkBuddyTransformer implements Transformer {
     // Tool names first (the upstream plugin normalizes tool_choice after
     // renaming, so a named choice must reference the safe name).
     const names = new Map<string, string>();
-    const taken = new Set<string>();
+    const taken = new Set<string>((Array.isArray(body.tools) ? body.tools : []).map((tool: any) => tool?.function?.name).filter((name: any) => typeof name === "string" && NAME_OK.test(name)));
     for (const tool of Array.isArray(body.tools) ? body.tools : []) {
       const original = tool?.function?.name;
       if (typeof original !== "string") continue;
@@ -136,6 +135,12 @@ export class WorkBuddyTransformer implements Transformer {
       }
     }
     if (names.size && context) context.workbuddyToolNames = names;
+    // Tool calls in history must use the same renamed identifiers as declarations.
+    for (const message of Array.isArray(body.messages) ? body.messages : []) {
+      for (const call of Array.isArray(message?.tool_calls) ? message.tool_calls : []) {
+        if (call?.function?.name) call.function.name = safeNameFor(names, call.function.name) ?? call.function.name;
+      }
+    }
 
     // tool_choice normalization
     if ("tool_choice" in body) {
@@ -175,8 +180,10 @@ export class WorkBuddyTransformer implements Transformer {
     // auth() never runs for this provider. routes.ts merges the returned
     // config.headers after the default Authorization, so the real token wins
     // and the marker api_key never reaches the upstream.
-    const headers = await this.resolveAuthService().buildChatHeaders(provider, body);
-    return { body, config: { headers, url: WORKBUDDY_CHAT_URL } };
+    const credential = await this.resolveAuthService().currentCredential();
+    if (!credential) throw new Error("WorkBuddy 未导入登录态，请先在管理页导入");
+    const headers = { ...credentialHeaders(credential), ...conversationHeaders(body) };
+    return { body, config: { headers, url: workBuddyChatUrl(workBuddySite(credential.kind)), workbuddyCredential: credential } };
   }
 
   async transformResponseOut(response: Response, context?: TransformerContext): Promise<Response> {
@@ -254,7 +261,27 @@ export class WorkBuddyTransformer implements Transformer {
    * of the client receiving a truncated/empty completion.
    */
   private async aggregateSSE(response: Response, names?: Map<string, string>): Promise<any> {
-    const text = await response.text();
+    if (!response.body) throw classifyWorkBuddyError(200, {});
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "", bytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > MAX_REWRITE_BYTES) {
+          await reader.cancel();
+          // Distinct upstream-size class (not a client 400): operators must be able
+          // to tell "response too large to aggregate" from a bad request.
+          const tooLarge = classifyWorkBuddyError(502, {});
+          tooLarge.message = "WorkBuddy 上游响应超过聚合上限（8 MiB），非流式请求已中止；请改用流式输出";
+          throw tooLarge;
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      text += decoder.decode();
+    } finally { reader.releaseLock(); }
     let id: string | undefined;
     let created: number | undefined;
     let model: string | undefined;
@@ -273,7 +300,7 @@ export class WorkBuddyTransformer implements Transformer {
       const chunk = this.parseOrNull(payload);
       if (chunk === null) continue;
       sawData = true;
-      if (chunk.error) { errorChunk = chunk; continue; }
+      if (chunk.error || (Number(chunk.code) > 0 && Number.isSafeInteger(Number(chunk.code)))) { errorChunk = chunk; continue; }
       if (chunk.id) id = chunk.id;
       if (chunk.created) created = chunk.created;
       if (chunk.model) model = chunk.model;
@@ -369,6 +396,10 @@ export class WorkBuddyTransformer implements Transformer {
         data = JSON.parse(payload);
       } catch {
         return line; // malformed JSON — preserve verbatim
+      }
+      if (data?.error || (Number(data?.code) > 0 && Number.isSafeInteger(Number(data?.code)))) {
+        const error = classifyWorkBuddyError(200, data);
+        return "data: " + JSON.stringify({ error: { code: error.code, message: error.message } });
       }
       for (const choice of Array.isArray(data?.choices) ? data.choices : []) {
         if (choice?.finish_reason === "error") {

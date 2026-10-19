@@ -53,7 +53,7 @@ export function maskHeaders(
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
     const lower = key.toLowerCase();
-    if (SENSITIVE_HEADERS.has(lower) || SENSITIVE_HEADER_PATTERN.test(lower)) {
+    if (SENSITIVE_HEADERS.has(lower) || (SENSITIVE_HEADER_PATTERN.test(lower) && !/^(?:x-|anthropic-)?ratelimit-/.test(lower))) {
       result[key] = "***MASKED***";
     } else {
       result[key] = value;

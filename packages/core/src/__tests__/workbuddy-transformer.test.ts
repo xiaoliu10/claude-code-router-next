@@ -9,7 +9,7 @@ import { join } from "node:path";
 const TOKEN = "chat-access-token";
 const CRED: WorkBuddyCredential = {
   version: 1, kind: "workbuddy", uid: "u-1", displayName: "Nick", domain: "",
-  enterpriseId: "", accessToken: TOKEN, expiresAt: 0,
+  enterpriseId: "", accessToken: TOKEN, expiresAt: 0, tokenType: "",
   importedAt: "2026-10-19T00:00:00.000Z", source: "desktop",
 };
 

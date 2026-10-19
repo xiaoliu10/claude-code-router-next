@@ -42,7 +42,9 @@ export function sendUnifiedRequest(
     ...(config.redirect ? { redirect: config.redirect } : {}),
   };
 
-  if (config.httpsProxy) {
+  if (config.dispatcher) {
+    (fetchOptions as any).dispatcher = config.dispatcher;
+  } else if (config.httpsProxy) {
     (fetchOptions as any).dispatcher = getProxyDispatcher(config.httpsProxy);
   }
   logger?.debug(

@@ -10,6 +10,7 @@ const TOKEN = "super-secret-access-token";
 const CRED: WorkBuddyCredential = {
   version: 1,
   kind: "workbuddy",
+  tokenType: "",
   uid: "u-1",
   displayName: "Nick",
   domain: "",
@@ -102,12 +103,18 @@ describe("WorkBuddy credential store", () => {
     expect((await s.load())?.accessToken).toBe(TOKEN);
   });
 
-  it("never stores a refresh token", async () => {
+  it("never stores or spends a refresh token", async () => {
+    // Contract §14.3: only access credentials are stored, never unused refresh secrets.
     const s = store();
-    await s.save(CRED);
+    await s.save({ ...CRED, tokenType: "Bearer" });
     const raw = readFileSync(s.path, "utf8");
     expect(raw).not.toContain("refreshToken");
-    expect(raw).not.toContain("unused-refresh");
+    const loaded = await s.load();
+    expect((loaded as any)?.refreshToken).toBeUndefined();
+    expect(loaded?.tokenType).toBe("Bearer");
+    // currentCredential must not call the network for a token that is not near expiry.
+    const service = new WorkBuddyAuthService({ configService: { get: () => undefined, getAll: () => ({}) }, logger: { info() {}, warn() {}, error() {} }, store: s, fetch: (async () => { throw new Error("no upstream call allowed"); }) as any });
+    expect(await service.currentCredential()).toMatchObject({ accessToken: CRED.accessToken });
   });
 
   it("deletes the credential and then reports not connected", async () => {
@@ -322,5 +329,92 @@ describe("WorkBuddy import flow", () => {
     const [a, b] = await Promise.all([h.service.syncModels(), h.service.syncModels()]);
     expect((h.service as any).options.fetch).toHaveBeenCalledTimes(1);
     expect(a.success && b.success).toBe(true);
+  });
+});
+
+describe("WorkBuddy credits summary (contract §14.4)", () => {
+  it("uses the enterprise meter when the summary grants no personal packages", async () => {
+    const fetchMock = vi.fn(async (url: any, init: any) => {
+      expect(init.headers["X-Enterprise-Id"]).toBe("team");
+      expect(init.headers["User-Agent"]).toBe("WorkBuddy/5.5.6");
+      return jsonEnv(String(url).endsWith("get-user-resource-summary")
+        ? { code: 0, data: { Packages: [] } }
+        : { code: 0, data: { credit: "7.5", limitNum: "100" } });
+    });
+    const h = harness({ fetch: fetchMock });
+    dirs.push(h.dir);
+    await h.store.save({ ...CRED, enterpriseId: "team" });
+    expect(await h.service.getUsage()).toEqual({ plan: "Enterprise", used: 7.5, limit: 100, unit: "credits" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  const dirs: string[] = [];
+  afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+  it("returns derived credits numbers for a personal account", async () => {
+    const fetchMock = vi.fn(async () => jsonEnv({
+      code: 0, data: { IsPaidUser: true, Packages: [
+        { CycleUsedCapacity: "12.5", CycleTotalCapacity: "100" },
+        { CycleUsedCapacity: "0", CycleTotalCapacity: "0" },
+      ] },
+    }, "https://copilot.tencent.com/billing/meter/get-user-resource-summary"));
+    const h = harness({ source: null, fetch: fetchMock });
+    dirs.push(h.dir);
+    await h.store.save(CRED);
+
+    const usage = await h.service.getUsage();
+    expect(usage).toEqual({ plan: "Pro", used: 12.5, limit: 100, unit: "credits" });
+    // The request is a tiny POST to the fixed origin, never the chat endpoint.
+    const [url, init] = fetchMock.mock.calls[0] as any;
+    expect(url).toBe("https://copilot.tencent.com/billing/meter/get-user-resource-summary");
+    expect(init.method).toBe("POST");
+    expect(init.redirect).toBe("error");
+    expect(String(init.body)).toBe("{}");
+  });
+
+  it("reports Free for an unpaid account", async () => {
+    const h = harness({ source: null, fetch: vi.fn(async () => jsonEnv({
+      code: 0, data: { IsPaidUser: false, Packages: [{ CycleUsedCapacity: "1", CycleTotalCapacity: "10" }] },
+    })) });
+    dirs.push(h.dir);
+    await h.store.save(CRED);
+    expect(await h.service.getUsage()).toEqual({ plan: "Free", used: 1, limit: 10, unit: "credits" });
+  });
+
+  it("returns null (never throws) when the meter fails, is refused or grants nothing", async () => {
+    const cases: Array<[string, any]> = [
+      ["network failure", vi.fn(async () => { throw new Error("ECONNRESET"); })],
+      ["http 500", vi.fn(async () => new Response("{}", { status: 500 }))],
+      ["upstream code", vi.fn(async () => jsonEnv({ code: 401, msg: "token invalid" }))],
+      ["no packages", vi.fn(async () => jsonEnv({ code: 0, data: { IsPaidUser: false, Packages: [] } }))],
+      ["non-json body", vi.fn(async () => new Response("<html>", { status: 200, headers: { "Content-Type": "text/html" } }))],
+    ];
+    for (const [label, fetchMock] of cases) {
+      const h = harness({ source: null, fetch: fetchMock });
+      dirs.push(h.dir);
+      await h.store.save(CRED);
+      expect(await h.service.getUsage(), label).toBeNull();
+    }
+  });
+
+  it("returns null when no credential is stored", async () => {
+    const h = harness({ source: null, fetch: vi.fn(async () => jsonEnv({ code: 0, data: {} })) });
+    dirs.push(h.dir);
+    expect(await h.service.getUsage()).toBeNull();
+    expect((h.service as any).options.fetch).not.toHaveBeenCalled();
+  });
+
+  it("asks the international site's meter for an international credential", async () => {
+    const fetchMock = vi.fn(async () => jsonEnv({
+      code: 0, data: { IsPaidUser: false, Packages: [{ CycleUsedCapacity: "2", CycleTotalCapacity: "20" }] },
+    }, "https://www.workbuddy.ai/billing/meter/get-user-resource-summary"));
+    const h = harness({ source: null, fetch: fetchMock });
+    dirs.push(h.dir);
+    await h.store.save({ ...CRED, kind: "workbuddy-ai", domain: "www.workbuddy.ai" });
+    expect(await h.service.getUsage()).toEqual({ plan: "Free", used: 2, limit: 20, unit: "credits" });
+    expect((fetchMock.mock.calls[0] as any)[0]).toBe("https://www.workbuddy.ai/billing/meter/get-user-resource-summary");
+    // The international build's attribution header rides along.
+    const headers = (fetchMock.mock.calls[0] as any)[1].headers;
+    expect(headers["X-Agent-Type"]).toBe("main");
+    expect(headers["X-Domain"]).toBe("www.workbuddy.ai");
   });
 });
