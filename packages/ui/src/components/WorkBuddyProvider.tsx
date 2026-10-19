@@ -2,14 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Coins, Globe2, RefreshCw, ShieldCheck } from "lucide-react";
 import { api } from "@/lib/api";
-import type { WorkBuddyKind, WorkBuddyStatusResponse, WorkBuddyUsage } from "@/types";
+import type { WorkBuddyLoginStartResponse, WorkBuddyKind, WorkBuddyStatusResponse, WorkBuddyUsage } from "@/types";
 import { hasDiscoveredModels, isWorkBuddyKind, maskWorkBuddyUid, mergeWorkBuddyProvider, parseWorkBuddyUsage, workBuddyErrorKey, workBuddyImagesUnsupportedModels, workBuddyStateKey } from "@/utils/workbuddy";
+import { createWorkBuddyLogin } from "@/utils/workbuddy-login";
 import { useConfig } from "./ConfigProvider";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
-import { Checkbox } from "./ui/checkbox";
-import { Label } from "./ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Toast } from "./ui/toast";
 
@@ -18,7 +17,7 @@ interface WorkBuddyProviderProps {
   onBusyChange: (busy: boolean) => void;
 }
 
-type Action = "import" | "sync" | "disconnect" | "usage";
+type Action = "login" | "sync" | "disconnect" | "usage";
 
 const WORKBUDDY_SITES: WorkBuddyKind[] = ["workbuddy", "workbuddy-ai"];
 
@@ -29,8 +28,10 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState<Action | null>(null);
   const [errorKey, setErrorKey] = useState<string | null>(null);
-  const [confirm, setConfirm] = useState<"import" | "disconnect" | null>(null);
-  const [consent, setConsent] = useState(false);
+  const [confirm, setConfirm] = useState<"disconnect" | null>(null);
+  const [login, setLogin] = useState<WorkBuddyLoginStartResponse | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const loginSession = useRef<ReturnType<typeof createWorkBuddyLogin> | null>(null);
   const [site, setSite] = useState<WorkBuddyKind>("workbuddy");
   const [usage, setUsage] = useState<WorkBuddyUsage | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -51,7 +52,11 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
     }).finally(() => {
       if (mounted.current && generation.current === id) setLoading(false);
     });
-    return () => { mounted.current = false; };
+    return () => {
+      mounted.current = false;
+      ++generation.current;
+      void loginSession.current?.cancel().catch(() => {});
+    };
   }, []);
 
   const run = async (next: Action) => {
@@ -73,8 +78,20 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
     setErrorKey(null);
     setToast(null);
     try {
-      const result = next === "import" ? await api.importWorkBuddy(site)
-        : next === "sync" ? await api.syncWorkBuddyModels() : await api.disconnectWorkBuddy();
+      let result;
+      if (next === "login") {
+        const session = createWorkBuddyLogin(api, site, value => {
+          if (mounted.current && generation.current === id) setLogin(value);
+        });
+        loginSession.current = session;
+        result = await session.done;
+        loginSession.current = null;
+        if (mounted.current && generation.current === id) setLogin(null);
+        if (!result) return;
+      } else {
+        result = next === "sync" ? await api.syncWorkBuddyModels() : await api.disconnectWorkBuddy();
+      }
+      if (!mounted.current || generation.current !== id) return;
       if (!result.success) {
         if (mounted.current && generation.current === id) setErrorKey(workBuddyErrorKey(result));
         return;
@@ -90,7 +107,6 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
       if (!mounted.current || generation.current !== id) return;
       setStatus(updated);
       setConfirm(null);
-      setConsent(false);
       // Credits belong to the previous site/login state until explicitly re-read.
       setUsage(null);
       setToast(next === "disconnect" ? t("workbuddy.disconnected")
@@ -101,7 +117,12 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
       release();
       locked.current = false;
       busyCallback.current(false);
-      if (mounted.current && generation.current === id) setAction(null);
+      loginSession.current = null;
+      if (mounted.current && generation.current === id) {
+        setAction(null);
+        setLogin(null);
+        setCancelling(false);
+      }
     }
   };
 
@@ -158,7 +179,7 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
           <p className="font-semibold">{t("workbuddy.server_host")}</p>
           <p>{t("workbuddy.privacy", { site: status?.site || t("workbuddy.privacy_selected") })}</p>
           <p>{t("workbuddy.backup_warning")}</p>
-          <p>{t("workbuddy.encrypted_warning")}</p>
+          <p>{t("workbuddy.browser_source")}</p>
         </div>
         <p className="text-xs text-muted-foreground">{t("workbuddy.routing_note")}</p>
         {status && status.status !== "not_connected" && (
@@ -170,8 +191,12 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
             <div><dt className="text-muted-foreground">{t("workbuddy.last_sync")}</dt><dd>{date(status.lastSyncAt)}</dd></div>
           </dl>
         )}
-        {status && status.status !== "not_connected" && status.renewalMode === "desktop" && (
-          <p className="text-xs text-muted-foreground">{t("workbuddy.renewal_desktop")}</p>
+        {status && status.status !== "not_connected" && (
+          <>
+            <p className="text-xs text-muted-foreground">{t(status.source === "browser" ? "workbuddy.source_browser" : status.source === "desktop" ? "workbuddy.source_desktop" : "workbuddy.source_unknown")}</p>
+            {status.renewalMode === "desktop" && <p className="text-xs text-muted-foreground">{t("workbuddy.renewal_desktop")}</p>}
+            {status.renewalMode === "browser" && <p className="text-xs text-muted-foreground">{t("workbuddy.renewal_browser")}</p>}
+          </>
         )}
         {imageUnsupported.length > 0 && (
           <p role="note" className="rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700">{t("workbuddy.images_unsupported", { models: imageUnsupported.join(", ") })}</p>
@@ -191,9 +216,27 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
           <p className="text-sm text-amber-600">{t(`workbuddy.help.${status.status}`)}</p>
         )}
         {visibleError && <p role="alert" className="rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-sm text-red-600">{t(`workbuddy.errors.${visibleError}`)}</p>}
+        <div role="radiogroup" aria-label={t("workbuddy.site.label")} className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          {WORKBUDDY_SITES.map(value => (
+            <button key={value} type="button" role="radio" aria-checked={site === value} disabled={busy || disabled}
+              onClick={() => setSite(value)}
+              className={`rounded-lg border p-3 text-left transition-colors ${site === value ? "border-primary bg-primary/5" : "border-border hover:bg-muted/40"}`}>
+              <span className="flex items-center gap-1.5 text-sm font-medium"><Globe2 className="h-3.5 w-3.5" aria-hidden="true" />{t(`workbuddy.site.${value}`)}</span>
+              <span className="mt-1 block text-xs text-muted-foreground">{t(`workbuddy.site.${value}_note`)}</span>
+            </button>
+          ))}
+        </div>
+        {login && <div role="status" className="space-y-2 rounded-lg border p-3 text-sm">
+          <p>{t("workbuddy.login_pending")}</p>
+          {!cancelling && <a href={login.url} target="_blank" rel="noopener noreferrer" className="block text-primary underline">{t("workbuddy.open_login", { site: t(`workbuddy.site.${login.site}`) })}</a>}
+          <Button variant="outline" size="sm" disabled={cancelling} onClick={() => {
+            setCancelling(true);
+            void loginSession.current?.cancel().catch(() => { if (mounted.current) setErrorKey("request_failed"); });
+          }}>{t(cancelling ? "workbuddy.working" : "app.cancel")}</Button>
+        </div>}
         <div className="flex flex-wrap gap-2">
-          <Button size="sm" disabled={busy || disabled} onClick={() => { setConsent(false); setSite(status && isWorkBuddyKind(status.kind) && status.status !== "not_connected" ? status.kind : "workbuddy"); setConfirm("import"); }}>
-            {action === "import" ? t("workbuddy.importing") : status?.status === "connected" ? t("workbuddy.reimport") : t("workbuddy.connect")}
+          <Button size="sm" disabled={busy || disabled} onClick={() => void run("login")}>
+            {action === "login" ? t("workbuddy.working") : t("workbuddy.browser_login")}
           </Button>
           <Button size="sm" variant="outline" disabled={busy || disabled || !canSync} onClick={() => void run("sync")}>
             <RefreshCw className={`mr-1 h-3.5 w-3.5 ${action === "sync" ? "animate-spin" : ""}`} aria-hidden="true" />{t("workbuddy.sync")}
@@ -208,30 +251,14 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
       <Dialog open={confirm !== null} onOpenChange={open => { if (!open && !action) setConfirm(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t(confirm === "disconnect" ? "workbuddy.disconnect_title" : "workbuddy.import_title", confirm === "import" ? { site: t(`workbuddy.site.${site}`) } : undefined)}</DialogTitle>
-            <DialogDescription>{t(confirm === "disconnect" ? "workbuddy.disconnect_warning" : "workbuddy.import_warning")}</DialogDescription>
+            <DialogTitle>{t("workbuddy.disconnect_title")}</DialogTitle>
+            <DialogDescription>{t("workbuddy.disconnect_warning")}</DialogDescription>
           </DialogHeader>
-          {confirm === "import" && (
-            <>
-              <div role="radiogroup" aria-label={t("workbuddy.site.label")} className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                {WORKBUDDY_SITES.map(value => (
-                  <button key={value} type="button" role="radio" aria-checked={site === value} disabled={busy || disabled}
-                    onClick={() => setSite(value)}
-                    className={`rounded-lg border p-3 text-left transition-colors ${site === value ? "border-primary bg-primary/5" : "border-border hover:bg-muted/40"}`}>
-                    <span className="flex items-center gap-1.5 text-sm font-medium"><Globe2 className="h-3.5 w-3.5" aria-hidden="true" />{t(`workbuddy.site.${value}`)}</span>
-                    <span className="mt-1 block text-xs text-muted-foreground">{t(`workbuddy.site.${value}_note`)}</span>
-                  </button>
-                ))}
-              </div>
-              <p className="text-xs text-muted-foreground">{t("workbuddy.site.privacy", { site: t(`workbuddy.site.${site}`) })}</p>
-              <div className="flex items-start gap-2"><Checkbox id="workbuddy-consent" checked={consent} disabled={busy} onCheckedChange={checked => setConsent(checked === true)} /><Label htmlFor="workbuddy-consent" className="text-sm leading-relaxed">{t("workbuddy.consent", { site: t(`workbuddy.site.${site}`) })}</Label></div>
-            </>
-          )}
           {errorKey && <p role="alert" className="text-sm text-red-600">{t(`workbuddy.errors.${errorKey}`)}</p>}
           <DialogFooter>
             <Button variant="outline" disabled={!!action} onClick={() => setConfirm(null)}>{t("app.cancel")}</Button>
-            <Button variant={confirm === "disconnect" ? "destructive" : "default"} disabled={busy || disabled || (confirm === "import" && !consent)} onClick={() => void run(confirm === "disconnect" ? "disconnect" : "import")}>
-              {action ? t("workbuddy.working") : t(confirm === "disconnect" ? "workbuddy.disconnect" : "workbuddy.import_confirm")}
+            <Button variant="destructive" disabled={busy || disabled} onClick={() => void run("disconnect")}>
+              {action ? t("workbuddy.working") : t("workbuddy.disconnect")}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -29,7 +29,8 @@ export function workBuddyErrorKey(value: unknown): string {
   const data = value && typeof value === "object" ? value as Record<string, unknown> : {};
   const code = data.reason || data.error;
   const allowed = ["sealed", "source_missing", "source_invalid", "models_fetch_failed",
-    "workbuddy_name_conflict", "workbuddy_site_conflict", "workbuddy_not_connected"];
+    "workbuddy_name_conflict", "workbuddy_site_conflict", "workbuddy_not_connected",
+    "login_state_rejected", "login_account_failed", "login_persist_failed", "login_expired"];
   if (typeof code === "string" && allowed.includes(code)) return code;
   // GET status may contain a server-sanitised diagnostic. Classify, do not show it.
   const message = typeof data.lastError === "string" ? data.lastError : "";

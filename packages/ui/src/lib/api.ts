@@ -1,4 +1,4 @@
-import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageResponse } from '@/types';
+import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyLoginStartResponse, WorkBuddyLoginPollResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageResponse } from '@/types';
 
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
@@ -105,7 +105,8 @@ class ApiClient {
         // Retain only known codes. Raw server/upstream messages must never enter
         // the browser's error object, console, toast or component state.
         const allowed = ['sealed', 'source_missing', 'source_invalid', 'models_fetch_failed',
-          'workbuddy_name_conflict', 'workbuddy_site_conflict', 'workbuddy_not_connected'];
+          'workbuddy_name_conflict', 'workbuddy_site_conflict', 'workbuddy_not_connected',
+          'login_state_rejected', 'login_account_failed', 'login_persist_failed'];
         let code = 'request_failed';
         try {
           const data = await response.json();
@@ -447,6 +448,21 @@ class ApiClient {
   importWorkBuddy(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
     const body: WorkBuddyImportRequest = { site };
     return this.post<WorkBuddyMutationResponse>('/workbuddy/import', body, 60_000);
+  }
+
+  startWorkBuddyLogin(site: WorkBuddyKind): Promise<WorkBuddyLoginStartResponse> {
+    return this.post('/workbuddy/login/start', { site }, 30_000);
+  }
+
+  pollWorkBuddyLogin(site: WorkBuddyKind, loginId: string, signal: AbortSignal): Promise<WorkBuddyLoginPollResponse> {
+    return this.apiFetch('/workbuddy/login/poll', {
+      method: 'POST', body: JSON.stringify({ site, loginId }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+    });
+  }
+
+  cancelWorkBuddyLogin(site: WorkBuddyKind, loginId: string): Promise<{ success: boolean }> {
+    return this.post('/workbuddy/login/cancel', { site, loginId }, 30_000);
   }
 
   syncWorkBuddyModels(): Promise<WorkBuddyMutationResponse> {

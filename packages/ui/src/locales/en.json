@@ -227,7 +227,8 @@
       "router": "Advanced Router",
       "projects": "Projects",
       "tools": "Tools",
-      "usage": "Usage"
+      "usage": "Usage",
+      "providers": "Providers"
     },
     "language": "Language",
     "token_speed": "Token Speed & TTFT Tracking",
@@ -557,13 +558,13 @@
   "workbuddy": {
     "section": "Built-in subscription providers",
     "builtin": "Built in",
-    "description": "Import your existing WorkBuddy subscription — CN or international (WorkBuddy AI) — and discover models automatically. No plugin or extra gateway process is needed. This manages a provider, not client takeover.",
+    "description": "Authorize your WorkBuddy subscription — CN or international (WorkBuddy AI) — in the browser and register discovered models. No desktop app, plugin or extra gateway is required. This manages a provider, not client takeover.",
     "server_host": "“Local” means the computer running the CCR server, not this browser’s computer.",
     "privacy_selected": "the selected fixed WorkBuddy origin",
-    "privacy": "Only an explicit import reads the selected site's fixed WorkBuddy login file, read-only. CCR stores the access token privately (0600); it is not returned to the browser or written to ordinary provider configuration. It is sent only to {{site}} for model discovery and inference.",
-    "backup_warning": "Configuration backups do not include the WorkBuddy login state. Re-import after restoring a backup.",
+    "privacy": "Enter your password only on the official authorization page. CCR stores credentials only in its private server file (0600), never in this browser or ordinary provider configuration. Tokens are sent only to the selected fixed WorkBuddy origin for discovery and inference.",
+    "backup_warning": "Configuration backups do not include credentials. Authorize again after restoring a backup.",
     "encrypted_warning": "Encrypted desktop login files are not decrypted and are unsupported. CCR does not refresh tokens: sign in again in WorkBuddy and re-import when expired.",
-    "routing_note": "Import, sync and disconnect do not change Router or select a default model. Choose workbuddy,<model> manually.",
+    "routing_note": "Login, import, sync and disconnect never change Router or select a default model. Choose workbuddy,<model> manually.",
     "account": "Account (masked UID)",
     "expires": "Access token expires",
     "model_count": "Registered models",
@@ -585,22 +586,22 @@
     "disconnected": "WorkBuddy disconnected. Router references were preserved; update them manually.",
     "synced": "Registered {{count}} WorkBuddy models. Router unchanged.",
     "other_edit": "Finish the current provider edit/save before managing WorkBuddy.",
-    "managed_notice": "WorkBuddy is managed here. Its name, URL, credentials and transformer cannot be edited in the generic dialog. Use Disconnect here to remove it without changing Router.",
+    "managed_notice": "Manage WorkBuddy in Settings → Providers. Generic edit/delete cannot change its name, URL, credentials or transformer. Use Disconnect here to remove it; Router is unchanged.",
     "status": {
       "loading": "Loading…",
       "not_connected": "Not connected",
       "connected": "Ready",
-      "expired": "Re-import required",
+      "expired": "Authorization required",
       "sealed": "Encrypted login unsupported",
       "source_missing": "Login file missing",
-      "source_changed": "Re-import required",
+      "source_changed": "Authorization required",
       "error": "Error",
       "restricted": "Account restricted"
     },
     "help": {
-      "expired": "Sign in again in WorkBuddy, then explicitly re-import. CCR does not refresh tokens.",
+      "expired": "Authorize again in the browser. For desktop-imported logins, renew in the desktop app before explicitly re-importing.",
       "sealed": "Encrypted desktop login files are unsupported. Nothing in the source login file is modified.",
-      "source_missing": "Sign in to WorkBuddy on the CCR server, then explicitly import again.",
+      "source_missing": "The optional desktop source is missing. You can authorize directly in the browser instead.",
       "source_changed": "Explicitly re-import to update CCR’s saved account. CCR does not monitor desktop account changes.",
       "error": "The connection is not ready. Review the error and retry explicitly."
     },
@@ -608,14 +609,18 @@
       "sealed": "WorkBuddy encrypted its local login state (newer desktop versions). Import is unsupported; CCR will not decrypt it. Existing login and models are preserved.",
       "source_missing": "No WorkBuddy login file was found at the fixed path on the CCR server. Sign in using WorkBuddy there, then retry.",
       "source_invalid": "The server’s WorkBuddy login file is invalid or unsupported. Sign in in WorkBuddy again and retry. Existing models are preserved.",
-      "models_fetch_failed": "Model discovery failed or returned no models. The previous model list is preserved; retry sync or explicitly re-import.",
-      "workbuddy_site_conflict": "Another WorkBuddy site is connected. Disconnect it, then import this site.",
-      "workbuddy_name_conflict": "An ordinary provider named “workbuddy” already exists. Rename or remove it before importing; CCR will not take it over.",
-      "workbuddy_not_connected": "WorkBuddy is not connected. Import the local login first.",
+      "models_fetch_failed": "Model discovery failed or returned no models. Previous models are preserved. Retry sync or authorize again.",
+      "workbuddy_site_conflict": "Another WorkBuddy site is connected. Disconnect it before authorizing this site.",
+      "workbuddy_name_conflict": "An ordinary provider named “workbuddy” already exists. Rename or remove it before authorization; CCR will not take it over.",
+      "workbuddy_not_connected": "WorkBuddy is not connected. Authorize in the browser first.",
       "request_failed": "WorkBuddy management failed. No success was confirmed. Existing model details remain visible; retry explicitly.",
       "restricted": "WorkBuddy restricted this account (11140). Stop retrying and use Submit feedback inside WorkBuddy to appeal.",
       "channel_rejected": "WorkBuddy rejected this client channel. Use another client or provider; CCR does not rewrite prompts to bypass this restriction.",
-      "busy": "A configuration save or another WorkBuddy action is in progress. Wait for it to finish and retry."
+      "busy": "A configuration save or another WorkBuddy action is in progress. Wait for it to finish and retry.",
+      "login_state_rejected": "Authorization was rejected or the login state is invalid. Start a new login.",
+      "login_account_failed": "Unable to confirm the authorized account. Start a new login.",
+      "login_persist_failed": "Unable to save the authorized login privately. Check the CCR server and retry.",
+      "login_expired": "This authorization attempt expired. Start a new login."
     },
     "site_origin": "Site origin (fixed)",
     "renewal_desktop": "Renewal mode: desktop. Sign in again in the WorkBuddy desktop app and re-import here when expired. CCR calls no credential-refresh API and stores no refresh credential.",
@@ -625,11 +630,11 @@
       "workbuddy-ai": "AI"
     },
     "site": {
-      "label": "Which WorkBuddy login should be imported?",
+      "label": "Which WorkBuddy site should be authorized?",
       "workbuddy": "WorkBuddy (CN)",
-      "workbuddy_note": "Desktop login for copilot.tencent.com",
+      "workbuddy_note": "Official CN browser authorization",
       "workbuddy-ai": "WorkBuddy AI (International)",
-      "workbuddy-ai_note": "International desktop login; the explicit selection makes it work even when both files exist.",
+      "workbuddy-ai_note": "Official international browser authorization",
       "privacy": "The access token is sent only to the fixed origin of the selected site: {{site}}. It never reaches this browser or the ordinary provider configuration."
     },
     "credits": {
@@ -638,6 +643,14 @@
       "title": "Credits",
       "plan": "Plan",
       "display": "{{used}} / {{limit}} used"
-    }
+    },
+    "browser_source": "Browser authorization is managed and renewed by CCR. Optional desktop imports are a separate source: shared desktop refresh credentials are never copied or used by CCR.",
+    "browser_login": "Authorize / sign in with browser",
+    "login_pending": "Waiting for authorization. Open the official page below and finish signing in. This attempt ends after at most five minutes.",
+    "open_login": "Open official {{site}} authorization page ↗",
+    "source_browser": "Login source: browser authorization",
+    "source_desktop": "Login source: optional desktop import",
+    "source_unknown": "Login source: unknown",
+    "renewal_browser": "Renewal mode: browser. CCR privately stores and refreshes this browser-owned login. Authorize again if renewal fails."
   }
 }

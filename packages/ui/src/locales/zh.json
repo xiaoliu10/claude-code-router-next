@@ -227,7 +227,8 @@
       "router": "路由高级配置",
       "projects": "项目配置",
       "tools": "工具",
-      "usage": "用量统计"
+      "usage": "用量统计",
+      "providers": "供应商"
     },
     "language": "语言",
     "token_speed": "Token 速度与 TTFT 追踪",
@@ -557,13 +558,13 @@
   "workbuddy": {
     "section": "内置订阅供应商",
     "builtin": "内置",
-    "description": "导入您已有的 WorkBuddy 订阅（中国版或国际版 WorkBuddy AI），自动发现并注册模型，无需安装插件或运行额外网关。这是供应商管理，不是客户端接管。",
+    "description": "在浏览器授权登录 WorkBuddy 订阅（中国版或国际版 WorkBuddy AI），自动发现并注册模型。无需桌面客户端、插件或额外网关。这是供应商管理，不是客户端接管。",
     "server_host": "“本机”指运行 CCR 服务的电脑，不是浏览器所在的电脑。",
     "privacy_selected": "所选 WorkBuddy 固定域名",
-    "privacy": "仅在您明确导入时只读所选站点固定路径的 WorkBuddy 登录文件，不修改源文件。访问令牌保存在 CCR 私有文件（0600），不回传浏览器、不写入普通供应商配置；仅发送到 {{site}} 用于模型发现和推理。",
-    "backup_warning": "配置备份不含 WorkBuddy 登录态；恢复配置后需重新导入。",
+    "privacy": "密码仅在官方授权页面输入。凭据仅保存在 CCR 服务端私有文件（0600），不回传此浏览器、不写入普通供应商配置；令牌仅发送到所选 WorkBuddy 固定域名用于模型发现和推理。",
+    "backup_warning": "配置备份不含凭据；恢复备份后请重新授权。",
     "encrypted_warning": "不解密、不支持新版已加密的本地登录文件。CCR 不自动刷新令牌：过期后请先在 WorkBuddy 重新登录，再明确重新导入。",
-    "routing_note": "导入、同步和断开均不修改 Router、不自动选择默认模型。请手工选择 workbuddy,<模型>。",
+    "routing_note": "登录、导入、同步和断开均不修改 Router、不自动选择默认模型。请手工选择 workbuddy,<模型>。",
     "account": "账号（UID 已脱敏）",
     "expires": "访问令牌过期时间",
     "model_count": "已注册模型",
@@ -585,22 +586,22 @@
     "disconnected": "WorkBuddy 已断开。Router 引用已保留，请手工修改。",
     "synced": "已注册 {{count}} 个 WorkBuddy 模型，Router 未变更。",
     "other_edit": "请先完成当前供应商编辑或保存，再管理 WorkBuddy。",
-    "managed_notice": "请在此管理 WorkBuddy。名称、地址、凭据和转换器不支持普通编辑；如需移除，请在此断开连接（不改 Router）。",
+    "managed_notice": "请在设置 → 供应商管理 WorkBuddy。普通编辑/删除无法修改其名称、地址、凭据或转换器；请在此断开连接以移除，Router 不变。",
     "status": {
       "loading": "加载中…",
       "not_connected": "未连接",
       "connected": "已就绪",
-      "expired": "需重新导入",
+      "expired": "需要重新授权",
       "sealed": "不支持加密登录态",
       "source_missing": "未找到登录文件",
-      "source_changed": "需重新导入",
+      "source_changed": "需要重新授权",
       "error": "错误",
       "restricted": "账号受限"
     },
     "help": {
-      "expired": "请先在 WorkBuddy 重新登录，再明确重新导入。CCR 不自动刷新令牌。",
+      "expired": "请在浏览器重新授权。桌面导入来源可先在桌面端续期，再明确重新导入。",
       "sealed": "不支持已加密的桌面登录文件；不修改源登录文件。",
-      "source_missing": "请在 CCR 服务所在电脑的 WorkBuddy 客户端登录，再明确导入。",
+      "source_missing": "可选桌面来源缺失，您也可以直接在浏览器授权登录。",
       "source_changed": "请明确重新导入以更新 CCR 已保存的账号。CCR 不监控桌面账号变化。",
       "error": "连接尚未就绪，请查看错误后明确重试。"
     },
@@ -608,14 +609,18 @@
       "sealed": "WorkBuddy 新版已加密本地登录态，暂不支持导入；CCR 不会解密，已有登录态和模型保留。",
       "source_missing": "未在 CCR 服务端固定路径找到 WorkBuddy 登录文件，请先在该电脑的 WorkBuddy 客户端登录后重试。",
       "source_invalid": "CCR 服务端的 WorkBuddy 登录文件无效或不受支持，请在 WorkBuddy 重新登录后重试。旧模型保留。",
-      "models_fetch_failed": "模型发现失败或列表为空，旧模型列表已保留，请重试同步或明确重新导入。",
-      "workbuddy_site_conflict": "已连接另一个 WorkBuddy 站点；请先断开，再导入当前站点。",
-      "workbuddy_name_conflict": "已存在同名普通供应商“workbuddy”，请先改名或删除；CCR 不会接管它。",
-      "workbuddy_not_connected": "WorkBuddy 尚未连接，请先导入本机登录态。",
+      "models_fetch_failed": "模型发现失败或返回空列表。旧模型保留，请重试同步或重新授权。",
+      "workbuddy_site_conflict": "已连接另一个 WorkBuddy 站点；请先断开，再授权当前站点。",
+      "workbuddy_name_conflict": "已存在同名普通供应商“workbuddy”，请先改名或删除再授权；CCR 不会接管它。",
+      "workbuddy_not_connected": "WorkBuddy 尚未连接，请先在浏览器授权登录。",
       "request_failed": "WorkBuddy 管理操作失败，未确认成功。保留已有模型显示，请明确重试。",
       "restricted": "WorkBuddy 已限制此账号（11140）。请停止反复重试，在 WorkBuddy 内通过 Submit feedback 申诉。",
       "channel_rejected": "WorkBuddy 拒绝了此客户端渠道，请换用其他客户端或供应商；CCR 不重写提示词以绕过限制。",
-      "busy": "配置保存或另一个 WorkBuddy 操作正在进行，请等待完成后重试。"
+      "busy": "配置保存或另一个 WorkBuddy 操作正在进行，请等待完成后重试。",
+      "login_state_rejected": "授权被拒绝或登录状态无效，请重新发起登录。",
+      "login_account_failed": "无法确认授权账号，请重新发起登录。",
+      "login_persist_failed": "无法私有保存授权登录态，请检查 CCR 服务端后重试。",
+      "login_expired": "本次授权已过期，请重新发起登录。"
     },
     "site_origin": "站点固定域名",
     "renewal_desktop": "续期方式：桌面端。过期后请在 WorkBuddy 桌面客户端重新登录，再回到此处明确重新导入。CCR 不调用刷新接口，也不保存刷新凭据。",
@@ -625,11 +630,11 @@
       "workbuddy-ai": "国际站"
     },
     "site": {
-      "label": "导入哪个 WorkBuddy 登录态？",
+      "label": "授权哪个 WorkBuddy 站点？",
       "workbuddy": "WorkBuddy（中国版）",
-      "workbuddy_note": "copilot.tencent.com 的桌面登录文件",
+      "workbuddy_note": "中国站官方浏览器授权",
       "workbuddy-ai": "WorkBuddy AI（国际版）",
-      "workbuddy-ai_note": "国际版桌面登录文件；明确选择站点后，两个文件同时存在也能正确导入。",
+      "workbuddy-ai_note": "国际站官方浏览器授权",
       "privacy": "访问令牌仅发送到所选站点的固定域名：{{site}}。令牌不会到达浏览器，也不会写入普通供应商配置。"
     },
     "credits": {
@@ -638,6 +643,14 @@
       "title": "额度",
       "plan": "套餐",
       "display": "已用 {{used}} / {{limit}}"
-    }
+    },
+    "browser_source": "浏览器授权由 CCR 管理和续期。可选的桌面导入属于独立来源：CCR 绝不复制或使用桌面端共享刷新凭据。",
+    "browser_login": "浏览器授权 / 登录",
+    "login_pending": "等待授权。请打开下方官方页面并完成登录。本次授权最多持续五分钟。",
+    "open_login": "打开 {{site}} 官方授权页面 ↗",
+    "source_browser": "登录来源：浏览器授权",
+    "source_desktop": "登录来源：可选桌面导入",
+    "source_unknown": "登录来源：未知",
+    "renewal_browser": "续期方式：浏览器。CCR 私有保存并刷新本次浏览器授权；续期失败时请重新授权。"
   }
 }

@@ -6,7 +6,7 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { useConfig } from "./ConfigProvider";
 import { ProviderList } from "./ProviderList";
-import { WorkBuddyProvider } from "./WorkBuddyProvider";
+import { useNavigate } from "react-router-dom";
 import { isManagedWorkBuddy } from "@/utils/workbuddy";
 import {
   Dialog,
@@ -129,11 +129,9 @@ export function Providers() {
   const { t } = useTranslation();
   const { config, refreshConfig } = useConfig();
   const [isSaving, setIsSaving] = useState(false);
-  const [workBuddyBusy, setWorkBuddyBusy] = useState(false);
+  const navigate = useNavigate();
   const showWorkBuddyManagement = () => {
-    document.getElementById('workbuddy-management')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    document.getElementById('workbuddy-management')?.focus({ preventScroll: true });
-    setToast({ message: t('workbuddy.managed_notice'), type: 'warning' });
+    navigate('/settings?tab=providers', { state: { workBuddyManagedNotice: true } });
   };
   const [editingProviderIndex, setEditingProviderIndex] = useState<number | null>(null);
   const [deletingProviderIndex, setDeletingProviderIndex] = useState<number | null>(null);
@@ -312,7 +310,7 @@ export function Providers() {
   // Used by enabled toggle and proxy toggle so both go through the same
   // POST /api/config path and refreshConfig afterwards.
   const persistProviderPatch = async (filteredIndex: number, patch: Partial<Provider>) => {
-    if (isSaving || workBuddyBusy) return;
+    if (isSaving) return;
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     if (actualIndex === -1) return;
 
@@ -356,7 +354,7 @@ export function Providers() {
     const actualIndex = validProviders.indexOf(filteredProviders[index]);
     const provider = config.Providers[actualIndex];
     if (isManagedWorkBuddy(provider)) { showWorkBuddyManagement(); return; }
-    if (workBuddyBusy || isSaving) return;
+    if (isSaving) return;
     setEditingProviderIndex(actualIndex);
     setEditingProviderData(JSON.parse(JSON.stringify(provider))); // 深拷贝
     setIsNewProvider(false);
@@ -370,7 +368,7 @@ export function Providers() {
   };
 
   const handleSaveProvider = async () => {
-    if (!editingProviderData || isSaving || workBuddyBusy) return;
+    if (!editingProviderData || isSaving) return;
     // Defense in depth: never allow the generic editor to mutate a managed
     // identity, key, URL, model set or transformer, even if config refreshed.
     if (isManagedWorkBuddy(editingProviderData) ||
@@ -484,7 +482,7 @@ export function Providers() {
   // Handle deletion by setting the correct index in the state
   const handleSetDeletingProviderIndex = (filteredIndex: number) => {
     if (isManagedWorkBuddy(filteredProviders[filteredIndex])) { showWorkBuddyManagement(); return; }
-    if (isSaving || workBuddyBusy) return;
+    if (isSaving) return;
     setDeletingProviderIndex(filteredIndex);
   };
 
@@ -494,7 +492,7 @@ export function Providers() {
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     const deletedProvider = config.Providers[actualIndex];
     if (isManagedWorkBuddy(deletedProvider)) { setDeletingProviderIndex(null); showWorkBuddyManagement(); return; }
-    if (isSaving || workBuddyBusy) return;
+    if (isSaving) return;
     const deletedModels = deletedProvider?.models || [];
     const deletedProviderName = deletedProvider?.name;
     const newProviders = [...config.Providers];
@@ -905,7 +903,7 @@ export function Providers() {
               <RefreshCw className={`h-4 w-4 mr-1 ${isProbingAllProviders ? "animate-spin" : ""}`} />
               {t("providers.probe_all")}
             </Button>
-            <Button onClick={handleAddProvider} disabled={workBuddyBusy || isSaving} size="sm" className="h-9 px-4 rounded-xl">
+            <Button onClick={handleAddProvider} disabled={isSaving} size="sm" className="h-9 px-4 rounded-xl">
               <Plus className="h-4 w-4 mr-1" />
               {t("providers.add")}
             </Button>
@@ -934,10 +932,6 @@ export function Providers() {
         </div>
       </CardHeader>
       <CardContent className="flex-grow overflow-y-auto p-6 custom-scrollbar">
-        <WorkBuddyProvider
-          disabled={isSaving || editingProviderIndex !== null || deletingProviderIndex !== null}
-          onBusyChange={setWorkBuddyBusy}
-        />
         <ProviderList
           providers={filteredProviders}
           healthStates={healthStates}
@@ -950,7 +944,7 @@ export function Providers() {
           probingProviders={probingProviders}
           proxyUrl={getConfiguredProxyUrl(config)}
           proxyGlobalEnabled={isGlobalProxyEnabled(config.PROXY_GLOBAL_ENABLED)}
-          saving={isSaving || workBuddyBusy}
+          saving={isSaving}
           onProxyToggle={handleProxyToggle}
         />
       </CardContent>

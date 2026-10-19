@@ -82,15 +82,15 @@ const providers = readFileSync(new URL("../src/components/Providers.tsx", import
 const apiSource = readFileSync(new URL("../src/lib/api.ts", import.meta.url), "utf8");
 test("WorkBuddy has no token/password/path input, no client takeover action", () => {
   assert.doesNotMatch(component, /<Input|type=["']password|localStorage|enableClient|restartService/);
-  assert.match(component, /workbuddy-consent/); assert.match(component, /setConfirm\("disconnect"\)/);
+  assert.match(component, /setConfirm\("disconnect"\)/);
   assert.match(component, /refreshConfig\(mergeWorkBuddyProvider\)/);
   assert.match(component, /locked\.current/); assert.match(component, /generation\.current === id/);
   assert.doesNotMatch(component, /console\.|result\.message|status\.lastError\}/);
 });
-test("import carries an explicit site selector; no refresh flow exists anywhere in the UI layer", () => {
-  assert.match(component, /role="radiogroup"/); assert.match(component, /importWorkBuddy\(site\)/);
+test("browser login carries an explicit site selector; credentials never reach UI", () => {
+  assert.match(component, /role="radiogroup"/); assert.match(component, /createWorkBuddyLogin\(api, site/);
   assert.match(component, /WORKBUDDY_SITES: WorkBuddyKind\[\] = \["workbuddy", "workbuddy-ai"\]/);
-  // No refreshToken use and no canRefresh in UI sources: renewal is desktop re-import only.
+  // Browser-owned refresh is backend-only; no credential handling in UI.
   assert.doesNotMatch(component, /refreshToken|refresh_token|canRefresh/i);
   assert.doesNotMatch(apiSource, /refreshToken|refresh_token|canRefresh|\/refresh/);
 });
@@ -108,6 +108,8 @@ test("status-derived warnings render from contract fields only", () => {
   assert.match(component, /imagesUnsupportedModels/);
   assert.match(component, /workBuddyImagesUnsupportedModels\(models/);
   assert.match(component, /renewalMode === "desktop"/);
+  assert.match(component, /renewalMode === "browser"/);
+  assert.match(component, /status.source === "browser"/);
   assert.match(component, /status\.site/);
 });
 test("generic edit and both delete stages guard managed provider", () => {
@@ -128,4 +130,18 @@ test("EN/ZH WorkBuddy locale parity covers statuses, sites, credits and safe err
     assert.match(String(locale.renewal_desktop), /desktop|桌面/i);
     assert.doesNotMatch(JSON.stringify(locale.credits), /refreshToken/i);
   }
+});
+
+const settings = readFileSync(new URL("../src/components/SettingsPage.tsx", import.meta.url), "utf8");
+test("settings owns management; dashboard only navigates managed edit/delete", () => {
+  assert.doesNotMatch(providers, /<WorkBuddyProvider|scrollIntoView|document.getElementById\(['"]workbuddy-management/);
+  assert.match(providers, /navigate\('\/settings\?tab=providers'/);
+  assert.match(settings, /TabsTrigger value="providers"/);
+  assert.match(settings, /TabsContent value="providers"/);
+  assert.match(settings, /<WorkBuddyProvider disabled=\{isSaving \|\| isRestarting\}/);
+  assert.equal((settings.match(/disabled=\{isSaving \|\| isRestarting \|\| workBuddyBusy\}/g) || []).length, 2);
+  assert.match(settings, /workbuddy.managed_notice/);
+  assert.match(component, /target="_blank" rel="noopener noreferrer"/);
+  assert.doesNotMatch(component, /window.open/);
+  assert.match(component, /loginSession.current\?\.cancel\(\)/);
 });

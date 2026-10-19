@@ -266,12 +266,10 @@ export type WorkBuddyStatus =
 
 // Which fixed-origin WorkBuddy site a saved login belongs to. The provider name
 // stays "workbuddy" for both; only one site is active at a time and switching
-// is an explicit disconnect + import.
+// is an explicit disconnect + login.
 export type WorkBuddyKind = "workbuddy" | "workbuddy-ai";
 
-// Only renewal path: bounded re-read of the same desktop login file.
-// No credential-refresh secret is stored and no refresh API is called.
-export type WorkBuddyRenewalMode = "desktop";
+export type WorkBuddyRenewalMode = "desktop" | "browser";
 
 export interface WorkBuddyStatusResponse {
   status: WorkBuddyStatus;
@@ -292,6 +290,7 @@ export interface WorkBuddyStatusResponse {
   // Registered models that cannot accept image input (e.g. GLM series).
   imagesUnsupportedModels?: string[];
   renewalMode?: WorkBuddyRenewalMode;
+  source?: "desktop" | "browser";
 }
 
 export interface WorkBuddyUsage {
@@ -310,7 +309,24 @@ export type WorkBuddyFailureReason =
   | "source_missing"
   | "source_invalid"
   | "models_fetch_failed"
-  | "workbuddy_site_conflict";
+  | "workbuddy_site_conflict"
+  | "workbuddy_name_conflict"
+  | "login_state_rejected"
+  | "login_account_failed"
+  | "login_persist_failed";
+
+export interface WorkBuddyLoginStartResponse {
+  ok: true;
+  site: WorkBuddyKind;
+  loginId: string;
+  url: string;
+  expiresAt: number;
+}
+
+export type WorkBuddyLoginPollResponse =
+  | { status: "pending" | "none" | "expired" }
+  | { status: "failed"; reason: WorkBuddyFailureReason }
+  | (WorkBuddyMutationResponse & { status: "connected"; success: true; models: string[] });
 
 export interface WorkBuddyImportRequest {
   site: WorkBuddyKind;

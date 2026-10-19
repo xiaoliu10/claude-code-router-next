@@ -72,3 +72,37 @@ test("full-config writes cannot overlap managed action and reconciliation", asyn
     const next = client.acquireWorkBuddyManagement(); assert.ok(next); next();
   } finally { globalThis.fetch = original; }
 });
+
+test("browser login uses exact start/poll/cancel bodies and safe failure allowlist", async () => {
+  const client = new ApiClient("/mock-api", "mock-key");
+  const original = globalThis.fetch;
+  const calls: Array<{ url: string; options?: RequestInit }> = [];
+  let httpStatus = 200; let payload: unknown = { status: "pending" };
+  globalThis.fetch = (async (url: string | URL | Request, options?: RequestInit) => {
+    calls.push({ url: String(url), options });
+    return new Response(JSON.stringify(payload), { status: httpStatus });
+  }) as typeof fetch;
+  try {
+    await client.startWorkBuddyLogin("workbuddy-ai");
+    const abort = new AbortController();
+    await client.pollWorkBuddyLogin("workbuddy-ai", "mock-job", abort.signal);
+    await client.cancelWorkBuddyLogin("workbuddy-ai", "mock-job");
+    assert.deepEqual(calls.map(call => call.url), ["/mock-api/workbuddy/login/start", "/mock-api/workbuddy/login/poll", "/mock-api/workbuddy/login/cancel"]);
+    assert.deepEqual(calls.map(call => JSON.parse(String(call.options?.body))), [{ site: "workbuddy-ai" }, { site: "workbuddy-ai", loginId: "mock-job" }, { site: "workbuddy-ai", loginId: "mock-job" }]);
+    assert.ok(calls.every(call => call.options?.method === "POST"));
+    httpStatus = 422;
+    for (const reason of ["login_state_rejected", "login_account_failed", "login_persist_failed", "models_fetch_failed", "workbuddy_name_conflict", "workbuddy_site_conflict", "unsafe-raw-token"]) {
+      payload = { reason, message: "private-marker" };
+      await assert.rejects(client.pollWorkBuddyLogin("workbuddy-ai", "mock-job", abort.signal), error => {
+        assert.equal((error as { reason: string }).reason, reason === "unsafe-raw-token" ? "request_failed" : reason);
+        assert.doesNotMatch(String(error), /private-marker|unsafe-raw-token/); return true;
+      });
+    }
+    httpStatus = 409; payload = { error: "workbuddy_site_conflict" };
+    await assert.rejects(client.startWorkBuddyLogin("workbuddy"), { reason: "workbuddy_site_conflict" });
+    httpStatus = 200;
+    const pending = client.pollWorkBuddyLogin("workbuddy-ai", "mock-job", abort.signal);
+    const signal = calls.at(-1)!.options!.signal!;
+    abort.abort(); assert.equal(signal.aborted, true); await pending;
+  } finally { globalThis.fetch = original; }
+});
