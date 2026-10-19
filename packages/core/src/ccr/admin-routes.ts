@@ -1028,6 +1028,69 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     }
   });
 
+  _app.post("/api/workbuddy/login/start", async (req: any, reply: any) => {
+    try {
+      assertLocalWorkBuddyRequest(req);
+      const site = (req.body as any)?.site ?? "workbuddy";
+      if (site !== "workbuddy" && site !== "workbuddy-ai") {
+        reply.status(422);
+        return { ok: false, error: "source_invalid" };
+      }
+      const started = await requireWorkBuddyService().startBrowserLogin(site);
+      if (!started.ok) {
+        reply.status(409);
+        return { ok: false, error: started.error, message: "已连接另一个 WorkBuddy 站点；请先断开，再登录当前站点" };
+      }
+      return { ok: true, site, loginId: started.loginId, url: started.url, expiresAt: started.expiresAt };
+    } catch (error: any) {
+      if (error?.statusCode === 403) { reply.status(403); return { error: "workbuddy_unauthorized" }; }
+      req.log?.warn("WorkBuddy browser sign-in start failed");
+      reply.status(500);
+      return { error: "workbuddy_login_start_failed" };
+    }
+  });
+
+  _app.post("/api/workbuddy/login/poll", async (req: any, reply: any) => {
+    try {
+      assertLocalWorkBuddyRequest(req);
+      const site = (req.body as any)?.site ?? "workbuddy";
+      if (site !== "workbuddy" && site !== "workbuddy-ai") {
+        reply.status(422);
+        return { status: "failed", reason: "source_invalid" };
+      }
+      const loginId = req.body?.loginId;
+      if (typeof loginId !== "string" || !/^[a-f0-9]{48}$/.test(loginId)) { reply.status(422); return { status: "failed", reason: "source_invalid" }; }
+      const result = await requireWorkBuddyService().pollBrowserLogin(site, loginId);
+      if (result.status === "connected") {
+        return { status: "connected", success: true, models: result.result.models, modelCount: result.result.modelCount, displayName: result.result.displayName };
+      }
+      if (result.status === "failed") {
+        reply.status(422);
+        return { status: "failed", reason: result.reason, message: result.message ?? undefined };
+      }
+      return result;
+    } catch (error: any) {
+      if (error?.statusCode === 403) { reply.status(403); return { error: "workbuddy_unauthorized" }; }
+      req.log?.warn("WorkBuddy browser sign-in poll failed");
+      reply.status(500);
+      return { error: "workbuddy_login_poll_failed" };
+    }
+  });
+
+  _app.post("/api/workbuddy/login/cancel", async (req: any, reply: any) => {
+    try {
+      assertLocalWorkBuddyRequest(req);
+      const { site, loginId } = req.body ?? {};
+      if ((site !== "workbuddy" && site !== "workbuddy-ai") || typeof loginId !== "string" || !/^[a-f0-9]{48}$/.test(loginId)) {
+        reply.status(422); return { error: "source_invalid" };
+      }
+      return requireWorkBuddyService().cancelBrowserLogin(site, loginId);
+    } catch (error: any) {
+      reply.status(error?.statusCode === 403 ? 403 : 500);
+      return { error: "workbuddy_login_cancel_failed" };
+    }
+  });
+
   _app.post("/api/workbuddy/sync", async (req: any, reply: any) => {
     try {
       assertLocalWorkBuddyRequest(req);

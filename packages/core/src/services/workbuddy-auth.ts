@@ -1,5 +1,5 @@
 /**
- * WorkBuddy (CN) managed-provider auth service.
+ * WorkBuddy (CN + international) managed-provider authorization service.
  *
  * Design contract: docs/design/workbuddy-provider-contract.md (§13 rulings win
  * over earlier sections). Key invariants implemented here:
@@ -13,10 +13,10 @@
  *  - Import/sync/disconnect never touch config.Router (D6).
  *  - Sync preserves an existing `enabled: false` so a user-disabled provider is
  *    never silently re-enabled.
- *  - No credential-refresh API, no browser login flow, no static model
- *    fallback, no prompt rewriting, no extra process or plugin install.
+ *  - Browser sign-ins own their refresh credential (§15); desktop imports never
+ *    copy/spend shared desktop refresh secrets (§14). No static models or plugins.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readConfigFileRaw, writeConfigFile } from "../ccr/config";
 import { reconcileHealthStore } from "../ccr/health-reconcile";
 import { ProviderService } from "./provider";
@@ -35,7 +35,11 @@ import {
   lockWorkBuddyProvider,
   parseWorkBuddyModels,
   protectWorkBuddyConfig,
+  createWorkBuddyLoginState,
+  fetchWorkBuddyLoginAccount,
+  pollWorkBuddyLoginToken,
   readWorkBuddySource,
+  refreshWorkBuddyToken,
   renewWorkBuddyFromDesktop,
   workBuddyChatUrl,
   workBuddyConfigUrl,
@@ -43,6 +47,7 @@ import {
   workBuddyNeedsRenewal,
   workBuddySite,
   type WorkBuddyCredential,
+  type WorkBuddyCredentialSource,
   type WorkBuddySiteId,
   type WorkBuddySourceResult,
   type WorkBuddyStatus,
@@ -65,8 +70,9 @@ export interface WorkBuddyStatusResult {
   importedAt: string | null;
   lastSyncAt: string | null;
   lastError: string | null;
-  /** Near-expiry renewal is by bounded, same-site desktop-file re-read only. */
-  renewalMode: "desktop";
+  source: WorkBuddyCredentialSource;
+  /** desktop: bounded desktop-file re-read; browser: CCR-owned refresh token. */
+  renewalMode: "desktop" | "browser";
   imagesUnsupportedModels: string[];
 }
 
@@ -83,7 +89,8 @@ export interface WorkBuddyMutationResult {
 }
 
 /** Injected so tests can stub fetch without touching a real upstream. */
-export type WorkBuddyFetch = (url: string, init?: RequestInit) => Promise<Response>;
+export type { WorkBuddyFetch } from "./workbuddy";
+import type { WorkBuddyFetch } from "./workbuddy";
 
 export interface WorkBuddyServiceOptions {
   configService: any;
@@ -119,6 +126,11 @@ export class WorkBuddyAuthService {
     return result;
   }
   private syncInFlight: Promise<WorkBuddyMutationResult> | null = null;
+  /** In-browser sign-ins under way, by site (contract §15): state + deadline only. */
+  private pendingLogins = new Map<string, { site: WorkBuddySiteId; state: string; url: string; expiresAt: number; epoch: number; lastPoll: number; token?: Extract<Awaited<ReturnType<typeof pollWorkBuddyLoginToken>>, { ok: true }>["token"]; result?: any; inFlight?: Promise<any> }>();
+  private loginStarts = 0;
+  private browserRefreshes = new Map<string, Promise<WorkBuddyCredential | null>>();
+  private credentialEpoch = 0;
 
   constructor(private readonly options: WorkBuddyServiceOptions) {}
 
@@ -168,6 +180,7 @@ export class WorkBuddyAuthService {
       importedAt: null,
       lastSyncAt: null,
       lastError: null,
+      source: "desktop",
       renewalMode: "desktop",
       imagesUnsupportedModels: [],
     };
@@ -191,6 +204,8 @@ export class WorkBuddyAuthService {
       status: credential.expiresAt > 0 && Date.now() >= credential.expiresAt ? "expired" : "connected",
       kind: site.id,
       site: site.origin,
+      source: credential.source ?? "desktop",
+      renewalMode: credential.source === "browser" ? "browser" : "desktop",
       models,
       modelCount: models.length,
       uid: credential.uid,
@@ -253,6 +268,8 @@ export class WorkBuddyAuthService {
    * models, and only then persist the credential + provider.
    */
   importFromLocalDesktop(site: WorkBuddySiteId = "workbuddy"): Promise<WorkBuddyMutationResult> {
+    this.credentialEpoch++;
+    this.pendingLogins.clear();
     workBuddySite(site); // Runtime validation: no arbitrary site or URL from HTTP.
     let running = this.importsInFlight.get(site);
     if (!running) {
@@ -280,7 +297,17 @@ export class WorkBuddyAuthService {
         modelsUnchanged: true,
       };
     }
-    const candidate = source.credential;
+    return this.persistCandidate(source.credential, "已导入本机 WorkBuddy 登录并同步模型");
+  }
+
+  /**
+   * Shared persistence path for both credential sources (desktop import and
+   * browser sign-in): site-conflict guard, validate-then-persist discovery,
+   * name conflict, and credential rollback when the provider write fails.
+   */
+  private async persistCandidate(candidate: WorkBuddyCredential, connectedMessage: string, isCurrent: () => boolean = () => true): Promise<WorkBuddyMutationResult> {
+    const cancelled = (): WorkBuddyMutationResult => ({ success: false, status: "error", models: [], modelCount: 0, displayName: null, message: "WorkBuddy 登录已取消", modelsUnchanged: true });
+    if (!isCurrent()) return cancelled();
     const existingCredential = await this.store.load().catch(() => null);
     if (existingCredential && existingCredential.kind !== candidate.kind) {
       return {
@@ -300,7 +327,7 @@ export class WorkBuddyAuthService {
     try {
       discovered = await this.fetchModels(candidate);
     } catch (error: any) {
-      this.log.warn?.(`[workbuddy] import discovery failed: ${error?.code || error?.message}`);
+      this.log.warn?.(`[workbuddy] discovery failed: ${error?.code || error?.message}`);
       return {
         success: false,
         status: "error",
@@ -339,44 +366,131 @@ export class WorkBuddyAuthService {
       };
     }
 
+    if (!isCurrent()) return cancelled();
     const previousCredential = existingCredential;
     let wroteCredential = false;
     try {
       await this.store.save(candidate);
       wroteCredential = true;
-      await this.upsertManagedProvider(models, candidate.kind);
+      if (!isCurrent()) throw new Error("workbuddy_login_cancelled");
+      await this.upsertManagedProvider(models, candidate.kind, isCurrent);
     } catch (error: any) {
       if (wroteCredential) {
         if (previousCredential) await this.store.save(previousCredential);
         else await this.store.delete();
       }
-      this.log.error?.("[workbuddy] import persist failed; private credential rolled back");
+      this.log.error?.("[workbuddy] persist failed; private credential rolled back");
       return {
         success: false,
         status: "error",
         models: [],
         modelCount: 0,
         displayName: candidate.displayName || null,
-        message: "WorkBuddy 导入失败；未写入配置",
+        message: "WorkBuddy 配置失败；未写入配置",
         modelsUnchanged: true,
       };
     }
-    return this.mutation("connected", models, candidate.displayName, "已导入本机 WorkBuddy 登录并同步模型");
+    return this.mutation("connected", models, candidate.displayName, connectedMessage);
+  }
+
+  // ------------------------------------------------------- browser login ----
+
+  /** Explicit browser authorization; upstream state never leaves this service. */
+  startBrowserLogin(site: WorkBuddySiteId): Promise<any> {
+    workBuddySite(site);
+    for (const [id, job] of this.pendingLogins) if (Date.now() >= job.expiresAt) this.pendingLogins.delete(id);
+    if (this.pendingLogins.size + this.loginStarts >= 8) return Promise.reject(new Error("workbuddy_login_busy"));
+    this.loginStarts++;
+    const epoch = this.credentialEpoch;
+    const task = (async () => {
+      const existing = await this.store.load().catch(() => null);
+      if (existing && existing.kind !== site) return { ok: false, error: "workbuddy_site_conflict" };
+      const started = await createWorkBuddyLoginState(site, (url, init) => this.directFetch(url, init));
+      if (epoch !== this.credentialEpoch) throw new Error("workbuddy_login_cancelled");
+      // A bounded number of pending browser jobs; each has a private random capability.
+      for (const [id, job] of this.pendingLogins) if (Date.now() >= job.expiresAt) this.pendingLogins.delete(id);
+      if (this.pendingLogins.size >= 8) throw new Error("workbuddy_login_busy");
+      const loginId = randomBytes(24).toString("hex");
+      this.pendingLogins.set(loginId, { ...started, site, epoch, lastPoll: 0 });
+      return { ok: true, loginId, url: started.url, expiresAt: started.expiresAt };
+    })().finally(() => { this.loginStarts--; });
+    return task;
+  }
+
+  cancelBrowserLogin(site: WorkBuddySiteId, loginId: string): { success: true } {
+    const job = this.pendingLogins.get(loginId);
+    if (job?.site === site) this.pendingLogins.delete(loginId);
+    return { success: true };
+  }
+
+  /** Single-flight poll; cancellation/disconnect invalidates every persistence checkpoint. */
+  async pollBrowserLogin(site: WorkBuddySiteId, loginId: string): Promise<any> {
+    workBuddySite(site);
+    const job = this.pendingLogins.get(loginId);
+    if (!job || job.site !== site) return { status: "none" };
+    if (job.result) return job.result;
+    if (Date.now() >= job.expiresAt) { this.pendingLogins.delete(loginId); return { status: "expired" }; }
+    if (job.inFlight) return job.inFlight;
+    if (Date.now() - job.lastPoll < 1000) return { status: "pending" };
+    job.lastPoll = Date.now();
+    const active = () => this.pendingLogins.get(loginId) === job && job.epoch === this.credentialEpoch && Date.now() < job.expiresAt;
+    const task = (async () => {
+      if (!job.token) {
+        const poll = await pollWorkBuddyLoginToken(site, job.state, (url, init) => this.directFetch(url, init));
+        if (!active()) return { status: "none" };
+        if (poll.pending) return { status: "pending" };
+        if (!poll.ok) return job.result = { status: "failed", reason: "login_state_rejected", message: null };
+        job.token = poll.token;
+      }
+      const t = job.token;
+      let account: { uid: string; displayName: string; enterpriseId: string } | null;
+      try {
+        account = await fetchWorkBuddyLoginAccount(site, job.state, t.accessToken, t.domain, (url, init) => this.directFetch(url, init));
+      } catch { return job.result = { status: "failed", reason: "login_account_failed", message: null }; }
+      if (!active()) return { status: "none" };
+      if (!account) return { status: "pending" };
+      if (!account.uid) return job.result = { status: "failed", reason: "login_account_failed", message: null };
+      const candidate: WorkBuddyCredential = {
+        version: 1, kind: site, uid: account.uid, displayName: account.displayName,
+        domain: t.domain || "", enterpriseId: account.enterpriseId,
+        accessToken: t.accessToken, expiresAt: t.expiresAt,
+        importedAt: new Date().toISOString(), source: "browser", tokenType: t.tokenType,
+        ...(t.refreshToken ? { refreshToken: t.refreshToken, ...(t.refreshExpiresAt ? { refreshExpiresAt: t.refreshExpiresAt } : {}) } : {}),
+      };
+      const result = await this.enqueueMutation(async () => {
+        if (!active()) return null;
+        return this.persistCandidate(candidate, "WorkBuddy 账号授权登录成功，已同步模型", active);
+      });
+      if (!result || !active()) return { status: "none" };
+      if (!result.success) {
+        const reason = result.error === "workbuddy_name_conflict" || result.error === "workbuddy_site_conflict"
+          ? result.error : (result.reason === "models_fetch_failed" ? "models_fetch_failed" : "login_persist_failed");
+        return job.result = { status: "failed", reason, message: null };
+      }
+      return job.result = { status: "connected", result };
+    })().finally(() => { job.inFlight = undefined; });
+    job.inFlight = task;
+    return task;
   }
 
   // ---------------------------------------------------------------- sync ----
 
   syncModels(): Promise<WorkBuddyMutationResult> {
     if (!this.syncInFlight) {
-      this.syncInFlight = this.enqueueMutation(() => this.runSync()).finally(() => { this.syncInFlight = null; });
+      const epoch = this.credentialEpoch;
+      this.syncInFlight = this.currentCredential().then(() => this.enqueueMutation(() => this.runSync(epoch))).finally(() => { this.syncInFlight = null; });
     }
     return this.syncInFlight;
   }
 
-  private async runSync(): Promise<WorkBuddyMutationResult> {
+  private async runSync(epoch: number): Promise<WorkBuddyMutationResult> {
+    if (epoch !== this.credentialEpoch) return { success: false, status: "not_connected", error: "workbuddy_not_connected", models: [], modelCount: 0, displayName: null };
     let credential: WorkBuddyCredential | null;
     try {
-      credential = await this.currentCredential();
+      credential = await this.store.load();
+      if (credential?.source === "desktop" && this.effectiveCredential?.generation === this.credentialGeneration(credential)) {
+        credential = this.effectiveCredential.credential;
+      }
     } catch {
       return { success: false, status: "error", models: [], modelCount: 0, displayName: null, message: "WorkBuddy 登录态不可读，请重新导入" };
     }
@@ -444,6 +558,8 @@ export class WorkBuddyAuthService {
    * provider and the whole Router object are left byte-identical (D6/Q3).
    */
   disconnect(): Promise<{ success: boolean; removedProvider: boolean; deletedCredential: boolean }> {
+    this.credentialEpoch++;
+    this.pendingLogins.clear();
     return this.enqueueMutation(() => this.runDisconnect());
   }
 
@@ -470,6 +586,7 @@ export class WorkBuddyAuthService {
     const deletedCredential = await this.store.delete();
     this.effectiveCredential = undefined;
     this.reauthProbes.clear();
+    this.pendingLogins.clear();
     try { reconcileHealthStore(config, this.log); } catch {}
     return { success: true, removedProvider, deletedCredential };
   }
@@ -490,8 +607,9 @@ export class WorkBuddyAuthService {
    * `siteId` is the site of the credential being imported/synced, so the managed
    * provider's locked URL matches the site that owns the token (contract §14.1).
    */
-  private async upsertManagedProvider(models: string[], siteId: WorkBuddySiteId = "workbuddy"): Promise<void> {
+  private async upsertManagedProvider(models: string[], siteId: WorkBuddySiteId = "workbuddy", isCurrent: () => boolean = () => true): Promise<void> {
     const config = await readConfigFileRaw();
+    const previousConfig = structuredClone(config);
     const routerBefore = JSON.stringify(config.Router ?? null);
     const { key, list } = providerList(config);
     const index = list.findIndex((p: any) => isManagedWorkBuddy(p));
@@ -508,7 +626,17 @@ export class WorkBuddyAuthService {
 
     // Defence in depth: a generic save must never redirect managed transport.
     protectWorkBuddyConfig(config, config);
-    await writeConfigFile(config);
+    if (!isCurrent()) throw new Error("workbuddy_login_cancelled");
+    try {
+      await writeConfigFile(config);
+      if (!isCurrent()) throw new Error("workbuddy_login_cancelled");
+    } catch {
+      try {
+        await writeConfigFile(previousConfig);
+        this.reloadRuntime(previousConfig);
+      } catch { this.log.error?.("[workbuddy] previous configuration restoration failed"); }
+      throw new Error("workbuddy_config_write_failed");
+    }
     if (JSON.stringify(config.Router ?? null) !== routerBefore) {
       throw new Error("WorkBuddy 配置写入被拒绝：Router 发生变化");
     }
@@ -667,8 +795,27 @@ export class WorkBuddyAuthService {
    */
   async currentCredential(readSource?: () => WorkBuddySourceResult): Promise<WorkBuddyCredential | null> {
     const credential = await this.store.load();
-    if (!credential) return null;
-    if (!workBuddyNeedsRenewal(credential)) return credential;
+    if (!credential || !workBuddyNeedsRenewal(credential)) return credential;
+    if (credential.source === "browser") {
+      const key = this.credentialGeneration(credential);
+      const existing = this.browserRefreshes.get(key);
+      if (existing) return existing;
+      const epoch = this.credentialEpoch;
+      const task = this.enqueueMutation(async () => {
+        const live = await this.store.load();
+        if (!live || epoch !== this.credentialEpoch || this.credentialGeneration(live) !== key) return live;
+        try {
+          const renewed = await refreshWorkBuddyToken(live, (url, init) => this.directFetch(url, init), async (next) => {
+            if (epoch !== this.credentialEpoch) return;
+            const current = await this.store.load();
+            if (current && this.credentialGeneration(current) === key) await this.store.save(next);
+          });
+          return epoch === this.credentialEpoch ? renewed : null;
+        } catch { return live; }
+      }).finally(() => this.browserRefreshes.delete(key));
+      this.browserRefreshes.set(key, task);
+      return task;
+    }
     const renewed = await renewWorkBuddyFromDesktop(credential, readSource ?? (() => this.readSource(credential.kind)));
     this.effectiveCredential = { generation: this.credentialGeneration(credential), credential: renewed };
     return renewed;

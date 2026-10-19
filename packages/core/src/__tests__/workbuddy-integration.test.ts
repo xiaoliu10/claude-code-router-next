@@ -538,6 +538,28 @@ describe("WorkBuddy admin API (isolated mocks)", () => {
     expect(sourceSpy).not.toHaveBeenCalled();
   });
 
+  it("browser login start/poll/cancel enforce local guard and never expose tokens", async () => {
+    const { server, service } = await build({ PORT: 3456, Providers: [], Router: {} }, null);
+    const start = vi.spyOn(service, "startBrowserLogin").mockResolvedValue({ ok: true, loginId: "a".repeat(48), url: "https://www.codebuddy.cn/login", expiresAt: Date.now() + 60000 });
+    vi.spyOn(service, "pollBrowserLogin").mockResolvedValue({ status: "connected", result: { success: true, status: "connected", models: ["m"], modelCount: 1, displayName: "name", accessToken: TOKEN, refreshToken: "refresh-secret" } });
+    vi.spyOn(service, "cancelBrowserLogin").mockReturnValue({ success: true });
+    const base = "http://localhost:3456/api/workbuddy/login/";
+    const started = await server.app.inject({ method: "POST", url: base + "start", payload: { site: "workbuddy" } });
+    expect(started.statusCode).toBe(200); expect(started.json().loginId).toBe("a".repeat(48));
+    const poll = await server.app.inject({ method: "POST", url: base + "poll", payload: { site: "workbuddy", loginId: "a".repeat(48) } });
+    expect(poll.json()).toMatchObject({ status: "connected", models: ["m"] });
+    expect(poll.body).not.toContain(TOKEN); expect(poll.body).not.toContain("refresh-secret");
+    for (const action of ["start", "poll", "cancel"]) {
+      const remote = await server.app.inject({ method: "POST", url: base + action, remoteAddress: "203.0.113.1", payload: { site: "workbuddy", loginId: "a".repeat(48) } });
+      expect(remote.statusCode).toBe(403);
+    }
+    const malformed = await server.app.inject({ method: "POST", url: base + "poll", payload: { site: "workbuddy", loginId: "../bad" } });
+    expect(malformed.statusCode).toBe(422);
+    const invalid = await server.app.inject({ method: "POST", url: base + "start", payload: { site: "https://evil.example" } });
+    expect(invalid.statusCode).toBe(422); expect(start).toHaveBeenCalledTimes(1);
+    expect((await server.app.inject({ method: "POST", url: base + "cancel", payload: { site: "workbuddy", loginId: "a".repeat(48) } })).json()).toEqual({ success: true });
+  });
+
   it("POST /api/workbuddy/sync returns 409 when not connected", async () => {
     const config = { Providers: [], Router: {} };
     const { server } = await build(config, null);

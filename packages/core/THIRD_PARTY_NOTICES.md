@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-## WorkBuddy protocol (CN site)
+## WorkBuddy protocol (CN + international, browser authorization)
 
 The WorkBuddy built-in subscription provider in `packages/core` implements a
 protocol reverse-engineered from the community plugin:
@@ -12,9 +12,9 @@ protocol reverse-engineered from the community plugin:
 The CCR implementation (`services/workbuddy.ts`, `services/workbuddy-auth.ts`,
 `transformer/workbuddy.transformer.ts` and their tests) was written from the
 protocol description (endpoints, user agents, header sets, request-body quirks,
-`/v3/config` schema handling, error codes). It does not copy substantial code
-from the plugin, but the protocol knowledge itself derives from that MIT
-project, and the upstream project's authors accordingly deserve attribution:
+`/v3/config` schema handling, error codes, browser authorization and refresh).
+The browser protocol implementation adapts the pinned plugin's flow and enterprise
+selection logic. The MIT notice is retained below for that derived implementation:
 
 ```
 MIT License

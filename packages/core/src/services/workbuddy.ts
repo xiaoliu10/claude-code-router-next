@@ -1,8 +1,8 @@
 /** WorkBuddy protocol (CN + international). Source: magpie-community/plugins@ab38da681af7716ea9a7609f045ca91d2ad9988a
  * packages/workbuddy/index.mjs (MIT); see ../../THIRD_PARTY_NOTICES.md.
  * No browser login, no prompt rewriting, no static model fallback, no source-file writes.
- * No check-in/sign-in feature: the upstream plugin has none (contract D11) — WorkBuddy's free
- * credits are a server-side daily slice package that needs no client action.
+ * No daily check-in/reward task: free credits are server-side daily packages (D11).
+ * Browser authorization (§15) does not require a desktop installation.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, fstatSync, openSync, readFileSync, constants } from "node:fs";
@@ -10,6 +10,9 @@ import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { HOME_DIR } from "@wengine-ai/claude-code-router-shared";
+
+/** Injected transport contract; implementations must enforce direct fixed-origin requests. */
+export type WorkBuddyFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 export const WORKBUDDY_PROVIDER_NAME = "workbuddy";
 export const WORKBUDDY_API_KEY = "ccr-managed-workbuddy";
@@ -62,11 +65,20 @@ export const WORKBUDDY_CHAT_URL = workBuddyChatUrl(WORKBUDDY_SITES.workbuddy);
 export const WORKBUDDY_CONFIG_URL = workBuddyConfigUrl(WORKBUDDY_SITES.workbuddy);
 
 export type WorkBuddyStatus = "not_connected" | "connected" | "expired" | "sealed" | "source_missing" | "source_changed" | "error";
+/** Where the credential came from: the desktop login file or a browser sign-in. */
+export type WorkBuddyCredentialSource = "desktop" | "browser";
 export interface WorkBuddyCredential {
   version: 1; kind: WorkBuddySiteId; uid: string; displayName: string; domain: string;
-  enterpriseId: string; accessToken: string; expiresAt: number; importedAt: string; source: "desktop";
-  /** Non-secret token type only; desktop refresh secrets are never persisted. */
+  enterpriseId: string; accessToken: string; expiresAt: number; importedAt: string; source: WorkBuddyCredentialSource;
+  /** Non-secret token type only. */
   tokenType?: string;
+  /**
+   * Browser sign-ins ONLY: CCR is the sole owner of this refresh token, so unlike a
+   * desktop credential (contract §14.3 — never stored, never spent) it is persisted
+   * in the 0600 private file and spent on near-expiry renewal.
+   */
+  refreshToken?: string;
+  refreshExpiresAt?: number;
   lastSyncAt?: string;
 }
 export type WorkBuddySourceResult = { ok: true; credential: WorkBuddyCredential } |
@@ -163,19 +175,43 @@ export class WorkBuddyCredentialStore {
       const stat = await file.stat();
       if (!stat.isFile() || stat.size > MAX_SOURCE_BYTES || (process.platform !== "win32" && (stat.mode & 0o077))) throw new Error();
       const c = JSON.parse(await file.readFile("utf8"));
-      const parsed = parseWorkBuddySource(JSON.stringify({ account: { uid: c.uid, nickname: c.displayName, enterpriseId: c.enterpriseId }, auth: c }), Date.now(), c.kind);
-      if (c.version !== 1 || !(c.kind === "workbuddy" || c.kind === "workbuddy-ai") || !parsed.ok) throw new Error();
-      return { ...parsed.credential,
-        importedAt: typeof c.importedAt === "string" ? c.importedAt : "", lastSyncAt: typeof c.lastSyncAt === "string" ? c.lastSyncAt : undefined };
+      return this.normalize(c);
     } catch (e: any) {
       if (e?.code === "ENOENT") return null;
       throw new Error("WorkBuddy 私有登录态不可读，请重新导入");
     } finally { await file?.close(); }
   }
+  /** Whitelist normalization: unknown junk never survives a save/load round-trip. */
+  private normalize(c: any): WorkBuddyCredential {
+    if (!c || typeof c !== "object") throw new Error();
+    if (c.version !== 1 || !(c.kind === "workbuddy" || c.kind === "workbuddy-ai") ||
+      !headerValue(c.accessToken, MAX_SOURCE_BYTES, true) || !headerValue(c.uid, 253, true) ||
+      (c.source !== "desktop" && c.source !== "browser")) throw new Error();
+    const site = workBuddySite(c.kind);
+    const domain = validDomain(c.domain, site);
+    if (!headerValue(c.displayName ?? "", 253) || !headerValue(c.enterpriseId ?? "", 253)) throw new Error();
+    const next: WorkBuddyCredential = {
+      version: 1, kind: c.kind, uid: c.uid,
+      displayName: typeof c.displayName === "string" ? c.displayName : "",
+      domain,
+      enterpriseId: headerValue(c.enterpriseId, 253) ? c.enterpriseId : "",
+      accessToken: c.accessToken,
+      expiresAt: Number.isFinite(c.expiresAt) && c.expiresAt >= 0 ? Math.floor(c.expiresAt) : 0,
+      importedAt: typeof c.importedAt === "string" ? c.importedAt : "",
+      source: c.source,
+      tokenType: typeof c.tokenType === "string" && headerValue(c.tokenType, 64) ? c.tokenType : undefined,
+      lastSyncAt: typeof c.lastSyncAt === "string" ? c.lastSyncAt : undefined,
+    };
+    if (c.source === "browser" && headerValue(c.refreshToken, MAX_SOURCE_BYTES)) {
+      next.refreshToken = c.refreshToken;
+      if (Number.isFinite(c.refreshExpiresAt) && c.refreshExpiresAt > 0) next.refreshExpiresAt = Math.floor(c.refreshExpiresAt);
+    }
+    return next;
+  }
+
   async save(c: WorkBuddyCredential): Promise<void> {
-    const parsed = parseWorkBuddySource(JSON.stringify({ account: { uid: c.uid, nickname: c.displayName, enterpriseId: c.enterpriseId }, auth: c }), Date.now(), c.kind);
-    if (!parsed.ok) throw new Error("WorkBuddy 私有登录态保存失败");
-    const safe = { ...parsed.credential, importedAt: c.importedAt, lastSyncAt: c.lastSyncAt };
+    let safe: WorkBuddyCredential;
+    try { safe = this.normalize(c); } catch { throw new Error("WorkBuddy 私有登录态保存失败"); }
     await fs.mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temp = `${this.path}.${randomBytes(12).toString("hex")}.tmp`;
     try {
@@ -337,6 +373,233 @@ export async function renewWorkBuddyFromDesktop(
   })();
   renewalInFlight.set(key, task);
   try { return await task; } finally { renewalInFlight.delete(key); }
+}
+
+// ---- browser sign-in (contract §15; magpie browserSignIn) ------------------
+
+/** The version WorkBuddy's sign-in page is opened with (magpie APP_VERSION). */
+export const WORKBUDDY_APP_VERSION = "2.0.0";
+export const WORKBUDDY_LOGIN_TTL_MS = 5 * 60 * 1000;
+
+/** The opaque sign-in state must be a bounded, control-char-free string. */
+function loginStateOk(state: unknown): state is string {
+  return typeof state === "string" && state.length >= 1 && state.length <= 512 && !/[\x00-\x1f\x7f]/.test(state);
+}
+
+function tokenExpiryMs(d: any, at = Date.now()): number {
+  if (Number.isFinite(d?.expiresAt) && d.expiresAt > 0) return d.expiresAt;
+  if (Number.isFinite(d?.expiresIn) && d.expiresIn > 0) return at + d.expiresIn * 1000;
+  return 0;
+}
+function refreshExpiryMs(d: any, at = Date.now()): number {
+  if (Number.isFinite(d?.refreshExpiresAt) && d.refreshExpiresAt > 0) return d.refreshExpiresAt;
+  if (Number.isFinite(d?.refreshExpiresIn) && d.refreshExpiresIn > 0) return at + d.refreshExpiresIn * 1000;
+  return 0;
+}
+
+/** Drain bounded upstream envelopes without retaining/logging raw error bodies. */
+export async function readWorkBuddyResponseText(response: Response, maxBytes = 1024 * 1024): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  let bytes = 0, text = "";
+  const decoder = new TextDecoder();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) { await reader.cancel(); throw new Error("workbuddy_response_too_large"); }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally { reader.releaseLock(); }
+}
+
+/**
+ * One WorkBuddy plugin-API call: fixed origin, JSON envelope {code,msg,data},
+ * no redirects. Network failures carry network:true so the login poll can
+ * distinguish "not yet" from a rejection.
+ */
+async function pluginEnvelope(fetchImpl: WorkBuddyFetch, url: string, init: RequestInit = {}): Promise<{ code: number; msg?: string; data: any }> {
+  let response: Response;
+  try {
+    response = await fetchImpl(url, {
+      ...init,
+      headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": WORKBUDDY_CHAT_UA, ...(init.headers ?? {}) },
+      redirect: "error",
+      signal: AbortSignal.timeout(15_000),
+    } as RequestInit);
+  } catch {
+    throw Object.assign(new Error("workbuddy_plugin_network"), { network: true, code: 0, status: 0 });
+  }
+  const text = await readWorkBuddyResponseText(response);
+  let env: any = {};
+  try { env = JSON.parse(text); } catch { /* non-JSON */ }
+  const code = Number.parseInt(env?.code, 10) || 0;
+  if (!response.ok || response.redirected || code !== 0) {
+    // Raw upstream strings may echo credentials. Expose classification only.
+    throw Object.assign(new Error("workbuddy_plugin_error"), { code, status: response.status });
+  }
+  return { code: 0, data: env?.data };
+}
+
+export interface WorkBuddyLoginStart { state: string; url: string; expiresAt: number; }
+
+/**
+ * Ask WorkBuddy for a sign-in page (magpie browserSignIn step 1). The URL is
+ * opened by the USER'S browser — CCR never fetches it. HTTPS and a site-specific
+ * WorkBuddy/CodeBuddy domain-family allowlist prevent arbitrary authorization links.
+ */
+export async function createWorkBuddyLoginState(siteId: WorkBuddySiteId, fetchImpl: WorkBuddyFetch): Promise<WorkBuddyLoginStart> {
+  const site = workBuddySite(siteId);
+  const env = await pluginEnvelope(fetchImpl, site.origin + "/v2/plugin/auth/state?platform=" + encodeURIComponent(site.id), {
+    method: "POST",
+    headers: { "X-No-Authorization": "true", "X-No-User-Id": "true", "X-No-Enterprise-Id": "true", "X-No-Department-Info": "true" },
+    body: "{}",
+  });
+  const state = env.data?.state;
+  const authUrl = env.data?.authUrl;
+  if (!loginStateOk(state) || typeof authUrl !== "string" || authUrl.length > 8192) throw new Error("workbuddy_login_state_failed");
+  let url: URL;
+  try { url = new URL(authUrl); } catch { throw new Error("workbuddy_login_state_failed"); }
+  const domains = siteId === "workbuddy" ? ["copilot.tencent.com", "codebuddy.cn"] : ["workbuddy.ai", "codebuddy.ai"];
+  if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443") ||
+      !domains.some((host) => url.hostname === host || url.hostname.endsWith("." + host))) {
+    throw new Error("workbuddy_login_state_failed");
+  }
+  url.searchParams.set("version", WORKBUDDY_APP_VERSION);
+  url.searchParams.set("loginSessionId", randomBytes(16).toString("hex"));
+  return { state, url: url.toString(), expiresAt: Date.now() + WORKBUDDY_LOGIN_TTL_MS };
+}
+
+export type WorkBuddyLoginTokenPoll =
+  | { pending: true }
+  | { pending: false; ok: true; token: { accessToken: string; refreshToken?: string; expiresAt: number; domain?: string; tokenType?: string; refreshExpiresAt?: number } }
+  | { pending: false; ok: false };
+
+/**
+ * One poll of the token endpoint (step 3). magpie retries code 11217 ("not
+ * yet") plus 408/429/network — those read as pending; anything else means the
+ * state was refused and the sign-in will not complete.
+ */
+export async function pollWorkBuddyLoginToken(siteId: WorkBuddySiteId, state: string, fetchImpl: WorkBuddyFetch): Promise<WorkBuddyLoginTokenPoll> {
+  const site = workBuddySite(siteId);
+  let env: { code: number; data: any };
+  try {
+    env = await pluginEnvelope(fetchImpl, site.origin + "/v2/plugin/auth/token?state=" + encodeURIComponent(state), { method: "GET" });
+  } catch (error: any) {
+    if (error?.code === 11217 || error?.status === 408 || error?.status === 429 || error?.network) return { pending: true };
+    return { pending: false, ok: false };
+  }
+  const d = env.data ?? {};
+  if (typeof d.accessToken === "string" && d.accessToken) {
+    return { pending: false, ok: true, token: {
+      accessToken: d.accessToken,
+      refreshToken: typeof d.refreshToken === "string" && d.refreshToken ? d.refreshToken : undefined,
+      expiresAt: tokenExpiryMs(d), domain: typeof d.domain === "string" && d.domain ? d.domain : undefined,
+      tokenType: typeof d.tokenType === "string" && d.tokenType ? d.tokenType : undefined,
+      refreshExpiresAt: refreshExpiryMs(d) || undefined,
+    } };
+  }
+  return { pending: true };
+}
+
+/**
+ * The account behind a finished sign-in (step 4). magpie retries code 12151
+ * while WorkBuddy finalizes the session; the enterprise follows /login/account,
+ * else — for a non-personal account type — the account list, exactly like
+ * WorkBuddy's own client picks it (enterpriseOf).
+ */
+export async function fetchWorkBuddyLoginAccount(
+  siteId: WorkBuddySiteId, state: string, accessToken: string, domain: string | undefined,
+  fetchImpl: WorkBuddyFetch
+): Promise<{ uid: string; displayName: string; enterpriseId: string } | null> {
+  const site = workBuddySite(siteId);
+  const headers: Record<string, string> = {
+    Authorization: "Bearer " + accessToken,
+    "X-Domain": domain || new URL(site.origin).host,
+    "X-No-User-Id": "true", "X-No-Enterprise-Id": "true",
+  };
+  let who: any;
+  try {
+    who = (await pluginEnvelope(fetchImpl, site.origin + "/v2/plugin/login/account?state=" + encodeURIComponent(state), { method: "GET", headers })).data ?? {};
+  } catch (error: any) {
+    if (error?.code === 12151 || error?.status === 408 || error?.status === 429 || error?.network) return null;
+    throw new Error("workbuddy_login_account_failed");
+  }
+  const uid = typeof who?.uid === "string" ? who.uid : "";
+  const displayName = [who?.nickname, who?.phoneNumber, uid].find((v: any) => typeof v === "string" && v) || uid;
+  let enterpriseId = typeof who?.enterpriseId === "string" ? who.enterpriseId.trim() : "";
+  const type = String(who?.type ?? "").trim().toLowerCase();
+  if (!enterpriseId && type && type !== "personal") {
+    try {
+      const list = (await pluginEnvelope(fetchImpl, site.origin + "/v2/plugin/accounts", {
+        method: "GET", headers: { Authorization: "Bearer " + accessToken, "X-Domain": headers["X-Domain"] },
+      })).data;
+      const mine = (Array.isArray(list?.accounts) ? list.accounts : []).filter((x: any) => x?.uid === uid && typeof x.enterpriseId === "string" && x.enterpriseId.trim());
+      const same = mine.filter((x: any) => String(x.type ?? "").trim().toLowerCase() === type);
+      const last = mine.filter((x: any) => x.lastLogin);
+      const pick = same.length === 1 ? same[0] : last.length === 1 ? last[0] : mine.length === 1 ? mine[0] : undefined;
+      enterpriseId = pick ? pick.enterpriseId.trim() : "";
+    } catch { enterpriseId = ""; }
+  }
+  return { uid, displayName, enterpriseId };
+}
+
+// ---- refresh for browser-owned credentials (contract §15) ------------------
+//
+// A browser sign-in's refresh token belongs to CCR alone — nothing else holds
+// it — so unlike the desktop file's shared refresh token (§14.3: never stored,
+// never spent) it is persisted and spent on near-expiry renewal, exactly like
+// magpie does for its browser sign-ins. Single-flight per refresh token, and a
+// 60s answer cache: a request that reads the old token after it was spent takes
+// the renewed one instead of spending it again.
+
+const refreshInFlight = new Map<string, Promise<WorkBuddyCredential>>();
+const refreshedCache = new Map<string, { credential: WorkBuddyCredential; at: number }>();
+
+export const workBuddyRefreshable = (c: WorkBuddyCredential): boolean =>
+  c.source === "browser" && typeof c.refreshToken === "string" && c.refreshToken.length > 0 &&
+  !(c.refreshExpiresAt && Date.now() >= c.refreshExpiresAt);
+
+export async function refreshWorkBuddyToken(
+  c: WorkBuddyCredential, fetchImpl: WorkBuddyFetch, save?: (next: WorkBuddyCredential) => Promise<void>
+): Promise<WorkBuddyCredential> {
+  if (!workBuddyRefreshable(c)) return c;
+  const key = createHash("sha256").update(JSON.stringify([c.kind, c.uid, c.enterpriseId, c.importedAt, c.accessToken, c.refreshToken])).digest("hex");
+  const done = refreshedCache.get(key);
+  if (done && Date.now() - done.at < 60_000) {
+    await save?.(done.credential);
+    return { ...c, ...done.credential };
+  }
+  let running = refreshInFlight.get(key);
+  if (!running) {
+    running = (async () => {
+      const site = workBuddySite(c.kind);
+      const headers: Record<string, string> = {
+        "X-Refresh-Token": c.refreshToken!, "X-Auth-Refresh-Source": "plugin", "X-Domain": validDomain(c.domain, site),
+      };
+      if (c.enterpriseId) { headers["X-Enterprise-Id"] = c.enterpriseId; headers["X-Tenant-Id"] = c.enterpriseId; }
+      const env = await pluginEnvelope(fetchImpl, site.origin + "/v2/plugin/auth/token/refresh", { method: "POST", headers, body: "{}" });
+      const d = env.data ?? {};
+      if (typeof d.accessToken !== "string" || !d.accessToken) throw new Error("workbuddy_refresh_no_token");
+      const next: WorkBuddyCredential = {
+        ...c,
+        accessToken: d.accessToken,
+        refreshToken: typeof d.refreshToken === "string" && d.refreshToken ? d.refreshToken : c.refreshToken,
+        expiresAt: tokenExpiryMs(d) || c.expiresAt,
+        refreshExpiresAt: refreshExpiryMs(d) || c.refreshExpiresAt,
+        domain: validDomain(typeof d.domain === "string" && d.domain ? d.domain : c.domain, site),
+        tokenType: typeof d.tokenType === "string" && d.tokenType ? d.tokenType : c.tokenType,
+      };
+      if (refreshedCache.size >= 64) refreshedCache.delete(refreshedCache.keys().next().value!);
+      refreshedCache.set(key, { credential: next, at: Date.now() });
+      await save?.(next);
+      return next;
+    })().finally(() => refreshInFlight.delete(key));
+    refreshInFlight.set(key, running);
+  }
+  return running;
 }
 
 /**

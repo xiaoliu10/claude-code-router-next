@@ -9,18 +9,20 @@
 
 ---
 
+> **当前裁决以 §15 为准**：页面浏览器授权是主入口，无需安装 WorkBuddy 桌面端；§13–14 桌面导入约束仅适用于 desktop 来源。
+
 ## 0. 决策速查（实现方先读这页）
 
 | # | 决策 | 状态 |
 |---|---|---|
 | D1 | 上游是 **OpenAI Chat Completions**（`/v2/chat/completions`），不是 Anthropic `/messages`。CCR 复用现有 Anthropic→Unified→OpenAI 管线，WorkBuddy 只做 Unified→OpenAI 的 quirk 层 + 固定 header/URL | 锁定 |
 | D2 | ~~首期**只做 CN 站** `https://copilot.tencent.com`~~ → **双站支持**：CN `https://copilot.tencent.com` + 国际 `https://www.workbuddy.ai`。站点由**导入的登录文件自动判定**（`workbuddy-desktop.info` = CN，`workbuddy-desktop-ai.info` = 国际），一次只连一个站（单 provider + 单凭证文件），切换需断开重导 | 锁定（§14 修订） |
-| D3 | 凭证来源**只做"用户显式导入本机 WorkBuddy 登录"**，固定平台路径、只读、只接受明文 token。**不做浏览器登录 flow**（上游 authUrl host 白名单未取证，照抄插件"只查 https"不安全） | 锁定 |
+| D3 | **浏览器授权为主入口**，无需桌面安装；desktop 导入保留兼容 API。登录 URL 必须 HTTPS、站点对应域名族白名单、无 userinfo/非标准端口；详见 §15 | 用户修订（§15） |
 | D4 | token 落 **CCR 私有 0600 文件**（`$CCR_CONFIG_DIR/workbuddy-credentials.json`），**不进 `config.json`、不进 `/api/config` 响应、不进浏览器** | 锁定 |
 | D5 | 模型发现 = `GET /v3/config` 取 `agents[name=="cli"].models`，join `data.models` 元信息；**无静态兜底列表**，失败/空列表保留旧 models | 锁定 |
 | D6 | **不动 Router**：导入/同步/断开都不改 `config.Router`、不自动设默认路由 | 锁定 |
 | D7 | 普通 provider 编辑对话框不得把 WorkBuddy 托管 provider 变成"API key 输入框"或可改外网目标 | 锁定 |
-| D8 | **不实现自有 refresh**，不保存或花费 refreshToken；临期只读同站同账号桌面文件，较新 accessToken 仅驻内存；status 不读源文件 | 用户锁定（§14.3） |
+| D8 | **desktop** 不保存/花费共享 refreshToken，临期同站同账号只读续期；**browser** 独享 refreshToken 仅存 0600 私有文件并轮换续期。status 均不读源文件 | 用户修订（§15） |
 | D11 | **不做自动签到**：调研确认 magpie WorkBuddy 插件无任何 checkin/签到功能；WorkBuddy 免费额度是服务端每日自动发放的 slice package（`DAILY_CODE`，每天 0 点重置），无需客户端动作 | 锁定（§14 新增） |
 | D9 | 不做 FLAGGED prompt 重写（对抗性适配，ban risk）；识别 `unapproved channel` 后给可执行错误 | 锁定 |
 | D10 | 外部插件安装 / 额外网关进程 / Magpie 依赖：**零** | 锁定 |
@@ -876,3 +878,34 @@ CCR 选择零风险路径：**不保存、不使用 refreshToken 于任何请求
 - 浏览器登录 flow（D3 不变）。
 - packages/price 商品码明细（§14.4）。
 - 账号池 / 多账号轮换（B 方案已否）。
+
+
+## 15. 浏览器授权与配置管理供应商 tab（2026-10-19 用户修订，优先于 §13–14）
+
+### 真实需求与入口
+- 配置管理新增「供应商」tab（`/settings?tab=providers`），不是新侧栏页，也不是 localStorage 显隐开关。
+- 开启=明确授权账号、非空模型发现并持久化托管 provider。首页只展示已配置 provider 的普通行和模型；未配置时不出现常驻 WorkBuddy 大卡片。托管 edit/delete 导航至此 tab。
+- 浏览器授权不要求安装桌面端；保留 desktop 导入 API 兼容原有账号，不再作为 UI 主入口。
+
+### 上游证据与安全边界
+- 一手源 `magpie-community/plugins@ab38da681af7716ea9a7609f045ca91d2ad9988a`，`packages/workbuddy/index.mjs:979–1032`：state→浏览器 authUrl→token poll→account，enterpriseOf `:302–323`。源码只能证明社区插件实现，不能声称官方推荐或已实测上游。
+- 固定站点 POST `/v2/plugin/auth/state?platform=<site>`；浏览器访问 HTTPS authUrl，带 version=2.0.0/loginSessionId。CCR 不代理登录页面或处理密码。
+- authUrl 允许 CN copilot.tencent.com / codebuddy.cn、AI workbuddy.ai / codebuddy.ai 域名族；拒绝非 HTTPS、userinfo、非 443 端口。不支持的真实登录 host 需用户反馈后基于证据调整，不接受任意目标。
+- token/account/refresh/发现均 fixed-origin、redirect:error、直连 dispatcher、15s 超时、1 MiB envelope 上限。上游原始错误不得进入日志或浏览器。
+
+### API 与生命周期
+- POST login/start `{site}`→`{ok,site,loginId,url,expiresAt}`，每次独立 48hex capability；upstream state 仅驻内存。最多 8 个 pending+starting 任务，5min TTL。
+- POST login/poll `{site,loginId}`→pending/expired/none/failed/connected。每任务单飞+1s 最小间隔，account 返回 12151 时保留 token 阶段供下次尝试，不重复兑换 token、不内部循环重试。
+- POST login/cancel `{site,loginId}` 只失效该任务；disconnect/import epoch 失效旧工作，提交前后检查并回滚取消时写入；浏览器 cancel/unmount/timeout 调用 cancel。
+- 成功前必须非空 `/v3/config`；发现失败/空、写入失败保留旧账号/provider/Router。token+refresh 仅 CCR 0600 私有凭证文件，不进 `/api/config` 或浏览器。
+
+### refresh 所有权（覆盖 D8 的 blanket 禁止）
+- `source:desktop` 仍绝不保存或花费共享桌面 refreshToken，只读更新 access 快照（§14.3）。
+- `source:browser` 的授权由 CCR 创建，refreshToken 仅存私有文件；临期单飞刷新并持久化轮换结果。不读取桌面文件。刷新和 mutation 队列/epoch 防止 disconnect/reimport 后旧结果复活。
+- status 返回 source/renewalMode，不做源文件读取或上游调用。
+
+### 验证与已知边界
+- WorkBuddy/debug 131/131；core 全量 596/596（本次未复现既有 usage 污染），UI 28/28；UI tsc 通过，core 基线110无新增；独立审查 SHIP。
+- 隔离 mock 浏览器：无常驻卡片→供应商tab→国际授权待定→取消→重新授权成功→手动额度→首页模型行→edit回管理tab。0 full-config POST、1 cancel、1 usage GET、Router 保持。
+- 真实 CN/AI 授权/host/模型推理尚待用户登录验证；不宣称 live 通过。
+- P2：提交完整成功后的极窄取消窗口可能让 UI 显示取消但连接已提交，重新进入 status 可见；不涉及秘密泄漏或半提交复活，独立审查定为非阻塞。
