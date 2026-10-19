@@ -1,10 +1,20 @@
-import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse } from '@/types';
+import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyMutationResponse, WorkBuddyStatusResponse } from '@/types';
 
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
   private baseUrl: string;
   private apiKey: string;
   private tempApiKey: string | null;
+  private configWrites = 0;
+  private workBuddyManagementBusy = false;
+
+  // Shared with top-level Save: a stale full-config write must not race a
+  // managed import/disconnect, including the subsequent config reconciliation.
+  acquireWorkBuddyManagement(): (() => void) | null {
+    if (this.workBuddyManagementBusy || this.configWrites > 0) return null;
+    this.workBuddyManagementBusy = true;
+    return () => { this.workBuddyManagementBusy = false; };
+  }
 
   constructor(baseUrl: string = '/api', apiKey: string = '') {
     this.baseUrl = baseUrl;
@@ -60,6 +70,7 @@ class ApiClient {
   // milliseconds so a hung server can't leave the caller pending forever.
   private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
+    const isWorkBuddy = endpoint.startsWith('/workbuddy/');
     const { timeoutMs, ...rest } = options;
 
     const config: RequestInit = {
@@ -86,7 +97,22 @@ class ApiClient {
         // We'll dispatch a custom event that the app can listen to
         window.dispatchEvent(new CustomEvent('unauthorized'));
         // Return a promise that never resolves to prevent further execution
+        if (isWorkBuddy) throw new Error('workbuddy_unauthorized');
         return new Promise(() => {}) as Promise<T>;
+      }
+
+      if (!response.ok && isWorkBuddy) {
+        // Retain only known codes. Raw server/upstream messages must never enter
+        // the browser's error object, console, toast or component state.
+        const allowed = ['sealed', 'source_missing', 'source_invalid', 'models_fetch_failed',
+          'workbuddy_name_conflict', 'workbuddy_not_connected'];
+        let code = 'request_failed';
+        try {
+          const data = await response.json();
+          const candidate = data.reason || data.error;
+          if (allowed.includes(candidate)) code = candidate;
+        } catch { /* use the safe default */ }
+        throw Object.assign(new Error('WorkBuddy request failed'), { reason: code });
       }
 
       if (!response.ok) {
@@ -111,6 +137,12 @@ class ApiClient {
       return text ? JSON.parse(text) : ({} as T);
 
     } catch (error) {
+      if (isWorkBuddy) {
+        // Network / JSON exceptions can include unsafe text too.
+        const reason = error && typeof error === 'object' && 'reason' in error
+          ? error.reason : 'request_failed';
+        throw Object.assign(new Error('WorkBuddy request failed'), { reason });
+      }
       console.error('API request error:', error);
       throw error;
     }
@@ -165,7 +197,13 @@ class ApiClient {
 
   // Update entire configuration
   async updateConfig(config: Config): Promise<{ success: boolean; message?: string }> {
-    return this.post<{ success: boolean; message?: string }>('/config', config);
+    if (this.workBuddyManagementBusy) return { success: false };
+    this.configWrites += 1;
+    try {
+      return await this.post<{ success: boolean; message?: string }>('/config', config);
+    } finally {
+      this.configWrites -= 1;
+    }
   }
 
   // Restart service
@@ -385,6 +423,33 @@ class ApiClient {
       '/providers/quota',
       ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
     );
+  }
+
+  // ========== WorkBuddy built-in provider API methods ==========
+
+  // Management reads are local (no upstream call): the status endpoint only
+  // reports the saved provider + credential file summary. It must never read
+  // the WorkBuddy desktop login file — only an explicit import does that once.
+  getWorkBuddyStatus(): Promise<WorkBuddyStatusResponse> {
+    return this.get<WorkBuddyStatusResponse>(
+      '/workbuddy/status',
+      ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
+    );
+  }
+
+  // Explicit user action: read the fixed local WorkBuddy login file once,
+  // register the managed provider and run model discovery. Never auto-invoked.
+  // Generous timeout: this performs an upstream /v3/config fetch.
+  importWorkBuddy(): Promise<WorkBuddyMutationResponse> {
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/import', {}, 60_000);
+  }
+
+  syncWorkBuddyModels(): Promise<WorkBuddyMutationResponse> {
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/sync', {}, 60_000);
+  }
+
+  disconnectWorkBuddy(): Promise<WorkBuddyMutationResponse> {
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/disconnect', {}, 30_000);
   }
 
   async probeProvider(providerName: string): Promise<ManualProbeResponse> {

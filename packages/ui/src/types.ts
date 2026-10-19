@@ -18,6 +18,13 @@ export interface Provider {
   quota_token?: string;
   // Optional SEC_TOKEN used to query Aliyun MaaS Token Plan quota usage.
   quota_sec_token?: string;
+  // Set by CCR for built-in subscription providers it manages (e.g. WorkBuddy).
+  // A managed provider's api_base_url / api_key / transformer are fixed by CCR and
+  // must not be edited through the generic provider dialog.
+  ccr_managed?: boolean;
+  // Which built-in subscription backend a managed provider belongs to:
+  // "workbuddy" (copilot.tencent.com) today; reserved for future sites.
+  workbuddy_kind?: string;
   // Thinking level injected when the client sends no thinking config:
   // "low" | "medium" | "high", a custom token budget (number), a free-form
   // provider effort string (e.g. "minimal"), or unset/empty to follow the
@@ -246,6 +253,51 @@ export interface ProviderHealthResponse {
   /** Optional for backwards compatibility with older servers. */
   probes?: ProviderProbeTelemetry[];
   timestamp: string;
+}
+
+export type WorkBuddyStatus =
+  | "not_connected"
+  | "connected"
+  | "expired"
+  | "sealed"
+  | "source_missing"
+  | "source_changed"
+  | "error";
+
+export interface WorkBuddyStatusResponse {
+  status: WorkBuddyStatus;
+  kind: string;
+  site: string;
+  providerName: string;
+  models: string[];
+  modelCount: number;
+  uid: string | null;
+  displayName: string | null;
+  domain: string | null;
+  expiresAt: number | null;
+  importedAt: string | null;
+  lastSyncAt: string | null;
+  lastError: string | null;
+}
+
+export type WorkBuddyFailureReason =
+  | "sealed"
+  | "source_missing"
+  | "source_invalid"
+  | "models_fetch_failed";
+
+export interface WorkBuddyMutationResponse {
+  success: boolean;
+  status?: WorkBuddyStatus;
+  models?: string[];
+  modelCount?: number;
+  displayName?: string | null;
+  message?: string | null;
+  modelsUnchanged?: boolean;
+  reason?: WorkBuddyFailureReason;
+  removedProvider?: boolean;
+  deletedCredential?: boolean;
+  error?: string;
 }
 
 export interface ManualProbeResponse {
