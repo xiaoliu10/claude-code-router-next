@@ -217,6 +217,64 @@ describe("WorkBuddy data plane (isolated mocks)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("aggregates then converts to an Anthropic message on /v1/messages (non-stream)", async () => {
+    // Claude Code's primary entry point: an Anthropic non-stream client must
+    // receive one valid Anthropic message JSON, never raw SSE.
+    const dir = mkdtempSync(join(tmpdir(), "wb-msg-"));
+    const store = new WorkBuddyCredentialStore(join(dir, "creds.json"));
+    await store.save(CRED);
+    const providers = [{
+      name: "workbuddy", api_base_url: CHAT_URL, api_key: "ccr-managed-workbuddy",
+      models: ["glm-5.3"], transformer: { use: ["workbuddy"] }, ccr_managed: true,
+    }];
+    const server = new Server({
+      logger: false, useJsonFile: false,
+      initialConfig: { providers, Router: { default: "workbuddy,glm-5.3" }, HOST: "127.0.0.1", PORT: 0 },
+    });
+    await server.ready();
+    await registerAdminRoutes(server, { PORT: 0, Providers: providers, Router: {} });
+    await server.registerNamespace("/");
+    await server.app.ready();
+    const { WorkBuddyAuthService } = await import("../services/workbuddy-auth");
+    const service = new WorkBuddyAuthService({
+      configService: server.configService,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      store,
+      getServer: () => server,
+    });
+    (server as any).workBuddyAuthService = service;
+    const { setWorkBuddyRuntime } = await import("../services/workbuddy");
+    setWorkBuddyRuntime({ authService: service });
+    vi.spyOn(configModule, "readConfigFileRaw").mockResolvedValue({ Providers: providers, Router: {} });
+
+    const fetchMock = vi.fn(async () => sseResponse([
+      "data: {\"id\":\"c1\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello from WorkBuddy\"}}]}\n\n",
+      "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n",
+      "data: [DONE]\n\n",
+    ]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await server.app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      payload: { model: "workbuddy,glm-5.3", max_tokens: 100, stream: false, messages: [{ role: "user", content: "hi" }] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("application/json");
+    const json = res.json();
+    expect(json.type).toBe("message");
+    expect(json.role).toBe("assistant");
+    expect(json.content).toEqual([{ type: "text", text: "Hello from WorkBuddy" }]);
+    expect(json.stop_reason).toBe("end_turn");
+    expect(json.usage.input_tokens).toBe(3);
+    expect(json.usage.output_tokens).toBe(4);
+    // No raw SSE frames leak to an Anthropic client.
+    expect(res.body).not.toContain("data:");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("restores client tool names end-to-end (shared transformer context)", async () => {
     const serverRuntime = await buildProviderServer([{
       name: "workbuddy", api_base_url: CHAT_URL, api_key: "ccr-managed-workbuddy",
