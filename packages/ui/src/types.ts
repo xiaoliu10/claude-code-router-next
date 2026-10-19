@@ -264,9 +264,20 @@ export type WorkBuddyStatus =
   | "source_changed"
   | "error";
 
+// Which fixed-origin WorkBuddy site a saved login belongs to. The provider name
+// stays "workbuddy" for both; only one site is active at a time and switching
+// is an explicit disconnect + import.
+export type WorkBuddyKind = "workbuddy" | "workbuddy-ai";
+
+// Only renewal path: bounded re-read of the same desktop login file.
+// No credential-refresh secret is stored and no refresh API is called.
+export type WorkBuddyRenewalMode = "desktop";
+
 export interface WorkBuddyStatusResponse {
   status: WorkBuddyStatus;
-  kind: string;
+  kind: WorkBuddyKind;
+  // Fixed origin of the active site, e.g. the CN origin. Display only; the UI
+  // never sends tokens anywhere itself.
   site: string;
   providerName: string;
   models: string[];
@@ -278,13 +289,32 @@ export interface WorkBuddyStatusResponse {
   importedAt: string | null;
   lastSyncAt: string | null;
   lastError: string | null;
+  // Registered models that cannot accept image input (e.g. GLM series).
+  imagesUnsupportedModels?: string[];
+  renewalMode?: WorkBuddyRenewalMode;
+}
+
+export interface WorkBuddyUsage {
+  plan: string;
+  used: number;
+  limit: number;
+  unit: "credits";
+}
+
+export interface WorkBuddyUsageResponse {
+  usage: WorkBuddyUsage | null;
 }
 
 export type WorkBuddyFailureReason =
   | "sealed"
   | "source_missing"
   | "source_invalid"
-  | "models_fetch_failed";
+  | "models_fetch_failed"
+  | "workbuddy_site_conflict";
+
+export interface WorkBuddyImportRequest {
+  site: WorkBuddyKind;
+}
 
 export interface WorkBuddyMutationResponse {
   success: boolean;

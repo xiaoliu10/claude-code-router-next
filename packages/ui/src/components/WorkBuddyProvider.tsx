@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { RefreshCw, ShieldCheck } from "lucide-react";
+import { Coins, Globe2, RefreshCw, ShieldCheck } from "lucide-react";
 import { api } from "@/lib/api";
-import type { WorkBuddyStatusResponse } from "@/types";
-import { hasDiscoveredModels, maskWorkBuddyUid, mergeWorkBuddyProvider, workBuddyErrorKey, workBuddyStateKey } from "@/utils/workbuddy";
+import type { WorkBuddyKind, WorkBuddyStatusResponse, WorkBuddyUsage } from "@/types";
+import { hasDiscoveredModels, isWorkBuddyKind, maskWorkBuddyUid, mergeWorkBuddyProvider, parseWorkBuddyUsage, workBuddyErrorKey, workBuddyImagesUnsupportedModels, workBuddyStateKey } from "@/utils/workbuddy";
 import { useConfig } from "./ConfigProvider";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
@@ -18,7 +18,9 @@ interface WorkBuddyProviderProps {
   onBusyChange: (busy: boolean) => void;
 }
 
-type Action = "import" | "sync" | "disconnect";
+type Action = "import" | "sync" | "disconnect" | "usage";
+
+const WORKBUDDY_SITES: WorkBuddyKind[] = ["workbuddy", "workbuddy-ai"];
 
 export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderProps) {
   const { t, i18n } = useTranslation();
@@ -29,6 +31,8 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
   const [errorKey, setErrorKey] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<"import" | "disconnect" | null>(null);
   const [consent, setConsent] = useState(false);
+  const [site, setSite] = useState<WorkBuddyKind>("workbuddy");
+  const [usage, setUsage] = useState<WorkBuddyUsage | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const mounted = useRef(false);
   const locked = useRef(false);
@@ -52,6 +56,14 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
 
   const run = async (next: Action) => {
     if (locked.current || disabled || loading) return;
+    if (next === "usage") {
+      if (!canSync) return;
+      // Same one-action-at-a-time mutex as mutations (review F2): while a credit
+      // read is in flight, Import/Sync/Disconnect stay disabled.
+      locked.current = true;
+      setAction("usage");
+      return void readUsage();
+    }
     const release = api.acquireWorkBuddyManagement();
     if (!release) { setErrorKey("busy"); return; }
     locked.current = true;
@@ -61,7 +73,7 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
     setErrorKey(null);
     setToast(null);
     try {
-      const result = next === "import" ? await api.importWorkBuddy()
+      const result = next === "import" ? await api.importWorkBuddy(site)
         : next === "sync" ? await api.syncWorkBuddyModels() : await api.disconnectWorkBuddy();
       if (!result.success) {
         if (mounted.current && generation.current === id) setErrorKey(workBuddyErrorKey(result));
@@ -79,6 +91,8 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
       setStatus(updated);
       setConfirm(null);
       setConsent(false);
+      // Credits belong to the previous site/login state until explicitly re-read.
+      setUsage(null);
       setToast(next === "disconnect" ? t("workbuddy.disconnected")
         : t("workbuddy.synced", { count: result.models?.length ?? 0 }));
     } catch (error) {
@@ -91,11 +105,33 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
     }
   };
 
+  // Explicit read only; never polled. Failures are non-critical: quietly hide
+  // the display instead of showing raw quota errors. The generation guard drops
+  // results that arrive after a newer import/disconnect/re-read started.
+  const readUsage = async () => {
+    const id = ++generation.current;
+    setErrorKey(null);
+    busyCallback.current(true);
+    try {
+      const payload = await api.getWorkBuddyUsage();
+      if (mounted.current && generation.current === id) setUsage(parseWorkBuddyUsage(payload));
+    } catch {
+      if (mounted.current && generation.current === id) setUsage(null);
+    } finally {
+      locked.current = false;
+      busyCallback.current(false);
+      if (mounted.current && generation.current === id) setAction(current => (current === "usage" ? null : current));
+    }
+  };
+
+  // "usage" participates in the mutex: every action button disables while reading.
   const busy = loading || action !== null;
+  const readingUsage = action === "usage";
   const state = loading ? "loading" : workBuddyStateKey(status);
   const models = status?.models || [];
   const canSync = status?.status === "connected";
   const canDisconnect = Boolean(status && (status.status !== "not_connected" || models.length > 0));
+  const imageUnsupported = workBuddyImagesUnsupportedModels(models, status?.imagesUnsupportedModels);
   const date = (value: string | number | null | undefined) => {
     if (!value) return t("workbuddy.unknown");
     const parsed = new Date(value);
@@ -110,6 +146,9 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
         <CardTitle className="flex flex-wrap items-center gap-2 text-lg">
           <ShieldCheck className="h-5 w-5" aria-hidden="true" /> WorkBuddy
           <Badge variant="outline">{t("workbuddy.builtin")}</Badge>
+          {status && isWorkBuddyKind(status.kind) && status.status !== "not_connected" && (
+            <Badge variant="outline" className="border-primary/40 text-primary">{t(`workbuddy.kind.${status.kind}`)}</Badge>
+          )}
           <Badge variant="secondary" role="status">{t(`workbuddy.status.${state}`)}</Badge>
         </CardTitle>
       </CardHeader>
@@ -117,7 +156,7 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
         <p className="text-sm text-muted-foreground">{t("workbuddy.description")}</p>
         <div className="space-y-1 rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-xs leading-relaxed">
           <p className="font-semibold">{t("workbuddy.server_host")}</p>
-          <p>{t("workbuddy.privacy")}</p>
+          <p>{t("workbuddy.privacy", { site: status?.site || t("workbuddy.privacy_selected") })}</p>
           <p>{t("workbuddy.backup_warning")}</p>
           <p>{t("workbuddy.encrypted_warning")}</p>
         </div>
@@ -126,8 +165,21 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
           <dl className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
             <div><dt className="text-muted-foreground">{t("workbuddy.account")}</dt><dd className="break-all">{status.displayName || t("workbuddy.unknown")} ({maskWorkBuddyUid(status.uid)})</dd></div>
             <div><dt className="text-muted-foreground">{t("workbuddy.expires")}</dt><dd>{date(status.expiresAt)}</dd></div>
+            <div><dt className="text-muted-foreground">{t("workbuddy.site_origin")}</dt><dd className="break-all">{status.site || t("workbuddy.unknown")}</dd></div>
             <div><dt className="text-muted-foreground">{t("workbuddy.model_count")}</dt><dd>{models.length}</dd></div>
             <div><dt className="text-muted-foreground">{t("workbuddy.last_sync")}</dt><dd>{date(status.lastSyncAt)}</dd></div>
+          </dl>
+        )}
+        {status && status.status !== "not_connected" && status.renewalMode === "desktop" && (
+          <p className="text-xs text-muted-foreground">{t("workbuddy.renewal_desktop")}</p>
+        )}
+        {imageUnsupported.length > 0 && (
+          <p role="note" className="rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700">{t("workbuddy.images_unsupported", { models: imageUnsupported.join(", ") })}</p>
+        )}
+        {usage && status?.status === "connected" && (
+          <dl className="grid grid-cols-1 gap-2 rounded-lg border p-3 text-xs sm:grid-cols-2">
+            <div><dt className="text-muted-foreground">{t("workbuddy.credits.plan")}</dt><dd className="break-all font-medium">{usage.plan}</dd></div>
+            <div><dt className="text-muted-foreground">{t("workbuddy.credits.title")}</dt><dd className="font-medium">{t("workbuddy.credits.display", { used: usage.used, limit: usage.limit })}</dd></div>
           </dl>
         )}
         {models.length > 0 && (
@@ -140,11 +192,14 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
         )}
         {visibleError && <p role="alert" className="rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-sm text-red-600">{t(`workbuddy.errors.${visibleError}`)}</p>}
         <div className="flex flex-wrap gap-2">
-          <Button size="sm" disabled={busy || disabled} onClick={() => { setConsent(false); setConfirm("import"); }}>
+          <Button size="sm" disabled={busy || disabled} onClick={() => { setConsent(false); setSite(status && isWorkBuddyKind(status.kind) && status.status !== "not_connected" ? status.kind : "workbuddy"); setConfirm("import"); }}>
             {action === "import" ? t("workbuddy.importing") : status?.status === "connected" ? t("workbuddy.reimport") : t("workbuddy.connect")}
           </Button>
           <Button size="sm" variant="outline" disabled={busy || disabled || !canSync} onClick={() => void run("sync")}>
             <RefreshCw className={`mr-1 h-3.5 w-3.5 ${action === "sync" ? "animate-spin" : ""}`} aria-hidden="true" />{t("workbuddy.sync")}
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy || disabled || !canSync} onClick={() => void run("usage")} aria-busy={readingUsage}>
+            <Coins className={`mr-1 h-3.5 w-3.5 ${readingUsage ? "animate-pulse" : ""}`} aria-hidden="true" />{readingUsage ? t("workbuddy.credits.reading") : t("workbuddy.credits.action")}
           </Button>
           <Button size="sm" variant="outline" disabled={busy || disabled || !canDisconnect} onClick={() => setConfirm("disconnect")}>{t("workbuddy.disconnect")}</Button>
         </div>
@@ -153,10 +208,25 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
       <Dialog open={confirm !== null} onOpenChange={open => { if (!open && !action) setConfirm(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t(confirm === "disconnect" ? "workbuddy.disconnect_title" : "workbuddy.import_title")}</DialogTitle>
+            <DialogTitle>{t(confirm === "disconnect" ? "workbuddy.disconnect_title" : "workbuddy.import_title", confirm === "import" ? { site: t(`workbuddy.site.${site}`) } : undefined)}</DialogTitle>
             <DialogDescription>{t(confirm === "disconnect" ? "workbuddy.disconnect_warning" : "workbuddy.import_warning")}</DialogDescription>
           </DialogHeader>
-          {confirm === "import" && <div className="flex items-start gap-2"><Checkbox id="workbuddy-consent" checked={consent} disabled={busy} onCheckedChange={checked => setConsent(checked === true)} /><Label htmlFor="workbuddy-consent" className="text-sm leading-relaxed">{t("workbuddy.consent")}</Label></div>}
+          {confirm === "import" && (
+            <>
+              <div role="radiogroup" aria-label={t("workbuddy.site.label")} className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {WORKBUDDY_SITES.map(value => (
+                  <button key={value} type="button" role="radio" aria-checked={site === value} disabled={busy || disabled}
+                    onClick={() => setSite(value)}
+                    className={`rounded-lg border p-3 text-left transition-colors ${site === value ? "border-primary bg-primary/5" : "border-border hover:bg-muted/40"}`}>
+                    <span className="flex items-center gap-1.5 text-sm font-medium"><Globe2 className="h-3.5 w-3.5" aria-hidden="true" />{t(`workbuddy.site.${value}`)}</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">{t(`workbuddy.site.${value}_note`)}</span>
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">{t("workbuddy.site.privacy", { site: t(`workbuddy.site.${site}`) })}</p>
+              <div className="flex items-start gap-2"><Checkbox id="workbuddy-consent" checked={consent} disabled={busy} onCheckedChange={checked => setConsent(checked === true)} /><Label htmlFor="workbuddy-consent" className="text-sm leading-relaxed">{t("workbuddy.consent", { site: t(`workbuddy.site.${site}`) })}</Label></div>
+            </>
+          )}
           {errorKey && <p role="alert" className="text-sm text-red-600">{t(`workbuddy.errors.${errorKey}`)}</p>}
           <DialogFooter>
             <Button variant="outline" disabled={!!action} onClick={() => setConfirm(null)}>{t("app.cancel")}</Button>

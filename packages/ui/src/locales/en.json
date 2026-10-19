@@ -556,10 +556,11 @@
   },
   "workbuddy": {
     "section": "Built-in subscription providers",
-    "builtin": "Built in · CN",
-    "description": "Import your existing WorkBuddy subscription and discover models automatically. No plugin or extra gateway process is needed. This manages a provider, not client takeover.",
+    "builtin": "Built in",
+    "description": "Import your existing WorkBuddy subscription — CN or international (WorkBuddy AI) — and discover models automatically. No plugin or extra gateway process is needed. This manages a provider, not client takeover.",
     "server_host": "“Local” means the computer running the CCR server, not this browser’s computer.",
-    "privacy": "Only an explicit import reads the fixed WorkBuddy login file, read-only. CCR stores the access token privately (0600); it is not returned to the browser or written to ordinary provider configuration. It is sent only to the fixed WorkBuddy domain (copilot.tencent.com) for model discovery and inference.",
+    "privacy_selected": "the selected fixed WorkBuddy origin",
+    "privacy": "Only an explicit import reads the selected site's fixed WorkBuddy login file, read-only. CCR stores the access token privately (0600); it is not returned to the browser or written to ordinary provider configuration. It is sent only to {{site}} for model discovery and inference.",
     "backup_warning": "Configuration backups do not include the WorkBuddy login state. Re-import after restoring a backup.",
     "encrypted_warning": "Encrypted desktop login files are not decrypted and are unsupported. CCR does not refresh tokens: sign in again in WorkBuddy and re-import when expired.",
     "routing_note": "Import, sync and disconnect do not change Router or select a default model. Choose workbuddy,<model> manually.",
@@ -574,9 +575,9 @@
     "importing": "Importing…",
     "sync": "Sync models",
     "disconnect": "Disconnect",
-    "import_title": "Import WorkBuddy login on the CCR server?",
-    "import_warning": "This reads the fixed WorkBuddy desktop login file once on the CCR server and sends the access token only to copilot.tencent.com to discover models. The source file is never modified. No arbitrary path or token input is accepted.",
-    "consent": "I consent to CCR importing this server’s WorkBuddy login and using it with the fixed WorkBuddy upstream.",
+    "import_title": "Import {{site}} login on the CCR server?",
+    "import_warning": "This reads the fixed desktop login file of the selected site once on the CCR server and sends the access token only to that site's fixed origin to discover models. The source file is never modified. No arbitrary path or token input is accepted. If the saved token is near expiry, this same explicit import additionally grants one bounded re-read of the same site + account login, used in memory only. CCR never calls a refresh API.",
+    "consent": "I consent to CCR importing this server's {{site}} login, sending the token only to that site's fixed origin, and — when near expiry — one bounded same-site, same-account re-read in memory only.",
     "import_confirm": "Import and discover models",
     "disconnect_title": "Disconnect WorkBuddy?",
     "disconnect_warning": "Only CCR’s private login state and its managed provider will be deleted. Your WorkBuddy desktop login will not be modified. Router references are preserved and may no longer work; update them manually. No default route will be changed for you.",
@@ -608,12 +609,35 @@
       "source_missing": "No WorkBuddy login file was found at the fixed path on the CCR server. Sign in using WorkBuddy there, then retry.",
       "source_invalid": "The server’s WorkBuddy login file is invalid or unsupported. Sign in in WorkBuddy again and retry. Existing models are preserved.",
       "models_fetch_failed": "Model discovery failed or returned no models. The previous model list is preserved; retry sync or explicitly re-import.",
+      "workbuddy_site_conflict": "Another WorkBuddy site is connected. Disconnect it, then import this site.",
       "workbuddy_name_conflict": "An ordinary provider named “workbuddy” already exists. Rename or remove it before importing; CCR will not take it over.",
       "workbuddy_not_connected": "WorkBuddy is not connected. Import the local login first.",
       "request_failed": "WorkBuddy management failed. No success was confirmed. Existing model details remain visible; retry explicitly.",
       "restricted": "WorkBuddy restricted this account (11140). Stop retrying and use Submit feedback inside WorkBuddy to appeal.",
       "channel_rejected": "WorkBuddy rejected this client channel. Use another client or provider; CCR does not rewrite prompts to bypass this restriction.",
       "busy": "A configuration save or another WorkBuddy action is in progress. Wait for it to finish and retry."
+    },
+    "site_origin": "Site origin (fixed)",
+    "renewal_desktop": "Renewal mode: desktop. Sign in again in the WorkBuddy desktop app and re-import here when expired. CCR calls no credential-refresh API and stores no refresh credential.",
+    "images_unsupported": "On the international site, these GLM models may report image support but the server can drop image content: {{models}}. Use another model for important image tasks.",
+    "kind": {
+      "workbuddy": "CN",
+      "workbuddy-ai": "AI"
+    },
+    "site": {
+      "label": "Which WorkBuddy login should be imported?",
+      "workbuddy": "WorkBuddy (CN)",
+      "workbuddy_note": "Desktop login for copilot.tencent.com",
+      "workbuddy-ai": "WorkBuddy AI (International)",
+      "workbuddy-ai_note": "International desktop login; the explicit selection makes it work even when both files exist.",
+      "privacy": "The access token is sent only to the fixed origin of the selected site: {{site}}. It never reaches this browser or the ordinary provider configuration."
+    },
+    "credits": {
+      "action": "Read credits",
+      "reading": "Reading…",
+      "title": "Credits",
+      "plan": "Plan",
+      "display": "{{used}} / {{limit}} used"
     }
   }
 }

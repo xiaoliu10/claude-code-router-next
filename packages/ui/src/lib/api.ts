@@ -1,4 +1,4 @@
-import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyMutationResponse, WorkBuddyStatusResponse } from '@/types';
+import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageResponse } from '@/types';
 
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
@@ -105,7 +105,7 @@ class ApiClient {
         // Retain only known codes. Raw server/upstream messages must never enter
         // the browser's error object, console, toast or component state.
         const allowed = ['sealed', 'source_missing', 'source_invalid', 'models_fetch_failed',
-          'workbuddy_name_conflict', 'workbuddy_not_connected'];
+          'workbuddy_name_conflict', 'workbuddy_site_conflict', 'workbuddy_not_connected'];
         let code = 'request_failed';
         try {
           const data = await response.json();
@@ -437,11 +437,16 @@ class ApiClient {
     );
   }
 
-  // Explicit user action: read the fixed local WorkBuddy login file once,
-  // register the managed provider and run model discovery. Never auto-invoked.
-  // Generous timeout: this performs an upstream /v3/config fetch.
-  importWorkBuddy(): Promise<WorkBuddyMutationResponse> {
-    return this.post<WorkBuddyMutationResponse>('/workbuddy/import', {}, 60_000);
+  // Explicit user action: read the fixed local login file of the explicitly
+  // selected site once (the selector makes the international site work even
+  // when both desktop files exist), register the managed provider and run
+  // model discovery. Never auto-invoked. Later near-expiry inference may do
+  // one bounded same-site/same-account desktop re-read in memory. CCR never
+  // stores a credential-refresh secret or calls a credential-refresh API.
+  // Generous timeout: this performs an upstream config fetch.
+  importWorkBuddy(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
+    const body: WorkBuddyImportRequest = { site };
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/import', body, 60_000);
   }
 
   syncWorkBuddyModels(): Promise<WorkBuddyMutationResponse> {
@@ -450,6 +455,16 @@ class ApiClient {
 
   disconnectWorkBuddy(): Promise<WorkBuddyMutationResponse> {
     return this.post<WorkBuddyMutationResponse>('/workbuddy/disconnect', {}, 30_000);
+  }
+
+  // Explicit user action only: read subscription credits once. Never polled
+  // automatically. Failures are non-critical and quietly hide the display in
+  // the component — no raw quota errors are surfaced.
+  getWorkBuddyUsage(): Promise<WorkBuddyUsageResponse> {
+    return this.get<WorkBuddyUsageResponse>(
+      '/workbuddy/usage',
+      ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
+    );
   }
 
   async probeProvider(providerName: string): Promise<ManualProbeResponse> {

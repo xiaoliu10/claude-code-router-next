@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { isManagedWorkBuddy, mergeWorkBuddyProvider, workBuddyErrorKey, workBuddyStateKey, maskWorkBuddyUid, hasDiscoveredModels } from "../src/utils/workbuddy.ts";
+import { isManagedWorkBuddy, isWorkBuddyKind, mergeWorkBuddyProvider, parseWorkBuddyUsage, workBuddyErrorKey, workBuddyImagesUnsupportedModels, workBuddyStateKey, maskWorkBuddyUid, hasDiscoveredModels } from "../src/utils/workbuddy.ts";
 import type { Config, Provider, WorkBuddyStatusResponse } from "../src/types.ts";
 
 const managed: Provider = { name: "workbuddy", api_base_url: "https://copilot.tencent.com/v2/chat/completions", api_key: "ccr-managed-workbuddy", models: ["new-model"], ccr_managed: true, enabled: false };
@@ -50,11 +50,36 @@ test("errors only select allowlisted localised labels, never raw messages", () =
 test("UID masked including short identifiers", () => {
   assert.equal(maskWorkBuddyUid("123456789"), "123…89"); assert.equal(maskWorkBuddyUid("123"), "•••"); assert.equal(maskWorkBuddyUid(null), "—");
 });
+test("site kind guard accepts only the two fixed sites", () => {
+  assert.equal(isWorkBuddyKind("workbuddy"), true); assert.equal(isWorkBuddyKind("workbuddy-ai"), true);
+  for (const value of [null, undefined, "", "copilot.tencent.com", "workbuddy-ai2", "WORKBUDDY"]) assert.equal(isWorkBuddyKind(value), false);
+});
+test("usage payload strictly validated; anything malformed quietly becomes null", () => {
+  assert.deepEqual(parseWorkBuddyUsage({ usage: { plan: "Pro", used: 3, limit: 100, unit: "credits" } }), { plan: "Pro", used: 3, limit: 100, unit: "credits" });
+  for (const value of [
+    null, undefined, {}, { usage: null },
+    { usage: {} },
+    { usage: { plan: "", used: 0, limit: 1, unit: "credits" } },
+    { usage: { plan: "Pro", used: -1, limit: 1, unit: "credits" } },
+    { usage: { plan: "Pro", used: Number.POSITIVE_INFINITY, limit: 1, unit: "credits" } },
+    { usage: { plan: "Pro", used: "3", limit: 1, unit: "credits" } },
+    { usage: { plan: "Pro", used: 3, limit: 0, unit: "credits" } },
+    { usage: { plan: "Pro", used: 3, limit: 1, unit: "tokens" } },
+    { usage: { plan: "Pro", used: 3, limit: 1, unit: "credits", refreshToken: "leak" } }
+  ]) assert.equal(parseWorkBuddyUsage(value), null);
+});
+test("image-unsupported warning lists only registered models (GLM line)", () => {
+  assert.deepEqual(workBuddyImagesUnsupportedModels(["glm-4.6", "claude-x"], ["glm-4.6", "glm-air", ""]), ["glm-4.6"]);
+  assert.deepEqual(workBuddyImagesUnsupportedModels(["glm-4.6"], null), []);
+  assert.deepEqual(workBuddyImagesUnsupportedModels(["glm-4.6"], "glm-4.6"), []);
+  assert.deepEqual(workBuddyImagesUnsupportedModels([], ["glm-4.6"]), []);
+});
 
 // Structural regression checks supplement helper tests; they are not rendered
 // interaction tests. See WORKBUDDY-TESTING.md for isolated browser smoke steps.
 const component = readFileSync(new URL("../src/components/WorkBuddyProvider.tsx", import.meta.url), "utf8");
 const providers = readFileSync(new URL("../src/components/Providers.tsx", import.meta.url), "utf8");
+const apiSource = readFileSync(new URL("../src/lib/api.ts", import.meta.url), "utf8");
 test("WorkBuddy has no token/password/path input, no client takeover action", () => {
   assert.doesNotMatch(component, /<Input|type=["']password|localStorage|enableClient|restartService/);
   assert.match(component, /workbuddy-consent/); assert.match(component, /setConfirm\("disconnect"\)/);
@@ -62,17 +87,45 @@ test("WorkBuddy has no token/password/path input, no client takeover action", ()
   assert.match(component, /locked\.current/); assert.match(component, /generation\.current === id/);
   assert.doesNotMatch(component, /console\.|result\.message|status\.lastError\}/);
 });
+test("import carries an explicit site selector; no refresh flow exists anywhere in the UI layer", () => {
+  assert.match(component, /role="radiogroup"/); assert.match(component, /importWorkBuddy\(site\)/);
+  assert.match(component, /WORKBUDDY_SITES: WorkBuddyKind\[\] = \["workbuddy", "workbuddy-ai"\]/);
+  // No refreshToken use and no canRefresh in UI sources: renewal is desktop re-import only.
+  assert.doesNotMatch(component, /refreshToken|refresh_token|canRefresh/i);
+  assert.doesNotMatch(apiSource, /refreshToken|refresh_token|canRefresh|\/refresh/);
+});
+test("credits are an explicit on-demand read that quietly hides failures", () => {
+  assert.match(component, /getWorkBuddyUsage\(\)/);
+  assert.match(component, /parseWorkBuddyUsage\(payload\)/);
+  // No polling interval: usage read is bound to the explicit action only.
+  assert.doesNotMatch(component, /setInterval|useInterval/);
+  // Failure path sets null (hide), never renders a raw error from the quota response.
+  assert.match(component, /catch \{[\s\S]*?setUsage\(null\)/);
+  // Stale generation guard also covers the usage read.
+  assert.match(component, /readUsage[\s\S]*generation\.current === id/);
+});
+test("status-derived warnings render from contract fields only", () => {
+  assert.match(component, /imagesUnsupportedModels/);
+  assert.match(component, /workBuddyImagesUnsupportedModels\(models/);
+  assert.match(component, /renewalMode === "desktop"/);
+  assert.match(component, /status\.site/);
+});
 test("generic edit and both delete stages guard managed provider", () => {
   assert.match(providers, /isManagedWorkBuddy\(provider\).*showWorkBuddyManagement/);
   assert.match(providers, /isManagedWorkBuddy\(filteredProviders\[filteredIndex\]\)/);
   assert.match(providers, /isManagedWorkBuddy\(deletedProvider\)/);
 });
-test("EN/ZH WorkBuddy locale parity covers statuses and safe errors", () => {
+test("EN/ZH WorkBuddy locale parity covers statuses, sites, credits and safe errors", () => {
   const locales = ["en", "zh"].map(lang => JSON.parse(readFileSync(new URL(`../src/locales/${lang}.json`, import.meta.url), "utf8")).workbuddy);
   const keys = (value: Record<string, unknown>, prefix = ""): string[] => Object.entries(value).flatMap(([key, item]) => typeof item === "object" && item ? keys(item as Record<string, unknown>, `${prefix}${key}.`) : [`${prefix}${key}`]);
   assert.deepEqual(keys(locales[0]).sort(), keys(locales[1]).sort());
   for (const locale of locales) {
     for (const state of ["loading", "not_connected", "connected", "expired", "sealed", "source_missing", "source_changed", "error", "restricted"]) assert.ok(locale.status[state]);
     assert.ok(locale.errors.models_fetch_failed); assert.ok(locale.server_host); assert.ok(locale.disconnect_warning);
+    assert.equal(locale.kind["workbuddy"].length > 0, true); assert.equal(locale.kind["workbuddy-ai"].length > 0, true);
+    assert.ok(locale.site.label); assert.ok(locale.site.workbuddy); assert.ok(locale.site["workbuddy-ai"]); assert.ok(locale.site.privacy);
+    assert.ok(locale.credits.action); assert.ok(locale.credits.display); assert.ok(locale.renewal_desktop); assert.ok(locale.images_unsupported);
+    assert.match(String(locale.renewal_desktop), /desktop|桌面/i);
+    assert.doesNotMatch(JSON.stringify(locale.credits), /refreshToken/i);
   }
 });
