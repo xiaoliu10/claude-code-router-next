@@ -1044,7 +1044,10 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       return { ok: true, site, loginId: started.loginId, url: started.url, expiresAt: started.expiresAt };
     } catch (error: any) {
       if (error?.statusCode === 403) { reply.status(403); return { error: "workbuddy_unauthorized" }; }
-      req.log?.warn("WorkBuddy browser sign-in start failed");
+      // Classification only (constant message plus numeric code/status); raw
+      // upstream bodies are never logged.
+      console.error("[workbuddy] login start failed:", error?.message, "code", error?.code, "status", error?.status);
+      req.log?.error({ err: { message: error?.message, code: error?.code, status: error?.status } }, "WorkBuddy browser sign-in start failed");
       reply.status(500);
       return { error: "workbuddy_login_start_failed" };
     }
