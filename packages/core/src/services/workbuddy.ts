@@ -154,6 +154,12 @@ export const isManagedWorkBuddy = (p: any): boolean =>
  */
 export const isWorkBuddyRuntime = (p: any): boolean => {
   if (p?.workbuddyManaged === true && (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name)) return true;
+  // A locally-registered alias pointing at a managed origin is still that site's
+  // upstream (§16 ruling 4): the denylist and the fixed-origin locks must apply
+  // to it exactly as they do to the canonical managed provider.
+  const base = typeof p?.baseUrl === "string" ? p.baseUrl : typeof p?.api_base_url === "string" ? p.api_base_url : "";
+  if (/(?:^|\/\/)(?:copilot\.tencent\.com|www\.workbuddy\.ai|www\.codebuddy\.ai)(?:\/|$|:)/.test(base) &&
+    Array.isArray(p?.transformer?.use) && p.transformer.use.some((t: any) => (typeof t === "string" ? t : t?.name) === "workbuddy")) return true;
   return (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name) &&
     (p?.apiKey === WORKBUDDY_API_KEY || p?.apiKey === WORKBUDDY_AI_API_KEY ||
      p?.api_key === WORKBUDDY_API_KEY || p?.api_key === WORKBUDDY_AI_API_KEY);

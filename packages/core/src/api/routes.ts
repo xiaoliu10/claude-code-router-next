@@ -1131,7 +1131,7 @@ async function inspectWorkBuddySse(response: Response): Promise<Response> {
         if (data === "[DONE]") { committed = true; break; }
         let value: any;
         try { value = JSON.parse(data); } catch { committed = true; break; }
-        if (value?.error || Number(value?.code) > 0) throw classifyWorkBuddyError(response.status, value);
+        if (value?.error || Number(value?.code) > 0 || Number(value?.data?.code) > 0) throw classifyWorkBuddyError(response.status, value);
         committed = value?.choices?.some((choice: any) => {
           const delta = choice.delta ?? choice.message;
           return delta && Object.entries(delta).some(([key, v]) => key !== "role" && v != null && v !== "" && (!Array.isArray(v) || v.length > 0));
@@ -1175,7 +1175,14 @@ async function sendRequestToProvider(
     });
   }
   const poolSize = await service.poolAccountCount(site);
-  const attempted = new Set<string>();
+  // One request may retry (generic same-model retry, fallback's {...req} spread);
+  // the ROTATION budget must survive those, so it lives on the request object.
+  // A transient (non-rotatable) failure may still retry the SAME account once
+  // via the outer retry — that is not an account rotation and stays within the
+  // contract's per-request upstream-attempt bound (retry is one-shot).
+  const state: any = ((context?.req as any).__workbuddyState ??= { attempted: new Map(), transient: new Set() });
+  const attempted = state.attempted.get(site) ?? new Set<string>();
+  state.attempted.set(site, attempted);
   let lastError: any;
   while (attempted.size < poolSize) {
     const credential = await service.currentCredential(site, model, [...attempted]);
@@ -1194,8 +1201,11 @@ async function sendRequestToProvider(
           terminal.workbuddyPoolAttempted = true;
           throw terminal;
         }
+        // Transient: the outer same-model retry may re-attempt this account.
+        state.transient.add(site);
         throw error;
       }
+      state.transient.delete(site);
       lastError = error;
       // Persist even for the last account: future requests must not hammer it.
       try { await service.markAccountCooldown(site, credential.uid, cooldown); }
@@ -1204,7 +1214,21 @@ async function sendRequestToProvider(
       fastify.log.info({ code: error.code }, "WorkBuddy account cooldown recorded");
     }
   }
-  if (lastError) throw lastError;
+  if (lastError) { state.transient.delete(site); throw lastError; }
+  if (attempted.size >= poolSize && poolSize > 0) {
+    // Budget exhausted by earlier attempts of this same request. A pending
+    // transient failure gets exactly one same-account retry (not a rotation);
+    // anything else is the §16 terminal pool-exhausted error.
+    if (state.transient.has(site)) {
+      state.transient.delete(site);
+      const credential = await service.currentCredential(site, model);
+      if (credential) {
+        const response = await sendProviderAttempt(requestBody, { ...config, headers: { ...config.headers }, workbuddyCredential: credential }, provider, fastify, bypass, transformer, context);
+        return await inspectWorkBuddySse(response);
+      }
+    }
+    throw workBuddyPoolExhaustedError(await service.poolCooldownRemainingMs(site, model));
+  }
   if (poolSize) throw workBuddyPoolExhaustedError(await service.poolCooldownRemainingMs(site, model));
   throw Object.assign(new Error("WorkBuddy 未导入登录态，请先在管理页导入"), { workbuddy: true, nonRetryable: true, statusCode: 409, code: "workbuddy_not_connected" });
 }

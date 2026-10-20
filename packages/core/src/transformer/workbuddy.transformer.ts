@@ -309,7 +309,7 @@ export class WorkBuddyTransformer implements Transformer {
       const chunk = this.parseOrNull(payload);
       if (chunk === null) continue;
       sawData = true;
-      if (chunk.error || (Number(chunk.code) > 0 && Number.isSafeInteger(Number(chunk.code)))) { errorChunk = chunk; continue; }
+      if (chunk.error || (Number(chunk.code) > 0 && Number.isSafeInteger(Number(chunk.code))) || (Number(chunk?.data?.code) > 0 && Number.isSafeInteger(Number(chunk.data.code)))) { errorChunk = chunk; continue; }
       if (chunk.id) id = chunk.id;
       if (chunk.created) created = chunk.created;
       if (chunk.model) model = chunk.model;
@@ -406,7 +406,7 @@ export class WorkBuddyTransformer implements Transformer {
       } catch {
         return line; // malformed JSON — preserve verbatim
       }
-      if (data?.error || (Number(data?.code) > 0 && Number.isSafeInteger(Number(data?.code)))) {
+      if (data?.error || (Number(data?.code) > 0 && Number.isSafeInteger(Number(data?.code))) || (Number(data?.data?.code) > 0 && Number.isSafeInteger(Number(data.data.code)))) {
         const error = classifyWorkBuddyError(200, data);
         return "data: " + JSON.stringify({ error: { code: error.code, message: error.message } });
       }

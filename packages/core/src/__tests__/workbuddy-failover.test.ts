@@ -227,6 +227,52 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     expect(response.body).toContain("visible"); expect(response.body).not.toContain("private-upstream-body");
     expect(f.fetch).toHaveBeenCalledTimes(1);
   });
+  it("nested data.code SSE error rotates exactly like the JSON envelope", async () => {
+    const h = await harness();
+    const f = stubSequence(() => sse([event({ data: { code: 6004, msg: "private-upstream-body", accessToken: "secret-b" } })]), () => sse([event({ choices: [{ delta: { content: "healthy" } }] }), "data: [DONE]\n\n"]));
+    const response = await h.send("workbuddy", "m", true);
+    expect(response.statusCode).toBe(200); expect(response.body).toContain("healthy");
+    expect(f.fetch).toHaveBeenCalledTimes(2);
+    expect(response.body).not.toMatch(/private-upstream-body|secret-/);
+  });
+  it("post-content nested data.code is redacted in the rewritten stream", async () => {
+    const h = await harness();
+    const f = stubSequence(() => sse([event({ choices: [{ delta: { content: "visible" } }] }) + event({ data: { code: 6004, msg: "private-upstream-body", accessToken: "secret-a" } }) + "data: [DONE]\n\n"]));
+    const response = await h.send("workbuddy", "m", true);
+    expect(response.body).toContain("visible");
+    expect(response.body).not.toMatch(/private-upstream-body|secret-a/);
+    expect(f.fetch).toHaveBeenCalledTimes(1);
+  });
+  it("a request never exceeds pool-size upstream attempts across the outer retry", async () => {
+    const h = await harness();
+    // First attempt: transient 503 (keeps the outer same-model retry alive).
+    // Second attempt: 6004 rotates. The retry must NOT reset the account budget.
+    const f = stubSequence(() => json({ msg: "temporary" }, 503), () => json({ code: 6004 }, 429));
+    const response = await h.send();
+    expect(response.statusCode).toBe(429);
+    expect(f.fetch.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(f.fetch).toHaveBeenCalledTimes(2);
+    expect(f.headers.map(headers => headers.get("authorization"))).toEqual(["Bearer secret-b", "Bearer secret-a"]);
+  });
+  it("single-account pool makes exactly one upstream attempt per request", async () => {
+    const h = await harness();
+    await h.service.removeAccount("workbuddy", "a");
+    const f = stubSequence(() => json({ code: 6004 }, 429));
+    expect((await h.send()).statusCode).toBe(429);
+    expect(f.fetch).toHaveBeenCalledTimes(1);
+  });
+  it("an alias provider pointing at a managed origin is still subject to the site denylist", async () => {
+    const h = await harness(["hidden"]);
+    const fetch = vi.fn(async () => success()); vi.stubGlobal("fetch", fetch);
+    const providers = h.server.configService.getAll().Providers ?? [];
+    h.server.configService.set("Providers", [
+      ...providers,
+      { name: "evil-alias", api_base_url: AI, api_key: "attacker", models: ["hidden"], transformer: { use: ["workbuddy"] } },
+    ]);
+    const response = await h.send("evil-alias", "hidden");
+    expect(response.statusCode).toBe(422); expect(response.body).toContain("workbuddy_model_hidden");
+    expect(fetch).not.toHaveBeenCalled();
+  });
   it("ordinary provider still receives its one same-model retry", async () => {
     const h = await harness(); const f = stubSequence(() => json({ error: "temporary" }, 503));
     const response = await h.send("ordinary"); expect(response.statusCode).toBe(200); expect(f.fetch).toHaveBeenCalledTimes(2);
