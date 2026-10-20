@@ -97,7 +97,7 @@ class ApiClient {
         // We'll dispatch a custom event that the app can listen to
         window.dispatchEvent(new CustomEvent('unauthorized'));
         // Return a promise that never resolves to prevent further execution
-        if (isWorkBuddy) throw new Error('workbuddy_unauthorized');
+        if (isWorkBuddy) throw Object.assign(new Error('workbuddy_unauthorized'), { reason: 'workbuddy_unauthorized' });
         return new Promise(() => {}) as Promise<T>;
       }
 
@@ -106,7 +106,7 @@ class ApiClient {
         // the browser's error object, console, toast or component state.
         const allowed = ['sealed', 'source_missing', 'source_invalid', 'models_fetch_failed',
           'workbuddy_name_conflict', 'workbuddy_site_conflict', 'workbuddy_not_connected',
-          'login_state_rejected', 'login_account_failed', 'login_persist_failed'];
+          'workbuddy_unauthorized', 'login_state_rejected', 'login_account_failed', 'login_persist_failed'];
         let code = 'request_failed';
         try {
           const data = await response.json();

@@ -617,6 +617,7 @@
       "workbuddy_name_conflict": "An ordinary provider named “workbuddy” already exists. Rename or remove it before authorization; CCR will not take it over.",
       "workbuddy_not_connected": "WorkBuddy is not connected. Authorize in the browser first.",
       "request_failed": "WorkBuddy management failed. No success was confirmed. Existing model details remain visible; retry explicitly.",
+      "workbuddy_unauthorized": "This browser was rejected by the local-machine check. WorkBuddy management only works on the computer running the CCR service, via http://127.0.0.1 or http://localhost on the service port. Open the UI there and try again.",
       "restricted": "WorkBuddy restricted this account (11140). Stop retrying and use Submit feedback inside WorkBuddy to appeal.",
       "channel_rejected": "WorkBuddy rejected this client channel. Use another client or provider; CCR does not rewrite prompts to bypass this restriction.",
       "busy": "A configuration save or another WorkBuddy action is in progress. Wait for it to finish and retry.",
