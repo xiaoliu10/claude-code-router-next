@@ -184,12 +184,51 @@ describe("WorkBuddy v2 account pool", () => {
     await store.upsertAccount(v1Credential({ uid: "a" }));
     await store.setHiddenModels("workbuddy", ["glm-5.3", "glm-5.3", "bad,id", "x"] as any);
     expect((await store.loadData())?.sites.workbuddy?.hiddenModels).toEqual(["glm-5.3", "x"]);
-    await store.setAccountCooldown("workbuddy", "a", { until: 1234, scope: "model", model: "glm-5.3", code: 6004 });
-    const c = (await store.loadData())?.sites.workbuddy?.accounts[0].cooldown;
-    expect(c).toEqual({ until: 1234, scope: "model", model: "glm-5.3", code: 6004 });
+    await store.setAccountCooldown("workbuddy", "a", { until: Date.now() + 60_000, scope: "model", model: "glm-5.3", code: 6004 });
+    const c = (await store.loadData())?.sites.workbuddy?.accounts[0];
+    // Model-scoped cooldowns live in the additive per-model map, not the account slot.
+    expect(c?.cooldown).toBeUndefined();
+    expect(c?.modelCooldowns?.["glm-5.3"]).toMatchObject({ code: 6004 });
+    await store.setAccountCooldown("workbuddy", "a", { until: Date.now() + 60_000, scope: "model", model: "kimi-k3-1", code: 6004 });
+    const both = (await store.loadData())?.sites.workbuddy?.accounts[0].modelCooldowns;
+    expect(Object.keys(both ?? {}).sort()).toEqual(["glm-5.3", "kimi-k3-1"]); // simultaneous A+B limits preserved
     await store.setAccountCooldown("workbuddy", "a", null);
-    expect((await store.loadData())?.sites.workbuddy?.accounts[0].cooldown).toBeUndefined();
+    const cleared = (await store.loadData())?.sites.workbuddy?.accounts[0];
+    expect(cleared?.cooldown).toBeUndefined();
+    expect(cleared?.modelCooldowns).toBeUndefined();
     await expect(store.setHiddenModels("workbuddy-ai", ["m"])).rejects.toThrow("workbuddy_not_connected");
+  });
+
+  it("preserves still-valid cooldowns across same-uid re-login and drops expired ones", async () => {
+    const { store } = newStore();
+    await store.upsertAccount(v1Credential({ uid: "a", accessToken: "token-a1" }));
+    await store.setAccountCooldown("workbuddy", "a", { until: Date.now() + 60_000, scope: "account", code: 14018 });
+    await store.setAccountCooldown("workbuddy", "a", { until: Date.now() + 60_000, scope: "model", model: "glm-5.3", code: 6004 });
+    // Successful login is NOT evidence quota/rate limits reset (§16 review).
+    await store.upsertAccount(v1Credential({ uid: "a", accessToken: "token-a2" }));
+    const kept = (await store.loadData())?.sites.workbuddy?.accounts[0];
+    expect(kept?.accessToken).toBe("token-a2");
+    expect(kept?.cooldown).toMatchObject({ scope: "account", code: 14018 });
+    expect(kept?.modelCooldowns?.["glm-5.3"]).toBeDefined();
+    // Expired state is dropped on the next normalization pass (fresh account with
+    // only an expired cooldown; the preserved live one above is separate).
+    const { store: s2 } = newStore();
+    await s2.upsertAccount(v1Credential({ uid: "b", accessToken: "token-b1", cooldown: { until: Date.now() - 1, scope: "account", code: 14018 } }));
+    const dropped = (await s2.loadData())?.sites.workbuddy?.accounts[0];
+    expect(dropped?.accessToken).toBe("token-b1");
+    expect(dropped?.cooldown).toBeUndefined();
+  });
+
+  it("migrates a permissive 0644 v1 file: backup and live file both end up 0600", async () => {
+    const { store, path, backup } = newStore();
+    const v1bytes = JSON.stringify(v1Credential({ uid: "permissive" }));
+    writeFileSync(path, v1bytes, { mode: 0o644 });
+    const result = await store.migrateV1();
+    expect(result.backupCreated).toBe(true);
+    expect(statSync(backup).mode & 0o777).toBe(0o600);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(readFileSync(backup, "utf8")).toBe(v1bytes); // exact bytes, single validated read
+    expect((await store.loadData())?.sites.workbuddy?.activeUid).toBe("permissive");
   });
 
   it("exposes the legacy single-credential shim for the pre-§16 service", async () => {

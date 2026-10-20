@@ -90,12 +90,15 @@ export type WorkBuddyStatus = "not_connected" | "connected" | "expired" | "seale
 /** Where the credential came from: the desktop login file or a browser sign-in. */
 export type WorkBuddyCredentialSource = "desktop" | "browser";
 export type WorkBuddyCooldownScope = "account" | "model";
+/** Account-scoped cooldown slot (quota/restriction classes). */
 export interface WorkBuddyCooldown {
   until: number;
   scope: WorkBuddyCooldownScope;
   model?: string;
   code: number;
 }
+/** Per-model cooldown slot; an account may hold MANY simultaneously (§16 review). */
+export interface WorkBuddyModelCooldown { until: number; code: number }
 /** One account in a site pool (contract §16 v2). */
 export interface WorkBuddyAccount {
   uid: string;
@@ -110,7 +113,10 @@ export interface WorkBuddyAccount {
   importedAt: string;
   /** Non-secret token type only. */
   tokenType?: string;
+  /** Account-scoped cooldown (quota/restriction). Still-valid state survives re-login. */
   cooldown?: WorkBuddyCooldown;
+  /** Additive per-model rate-limit cooldowns (6004/429): one slot PER MODEL. */
+  modelCooldowns?: Record<string, WorkBuddyModelCooldown>;
 }
 export interface WorkBuddySiteState {
   hiddenModels: string[];
@@ -231,7 +237,7 @@ const MODEL_ID_OK = /^[^\x00-\x1f\x7f,]{1,256}$/;
 function modelIdOk(value: unknown): value is string {
   return typeof value === "string" && MODEL_ID_OK.test(value) && !value.includes(",");
 }
-function normalizeAccount(c: any, siteId: WorkBuddySiteId): WorkBuddyAccount {
+function normalizeAccount(c: any, siteId: WorkBuddySiteId, now = Date.now()): WorkBuddyAccount {
   if (!c || typeof c !== "object" ||
     !headerValue(c.accessToken, MAX_SOURCE_BYTES, true) || !headerValue(c.uid, 253, true) ||
     (c.source !== "desktop" && c.source !== "browser")) throw new Error();
@@ -251,14 +257,26 @@ function normalizeAccount(c: any, siteId: WorkBuddySiteId): WorkBuddyAccount {
     account.refreshToken = c.refreshToken;
     if (Number.isFinite(c.refreshExpiresAt) && c.refreshExpiresAt > 0) account.refreshExpiresAt = Math.floor(c.refreshExpiresAt);
   }
-  if (c.cooldown && typeof c.cooldown === "object" &&
-      Number.isFinite(c.cooldown.until) && c.cooldown.until > 0 &&
-      Number.isSafeInteger(Number(c.cooldown.code)) &&
-      (c.cooldown.scope === "account" ||
-        (c.cooldown.scope === "model" && modelIdOk(c.cooldown.model)))) {
-    account.cooldown = c.cooldown.scope === "account"
-      ? { until: Math.floor(c.cooldown.until), scope: "account", code: Number(c.cooldown.code) }
-      : { until: Math.floor(c.cooldown.until), scope: "model", model: c.cooldown.model, code: Number(c.cooldown.code) };
+  // Cooldown normalization: expired entries may be dropped (§16 review); a
+  // legacy model-scoped `cooldown` slot migrates into the additive map.
+  const cooldown = c.cooldown && typeof c.cooldown === "object" ? c.cooldown : undefined;
+  if (cooldown && Number.isFinite(cooldown.until) && cooldown.until > now &&
+      Number.isSafeInteger(Number(cooldown.code))) {
+    if (cooldown.scope === "account") {
+      account.cooldown = { until: Math.floor(cooldown.until), scope: "account", code: Number(cooldown.code) };
+    } else if (cooldown.scope === "model" && modelIdOk(cooldown.model)) {
+      account.modelCooldowns = { [cooldown.model]: { until: Math.floor(cooldown.until), code: Number(cooldown.code) } };
+    }
+  }
+  if (c.modelCooldowns && typeof c.modelCooldowns === "object") {
+    const map: Record<string, WorkBuddyModelCooldown> = {};
+    for (const [model, slot] of Object.entries(c.modelCooldowns)) {
+      if (!modelIdOk(model) || !slot || typeof slot !== "object") continue;
+      if (!Number.isFinite((slot as any).until) || (slot as any).until <= now || !Number.isSafeInteger(Number((slot as any).code))) continue;
+      map[model] = { until: Math.floor((slot as any).until), code: Number((slot as any).code) };
+      if (Object.keys(map).length >= 32) break;
+    }
+    if (Object.keys(map).length) account.modelCooldowns = map;
   }
   return account;
 }
@@ -289,17 +307,19 @@ export class WorkBuddyCredentialStore {
   }
 
   /**
-   * Migration-only read: parses v1 bytes without the mode check (a stray
+   * Migration-only read: parses v1 bytes WITHOUT the mode check (a stray
    * permissive v1 file must be CONVERTED to a 0600 v2 file, not brick the
-   * pool). Size/type/no-symlink bounds still apply.
+   * pool). Returns the exact bytes from the SAME validated O_NOFOLLOW handle —
+   * the backup must never re-resolve the path (§16 review: TOCTOU race).
    */
-  private async readV1Lenient(): Promise<WorkBuddyCredential | null> {
+  private async readV1Lenient(): Promise<{ credential: WorkBuddyCredential; bytes: Buffer } | null> {
     let file: Awaited<ReturnType<typeof fs.open>> | undefined;
     try {
       file = await fs.open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
       const stat = await file.stat();
       if (!stat.isFile() || stat.size > MAX_SOURCE_BYTES) return null;
-      return this.normalizeV1(JSON.parse(await file.readFile("utf8")));
+      const bytes = await file.readFile();
+      return { credential: this.normalizeV1(JSON.parse(bytes.toString("utf8"))), bytes };
     } catch {
       return null;
     } finally { await file?.close(); }
@@ -366,7 +386,10 @@ export class WorkBuddyCredentialStore {
   async migrateV1(): Promise<{ data: WorkBuddyCredentialData; legacy: WorkBuddyCredential | null; backupCreated: boolean }> {
     // A permissive/unreadable file must still migrate: read bytes leniently,
     // back them up, then rewrite v2 at 0600 (which repairs the mode).
-    const legacy = await this.readV1Lenient();
+    let legacy: WorkBuddyCredential | null = null;
+    let v1bytes: Buffer | null = null;
+    const lenient = await this.readV1Lenient();
+    if (lenient) { legacy = lenient.credential; v1bytes = lenient.bytes; }
     if (!legacy) {
       const raw = await this.readRaw();
       if (raw?.version === 2) return { data: raw, legacy: null, backupCreated: false };
@@ -376,8 +399,8 @@ export class WorkBuddyCredentialStore {
     try {
       await fs.access(this.backupV1Path, constants.O_RDONLY);
     } catch {
-      const v1bytes = await fs.readFile(this.path);
-      await this.writePrivate(this.backupV1Path, v1bytes);
+      // Exact bytes from the validated handle — never a second path lookup.
+      await this.writePrivate(this.backupV1Path, v1bytes!);
       backupCreated = true;
     }
     const data = this.migrateV1Data(legacy);
@@ -419,7 +442,18 @@ export class WorkBuddyCredentialStore {
     const replaced = idx >= 0;
     if (replaced) {
       // Re-login keeps pool position, hidden list and the sticky active uid.
-      prev.accounts[idx] = { ...account, cooldown: undefined };
+      // STILL-VALID cooldown state survives credential replacement (§16 review):
+      // a fresh login is NOT evidence that quota/rate limits reset. Expired
+      // entries are dropped.
+      const prior = prev.accounts[idx];
+      const now = Date.now();
+      if (prior.cooldown && prior.cooldown.until > now) account.cooldown = prior.cooldown;
+      if (prior.modelCooldowns) {
+        const live: Record<string, WorkBuddyModelCooldown> = {};
+        for (const [model, slot] of Object.entries(prior.modelCooldowns)) if (slot.until > now) live[model] = slot;
+        if (Object.keys(live).length) account.modelCooldowns = live;
+      }
+      prev.accounts[idx] = account;
     } else {
       prev.accounts.push(account);
     }
@@ -482,13 +516,27 @@ export class WorkBuddyCredentialStore {
     return current;
   }
 
-  /** Persist a failover cooldown on one pool account (or clear it with `cooldown === null`). */
+  /**
+   * Set cooldown state on one pool account. Account scope fills the single
+   * account slot; model scope ADDS to the per-model map (an account can be
+   * limited on model A and model B at once — §16 review). `null` clears ALL
+   * cooldown state (full reset). Values are validated; expired entries are
+   * dropped.
+   */
   async setAccountCooldown(site: WorkBuddySiteId, uid: string, cooldown: WorkBuddyCooldown | null): Promise<WorkBuddyCredentialData> {
     const current = await this.loadData();
     const account = current?.sites[site]?.accounts.find((a) => a.uid === uid);
     if (!account) throw new Error("workbuddy_account_not_found");
-    if (cooldown === null) delete account.cooldown;
-    else account.cooldown = { ...cooldown, model: cooldown.scope === "model" ? cooldown.model : undefined };
+    if (cooldown === null) {
+      delete account.cooldown;
+      delete account.modelCooldowns;
+    } else if (cooldown.scope === "account") {
+      account.cooldown = { until: Math.floor(cooldown.until), scope: "account", code: cooldown.code };
+    } else if (cooldown.scope === "model" && modelIdOk(cooldown.model)) {
+      const map = { ...(account.modelCooldowns ?? {}) };
+      map[cooldown.model!] = { until: Math.floor(cooldown.until), code: cooldown.code };
+      account.modelCooldowns = map;
+    }
     await this.saveData(current!);
     return current!;
   }

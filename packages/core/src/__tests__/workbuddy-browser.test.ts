@@ -174,8 +174,8 @@ describe("browser login jobs", () => {
   });
   it("does not recreate the provider if disconnect invalidates sync's initial load", async () => {
     const h = harness(flowFetch()); await h.store.save(credential({ expiresAt: Date.now() + 3600000 }));
-    const read = h.store.load.bind(h.store); let release!: () => void; let first = true;
-    vi.spyOn(h.store, "load").mockImplementation(async () => {
+    const read = h.store.loadData.bind(h.store); let release!: () => void; let first = true;
+    vi.spyOn(h.store, "loadData").mockImplementation(async () => {
       const snapshot = await read();
       if (first) { first = false; await new Promise<void>(r => { release = r; }); }
       return snapshot;
