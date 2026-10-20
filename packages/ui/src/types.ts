@@ -343,11 +343,14 @@ export interface WorkBuddyUsageRequest {
   uid?: string;
 }
 
-// §16: hiding a model also clears Router references that point at it; the
-// server returns them so the UI can list them in a toast.
+// §16 hide response: Router path labels are display-only, never model refs.
+// Optional reconciliation metadata permits a one-version older-server fallback.
 export interface WorkBuddyModelHideResponse {
   ok: boolean;
   clearedRefs?: string[];
+  removedModelRefs?: string[];
+  // Actual persisted Router.default after hide; null means no default remains.
+  defaultFallback?: string | null;
 }
 
 // Restoring never rewrites Router references (§16).

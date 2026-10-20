@@ -685,6 +685,12 @@
     "cleared_refs": "已从 Router 清理：{{refs}}",
     "restored_toast": "已恢复 {{model}}，Router 引用未自动改写。",
     "restored_all_toast": "已恢复 {{count}} 个隐藏模型，Router 引用未自动改写。",
-    "hidden_note": "隐藏的模型在同步和重新授权后保持隐藏，不会注册到托管供应商；可随时在此恢复。"
+    "hidden_note": "隐藏的模型在同步和重新授权后保持隐藏，不会注册到托管供应商；可随时在此恢复。",
+    "router_path": {
+      "default": "默认路由",
+      "model_alias": "模型别名（{{name}}）",
+      "family_default": "模型族默认（{{family}}）",
+      "custom_route": "自定义路由（{{name}}）"
+    }
   }
 }

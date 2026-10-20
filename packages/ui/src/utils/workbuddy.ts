@@ -54,42 +54,55 @@ function customEntryReferencesRef(entry: unknown, provider: string, model: strin
 }
 
 /**
- * §16 hide reconciliation (explicitly authorized action): the backend just
- * rewrote its SAVED Router for the hidden model (references cleared, default
- * re-pointed at the first visible model, referencing custom routes removed).
- * The ordinary draft-preserving merge would keep the pre-clean local Router,
- * so the next full-config Save would silently resurrect exactly the
- * references the toast announced as cleared.
+ * §16 hide reconciliation (explicitly authorized action). The backend just
+ * rewrote its SAVED Router for one exact `provider,model` reference. Path
+ * labels in `clearedRefs` (default/scenario:think/...) are toast-only and
+ * must never be interpreted as model references. Model references used for
+ * cleanup come from `removedModelRefs`; for a one-version older hide payload
+ * without that field the caller may derive the single ref for the explicitly
+ * hidden site+model.
  *
- * This variant applies EXACTLY the reported cleanup to the local draft and
- * nothing else: a slot/alias/fallback is rewritten only when it still points
- * at one of the cleared refs, custom entries referencing a cleared model are
- * removed entirely, `default` gets the §16 first-visible-model fallback, and
- * every unrelated local edit (Router or otherwise) survives. With no cleared
- * refs it is byte-identical to the draft-preserving merge. Login / sync /
- * disconnect / restore keep using mergeWorkBuddyProvider (Router preserved).
+ * This narrow merge never adopts the whole server Router: it applies only the
+ * cleanup matching exact removed refs to the local draft, then sets default
+ * to the server-authoritative persisted fallback. Unrelated edits survive.
+ * Login/sync/disconnect/restore keep mergeWorkBuddyProvider (Router preserved).
  */
-export function mergeWorkBuddyHiddenRefs(local: Config, server: Config, clearedRefs: string[] | undefined, defaultFallback: string | null): Config {
+export function mergeWorkBuddyHiddenRefs(
+  local: Config,
+  server: Config,
+  removedModelRefs: string[] | undefined,
+  defaultFallback?: string | null,
+): Config {
   const merged = mergeWorkBuddyProvider(local, server);
-  const refs = sanitizeClearedRefs(clearedRefs);
+  const refs = sanitizeWorkBuddyModelRefs(removedModelRefs);
   if (refs.length === 0) return merged;
   const refSet = new Set(refs);
   const parsed = refs.map(ref => {
-    const index = ref.indexOf(",");
-    return index > 0
-      ? { ref, provider: ref.slice(0, index), model: ref.slice(index + 1) }
-      : { ref, provider: "", model: ref };
+    const [provider, model] = ref.split(",");
+    return { ref, provider, model };
   });
   const source = (local.Router || {}) as Record<string, unknown>;
   const router: Record<string, unknown> = { ...source };
-  // Scenario slots: only a slot still pointing exactly at a cleared ref moves.
+  // Scenario slots: only a slot still pointing exactly at a removed ref moves.
   for (const slot of ROUTER_REF_SLOTS) {
     const value = router[slot];
     if (typeof value === "string" && refSet.has(value)) {
-      router[slot] = slot === "default" && defaultFallback ? defaultFallback : "";
+      if (slot === "default") {
+        // New seam: server-authoritative persisted default. null explicitly
+        // clears it. Older payloads omit it, so adopt the fetched server
+        // Router default rather than guessing from local model order.
+        router[slot] = defaultFallback === undefined
+          ? (typeof server.Router?.default === "string" ? server.Router.default : "")
+          : (defaultFallback ?? "");
+      } else {
+        router[slot] = "";
+      }
+    } else if (Array.isArray(value) && value.every(item => typeof item === "string")) {
+      // Some scenario fields may carry arrays of refs; drop removed entries.
+      router[slot] = value.filter(item => !refSet.has(item));
     }
   }
-  // Model alias map: drop entries whose target was cleared.
+  // Model alias map: drop entries whose target was removed.
   if (source.models && typeof source.models === "object") {
     const kept: Record<string, unknown> = {};
     for (const [alias, target] of Object.entries(source.models as Record<string, unknown>)) {
@@ -98,38 +111,29 @@ export function mergeWorkBuddyHiddenRefs(local: Config, server: Config, clearedR
     }
     router.models = kept;
   }
-  // Family routing configs carry the same reference semantics.
+  // Family routing configs carry the same reference semantics. Only the
+  // backend's documented families.<family>.default cleanup is represented,
+  // while fallback stages deliberately remain untouched.
   if (source.families && typeof source.families === "object") {
     const keptFamilies: Record<string, unknown> = {};
     for (const [family, familyConfig] of Object.entries(source.families as Record<string, unknown>)) {
       if (!familyConfig || typeof familyConfig !== "object") { keptFamilies[family] = familyConfig; continue; }
       const record = { ...(familyConfig as Record<string, unknown>) };
-      for (const slot of ROUTER_REF_SLOTS) {
-        const value = record[slot];
-        if (typeof value === "string" && refSet.has(value)) record[slot] = "";
-      }
-      if (record.fallback && typeof record.fallback === "object") {
-        const keptFallback: Record<string, unknown> = {};
-        for (const [key, list] of Object.entries(record.fallback as Record<string, unknown>)) {
-          keptFallback[key] = Array.isArray(list)
-            ? list.filter(item => !(typeof item === "string" && refSet.has(item)))
-            : list;
-        }
-        record.fallback = keptFallback;
-      }
+      const familyDefault = record.default;
+      if (typeof familyDefault === "string" && refSet.has(familyDefault)) record.default = "";
       keptFamilies[family] = record;
     }
     router.families = keptFamilies;
   }
-  // Custom routes: an entry referencing a cleared model is removed entirely (§16).
-  const referencesCleared = (entry: unknown) =>
+  // Custom routes: an entry referencing a removed model is removed entirely (§16).
+  const referencesRemoved = (entry: unknown) =>
     parsed.some(({ ref, provider, model }) => customEntryReferencesRef(entry, provider, model, ref));
   if (Array.isArray(source.custom)) {
-    router.custom = source.custom.filter(entry => !referencesCleared(entry));
+    router.custom = source.custom.filter(entry => !referencesRemoved(entry));
   } else if (source.custom && typeof source.custom === "object") {
     const keptCustom: Record<string, unknown> = {};
     for (const [name, entry] of Object.entries(source.custom as Record<string, unknown>)) {
-      if (!referencesCleared(entry)) keptCustom[name] = entry;
+      if (!referencesRemoved(entry)) keptCustom[name] = entry;
     }
     router.custom = keptCustom;
   }
@@ -280,16 +284,50 @@ export function workBuddySiteStatus(response: WorkBuddyStatusResponse | null | u
   return null;
 }
 
-/**
- * Toast-safe Router references from a successful hide. Only plain reference
- * strings ("<provider>,<model>") are shown, capped to keep the toast small.
- */
-export function sanitizeClearedRefs(value: unknown): string[] {
+const WORKBUDDY_MODEL_REF_PATTERN = /^(?:workbuddy|workbuddy-ai),[A-Za-z0-9._:@/-]{1,120}$/;
+
+/** Exact WorkBuddy provider/model references that may drive local Router cleanup. */
+export function sanitizeWorkBuddyModelRefs(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
-  return value
+  const clean = value
     .map(item => (typeof item === "string" ? item.trim() : ""))
-    .filter(item => /^[\w.,:@/-]{1,120}$/.test(item))
-    .slice(0, 8);
+    .filter(item => WORKBUDDY_MODEL_REF_PATTERN.test(item));
+  return Array.from(new Set(clean)).slice(0, 8);
+}
+
+const ROUTER_PATH_LABEL_PATTERN = /^(?:default|scenario:(?:background|think|longContext|extendedContext|webSearch|image)|models:[A-Za-z0-9_-]{1,80}|families\.[A-Za-z0-9_-]{1,80}\.default|custom:[A-Za-z0-9_.:@/-]{1,100})$/;
+
+/**
+ * Toast-safe Router PATH LABELS from a successful hide (default,
+ * scenario:think, models:alias, custom:name). These are structural labels,
+ * not provider/model references; raw/HTML/error text is rejected.
+ */
+export function sanitizeWorkBuddyRouterPaths(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const clean = value
+    .map(item => (typeof item === "string" ? item.trim() : ""))
+    .filter(item => ROUTER_PATH_LABEL_PATTERN.test(item));
+  return Array.from(new Set(clean)).slice(0, 8);
+}
+
+export interface WorkBuddyRouterPathLabels {
+  default: string;
+  scenario: (name: string) => string | null;
+  modelAlias: (name: string) => string;
+  familyDefault: (family: string) => string;
+  customRoute: (name: string) => string;
+}
+
+/** Convert a sanitized Router path label into localized display text. */
+export function labelWorkBuddyRouterPath(path: string, labels: WorkBuddyRouterPathLabels): string | null {
+  const [pathLabel] = sanitizeWorkBuddyRouterPaths([path]);
+  if (!pathLabel) return null;
+  if (pathLabel === "default") return labels.default;
+  if (pathLabel.startsWith("scenario:")) return labels.scenario(pathLabel.slice(9));
+  if (pathLabel.startsWith("models:")) return labels.modelAlias(pathLabel.slice(7));
+  if (pathLabel.startsWith("custom:")) return labels.customRoute(pathLabel.slice(7));
+  const familyMatch = /^families\.([A-Za-z0-9_-]{1,80})\.default$/.exec(pathLabel);
+  return familyMatch ? labels.familyDefault(familyMatch[1]) : null;
 }
 
 // Strict validation of the usage payload. Anything malformed becomes null so

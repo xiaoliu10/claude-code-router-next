@@ -685,6 +685,12 @@
     "cleared_refs": "Cleared from Router: {{refs}}",
     "restored_toast": "Restored {{model}}. Router references were not rewritten.",
     "restored_all_toast": "Restored {{count}} hidden models. Router references were not rewritten.",
-    "hidden_note": "Hidden models stay hidden across sync and re-authorization and are excluded from the managed provider; restore them here at any time."
+    "hidden_note": "Hidden models stay hidden across sync and re-authorization and are excluded from the managed provider; restore them here at any time.",
+    "router_path": {
+      "default": "Default route",
+      "model_alias": "Model alias ({{name}})",
+      "family_default": "Family default ({{family}})",
+      "custom_route": "Custom route ({{name}})"
+    }
   }
 }

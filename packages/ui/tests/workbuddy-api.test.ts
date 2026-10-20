@@ -97,8 +97,10 @@ test("§16 per-site pool requests carry exact bodies; hide passes clearedRefs th
       { site: "workbuddy", model: "glm-4.6" },
       { site: "workbuddy-ai" },
     ]);
-    payload = { ok: true, clearedRefs: ["workbuddy,glm-4.6", "scenarios.research"] };
-    assert.deepEqual(await client.hideWorkBuddyModel("workbuddy", "glm-4.6"), { ok: true, clearedRefs: ["workbuddy,glm-4.6", "scenarios.research"] });
+    // Checkpoint seam: clearedRefs are Router path labels for toast;
+    // removedModelRefs/defaultFallback carry exact reconciliation data.
+    payload = { ok: true, clearedRefs: ["default", "scenario:think"], removedModelRefs: ["workbuddy,m1"], defaultFallback: "workbuddy,m2" };
+    assert.deepEqual(await client.hideWorkBuddyModel("workbuddy", "m1"), payload);
     // Failures keep the same sanitised allowlist as every other workbuddy route.
     httpStatus = 422;
     payload = { error: "raw upstream text", message: "raw upstream text" };

@@ -4,9 +4,10 @@ import { Coins, RefreshCw, ShieldCheck, X } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Config, WorkBuddyKind, WorkBuddyLoginStartResponse, WorkBuddySiteStatus, WorkBuddyStatusResponse, WorkBuddyUsage } from "@/types";
 import {
-  formatWorkBuddyClock, isWorkBuddyConnected, maskWorkBuddyUid, mergeWorkBuddyHiddenRefs, mergeWorkBuddyProvider, parseWorkBuddyUsage,
-  sanitizeClearedRefs, workBuddyAccountCooling, workBuddyAccountRestricted, workBuddyErrorKey,
-  workBuddyImagesUnsupportedModels, workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
+  formatWorkBuddyClock, isWorkBuddyConnected, labelWorkBuddyRouterPath, maskWorkBuddyUid, mergeWorkBuddyHiddenRefs,
+  mergeWorkBuddyProvider, parseWorkBuddyUsage, sanitizeWorkBuddyModelRefs, sanitizeWorkBuddyRouterPaths,
+  workBuddyAccountCooling, workBuddyAccountRestricted, workBuddyErrorKey, workBuddyImagesUnsupportedModels,
+  workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
 } from "@/utils/workbuddy";
 import { createWorkBuddyLogin } from "@/utils/workbuddy-login";
 import { useConfig } from "./ConfigProvider";
@@ -167,21 +168,34 @@ export function WorkBuddyProvider({ disabled, onBusyChange, focusSite = null }: 
         const hidden = await api.hideWorkBuddyModel(site, model);
         if (!mounted.current || generation.current !== id) return;
         if (!hidden || hidden.ok !== true) { setSiteError(site, "request_failed"); return; }
-        // §16: the toast lists exactly the Router references the server cleared.
-        const refs = sanitizeClearedRefs(hidden.clearedRefs);
-        // §16 auto-clean: default falls back to the first remaining visible
-        // model (computed from the pre-refresh site models minus the hidden
-        // one); with none left the default is simply cleared.
-        const siteStatus = siteStatuses[site];
-        const remaining = (siteStatus?.models || []).filter(candidate => candidate !== model);
-        const fallback = remaining.length > 0 ? `${siteStatus?.providerName || site},${remaining[0]}` : null;
+        // clearedRefs are Router PATH LABELS for display only. Never parse
+        // them as provider/model references.
+        const paths = sanitizeWorkBuddyRouterPaths(hidden.clearedRefs)
+          .map(pathLabel => labelWorkBuddyRouterPath(pathLabel, {
+            default: t("workbuddy.router_path.default"),
+            scenario: name => t(`router.${name}`),
+            modelAlias: name => t("workbuddy.router_path.model_alias", { name }),
+            familyDefault: family => t("workbuddy.router_path.family_default", { family }),
+            customRoute: name => t("workbuddy.router_path.custom_route", { name }),
+          }))
+          .filter((pathLabel): pathLabel is string => pathLabel !== null);
+        // New checkpoint seam: exact hidden refs drive cleanup. For one older
+        // payload without the field, the explicitly hidden site+model is the
+        // single safe ref. No Router path label is used as a model ref.
+        const refs = sanitizeWorkBuddyModelRefs(hidden.removedModelRefs);
+        const removedRefs = refs.length > 0 ? refs : sanitizeWorkBuddyModelRefs([`${site},${model}`]);
+        // defaultFallback is the authoritative value persisted by the server
+        // (null when all models are hidden); absent on older payloads lets the
+        // helper take the cleaned server Router default. Pre-refresh model
+        // order is intentionally not used (cumulative discovery can differ).
         // Explicitly authorized action: narrowly adopt the backend's Router
         // cleanup into the local draft so the next full Save cannot resurrect
-        // the cleared references (unrelated local edits survive).
-        await finish(site, id, refs.length > 0
-          ? `${t("workbuddy.hidden_toast", { model })} ${t("workbuddy.cleared_refs", { refs: refs.join(", ") })}`
+        // the removed references (unrelated local edits survive).
+        const toastRefs = paths.join(", ");
+        await finish(site, id, toastRefs
+          ? `${t("workbuddy.hidden_toast", { model })} ${t("workbuddy.cleared_refs", { refs: toastRefs })}`
           : t("workbuddy.hidden_toast", { model }),
-          { merge: (local, server) => mergeWorkBuddyHiddenRefs(local, server, refs, fallback) });
+          { merge: (local, server) => mergeWorkBuddyHiddenRefs(local, server, removedRefs, hidden.defaultFallback) });
         return;
       }
       if (kind === "restore") {

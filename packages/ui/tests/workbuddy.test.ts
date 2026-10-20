@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   formatWorkBuddyClock, hasDiscoveredModels, isManagedWorkBuddy, isWorkBuddyConnected, isWorkBuddyKind,
-  maskWorkBuddyUid, mergeWorkBuddyHiddenRefs, mergeWorkBuddyProvider, parseWorkBuddyUsage, sanitizeClearedRefs,
-  workBuddyAccountCooling, workBuddyAccountRestricted, workBuddyErrorKey, workBuddyImagesUnsupportedModels,
-  workBuddyKindOf, workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
+  labelWorkBuddyRouterPath, maskWorkBuddyUid, mergeWorkBuddyHiddenRefs, mergeWorkBuddyProvider, parseWorkBuddyUsage,
+  sanitizeWorkBuddyModelRefs, sanitizeWorkBuddyRouterPaths, workBuddyAccountCooling, workBuddyAccountRestricted, workBuddyErrorKey,
+  workBuddyImagesUnsupportedModels, workBuddyKindOf, workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
 } from "../src/utils/workbuddy.ts";
 import type { Config, Provider, WorkBuddyAccountSummary, WorkBuddyMutationResponse, WorkBuddySiteStatus, WorkBuddyStatusResponse } from "../src/types.ts";
 
@@ -68,7 +68,9 @@ test("P1 hide reconciliation: save payload drops exactly the backend-cleared ref
       webSearch: cleared,
       image: "vision-provider,vision-model",
       models: { keep: unrelated, drop: cleared },
-      families: { balanced: { default: cleared, background: unrelated, fallback: { longContext: [cleared, unrelated] } } },
+      // The checkpoint backend only rewrites families.<name>.default; family
+      // fallback stages are outside the explicit cleanup contract.
+      families: { balanced: { default: cleared, background: unrelated, fallback: { longContext: [unrelated] } } },
       custom: {
         "route-keep": { provider: "other-provider", model: "long-model" },
         "route-drop": { provider: "workbuddy", model: "glm-4.6" },  // §16: entry removed entirely
@@ -102,17 +104,61 @@ test("P1 hide reconciliation: save payload drops exactly the backend-cleared ref
   assert.deepEqual(merged.Providers, [other, managed]);
   assert.equal((merged as { customDraft: string }).customDraft, "not saved");
 });
-test("P1 hide reconciliation is narrow: no refs reported → draft Router identity; no visible model → default cleared", () => {
+test("P1 hide reconciliation is narrow: no refs reported → draft Router identity; all hidden → default cleared", () => {
   const local = { Providers: [other], Router: { default: "workbuddy,glm-4.6", think: "x,y" }, customDraft: "d" } as unknown as Config;
   const server = config([managed]);
-  // Server reported nothing cleared: the hide merge reduces to the ordinary
+  // Server reported no removed refs: the hide merge reduces to the ordinary
   // draft-preserving merge (Router identity kept byte-for-byte).
   const untouched = mergeWorkBuddyHiddenRefs(local, server, [], "workbuddy,kimi-k2");
   assert.equal(untouched.Router, local.Router);
-  // All models hidden → no §16 fallback target: default cleared like scenarios.
+  // All models hidden → authoritative null fallback clears default.
   const emptied = mergeWorkBuddyHiddenRefs(local, server, ["workbuddy,glm-4.6"], null);
   assert.equal(emptied.Router.default, "");
   assert.equal((emptied.Router as { think: string }).think, "x,y");
+});
+test("checkpoint hide seam: path labels drive toast only; removedModelRefs + defaultFallback drive cleanup", () => {
+  // Actual response shape from backend checkpoint 844d203 for hiding m1.
+  const local = {
+    Providers: [other],
+    Router: {
+      default: "workbuddy,m1",
+      think: "workbuddy,m1",
+      background: "custom,keep",
+      unrelatedDraft: "provider,model",
+    },
+    topLevelDraft: true,
+  } as unknown as Config;
+  const server = config([{ ...managed, models: ["m2"] }]);
+  server.Router = { ...local.Router, default: "workbuddy,m2", think: "" } as Config["Router"];
+  const merged = mergeWorkBuddyHiddenRefs(
+    local,
+    server,
+    ["workbuddy,m1"],
+    "workbuddy,m2",
+  );
+  assert.equal(merged.Router.default, "workbuddy,m2");
+  assert.equal((merged.Router as { think: string }).think, "");
+  assert.equal((merged.Router as { background: string }).background, "custom,keep");
+  assert.equal((merged.Router as { unrelatedDraft: string }).unrelatedDraft, "provider,model");
+  assert.equal((merged as { topLevelDraft: boolean }).topLevelDraft, true);
+  assert.doesNotMatch(JSON.stringify(merged.Router), /workbuddy,m1/);
+});
+test("checkpoint labels default/scenario:think are never parsed as model references", () => {
+  const local = { Providers: [other], Router: { default: "workbuddy,m1", think: "workbuddy,m1", customDraft: 1 } } as unknown as Config;
+  const server = config([{ ...managed, models: ["m2"] }]);
+  server.Router = { ...local.Router, default: "workbuddy,m2", think: "" } as Config["Router"];
+  // removedModelRefs intentionally absent here; the component-derived single
+  // ref would be supplied. Passing only toast labels must be a no-op cleanup.
+  const merged = mergeWorkBuddyHiddenRefs(local, server, ["default", "scenario:think"], "workbuddy,m2");
+  assert.equal(merged.Router, local.Router);
+});
+test("older hide payload without removedModelRefs/defaultFallback adopts fetched server default", () => {
+  const local = { Providers: [other], Router: { default: "workbuddy,m1", think: "workbuddy,m1" } } as unknown as Config;
+  const server = config([{ ...managed, models: ["m2", "m3"] }]);
+  server.Router = { default: "workbuddy,m2", think: "" } as Config["Router"];
+  const merged = mergeWorkBuddyHiddenRefs(local, server, ["workbuddy,m1"], undefined);
+  assert.equal(merged.Router.default, "workbuddy,m2");
+  assert.equal((merged.Router as { think: string }).think, "");
 });
 test("P1 login/sync/disconnect/restore merges never adopt the server Router — only hide does", () => {
   const local = config([managed, other]);
@@ -240,13 +286,31 @@ test("§16 pool truth beats a stale site-level restriction alert (P2)", () => {
   assert.equal(workBuddyVisibleErrorKey("busy", site([account()], { lastError: "11140 restricted secret" }), now), "busy");
   assert.equal(workBuddyVisibleErrorKey(null, site([account()]), now), null);
 });
-test("clearedRefs toast input is filtered to plain references and capped", () => {
+test("hide path labels are sanitized structurally and never treated as model refs", () => {
   assert.deepEqual(
-    sanitizeClearedRefs(["workbuddy,glm-4.6", "  workbuddy-ai,kimi-k2 ", 42, "<script>", "a b", "x".repeat(121)]),
-    ["workbuddy,glm-4.6", "workbuddy-ai,kimi-k2"],
+    sanitizeWorkBuddyRouterPaths(["  default ", "scenario:think", "models:a", "custom:r1", "families.f.default", "scenario:foo", 42, "<script>", "workbuddy,m1", "default\n", "x".repeat(121)]),
+    ["default", "scenario:think", "models:a", "custom:r1", "families.f.default"],
   );
-  assert.deepEqual(sanitizeClearedRefs("nope"), []);
-  assert.equal(sanitizeClearedRefs(Array.from({ length: 12 }, (_, index) => `p,m${index}`)).length, 8);
+  assert.deepEqual(sanitizeWorkBuddyRouterPaths("nope"), []);
+  assert.deepEqual(sanitizeWorkBuddyModelRefs(["default", "scenario:think", "custom:r1", "workbuddy,m1", "  workbuddy-ai,m2 ", "x,m3"]), ["workbuddy,m1", "workbuddy-ai,m2"]);
+  assert.deepEqual(sanitizeWorkBuddyModelRefs("nope"), []);
+  assert.equal(sanitizeWorkBuddyRouterPaths(Array.from({ length: 12 }, (_, index) => `models:alias-${index}`)).length, 8);
+});
+test("sanitized Router path labels map to localized safe text", () => {
+  const labels = {
+    default: "Default route",
+    scenario: (name: string) => `scenario:${name}`,
+    modelAlias: (name: string) => `alias:${name}`,
+    familyDefault: (family: string) => `family:${family}`,
+    customRoute: (name: string) => `custom:${name}`,
+  };
+  assert.equal(labelWorkBuddyRouterPath("default", labels), "Default route");
+  assert.equal(labelWorkBuddyRouterPath("scenario:think", labels), "scenario:think");
+  assert.equal(labelWorkBuddyRouterPath("models:a", labels), "alias:a");
+  assert.equal(labelWorkBuddyRouterPath("custom:r-1", labels), "custom:r-1");
+  assert.equal(labelWorkBuddyRouterPath("families.f.default", labels), "family:f");
+  assert.equal(labelWorkBuddyRouterPath("workbuddy,m1", labels), null);
+  assert.equal(labelWorkBuddyRouterPath("<img>", labels), null);
 });
 test("cooldown clock renders a localized hh:mm and never throws on bad input", () => {
   assert.match(formatWorkBuddyClock(new Date("2026-01-01T08:05:00").getTime()), /\d{1,2}:\d{2}/);
@@ -331,15 +395,17 @@ test("§16 model chips hide with a pending lock; hidden models restore singly or
   assert.match(component, /=> onAction\("restore"\)\}/);
   assert.match(component, /workbuddy\.hidden_models/);
   assert.match(component, /workbuddy\.cleared_refs/);
-  assert.match(component, /sanitizeClearedRefs\(hidden\.clearedRefs\)/);
+  assert.match(component, /sanitizeWorkBuddyRouterPaths\(hidden\.clearedRefs\)/);
   assert.match(apiSource, /'\/workbuddy\/models\/hide'/);
   assert.match(apiSource, /'\/workbuddy\/models\/restore'/);
 });
-test("P1 hide reconciles the local Router with the backend cleanup; other actions never do", () => {
-  // Hide path: explicit reconciliation merge with the sanitized refs and the
-  // §16 first-visible-model fallback, computed from the pre-refresh models.
-  assert.match(component, /mergeWorkBuddyHiddenRefs\(local, server, refs, fallback\)/);
-  assert.match(component, /filter\(candidate => candidate !== model\)/);
+test("hide seam reconciles removedModelRefs/defaultFallback and keeps path labels toast-only", () => {
+  assert.match(component, /sanitizeWorkBuddyRouterPaths\(hidden\.clearedRefs\)/);
+  assert.match(component, /labelWorkBuddyRouterPath\(pathLabel,/);
+  assert.match(component, /workbuddy\.router_path\.default/);
+  assert.match(component, /sanitizeWorkBuddyModelRefs\(hidden\.removedModelRefs\)/);
+  assert.match(component, /mergeWorkBuddyHiddenRefs\(local, server, removedRefs, hidden\.defaultFallback\)/);
+  assert.doesNotMatch(component, /sanitizeClearedRefs/);
   // Alerts use the pool-truth helper instead of the raw lastError derivation.
   assert.match(component, /workBuddyVisibleErrorKey\(errorKey, status\)/);
 });
