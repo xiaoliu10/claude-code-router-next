@@ -707,6 +707,71 @@ export function classifyWorkBuddyError(status: number, body?: any): Error & { co
 }
 export function sanitizeWorkBuddyError(_error: unknown): string { return "WorkBuddy 操作失败；请检查本机登录状态后重新导入"; }
 
+// ---- §16 ruling 3: in-request account failover -----------------------------
+
+/**
+ * Next local 00:05 (the daily quota-slice reset), capped at 24h from `now`.
+ * Local time on purpose: the reset is defined in the user's timezone.
+ */
+export function nextWorkBuddyQuotaReset(now = Date.now()): number {
+  const d = new Date(now);
+  const target = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 5, 0, 0);
+  if (target.getTime() <= now) target.setDate(target.getDate() + 1);
+  return Math.min(target.getTime(), now + 24 * 60 * 60 * 1000);
+}
+
+/** Upstream codes that permit a silent account switch (contract §16). */
+const WORKBUDDY_ROTATE_CODES = new Set([14018, 6004, 11140]);
+
+/**
+ * Map a classified upstream error to the cooldown to record before rotating
+ * accounts (§16 ruling 3). Returns null for every terminal class — 10085
+ * protocol errors, workbuddy_reauth, network faults — which must propagate
+ * unchanged and must never trigger a switch.
+ *
+ * - 14018 insufficient_quota → account-scoped, until the next local 00:05
+ *   (daily slice reset), capped at 24h;
+ * - 6004 / HTTP 429 → model-scoped (additive per model), using the upstream
+ *   "将在 … 重置" reset time already parsed by classifyWorkBuddyError,
+ *   otherwise 15 minutes;
+ * - 11140 → account-scoped 7200s restriction.
+ */
+export function workBuddyFailoverCooldown(error: any, model?: string, now = Date.now()): WorkBuddyCooldown | null {
+  if (!error?.workbuddy || error.code === "workbuddy_reauth" || error.code === "workbuddy_protocol_error" || Number(error.upstreamCode) === 10085) return null;
+  let code = Number(error.upstreamCode);
+  if (!WORKBUDDY_ROTATE_CODES.has(code)) {
+    if (error.statusCode !== 429) return null;
+    code = 6004;
+  }
+  if (code === 14018) {
+    return { scope: "account", until: nextWorkBuddyQuotaReset(now), code };
+  }
+  if (code === 11140) {
+    return { scope: "account", until: now + 7200 * 1000, code };
+  }
+  // 6004 / HTTP 429: rate limit for THIS model. classifyWorkBuddyError already
+  // parsed the upstream reset time into cooldownSeconds (default 15min).
+  const seconds = Number(error.cooldownSeconds);
+  const until = now + (Number.isFinite(seconds) && seconds > 0 ? seconds : 900) * 1000;
+  return model && model.trim()
+    ? { scope: "model", model: model.trim(), until, code }
+    : { scope: "account", until, code };
+}
+
+/**
+ * Sanitized terminal error for "the site's pool has no usable account right now"
+ * (§16): every account is cooling from earlier failover rounds. Carries the
+ * rate_limit class so handleFallback immediately isolates the model and tries a
+ * fallback instead of hammering a cooled pool. No upstream detail is included.
+ */
+export function workBuddyPoolExhaustedError(cooldownMs: number): Error & { code: string; statusCode: number; nonRetryable: boolean; workbuddy: true; cooldownSeconds: number; isRateLimit: boolean } {
+  const seconds = Math.max(60, Math.ceil((Number.isFinite(cooldownMs) ? cooldownMs : 0) / 1000));
+  return Object.assign(new Error("WorkBuddy 账号池暂无可用账号（额度/限流冷却中），请稍后重试或在管理页切换账号"), {
+    code: "rate_limit", statusCode: 429, nonRetryable: true, workbuddy: true as const,
+    cooldownSeconds: seconds, isRateLimit: true,
+  });
+}
+
 // ---- token renewal by re-reading the desktop file (contract §14.3) ---------
 
 /**

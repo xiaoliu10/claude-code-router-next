@@ -22,7 +22,7 @@ import { UnifiedChatRequest } from "@/types/llm";
 import { Transformer, TransformerContext } from "@/types/transformer";
 import { peekBodyForSSE, readBodyForSSE } from "./response-body";
 import type { WorkBuddyAuthService } from "@/services/workbuddy-auth";
-import { workBuddyChatUrl, workBuddySite, credentialHeaders } from "@/services/workbuddy";
+import { workBuddyChatUrl, workBuddySite, credentialHeaders, workBuddySiteFromProvider, type WorkBuddyCredential } from "@/services/workbuddy";
 import { classifyWorkBuddyError, conversationHeaders, getWorkBuddyAuthService } from "@/services/workbuddy";
 
 const NAME_OK = /^[A-Za-z0-9_-]+$/;
@@ -69,10 +69,16 @@ export class WorkBuddyTransformer implements Transformer {
    * WorkBuddy headers and the real access token. routes.ts merges
    * `{ Authorization: Bearer provider.apiKey, ...config.headers }`, so the
    * Authorization written here overrides the marker api_key.
+   *
+   * §16 failover: `context.config.workbuddyCredential` is selected by transport for
+   * THIS attempt (possibly a rotated account). When present it wins over the
+   * sticky `currentCredential()` so a rotated attempt never re-sends a stale
+   * token; callers that do not pass it keep the legacy behavior.
    */
-  async auth(request: any, provider: any): Promise<any> {
+  async auth(request: any, provider: any, context?: TransformerContext): Promise<any> {
     const service = this.resolveAuthService();
-    const credential = await service.currentCredential();
+    const supplied: WorkBuddyCredential | undefined = context?.config?.workbuddyCredential;
+    const credential = supplied ?? await service.currentCredential(workBuddySiteFromProvider(provider), request?.model);
     const url = new URL(workBuddyChatUrl(workBuddySite(credential?.kind ?? "workbuddy")));
     if (url.protocol !== "https:") throw new Error("WorkBuddy 上游地址不合法");
     if (!credential) throw new Error("WorkBuddy 未导入登录态，请先在管理页导入");
@@ -180,8 +186,11 @@ export class WorkBuddyTransformer implements Transformer {
     // auth() never runs for this provider. routes.ts merges the returned
     // config.headers after the default Authorization, so the real token wins
     // and the marker api_key never reaches the upstream.
-    const credential = await this.resolveAuthService().currentCredential();
-    if (!credential) throw new Error("WorkBuddy 未导入登录态，请先在管理页导入");
+    const service = this.resolveAuthService();
+    const site = workBuddySiteFromProvider(provider);
+    const credential = await service.currentCredential(site, body.model);
+    // The transport owns the pool-cooling error and account attempt budget.
+    if (!credential) return { body, config: {} };
     const headers = { ...credentialHeaders(credential), ...conversationHeaders(body) };
     return { body, config: { headers, url: workBuddyChatUrl(workBuddySite(credential.kind)), workbuddyCredential: credential } };
   }

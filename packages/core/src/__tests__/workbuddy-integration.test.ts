@@ -159,14 +159,14 @@ describe("WorkBuddy data plane (isolated mocks)", () => {
 
   it("international credentials use the international chat origin even with a hostile config", async () => {
     const { server, store, dir } = await buildProviderServer([{
-      name: "workbuddy", ccr_managed: true, api_base_url: "https://evil.example/chat",
-      api_key: "ccr-managed-workbuddy", models: ["gpt-5.5"], transformer: { use: ["workbuddy"] },
+      name: "workbuddy-ai", ccr_managed: true, api_base_url: "https://evil.example/chat",
+      api_key: "ccr-managed-workbuddy-ai", models: ["gpt-5.5"], transformer: { use: ["workbuddy"] },
     }]);
     await store.save({ ...CRED, kind: "workbuddy-ai", domain: "www.codebuddy.ai" });
     const fetchMock = vi.fn(async () => jsonResponse({ choices: [{ message: { role: "assistant", content: "ai" } }] }));
     vi.stubGlobal("fetch", fetchMock);
     const res = await server.app.inject({ method: "POST", url: "/v1/chat/completions", payload: {
-      model: "workbuddy,gpt-5.5", stream: false, messages: [{ role: "user", content: "hi" }],
+      model: "workbuddy-ai,gpt-5.5", stream: false, messages: [{ role: "user", content: "hi" }],
     } });
     expect(res.statusCode).toBe(200);
     const [url, init] = fetchMock.mock.calls[0] as any;
@@ -227,7 +227,7 @@ describe("WorkBuddy data plane (isolated mocks)", () => {
     const fetchMock = vi.fn(async () => {
       calls += 1;
       if (calls === 1) {
-        return new Response(JSON.stringify({ code: 6004, msg: "频率限制" }), { status: 429, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ msg: "temporarily unavailable" }), { status: 503, headers: { "Content-Type": "application/json" } });
       }
       return jsonResponse({ choices: [{ message: { role: "assistant", content: "ok" } }] });
     });

@@ -1427,6 +1427,41 @@ export class WorkBuddyAuthService {
     await this.enqueueMutation(() => this.store.setAccountCooldown(site, uid, cooldown));
   }
 
+  /** Site-wide denylist applies even to explicit provider,model sends. */
+  async isModelHidden(site: WorkBuddySiteId, model: string): Promise<boolean> {
+    try {
+      const data = await this.store.loadData();
+      return data?.sites[site]?.hiddenModels.includes(model) ?? false;
+    } catch {
+      throw Object.assign(new Error("WorkBuddy 登录态不可读，请重新导入"), {
+        code: "workbuddy_not_connected", statusCode: 409, workbuddy: true, nonRetryable: true,
+      });
+    }
+  }
+
+  /** Pool size bounds in-request upstream attempts (§16 ruling 3). */
+  async poolAccountCount(site: WorkBuddySiteId): Promise<number> {
+    const data = await this.store.loadData().catch((): WorkBuddyCredentialData | null => null);
+    return data?.sites[site]?.accounts.length ?? 0;
+  }
+
+  /**
+   * Milliseconds until some pool account becomes usable for `model` again
+   * (0 when one is usable right now or the site is not connected). Used only
+   * for the sanitized client-facing hint when every account is cooling.
+   */
+  async poolCooldownRemainingMs(site: WorkBuddySiteId, model?: string): Promise<number> {
+    const data = await this.store.loadData().catch((): WorkBuddyCredentialData | null => null);
+    const accounts = data?.sites[site]?.accounts ?? [];
+    if (!accounts.length) return 0;
+    const now = Date.now();
+    if (accounts.some((a) => this.usableFor(a, model, now))) return 0;
+    const remaining = accounts
+      .map((a) => this.remainingCooldownMs(a, model, now))
+      .filter((ms) => ms > 0);
+    return remaining.length ? Math.min(...remaining) : 0;
+  }
+
   /**
    * Explicit sticky switch (§16 account/switch). Does NOT touch Router, the
    * provider entry, or any epoch — only the store's activeUid.

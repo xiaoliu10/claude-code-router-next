@@ -313,6 +313,7 @@ describe("WorkBuddy sync with hidden models (cumulative union)", () => {
     const sync = await h.service.syncModels("workbuddy");
     expect(sync.success).toBe(true);
     expect(sync.models).toEqual(["kimi-k3-1"]);           // hidden glm-5.3 filtered
+    expect(h.config().Providers[0].models).toEqual(["kimi-k3-1"]); // persisted registration also filtered
     expect(h.config().Router).toEqual(afterHide);          // sync doesn't rewrite Router
     // Cumulative union: a model that disappears upstream stays registered.
     (h.service as any).options.fetch = multiSiteFetch({ cn: ["kimi-k3-1"], ai: [] });
