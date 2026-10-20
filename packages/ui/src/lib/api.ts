@@ -1,4 +1,4 @@
-import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyLoginStartResponse, WorkBuddyLoginPollResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageResponse } from '@/types';
+import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyAccountRemoveRequest, WorkBuddyAccountSwitchRequest, WorkBuddyLoginStartResponse, WorkBuddyLoginPollResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyModelHideRequest, WorkBuddyModelHideResponse, WorkBuddyModelRestoreRequest, WorkBuddyModelRestoreResponse, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageRequest, WorkBuddyUsageResponse } from '@/types';
 
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
@@ -465,22 +465,54 @@ class ApiClient {
     return this.post('/workbuddy/login/cancel', { site, loginId }, 30_000);
   }
 
-  syncWorkBuddyModels(): Promise<WorkBuddyMutationResponse> {
-    return this.post<WorkBuddyMutationResponse>('/workbuddy/sync', {}, 60_000);
+  // §16 per-site pool management. Every body carries the site; CN and the
+  // international site are fully independent pools and never conflict.
+  syncWorkBuddyModels(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/sync', { site }, 60_000);
   }
 
-  disconnectWorkBuddy(): Promise<WorkBuddyMutationResponse> {
-    return this.post<WorkBuddyMutationResponse>('/workbuddy/disconnect', {}, 30_000);
+  // Disconnects the WHOLE site (its provider + account pool). Router
+  // references are preserved server-side (§14 semantics).
+  disconnectWorkBuddy(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/disconnect', { site }, 30_000);
   }
 
-  // Explicit user action only: read subscription credits once. Never polled
+  switchWorkBuddyAccount(site: WorkBuddyKind, uid: string): Promise<WorkBuddyMutationResponse> {
+    const body: WorkBuddyAccountSwitchRequest = { site, uid };
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/account/switch', body, 30_000);
+  }
+
+  // Removing the last account disconnects the site server-side (§16).
+  removeWorkBuddyAccount(site: WorkBuddyKind, uid: string): Promise<WorkBuddyMutationResponse> {
+    const body: WorkBuddyAccountRemoveRequest = { site, uid };
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/account/remove', body, 30_000);
+  }
+
+  // Explicit user action only: read subscription credits once for the site
+  // (uid defaults to the active account server-side). Never polled
   // automatically. Failures are non-critical and quietly hide the display in
   // the component — no raw quota errors are surfaced.
-  getWorkBuddyUsage(): Promise<WorkBuddyUsageResponse> {
-    return this.get<WorkBuddyUsageResponse>(
+  getWorkBuddyUsage(site: WorkBuddyKind, uid?: string): Promise<WorkBuddyUsageResponse> {
+    const body: WorkBuddyUsageRequest = uid ? { site, uid } : { site };
+    return this.post<WorkBuddyUsageResponse>(
       '/workbuddy/usage',
+      body,
       ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
     );
+  }
+
+  // §16: hiding a model removes it from the managed provider, keeps it hidden
+  // across sync/re-login, and lets the server clear Router references that
+  // point at it. The cleared references come back for a UI toast.
+  hideWorkBuddyModel(site: WorkBuddyKind, model: string): Promise<WorkBuddyModelHideResponse> {
+    const body: WorkBuddyModelHideRequest = { site, model };
+    return this.post<WorkBuddyModelHideResponse>('/workbuddy/models/hide', body, 30_000);
+  }
+
+  // Restoring never rewrites Router references (§16); model omitted = all.
+  restoreWorkBuddyModel(site: WorkBuddyKind, model?: string): Promise<WorkBuddyModelRestoreResponse> {
+    const body: WorkBuddyModelRestoreRequest = model ? { site, model } : { site };
+    return this.post<WorkBuddyModelRestoreResponse>('/workbuddy/models/restore', body, 30_000);
   }
 
   async probeProvider(providerName: string): Promise<ManualProbeResponse> {

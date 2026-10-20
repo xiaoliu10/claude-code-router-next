@@ -264,30 +264,62 @@ export type WorkBuddyStatus =
   | "source_changed"
   | "error";
 
-// Which fixed-origin WorkBuddy site a saved login belongs to. The provider name
-// stays "workbuddy" for both; only one site is active at a time and switching
-// is an explicit disconnect + login.
+// Which fixed-origin WorkBuddy site a saved login belongs to. Since the §16
+// multi-account pool each site is independently connected and owns its own
+// managed provider: "workbuddy" (CN) and "workbuddy-ai" (international).
 export type WorkBuddyKind = "workbuddy" | "workbuddy-ai";
 
 export type WorkBuddyRenewalMode = "desktop" | "browser";
 
-export interface WorkBuddyStatusResponse {
-  status: WorkBuddyStatus;
-  kind: WorkBuddyKind;
-  // Fixed origin of the active site, e.g. the CN origin. Display only; the UI
-  // never sends tokens anywhere itself.
-  site: string;
-  providerName: string;
-  models: string[];
-  modelCount: number;
-  uid: string | null;
+// One account of a site's pool (§16). Only summary fields cross the API:
+// no token material of any kind.
+export interface WorkBuddyAccountSummary {
+  uid: string;
   displayName: string | null;
-  domain: string | null;
-  expiresAt: number | null;
-  importedAt: string | null;
+  source: "desktop" | "browser";
+  active: boolean;
+  coolingUntil?: number | null;
+  restrictedUntil?: number | null;
+  expiresAt?: number | null;
+}
+
+// Per-site status entry of GET /api/workbuddy/status → sites[site] (§16).
+export interface WorkBuddySiteStatus {
+  status: WorkBuddyStatus;
+  providerName: string;
+  accounts: WorkBuddyAccountSummary[];
+  activeUid: string | null;
+  models: string[];
+  hiddenModels: string[];
+  modelCount: number;
   lastSyncAt: string | null;
   lastError: string | null;
-  // Registered models that cannot accept image input (e.g. GLM series).
+  // Display-only extras. Optional so the UI also renders against a server
+  // that returns exactly the §16 fields.
+  site?: string;
+  source?: "desktop" | "browser";
+  renewalMode?: WorkBuddyRenewalMode;
+  imagesUnsupportedModels?: string[];
+}
+
+export interface WorkBuddyStatusResponse {
+  // §16 source of truth: one independent entry per site.
+  sites: Partial<Record<WorkBuddyKind, WorkBuddySiteStatus>>;
+  // Legacy flat mirror of the only connected site. Kept one version for
+  // backwards compatibility; the UI reads it only when `sites` is absent.
+  status?: WorkBuddyStatus;
+  kind?: WorkBuddyKind;
+  providerName?: string;
+  site?: string;
+  models?: string[];
+  modelCount?: number;
+  uid?: string | null;
+  displayName?: string | null;
+  domain?: string | null;
+  expiresAt?: number | null;
+  importedAt?: string | null;
+  lastSyncAt?: string | null;
+  lastError?: string | null;
   imagesUnsupportedModels?: string[];
   renewalMode?: WorkBuddyRenewalMode;
   source?: "desktop" | "browser";
@@ -302,6 +334,25 @@ export interface WorkBuddyUsage {
 
 export interface WorkBuddyUsageResponse {
   usage: WorkBuddyUsage | null;
+}
+
+// §16: usage is an explicit POST {site, uid?}; uid defaults to the site's
+// active account server-side. Still invoked only on click, never polled.
+export interface WorkBuddyUsageRequest {
+  site: WorkBuddyKind;
+  uid?: string;
+}
+
+// §16: hiding a model also clears Router references that point at it; the
+// server returns them so the UI can list them in a toast.
+export interface WorkBuddyModelHideResponse {
+  ok: boolean;
+  clearedRefs?: string[];
+}
+
+// Restoring never rewrites Router references (§16).
+export interface WorkBuddyModelRestoreResponse {
+  ok: boolean;
 }
 
 export type WorkBuddyFailureReason =
@@ -330,6 +381,26 @@ export type WorkBuddyLoginPollResponse =
 
 export interface WorkBuddyImportRequest {
   site: WorkBuddyKind;
+}
+
+export interface WorkBuddyAccountSwitchRequest {
+  site: WorkBuddyKind;
+  uid: string;
+}
+
+export interface WorkBuddyAccountRemoveRequest {
+  site: WorkBuddyKind;
+  uid: string;
+}
+
+export interface WorkBuddyModelHideRequest {
+  site: WorkBuddyKind;
+  model: string;
+}
+
+export interface WorkBuddyModelRestoreRequest {
+  site: WorkBuddyKind;
+  model?: string;
 }
 
 export interface WorkBuddyMutationResponse {

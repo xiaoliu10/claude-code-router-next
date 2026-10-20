@@ -7,7 +7,8 @@ import { Button } from "@/components/ui/button";
 import { useConfig } from "./ConfigProvider";
 import { ProviderList } from "./ProviderList";
 import { useNavigate } from "react-router-dom";
-import { isManagedWorkBuddy } from "@/utils/workbuddy";
+import { isManagedWorkBuddy, workBuddyKindOf } from "@/utils/workbuddy";
+import type { WorkBuddyKind } from "@/types";
 import {
   Dialog,
   DialogContent,
@@ -130,8 +131,9 @@ export function Providers() {
   const { config, refreshConfig } = useConfig();
   const [isSaving, setIsSaving] = useState(false);
   const navigate = useNavigate();
-  const showWorkBuddyManagement = () => {
-    navigate('/settings?tab=providers', { state: { workBuddyManagedNotice: true } });
+  const showWorkBuddyManagement = (site: WorkBuddyKind | null) => {
+    // §16: each site has its own card; land the user on the right one.
+    navigate('/settings?tab=providers', { state: { workBuddyManagedNotice: true, workBuddySite: site ?? undefined } });
   };
   const [editingProviderIndex, setEditingProviderIndex] = useState<number | null>(null);
   const [deletingProviderIndex, setDeletingProviderIndex] = useState<number | null>(null);
@@ -353,7 +355,7 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[index]);
     const provider = config.Providers[actualIndex];
-    if (isManagedWorkBuddy(provider)) { showWorkBuddyManagement(); return; }
+    if (isManagedWorkBuddy(provider)) { showWorkBuddyManagement(workBuddyKindOf(provider)); return; }
     if (isSaving) return;
     setEditingProviderIndex(actualIndex);
     setEditingProviderData(JSON.parse(JSON.stringify(provider))); // 深拷贝
@@ -373,7 +375,7 @@ export function Providers() {
     // identity, key, URL, model set or transformer, even if config refreshed.
     if (isManagedWorkBuddy(editingProviderData) ||
         (editingProviderIndex !== null && isManagedWorkBuddy(config.Providers[editingProviderIndex]))) {
-      showWorkBuddyManagement();
+      showWorkBuddyManagement(workBuddyKindOf(editingProviderData) ?? workBuddyKindOf(editingProviderIndex !== null ? config.Providers[editingProviderIndex] : null));
       return;
     }
     
@@ -481,7 +483,7 @@ export function Providers() {
 
   // Handle deletion by setting the correct index in the state
   const handleSetDeletingProviderIndex = (filteredIndex: number) => {
-    if (isManagedWorkBuddy(filteredProviders[filteredIndex])) { showWorkBuddyManagement(); return; }
+    if (isManagedWorkBuddy(filteredProviders[filteredIndex])) { showWorkBuddyManagement(workBuddyKindOf(filteredProviders[filteredIndex])); return; }
     if (isSaving) return;
     setDeletingProviderIndex(filteredIndex);
   };
@@ -491,7 +493,7 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     const deletedProvider = config.Providers[actualIndex];
-    if (isManagedWorkBuddy(deletedProvider)) { setDeletingProviderIndex(null); showWorkBuddyManagement(); return; }
+    if (isManagedWorkBuddy(deletedProvider)) { setDeletingProviderIndex(null); showWorkBuddyManagement(workBuddyKindOf(deletedProvider)); return; }
     if (isSaving) return;
     const deletedModels = deletedProvider?.models || [];
     const deletedProviderName = deletedProvider?.name;

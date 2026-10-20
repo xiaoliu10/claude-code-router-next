@@ -1,16 +1,26 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { isManagedWorkBuddy, isWorkBuddyKind, mergeWorkBuddyProvider, parseWorkBuddyUsage, workBuddyErrorKey, workBuddyImagesUnsupportedModels, workBuddyStateKey, maskWorkBuddyUid, hasDiscoveredModels } from "../src/utils/workbuddy.ts";
-import type { Config, Provider, WorkBuddyStatusResponse } from "../src/types.ts";
+import {
+  formatWorkBuddyClock, hasDiscoveredModels, isManagedWorkBuddy, isWorkBuddyConnected, isWorkBuddyKind,
+  maskWorkBuddyUid, mergeWorkBuddyProvider, parseWorkBuddyUsage, sanitizeClearedRefs, workBuddyAccountCooling,
+  workBuddyAccountRestricted, workBuddyErrorKey, workBuddyImagesUnsupportedModels, workBuddyKindOf,
+  workBuddySiteStatus, workBuddyStateKey,
+} from "../src/utils/workbuddy.ts";
+import type { Config, Provider, WorkBuddyAccountSummary, WorkBuddyMutationResponse, WorkBuddySiteStatus, WorkBuddyStatusResponse } from "../src/types.ts";
 
 const managed: Provider = { name: "workbuddy", api_base_url: "https://copilot.tencent.com/v2/chat/completions", api_key: "ccr-managed-workbuddy", models: ["new-model"], ccr_managed: true, enabled: false };
+const managedAi: Provider = { name: "workbuddy-ai", api_base_url: "https://copilot.tencent.com/v2/chat/completions", api_key: "ccr-managed-workbuddy-ai", models: ["kimi-k2"], ccr_managed: true, enabled: false };
 const other: Provider = { name: "custom", api_base_url: "https://example.invalid", api_key: "mock", models: ["draft"] };
 const config = (providers: Provider[]) => ({ Providers: providers, Router: { default: "local,draft", custom: { preserve: true } }, customDraft: "not saved" }) as unknown as Config;
 
-test("managed detection requires exact name plus strict true", () => {
+test("managed detection requires exact managed name plus strict true (both sites)", () => {
   assert.equal(isManagedWorkBuddy(managed), true);
-  for (const value of [null, {}, { name: "workbuddy" }, { name: "workbuddy", ccr_managed: "true" }, { name: "other", ccr_managed: true }]) assert.equal(isManagedWorkBuddy(value), false);
+  assert.equal(isManagedWorkBuddy(managedAi), true);
+  for (const value of [null, {}, { name: "workbuddy" }, { name: "workbuddy", ccr_managed: "true" }, { name: "other", ccr_managed: true }, { name: "workbuddy-ai", ccr_managed: false }]) assert.equal(isManagedWorkBuddy(value), false);
+  assert.equal(workBuddyKindOf(managed), "workbuddy");
+  assert.equal(workBuddyKindOf(managedAi), "workbuddy-ai");
+  assert.equal(workBuddyKindOf({ name: "workbuddy" }), null);
 });
 test("import merges managed provider only, preserving local drafts and Router identity", () => {
   const local = config([other]); const server = config([managed]); server.Router.default = "server,old";
@@ -33,11 +43,31 @@ test("ordinary same-name provider is never overwritten or removed", () => {
   assert.deepEqual(mergeWorkBuddyProvider(config([ordinary]), config([managed])).Providers, [ordinary]);
   assert.deepEqual(mergeWorkBuddyProvider(config([ordinary]), config([])).Providers, [ordinary]);
 });
+test("§16 both sites merge independently; one site's disconnect never touches the other", () => {
+  const both = mergeWorkBuddyProvider(config([other]), config([managed, managedAi]));
+  assert.deepEqual(both.Providers, [other, managed, managedAi]);
+  // AI disconnects: the CN provider stays byte-identical and no duplicate rows appear.
+  const afterAiDisconnect = mergeWorkBuddyProvider(both, config([managed]));
+  assert.deepEqual(afterAiDisconnect.Providers, [other, managed]);
+  // AI re-login appends its own provider again without duplicating either site.
+  const reconnected = mergeWorkBuddyProvider(afterAiDisconnect, config([managed, { ...managedAi, models: ["kimi-next"] }]));
+  assert.deepEqual(reconnected.Providers, [other, managed, { ...managedAi, models: ["kimi-next"] }]);
+  assert.equal(reconnected.Providers.filter(provider => provider.name === "workbuddy").length, 1);
+  assert.equal(reconnected.Providers.filter(provider => provider.name === "workbuddy-ai").length, 1);
+});
 test("empty or failed discovery is never success", () => {
   for (const result of [{ success: false }, { success: true, status: "connected", models: [] }, { success: true, models: ["a"] }, { success: true, status: "error", models: ["a"] }, { success: true, status: "connected", models: [""] }]) {
     assert.equal(hasDiscoveredModels(result as Parameters<typeof hasDiscoveredModels>[0]), false);
   }
   assert.equal(hasDiscoveredModels({ success: true, status: "connected", models: ["a"] }), true);
+});
+test("§16 connected verdict tolerates a fully hidden (empty) model set, never failures", () => {
+  assert.equal(isWorkBuddyConnected({ success: true, status: "connected", models: [] }), true);
+  assert.equal(isWorkBuddyConnected({ success: true, status: "connected" }), true);
+  assert.equal(isWorkBuddyConnected({ success: true, status: "connected", models: ["m"] }), true);
+  for (const bad of [{ success: false, status: "connected", models: [] }, { success: true, status: "error", models: [] }, { success: true, status: "connected", models: [""] }, { success: true }]) {
+    assert.equal(isWorkBuddyConnected(bad as WorkBuddyMutationResponse), false);
+  }
 });
 test("errors only select allowlisted localised labels, never raw messages", () => {
   assert.equal(workBuddyErrorKey({ reason: "sealed", message: "secret" }), "sealed");
@@ -45,7 +75,7 @@ test("errors only select allowlisted localised labels, never raw messages", () =
   assert.equal(workBuddyErrorKey(new Error("Bearer secret")), "request_failed");
   assert.equal(workBuddyErrorKey({ lastError: "11140 restricted secret" }), "restricted");
   assert.equal(workBuddyErrorKey({ lastError: "unapproved channel" }), "channel_rejected");
-  assert.equal(workBuddyStateKey({ status: "error", lastError: "11140" } as WorkBuddyStatusResponse), "restricted");
+  assert.equal(workBuddyStateKey({ status: "error", lastError: "11140" } as WorkBuddySiteStatus), "restricted");
 });
 test("UID masked including short identifiers", () => {
   assert.equal(maskWorkBuddyUid("123456789"), "123…89"); assert.equal(maskWorkBuddyUid("123"), "•••"); assert.equal(maskWorkBuddyUid(null), "—");
@@ -74,6 +104,67 @@ test("image-unsupported warning lists only registered models (GLM line)", () => 
   assert.deepEqual(workBuddyImagesUnsupportedModels(["glm-4.6"], "glm-4.6"), []);
   assert.deepEqual(workBuddyImagesUnsupportedModels([], ["glm-4.6"]), []);
 });
+test("§16 status: the sites map is the source of truth, extracted per site", () => {
+  const account: WorkBuddyAccountSummary = { uid: "u1", displayName: "A", source: "browser", active: true };
+  const backup: WorkBuddyAccountSummary = { uid: "u2", displayName: null, source: "desktop", active: false, coolingUntil: Date.now() + 60_000 };
+  const cn: WorkBuddySiteStatus = { status: "connected", providerName: "workbuddy", accounts: [account, backup], activeUid: "u1", models: ["m1"], hiddenModels: ["m2"], modelCount: 1, lastSyncAt: null, lastError: null };
+  const response: WorkBuddyStatusResponse = {
+    sites: {
+      workbuddy: cn,
+      "workbuddy-ai": { status: "not_connected", providerName: "workbuddy-ai", accounts: [], activeUid: null, models: [], hiddenModels: [], modelCount: 0, lastSyncAt: null, lastError: null },
+    },
+  };
+  assert.equal(workBuddySiteStatus(response, "workbuddy")?.status, "connected");
+  assert.equal(workBuddySiteStatus(response, "workbuddy")?.accounts.length, 2);
+  assert.equal(workBuddySiteStatus(response, "workbuddy-ai")?.status, "not_connected");
+  // Malformed account rows are dropped, never rendered.
+  const dirty = { sites: { workbuddy: { ...cn, accounts: [account, { uid: 5 }, null] } } } as unknown as WorkBuddyStatusResponse;
+  assert.equal(workBuddySiteStatus(dirty, "workbuddy")?.accounts.length, 1);
+  // A missing site entry is null, never the other site's state.
+  assert.equal(workBuddySiteStatus({ sites: {} }, "workbuddy-ai"), null);
+  assert.equal(workBuddySiteStatus({ sites: { "workbuddy-ai": cn } }, "workbuddy"), null);
+  assert.equal(workBuddySiteStatus(null, "workbuddy"), null);
+});
+test("§16 legacy flat status is only a one-version fallback for its own site", () => {
+  const legacy = { status: "connected", kind: "workbuddy", providerName: "workbuddy", models: ["m1"], modelCount: 1, uid: "u9", displayName: "D", source: "browser", lastSyncAt: null, lastError: null } as unknown as WorkBuddyStatusResponse;
+  const cn = workBuddySiteStatus(legacy, "workbuddy");
+  assert.equal(cn?.status, "connected");
+  assert.equal(cn?.activeUid, "u9");
+  assert.equal(cn?.accounts[0]?.active, true);
+  assert.deepEqual(cn?.hiddenModels, []);
+  // The other site never inherits the legacy mirror.
+  assert.equal(workBuddySiteStatus(legacy, "workbuddy-ai"), null);
+});
+test("per-site badge: cooling/restricted only when the whole pool is unavailable", () => {
+  const now = 1_000_000_000;
+  const account = (over: Partial<WorkBuddyAccountSummary> = {}): WorkBuddyAccountSummary =>
+    ({ uid: "u", displayName: null, source: "browser", active: true, ...over });
+  const site = (accounts: WorkBuddyAccountSummary[], over: Partial<WorkBuddySiteStatus> = {}): WorkBuddySiteStatus =>
+    ({ status: "connected", providerName: "workbuddy", accounts, activeUid: "u", models: [], hiddenModels: [], modelCount: 0, lastSyncAt: null, lastError: null, ...over });
+  assert.equal(workBuddyStateKey(site([account()]), now), "connected");
+  assert.equal(workBuddyStateKey(site([account({ coolingUntil: now + 1 }), account({ coolingUntil: now + 2 })]), now), "cooling");
+  assert.equal(workBuddyStateKey(site([account({ restrictedUntil: now + 1 })]), now), "restricted");
+  // One usable account keeps the card "connected"; per-row labels show cooling.
+  assert.equal(workBuddyStateKey(site([account(), account({ coolingUntil: now + 1 })]), now), "connected");
+  // Expired cooldowns no longer count as unavailable.
+  assert.equal(workBuddyStateKey(site([account({ coolingUntil: now - 1 })]), now), "connected");
+  assert.equal(workBuddyAccountCooling(account({ coolingUntil: now + 5 }), now), now + 5);
+  assert.equal(workBuddyAccountCooling(account({ coolingUntil: now - 5 }), now), null);
+  assert.equal(workBuddyAccountRestricted(account({ restrictedUntil: now + 5 }), now), now + 5);
+  assert.equal(workBuddyAccountRestricted(account()), null);
+});
+test("clearedRefs toast input is filtered to plain references and capped", () => {
+  assert.deepEqual(
+    sanitizeClearedRefs(["workbuddy,glm-4.6", "  workbuddy-ai,kimi-k2 ", 42, "<script>", "a b", "x".repeat(121)]),
+    ["workbuddy,glm-4.6", "workbuddy-ai,kimi-k2"],
+  );
+  assert.deepEqual(sanitizeClearedRefs("nope"), []);
+  assert.equal(sanitizeClearedRefs(Array.from({ length: 12 }, (_, index) => `p,m${index}`)).length, 8);
+});
+test("cooldown clock renders a localized hh:mm and never throws on bad input", () => {
+  assert.match(formatWorkBuddyClock(new Date("2026-01-01T08:05:00").getTime()), /\d{1,2}:\d{2}/);
+  assert.equal(formatWorkBuddyClock(Number.NaN), "");
+});
 
 // Structural regression checks supplement helper tests; they are not rendered
 // interaction tests. See WORKBUDDY-TESTING.md for isolated browser smoke steps.
@@ -82,51 +173,103 @@ const providers = readFileSync(new URL("../src/components/Providers.tsx", import
 const apiSource = readFileSync(new URL("../src/lib/api.ts", import.meta.url), "utf8");
 test("WorkBuddy has no token/password/path input, no client takeover action", () => {
   assert.doesNotMatch(component, /<Input|type=["']password|localStorage|enableClient|restartService/);
-  assert.match(component, /setConfirm\("disconnect"\)/);
+  assert.match(component, /kind: "disconnect", site \}/);
   assert.match(component, /refreshConfig\(mergeWorkBuddyProvider\)/);
   assert.match(component, /locked\.current/); assert.match(component, /generation\.current === id/);
   assert.doesNotMatch(component, /console\.|result\.message|status\.lastError\}/);
 });
-test("browser login carries an explicit site selector; credentials never reach UI", () => {
-  assert.match(component, /role="radiogroup"/); assert.match(component, /createWorkBuddyLogin\(api, site/);
-  assert.match(component, /WORKBUDDY_SITES: WorkBuddyKind\[\] = \["workbuddy", "workbuddy-ai"\]/);
+test("§16 one independent card per site with per-site state, never shared", () => {
+  assert.match(component, /const WORKBUDDY_SITES: WorkBuddyKind\[\] = \["workbuddy", "workbuddy-ai"\];/);
+  assert.match(component, /WORKBUDDY_SITES\.map\(site =>/);
+  assert.match(component, /id=\{`workbuddy-management-\$\{site\}`\}/);
+  // State lookups are keyed by site: CN actions can never render or clear AI state.
+  assert.match(component, /siteStatuses\[site\]/);
+  assert.match(component, /errors\[site\] \?\? null/);
+  assert.match(component, /usage\[site\]/);
+  assert.match(component, /login\.site === site/);
+  assert.match(component, /void run\(kind, site, argument\)/);
+  // Primary button flips per site state: authorize when offline, add account when connected.
+  assert.match(component, /t\("workbuddy\.add_account"\)/);
+  assert.match(component, /t\("workbuddy\.browser_login"\)/);
+});
+test("each site card starts the sequential login helper; credentials never reach UI", () => {
+  assert.match(component, /createWorkBuddyLogin\(api, site,/);
+  assert.match(component, /target="_blank" rel="noopener noreferrer"/);
+  assert.doesNotMatch(component, /window\.open/);
+  assert.match(component, /loginSession\.current\?\.cancel\(\)/);
   // Browser-owned refresh is backend-only; no credential handling in UI.
   assert.doesNotMatch(component, /refreshToken|refresh_token|canRefresh/i);
   assert.doesNotMatch(apiSource, /refreshToken|refresh_token|canRefresh|\/refresh/);
 });
-test("credits are an explicit on-demand read that quietly hides failures", () => {
-  assert.match(component, /getWorkBuddyUsage\(\)/);
+test("credits are an explicit per-account read that quietly hides failures", () => {
+  assert.match(component, /getWorkBuddyUsage\(site, uid\)/);
   assert.match(component, /parseWorkBuddyUsage\(payload\)/);
   // No polling interval: usage read is bound to the explicit action only.
   assert.doesNotMatch(component, /setInterval|useInterval/);
   // Failure path sets null (hide), never renders a raw error from the quota response.
-  assert.match(component, /catch \{[\s\S]*?setUsage\(null\)/);
+  assert.match(component, /catch \{[\s\S]*?\[uid\]: null/);
   // Stale generation guard also covers the usage read.
   assert.match(component, /readUsage[\s\S]*generation\.current === id/);
+  // §16: usage moved to an explicit per-site POST body.
+  assert.match(apiSource, /post<WorkBuddyUsageResponse>\(\s*'\/workbuddy\/usage'/);
 });
 test("status-derived warnings render from contract fields only", () => {
   assert.match(component, /imagesUnsupportedModels/);
   assert.match(component, /workBuddyImagesUnsupportedModels\(models/);
   assert.match(component, /renewalMode === "desktop"/);
   assert.match(component, /renewalMode === "browser"/);
-  assert.match(component, /status.source === "browser"/);
-  assert.match(component, /status\.site/);
+  assert.match(component, /status\.source === "browser"/);
+  assert.match(component, /status\?\.site/);
 });
-test("generic edit and both delete stages guard managed provider", () => {
+test("§16 account rows: per-account read/switch/remove with masked uid and cooldown labels", () => {
+  assert.match(component, /maskWorkBuddyUid\(account\.uid\)/);
+  assert.match(component, /onAction\("usage", account\.uid\)/);
+  assert.match(component, /onAction\("switch", account\.uid\)/);
+  assert.match(component, /onConfirm\(\{ kind: "remove", site, uid: account\.uid \}\)/);
+  assert.match(component, /workBuddyAccountCooling\(account\)/);
+  assert.match(component, /workBuddyAccountRestricted\(account\)/);
+  assert.match(component, /workbuddy\.cooling_until/);
+  assert.match(component, /workbuddy\.restricted_until/);
+  assert.match(component, /source_badge\.\$\{account\.source\}/);
+  assert.match(component, /workbuddy\.account_remove_warning/);
+  // §16 request shapes live in the api client, per site.
+  assert.match(apiSource, /'\/workbuddy\/account\/switch', body/);
+  assert.match(apiSource, /'\/workbuddy\/account\/remove', body/);
+});
+test("§16 model chips hide with a pending lock; hidden models restore singly or all", () => {
+  assert.match(component, /onAction\("hide", model\)/);
+  assert.match(component, /aria-busy=\{pendingHide\(model\)\}/);
+  assert.match(component, /onAction\("restore", model\)/);
+  assert.match(component, /=> onAction\("restore"\)\}/);
+  assert.match(component, /workbuddy\.hidden_models/);
+  assert.match(component, /workbuddy\.cleared_refs/);
+  assert.match(component, /sanitizeClearedRefs\(hidden\.clearedRefs\)/);
+  assert.match(apiSource, /'\/workbuddy\/models\/hide'/);
+  assert.match(apiSource, /'\/workbuddy\/models\/restore'/);
+});
+test("generic edit and both delete stages guard managed provider and name the site", () => {
   assert.match(providers, /isManagedWorkBuddy\(provider\).*showWorkBuddyManagement/);
   assert.match(providers, /isManagedWorkBuddy\(filteredProviders\[filteredIndex\]\)/);
   assert.match(providers, /isManagedWorkBuddy\(deletedProvider\)/);
+  assert.match(providers, /workBuddyKindOf\(provider\)/);
+  // The dashboard never fabricates or deduplicates managed rows itself.
+  assert.doesNotMatch(providers, /name:\s*["']workbuddy/);
 });
 test("EN/ZH WorkBuddy locale parity covers statuses, sites, credits and safe errors", () => {
   const locales = ["en", "zh"].map(lang => JSON.parse(readFileSync(new URL(`../src/locales/${lang}.json`, import.meta.url), "utf8")).workbuddy);
   const keys = (value: Record<string, unknown>, prefix = ""): string[] => Object.entries(value).flatMap(([key, item]) => typeof item === "object" && item ? keys(item as Record<string, unknown>, `${prefix}${key}.`) : [`${prefix}${key}`]);
   assert.deepEqual(keys(locales[0]).sort(), keys(locales[1]).sort());
   for (const locale of locales) {
-    for (const state of ["loading", "not_connected", "connected", "expired", "sealed", "source_missing", "source_changed", "error", "restricted"]) assert.ok(locale.status[state]);
+    for (const state of ["loading", "not_connected", "connected", "expired", "sealed", "source_missing", "source_changed", "error", "restricted", "cooling"]) assert.ok(locale.status[state]);
     assert.ok(locale.errors.models_fetch_failed); assert.ok(locale.server_host); assert.ok(locale.disconnect_warning);
     assert.equal(locale.kind["workbuddy"].length > 0, true); assert.equal(locale.kind["workbuddy-ai"].length > 0, true);
     assert.ok(locale.site.label); assert.ok(locale.site.workbuddy); assert.ok(locale.site["workbuddy-ai"]); assert.ok(locale.site.privacy);
     assert.ok(locale.credits.action); assert.ok(locale.credits.display); assert.ok(locale.renewal_desktop); assert.ok(locale.images_unsupported);
+    // §16 additions.
+    assert.ok(locale.add_account); assert.ok(locale.managed_provider); assert.ok(locale.hidden_models);
+    assert.ok(locale.cleared_refs); assert.ok(locale.restore_all); assert.ok(locale.set_active); assert.ok(locale.remove);
+    assert.ok(locale.source_badge.desktop); assert.ok(locale.source_badge.browser);
+    assert.ok(locale.cooling_until); assert.ok(locale.restricted_until); assert.ok(locale.account_remove_warning);
     assert.match(String(locale.renewal_desktop), /desktop|桌面/i);
     assert.doesNotMatch(JSON.stringify(locale.credits), /refreshToken/i);
   }
@@ -136,12 +279,11 @@ const settings = readFileSync(new URL("../src/components/SettingsPage.tsx", impo
 test("settings owns management; dashboard only navigates managed edit/delete", () => {
   assert.doesNotMatch(providers, /<WorkBuddyProvider|scrollIntoView|document.getElementById\(['"]workbuddy-management/);
   assert.match(providers, /navigate\('\/settings\?tab=providers'/);
+  assert.match(providers, /workBuddySite: site \?\? undefined/);
   assert.match(settings, /TabsTrigger value="providers"/);
   assert.match(settings, /TabsContent value="providers"/);
   assert.match(settings, /<WorkBuddyProvider disabled=\{isSaving \|\| isRestarting\}/);
+  assert.match(settings, /focusSite=\{isWorkBuddyKind\(location\.state\?\.workBuddySite\)/);
   assert.equal((settings.match(/disabled=\{isSaving \|\| isRestarting \|\| workBuddyBusy\}/g) || []).length, 2);
   assert.match(settings, /workbuddy.managed_notice/);
-  assert.match(component, /target="_blank" rel="noopener noreferrer"/);
-  assert.doesNotMatch(component, /window.open/);
-  assert.match(component, /loginSession.current\?\.cancel\(\)/);
 });
