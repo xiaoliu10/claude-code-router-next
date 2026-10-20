@@ -909,3 +909,51 @@ CCR 选择零风险路径：**不保存、不使用 refreshToken 于任何请求
 - 隔离 mock 浏览器：无常驻卡片→供应商tab→国际授权待定→取消→重新授权成功→手动额度→首页模型行→edit回管理tab。0 full-config POST、1 cancel、1 usage GET、Router 保持。
 - 真实 CN/AI 授权/host/模型推理尚待用户登录验证；不宣称 live 通过。
 - P2：提交完整成功后的极窄取消窗口可能让 UI 显示取消但连接已提交，重新进入 status 可见；不涉及秘密泄漏或半提交复活，独立审查定为非阻塞。
+
+
+## 16. 跨站点 + 多账号池 + 模型隐藏（2026-10-20 用户修订，优先于 §13–15 的单账号限制）
+
+### 用户裁决
+1. **跨站点同时连接**：CN 与国际站可同时在线，各自一个托管 provider：CN=`workbuddy`，国际站=`workbuddy-ai`。站点间互不冲突（原 409 workbuddy_site_conflict 仅在"同站点重新授权另一个账号"之外不再出现）。
+2. **同站点多账号**：每站点账号池（1..N）。登录/导入=向该站点池添加账号；同 uid 重复登录=替换该账号凭证。
+3. **请求中自动故障转移**：上游额度/限流/封禁类错误时，把该账号按错误类冷却，透明换号重试同一请求（次数≤池大小），全部不可用才把最后一个已分类错误返回给客户端。
+4. **模型隐藏**：hiddenModels 黑名单按站点存储；隐藏=从 provider.models 移除且同步/重登不复活，可随时恢复；提供"恢复全部"。
+5. **自动清理 Router**：隐藏模型时自动把 Router 中引用 `<provider>,<model>` 的场景清空；若 default 被清，则置为 `<provider>,<首个可见模型>`；custom routes 中引用该模型的条目整条移除。返回 clearedRefs 供 UI toast。同步导致的模型消失不做 Router 改写（只有显式 hide 才改）。断开整站仍保留 Router 引用+提示（不变）。
+
+### 错误→冷却分类（复用 §"错误分类"，账号粒度）
+- **14018** insufficient_quota：账号级，冷却到下个本地 00:05（slice 每日重置），上限 24h。
+- **6004 / HTTP429** rate_limit：账号+模型粒度；上游"将在 … 重置"可解析则用之，否则 15min。
+- **11140** workbuddy_account_restricted：账号级 7200s 起长冷却；全部受限时返回申诉文案（不重试轰炸）。
+- 10085（CCR 自身协议错误）与 workbuddy_reauth 非重试类**不触发换号**；换号重试只对上三类，且每请求总上游尝试次数 ≤ 池大小。
+
+### 存储（workbuddy-credentials.json v2，仍 0600，仍不入 config/备份）
+```
+{ version: 2, sites: { "<site>": { hiddenModels: string[], activeUid: string|null,
+    accounts: [ { uid, displayName, enterpriseId, domain, source: desktop|browser,
+      accessToken, refreshToken?, expiresAt, refreshExpiresAt?, importedAt, tokenType?,
+      cooldown?: { until: number, scope: "account"|"model", model?: string, code: number } } ] } } }
+```
+- v1 单对象迁移：进入 `sites[kind].accounts[0]` 并设为 activeUid；迁移前写 `workbuddy-credentials.v1.bak`（0600）。
+- provider 迁移：kind=workbuddy-ai 且旧 provider 名为 `workbuddy` → 改名为 `workbuddy-ai`，并把 Router 中模型 ∈ 该站模型列表的 `workbuddy,<model>` 引用改写为 `workbuddy-ai,<model>`；其余引用不动。CN 凭证沿用 `workbuddy` 名，无需改写。
+- marker：CN 沿用 `ccr-managed-workbuddy`；国际站新增 `ccr-managed-workbuddy-ai`。isWorkBuddyRuntime 同时识别两者；transformer 由 provider 名/api_base_url 判站点。
+- epoch 改为**按站点**；disconnect/account remove/取消登录使该站 epoch+1，失效该站的 poll/refresh/sync/persist 检查点，回滚语义同 §15。
+- refresh：browser 账号各存各的 refreshToken，仅存本文件并按 uid 单飞轮换；desktop 账号仍绝不保存/花费共享刷新态，临期同站+同 uid+同 enterprise 有界内存续期。
+
+### 账号选择与换号
+- 选择：activeUid 可用（无覆盖该请求模型的冷却）则沿用（粘滞）；否则按「冷却剩余最少、importedAt 最早」选可用账号；无可用→返回最后一个已分类错误。
+- 变更账号（登录入池/移除/切换/冷却）不修改 Router、不改 provider 名称/URL；移除 active 账号时 activeUid 顺延到剩余最早账号；池空=该站断开（provider 移除，Router 引用保留+提示，同 §14 语义）。
+- 模型发现仍按站点、用当时 active 账号执行；站点模型集=并集累计，注册前过滤 hiddenModels。
+
+### API（全部本机校验 + 脱敏，路径均在 /api/workbuddy 下）
+- GET `status` → `{ sites: { "<site>": { status, providerName, accounts: [{ uid, displayName, source, active, coolingUntil?, restrictedUntil?, expiresAt }], activeUid, models, hiddenModels, modelCount, lastSyncAt, lastError } } }`；顶层旧扁平字段保留为"唯一已连站点"的镜像（仅向后兼容一版）。
+- POST `login/start|poll|cancel` `{site,...}` 不变；persist 成功=入池（新 uid 追加，旧 uid 替换凭证）。
+- POST `account/switch` `{site, uid}`；POST `account/remove` `{site, uid}`；POST `sync` `{site}`；POST `disconnect` `{site}`（整站断开）。
+- POST `usage` `{site, uid?}`（uid 缺省=active；仍只在点击时调用）。
+- POST `models/hide` `{site, model}`（含 Router 自动清理，返回 `{ok, clearedRefs}`）；POST `models/restore` `{site, model?}`（缺 model=全部恢复，恢复不自动回写 Router）。
+
+### UI（设置→供应商）
+- 每站点一张卡（CN/国际站各自独立，互不互斥）；卡内：账号列表行（脱敏 uid、来源徽章、active/冷却中(至 hh:mm)/受限 徽章、每账号「读取额度」「设为当前」「移除」）、「浏览器授权 / 添加账号」按钮、模型 chips 带 × 隐藏、折叠「已隐藏模型 (n)」可恢复、Router 自动清理 toast（列出 clearedRefs）。
+- 首页：每个已连站点一行普通 provider（workbuddy / workbuddy-ai）+ 各自模型；edit/delete 导航回设置对应站点卡。
+
+### 测试要求
+- store v1→v2 迁移（含 provider 改名 + Router 改写 + .bak）；池 rotation/冷却（fake timers）；换号仅对 14018/6004/11140、上限=池大小、reauth 不换；hiddenModels 过滤同步/注册、hide 的 Router 自动清理（default/场景/custom 三种引用）、恢复不回写 Router；per-site epoch 隔离（CN 断开不影响 AI 的 poll/refresh）；browser 多账号各自单飞刷新；本地校验/脱敏不变；UI mock 双卡、账号行操作、隐藏/恢复、toast。
