@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { WORKBUDDY_POLL_TIMEOUT } from "../src/utils/workbuddy-login.ts";
 
 const storage = new Map<string, string>();
 Object.assign(globalThis, { localStorage: { getItem: (key: string) => storage.get(key) || null, removeItem: (key: string) => storage.delete(key), setItem: (key: string, value: string) => storage.set(key, value) }, window: { location: { search: "" }, dispatchEvent: () => {} } });
@@ -156,5 +157,21 @@ test("browser login uses exact start/poll/cancel bodies and safe failure allowli
     const pending = client.pollWorkBuddyLogin("workbuddy-ai", "mock-job", abort.signal);
     const signal = calls.at(-1)!.options!.signal!;
     abort.abort(); assert.equal(signal.aborted, true); await pending;
+  } finally { globalThis.fetch = original; }
+});
+
+test("a local poll timeout is tagged for retry without leaking the raw error (P3)", async () => {
+  const client = new ApiClient("/mock-api", "mock-key");
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new DOMException("The operation timed out. private-marker", "TimeoutError");
+  }) as typeof fetch;
+  try {
+    await assert.rejects(client.pollWorkBuddyLogin("workbuddy", "mock-job", new AbortController().signal), error => {
+      assert.equal((error as { reason: string }).reason, WORKBUDDY_POLL_TIMEOUT);
+      // Sanitized boundary: the DOMException text never escapes apiFetch.
+      assert.equal(String(error), "Error: WorkBuddy request failed");
+      return true;
+    });
   } finally { globalThis.fetch = original; }
 });

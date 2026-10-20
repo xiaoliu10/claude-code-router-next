@@ -1,4 +1,5 @@
 import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyAccountRemoveRequest, WorkBuddyAccountSwitchRequest, WorkBuddyLoginStartResponse, WorkBuddyLoginPollResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyModelHideRequest, WorkBuddyModelHideResponse, WorkBuddyModelRestoreRequest, WorkBuddyModelRestoreResponse, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageRequest, WorkBuddyUsageResponse } from '@/types';
+import { WORKBUDDY_POLL_TIMEOUT } from '../utils/workbuddy-login.ts';
 
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
@@ -140,8 +141,14 @@ class ApiClient {
     } catch (error) {
       if (isWorkBuddy) {
         // Network / JSON exceptions can include unsafe text too.
-        const reason = error && typeof error === 'object' && 'reason' in error
-          ? error.reason : 'request_failed';
+        // A local request timeout is NOT a server verdict: tag it so the
+        // sequential login helper can retry within its deadline. The thrown
+        // value stays fully sanitized either way — the original DOMException
+        // text never leaves this boundary.
+        const reason = error instanceof DOMException && error.name === 'TimeoutError'
+          ? WORKBUDDY_POLL_TIMEOUT
+          : error && typeof error === 'object' && 'reason' in error
+            ? error.reason : 'request_failed';
         throw Object.assign(new Error('WorkBuddy request failed'), { reason });
       }
       console.error('API request error:', error);

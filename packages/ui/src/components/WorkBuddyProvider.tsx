@@ -2,11 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Coins, RefreshCw, ShieldCheck, X } from "lucide-react";
 import { api } from "@/lib/api";
-import type { WorkBuddyKind, WorkBuddyLoginStartResponse, WorkBuddySiteStatus, WorkBuddyStatusResponse, WorkBuddyUsage } from "@/types";
+import type { Config, WorkBuddyKind, WorkBuddyLoginStartResponse, WorkBuddySiteStatus, WorkBuddyStatusResponse, WorkBuddyUsage } from "@/types";
 import {
-  formatWorkBuddyClock, isWorkBuddyConnected, maskWorkBuddyUid, mergeWorkBuddyProvider, parseWorkBuddyUsage,
+  formatWorkBuddyClock, isWorkBuddyConnected, maskWorkBuddyUid, mergeWorkBuddyHiddenRefs, mergeWorkBuddyProvider, parseWorkBuddyUsage,
   sanitizeClearedRefs, workBuddyAccountCooling, workBuddyAccountRestricted, workBuddyErrorKey,
-  workBuddyImagesUnsupportedModels, workBuddySiteStatus, workBuddyStateKey,
+  workBuddyImagesUnsupportedModels, workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
 } from "@/utils/workbuddy";
 import { createWorkBuddyLogin } from "@/utils/workbuddy-login";
 import { useConfig } from "./ConfigProvider";
@@ -90,9 +90,11 @@ export function WorkBuddyProvider({ disabled, onBusyChange, focusSite = null }: 
 
   // Success tail shared by the mutating actions: reconcile the managed
   // providers into the local config, re-read the per-site status, then show
-  // the settled message. Guards drop stale completions.
-  const finish = async (site: WorkBuddyKind, id: number, message: string, options: { clearUsage?: boolean; dropUsageUid?: string } = {}) => {
-    await refreshConfig(mergeWorkBuddyProvider);
+  // the settled message. Guards drop stale completions. The merge defaults to
+  // the Router-draft-preserving variant; only the explicitly authorized hide
+  // passes its §16 Router reconciliation (see mergeWorkBuddyHiddenRefs).
+  const finish = async (site: WorkBuddyKind, id: number, message: string, options: { clearUsage?: boolean; dropUsageUid?: string; merge?: (local: Config, server: Config) => Config } = {}) => {
+    await refreshConfig(options.merge ?? mergeWorkBuddyProvider);
     const updated = await api.getWorkBuddyStatus();
     if (!mounted.current || generation.current !== id) return;
     setStatus(updated);
@@ -167,9 +169,19 @@ export function WorkBuddyProvider({ disabled, onBusyChange, focusSite = null }: 
         if (!hidden || hidden.ok !== true) { setSiteError(site, "request_failed"); return; }
         // §16: the toast lists exactly the Router references the server cleared.
         const refs = sanitizeClearedRefs(hidden.clearedRefs);
+        // §16 auto-clean: default falls back to the first remaining visible
+        // model (computed from the pre-refresh site models minus the hidden
+        // one); with none left the default is simply cleared.
+        const siteStatus = siteStatuses[site];
+        const remaining = (siteStatus?.models || []).filter(candidate => candidate !== model);
+        const fallback = remaining.length > 0 ? `${siteStatus?.providerName || site},${remaining[0]}` : null;
+        // Explicitly authorized action: narrowly adopt the backend's Router
+        // cleanup into the local draft so the next full Save cannot resurrect
+        // the cleared references (unrelated local edits survive).
         await finish(site, id, refs.length > 0
           ? `${t("workbuddy.hidden_toast", { model })} ${t("workbuddy.cleared_refs", { refs: refs.join(", ") })}`
-          : t("workbuddy.hidden_toast", { model }));
+          : t("workbuddy.hidden_toast", { model }),
+          { merge: (local, server) => mergeWorkBuddyHiddenRefs(local, server, refs, fallback) });
         return;
       }
       if (kind === "restore") {
@@ -305,7 +317,7 @@ function WorkBuddySiteCard({ site, status, loading, loadFailed, busy, disabled, 
   const canDisconnect = Boolean(status && (status.status !== "not_connected" || models.length > 0 || accounts.length > 0));
   const readingUsage = action?.kind === "usage" && action.site === site;
   const imageUnsupported = workBuddyImagesUnsupportedModels(models, status?.imagesUnsupportedModels);
-  const visibleError = errorKey || (status?.lastError ? workBuddyErrorKey(status) : null);
+  const visibleError = workBuddyVisibleErrorKey(errorKey, status);
   const pendingHide = (model: string) => action?.kind === "hide" && action.site === site && action.model === model;
 
   return (

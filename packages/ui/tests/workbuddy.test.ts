@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   formatWorkBuddyClock, hasDiscoveredModels, isManagedWorkBuddy, isWorkBuddyConnected, isWorkBuddyKind,
-  maskWorkBuddyUid, mergeWorkBuddyProvider, parseWorkBuddyUsage, sanitizeClearedRefs, workBuddyAccountCooling,
-  workBuddyAccountRestricted, workBuddyErrorKey, workBuddyImagesUnsupportedModels, workBuddyKindOf,
-  workBuddySiteStatus, workBuddyStateKey,
+  maskWorkBuddyUid, mergeWorkBuddyHiddenRefs, mergeWorkBuddyProvider, parseWorkBuddyUsage, sanitizeClearedRefs,
+  workBuddyAccountCooling, workBuddyAccountRestricted, workBuddyErrorKey, workBuddyImagesUnsupportedModels,
+  workBuddyKindOf, workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
 } from "../src/utils/workbuddy.ts";
 import type { Config, Provider, WorkBuddyAccountSummary, WorkBuddyMutationResponse, WorkBuddySiteStatus, WorkBuddyStatusResponse } from "../src/types.ts";
 
@@ -54,6 +54,74 @@ test("§16 both sites merge independently; one site's disconnect never touches t
   assert.deepEqual(reconnected.Providers, [other, managed, { ...managedAi, models: ["kimi-next"] }]);
   assert.equal(reconnected.Providers.filter(provider => provider.name === "workbuddy").length, 1);
   assert.equal(reconnected.Providers.filter(provider => provider.name === "workbuddy-ai").length, 1);
+});
+test("P1 hide reconciliation: save payload drops exactly the backend-cleared refs, keeps unrelated drafts", () => {
+  const cleared = "workbuddy,glm-4.6";
+  const unrelated = "custom-provider,draft-model";
+  const local = {
+    Providers: [other],
+    Router: {
+      default: cleared,                      // §16: default → first visible model
+      background: cleared,                    // scenario cleared → ""
+      think: unrelated,                       // unrelated local edit survives
+      longContext: "other-provider,long-model",
+      webSearch: cleared,
+      image: "vision-provider,vision-model",
+      models: { keep: unrelated, drop: cleared },
+      families: { balanced: { default: cleared, background: unrelated, fallback: { longContext: [cleared, unrelated] } } },
+      custom: {
+        "route-keep": { provider: "other-provider", model: "long-model" },
+        "route-drop": { provider: "workbuddy", model: "glm-4.6" },  // §16: entry removed entirely
+        "route-ref": "workbuddy,glm-4.6",                            // ref-shaped entry removed too
+        "route-other": "custom-provider,other",
+      },
+    },
+    customDraft: "not saved",
+  } as unknown as Config;
+  // Backend fetched after its own cleanup: its saved Router is already clean,
+  // while the local draft still carries every cleared reference.
+  const server = config([managed]); server.Router.default = "workbuddy,kimi-k2";
+  const merged = mergeWorkBuddyHiddenRefs(local, server, [cleared], "workbuddy,kimi-k2");
+  // The full-config Save payload is the merged config itself: it must contain
+  // none of the removed references, across default/scenario/custom.
+  assert.equal(merged.Router.default, "workbuddy,kimi-k2");
+  assert.equal(merged.Router.background, "");
+  assert.equal(merged.Router.webSearch, "");
+  assert.doesNotMatch(JSON.stringify(merged.Router), new RegExp(cleared.replace(/[.*]/g, "\\$&")));
+  // Unrelated references and local draft edits survive untouched.
+  assert.equal(merged.Router.think, unrelated);
+  assert.equal(merged.Router.longContext, "other-provider,long-model");
+  assert.equal(merged.Router.image, "vision-provider,vision-model");
+  assert.deepEqual(merged.Router.models, { keep: unrelated });
+  const family = (merged.Router.families as Record<string, { default: string; background: string; fallback: { longContext: string[] } }>).balanced;
+  assert.equal(family.default, "");
+  assert.equal(family.background, unrelated);
+  assert.deepEqual(family.fallback.longContext, [unrelated]);
+  assert.deepEqual(Object.keys(merged.Router.custom as Record<string, unknown>).sort(), ["route-keep", "route-other"]);
+  // Unrelated providers (merge) and non-Router drafts survive.
+  assert.deepEqual(merged.Providers, [other, managed]);
+  assert.equal((merged as { customDraft: string }).customDraft, "not saved");
+});
+test("P1 hide reconciliation is narrow: no refs reported → draft Router identity; no visible model → default cleared", () => {
+  const local = { Providers: [other], Router: { default: "workbuddy,glm-4.6", think: "x,y" }, customDraft: "d" } as unknown as Config;
+  const server = config([managed]);
+  // Server reported nothing cleared: the hide merge reduces to the ordinary
+  // draft-preserving merge (Router identity kept byte-for-byte).
+  const untouched = mergeWorkBuddyHiddenRefs(local, server, [], "workbuddy,kimi-k2");
+  assert.equal(untouched.Router, local.Router);
+  // All models hidden → no §16 fallback target: default cleared like scenarios.
+  const emptied = mergeWorkBuddyHiddenRefs(local, server, ["workbuddy,glm-4.6"], null);
+  assert.equal(emptied.Router.default, "");
+  assert.equal((emptied.Router as { think: string }).think, "x,y");
+});
+test("P1 login/sync/disconnect/restore merges never adopt the server Router — only hide does", () => {
+  const local = config([managed, other]);
+  (local.Router as { default: string }).default = "workbuddy,glm-4.6";
+  const server = config([managed]);
+  (server.Router as { default: string }).default = "workbuddy,kimi-k2";
+  // The default merge used by login/sync/disconnect/restore keeps the local
+  // draft Router identity — even when the server copy differs.
+  assert.equal(mergeWorkBuddyProvider(local, server).Router, local.Router);
 });
 test("empty or failed discovery is never success", () => {
   for (const result of [{ success: false }, { success: true, status: "connected", models: [] }, { success: true, models: ["a"] }, { success: true, status: "error", models: ["a"] }, { success: true, status: "connected", models: [""] }]) {
@@ -148,10 +216,29 @@ test("per-site badge: cooling/restricted only when the whole pool is unavailable
   assert.equal(workBuddyStateKey(site([account(), account({ coolingUntil: now + 1 })]), now), "connected");
   // Expired cooldowns no longer count as unavailable.
   assert.equal(workBuddyStateKey(site([account({ coolingUntil: now - 1 })]), now), "connected");
+  // P2 regression: a healthy account plus a stale site-level 11140 diagnostic
+  // reads connected — the whole card must not be branded restricted.
+  assert.equal(workBuddyStateKey(site([account()], { lastError: "11140 restricted secret" }), now), "connected");
   assert.equal(workBuddyAccountCooling(account({ coolingUntil: now + 5 }), now), now + 5);
   assert.equal(workBuddyAccountCooling(account({ coolingUntil: now - 5 }), now), null);
   assert.equal(workBuddyAccountRestricted(account({ restrictedUntil: now + 5 }), now), now + 5);
   assert.equal(workBuddyAccountRestricted(account()), null);
+});
+test("§16 pool truth beats a stale site-level restriction alert (P2)", () => {
+  const now = 1_000_000_000;
+  const account = (over: Partial<WorkBuddyAccountSummary> = {}): WorkBuddyAccountSummary =>
+    ({ uid: "u", displayName: null, source: "browser", active: true, ...over });
+  const site = (accounts: WorkBuddyAccountSummary[], over: Partial<WorkBuddySiteStatus> = {}): WorkBuddySiteStatus =>
+    ({ status: "connected", providerName: "workbuddy", accounts, activeUid: "u", models: [], hiddenModels: [], modelCount: 0, lastSyncAt: null, lastError: null, ...over });
+  // The false "entire site restricted" alert is suppressed while an account is usable...
+  assert.equal(workBuddyVisibleErrorKey(null, site([account()], { lastError: "11140 restricted secret" }), now), null);
+  // ...but still surfaces when the pool really has no usable account...
+  assert.equal(workBuddyVisibleErrorKey(null, site([account({ restrictedUntil: now + 1 })], { lastError: "11140 restricted secret" }), now), "restricted");
+  // ...or the site is not connected (non-restricted diagnostics always surface).
+  assert.equal(workBuddyVisibleErrorKey(null, site([], { status: "expired", lastError: "unapproved channel" }), now), "channel_rejected");
+  // Action errors always win over the derived diagnostic.
+  assert.equal(workBuddyVisibleErrorKey("busy", site([account()], { lastError: "11140 restricted secret" }), now), "busy");
+  assert.equal(workBuddyVisibleErrorKey(null, site([account()]), now), null);
 });
 test("clearedRefs toast input is filtered to plain references and capped", () => {
   assert.deepEqual(
@@ -174,7 +261,8 @@ const apiSource = readFileSync(new URL("../src/lib/api.ts", import.meta.url), "u
 test("WorkBuddy has no token/password/path input, no client takeover action", () => {
   assert.doesNotMatch(component, /<Input|type=["']password|localStorage|enableClient|restartService/);
   assert.match(component, /kind: "disconnect", site \}/);
-  assert.match(component, /refreshConfig\(mergeWorkBuddyProvider\)/);
+  // Default merge stays draft-preserving; only hide passes its reconciliation.
+  assert.match(component, /refreshConfig\(options\.merge \?\? mergeWorkBuddyProvider\)/);
   assert.match(component, /locked\.current/); assert.match(component, /generation\.current === id/);
   assert.doesNotMatch(component, /console\.|result\.message|status\.lastError\}/);
 });
@@ -246,6 +334,14 @@ test("§16 model chips hide with a pending lock; hidden models restore singly or
   assert.match(component, /sanitizeClearedRefs\(hidden\.clearedRefs\)/);
   assert.match(apiSource, /'\/workbuddy\/models\/hide'/);
   assert.match(apiSource, /'\/workbuddy\/models\/restore'/);
+});
+test("P1 hide reconciles the local Router with the backend cleanup; other actions never do", () => {
+  // Hide path: explicit reconciliation merge with the sanitized refs and the
+  // §16 first-visible-model fallback, computed from the pre-refresh models.
+  assert.match(component, /mergeWorkBuddyHiddenRefs\(local, server, refs, fallback\)/);
+  assert.match(component, /filter\(candidate => candidate !== model\)/);
+  // Alerts use the pool-truth helper instead of the raw lastError derivation.
+  assert.match(component, /workBuddyVisibleErrorKey\(errorKey, status\)/);
 });
 test("generic edit and both delete stages guard managed provider and name the site", () => {
   assert.match(providers, /isManagedWorkBuddy\(provider\).*showWorkBuddyManagement/);

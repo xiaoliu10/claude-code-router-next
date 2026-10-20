@@ -6,6 +6,15 @@ interface LoginApi {
   cancelWorkBuddyLogin(site: WorkBuddyKind, loginId: string): Promise<{ success: boolean }>;
 }
 
+/** Client-side sentinel for a poll that hit its LOCAL request timeout. It is
+ * not a server verdict (and never rendered): the login helper retries within
+ * the existing deadline instead of aborting the whole authorization. */
+export const WORKBUDDY_POLL_TIMEOUT = "workbuddy_poll_timeout";
+
+export function isWorkBuddyPollTimeout(error: unknown): boolean {
+  return !!error && typeof error === "object" && (error as { reason?: unknown }).reason === WORKBUDDY_POLL_TIMEOUT;
+}
+
 function wait(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const abort = () => { clearTimeout(timer); reject(new Error("cancelled")); };
@@ -49,7 +58,23 @@ export function createWorkBuddyLogin(
       onReady(job);
       while (!controller.signal.aborted) {
         if (Date.now() >= job.expiresAt) { expired = true; break; }
-        const result = await api.pollWorkBuddyLogin(site, job.loginId, controller.signal);
+        let result: WorkBuddyLoginPollResponse;
+        try {
+          result = await api.pollWorkBuddyLogin(site, job.loginId, controller.signal);
+        } catch (error) {
+          if (isWorkBuddyPollTimeout(error)) {
+            // One hung/slow poll must not kill the whole authorization: wait
+            // out the interval and retry until the server-side job expires
+            // (loop-top check then ends the session with the regular safe
+            // expiry reason, so the retry is always bounded). Explicit server
+            // failures, security rejections and user cancellation still
+            // propagate unchanged.
+            if (Date.now() >= job.expiresAt) { expired = true; break; }
+            await wait(timing.intervalMs, controller.signal);
+            continue;
+          }
+          throw error;
+        }
         if (controller.signal.aborted) break;
         if (result.status === "connected") { connected = true; return result; }
         if (result.status === "failed") throw Object.assign(new Error("login failed"), { reason: result.reason });

@@ -42,6 +42,100 @@ export function mergeWorkBuddyProvider(local: Config, server: Config): Config {
   return { ...local, Providers: providers };
 }
 
+// Router slots that hold a single "<provider>,<model>" reference.
+const ROUTER_REF_SLOTS = ["default", "background", "think", "longContext", "extendedContext", "webSearch", "image"] as const;
+
+function customEntryReferencesRef(entry: unknown, provider: string, model: string, ref: string): boolean {
+  if (typeof entry === "string") return entry === ref;
+  if (!entry || typeof entry !== "object") return false;
+  const record = entry as Record<string, unknown>;
+  if (record.provider === provider && record.model === model) return true;
+  return Object.values(record).some(value => customEntryReferencesRef(value, provider, model, ref));
+}
+
+/**
+ * §16 hide reconciliation (explicitly authorized action): the backend just
+ * rewrote its SAVED Router for the hidden model (references cleared, default
+ * re-pointed at the first visible model, referencing custom routes removed).
+ * The ordinary draft-preserving merge would keep the pre-clean local Router,
+ * so the next full-config Save would silently resurrect exactly the
+ * references the toast announced as cleared.
+ *
+ * This variant applies EXACTLY the reported cleanup to the local draft and
+ * nothing else: a slot/alias/fallback is rewritten only when it still points
+ * at one of the cleared refs, custom entries referencing a cleared model are
+ * removed entirely, `default` gets the §16 first-visible-model fallback, and
+ * every unrelated local edit (Router or otherwise) survives. With no cleared
+ * refs it is byte-identical to the draft-preserving merge. Login / sync /
+ * disconnect / restore keep using mergeWorkBuddyProvider (Router preserved).
+ */
+export function mergeWorkBuddyHiddenRefs(local: Config, server: Config, clearedRefs: string[] | undefined, defaultFallback: string | null): Config {
+  const merged = mergeWorkBuddyProvider(local, server);
+  const refs = sanitizeClearedRefs(clearedRefs);
+  if (refs.length === 0) return merged;
+  const refSet = new Set(refs);
+  const parsed = refs.map(ref => {
+    const index = ref.indexOf(",");
+    return index > 0
+      ? { ref, provider: ref.slice(0, index), model: ref.slice(index + 1) }
+      : { ref, provider: "", model: ref };
+  });
+  const source = (local.Router || {}) as Record<string, unknown>;
+  const router: Record<string, unknown> = { ...source };
+  // Scenario slots: only a slot still pointing exactly at a cleared ref moves.
+  for (const slot of ROUTER_REF_SLOTS) {
+    const value = router[slot];
+    if (typeof value === "string" && refSet.has(value)) {
+      router[slot] = slot === "default" && defaultFallback ? defaultFallback : "";
+    }
+  }
+  // Model alias map: drop entries whose target was cleared.
+  if (source.models && typeof source.models === "object") {
+    const kept: Record<string, unknown> = {};
+    for (const [alias, target] of Object.entries(source.models as Record<string, unknown>)) {
+      if (typeof target === "string" && refSet.has(target)) continue;
+      kept[alias] = target;
+    }
+    router.models = kept;
+  }
+  // Family routing configs carry the same reference semantics.
+  if (source.families && typeof source.families === "object") {
+    const keptFamilies: Record<string, unknown> = {};
+    for (const [family, familyConfig] of Object.entries(source.families as Record<string, unknown>)) {
+      if (!familyConfig || typeof familyConfig !== "object") { keptFamilies[family] = familyConfig; continue; }
+      const record = { ...(familyConfig as Record<string, unknown>) };
+      for (const slot of ROUTER_REF_SLOTS) {
+        const value = record[slot];
+        if (typeof value === "string" && refSet.has(value)) record[slot] = "";
+      }
+      if (record.fallback && typeof record.fallback === "object") {
+        const keptFallback: Record<string, unknown> = {};
+        for (const [key, list] of Object.entries(record.fallback as Record<string, unknown>)) {
+          keptFallback[key] = Array.isArray(list)
+            ? list.filter(item => !(typeof item === "string" && refSet.has(item)))
+            : list;
+        }
+        record.fallback = keptFallback;
+      }
+      keptFamilies[family] = record;
+    }
+    router.families = keptFamilies;
+  }
+  // Custom routes: an entry referencing a cleared model is removed entirely (§16).
+  const referencesCleared = (entry: unknown) =>
+    parsed.some(({ ref, provider, model }) => customEntryReferencesRef(entry, provider, model, ref));
+  if (Array.isArray(source.custom)) {
+    router.custom = source.custom.filter(entry => !referencesCleared(entry));
+  } else if (source.custom && typeof source.custom === "object") {
+    const keptCustom: Record<string, unknown> = {};
+    for (const [name, entry] of Object.entries(source.custom as Record<string, unknown>)) {
+      if (!referencesCleared(entry)) keptCustom[name] = entry;
+    }
+    router.custom = keptCustom;
+  }
+  return { ...merged, Router: router as Config["Router"] };
+}
+
 // Use only localised allowlisted messages, never render / log upstream error text.
 export function workBuddyErrorKey(value: unknown): string {
   const data = value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -80,14 +174,15 @@ export function maskWorkBuddyUid(uid: string | null): string {
   return uid.length > 5 ? `${uid.slice(0, 3)}…${uid.slice(-2)}` : "•••";
 }
 
-/** Card badge key for one site: base status, overridden by pool-wide cooling/restriction. */
+/** Card badge key for one site. Pool truth first (§16): a stale site-level
+ * 11140 diagnostic must never brand a connected card with usable accounts as
+ * restricted — per-account truth lives in the row badges. */
 export function workBuddyStateKey(site: WorkBuddySiteStatus | null, now = Date.now()): string {
   if (!site) return "not_connected";
-  if (site.lastError && workBuddyErrorKey(site) === "restricted") return "restricted";
   if (site.status === "connected") {
-    const pool = workBuddyPoolState(site, now);
-    if (pool) return pool;
+    return workBuddyPoolState(site, now) ?? "connected";
   }
+  if (site.lastError && workBuddyErrorKey(site) === "restricted") return "restricted";
   return site.status;
 }
 
@@ -108,6 +203,20 @@ export function workBuddyPoolState(site: WorkBuddySiteStatus, now = Date.now()):
   if (site.accounts.every(account =>
     workBuddyAccountCooling(account, now) !== null || workBuddyAccountRestricted(account, now) !== null)) return "cooling";
   return null;
+}
+
+/**
+ * Alert key for one card. Action errors always win. A server-sanitised site
+ * diagnostic is shown only while it is still meaningful: a stale 11140
+ * "restricted" claim is suppressed while a connected pool still has a usable
+ * account (the rows carry the per-account truth) instead of falsely telling
+ * the user the entire site is restricted.
+ */
+export function workBuddyVisibleErrorKey(actionErrorKey: string | null, site: WorkBuddySiteStatus | null, now = Date.now()): string | null {
+  if (actionErrorKey) return actionErrorKey;
+  const derived = site?.lastError ? workBuddyErrorKey(site) : null;
+  if (derived === "restricted" && site?.status === "connected" && workBuddyPoolState(site, now) === null) return null;
+  return derived;
 }
 
 /** Compact clock ("hh:mm") for 冷却中(至 hh:mm) / 受限(至 hh:mm) account labels. */
