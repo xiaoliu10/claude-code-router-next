@@ -15,7 +15,29 @@ import { HOME_DIR } from "@wengine-ai/claude-code-router-shared";
 export type WorkBuddyFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 export const WORKBUDDY_PROVIDER_NAME = "workbuddy";
+export const WORKBUDDY_AI_PROVIDER_NAME = "workbuddy-ai";
 export const WORKBUDDY_API_KEY = "ccr-managed-workbuddy";
+export const WORKBUDDY_AI_API_KEY = "ccr-managed-workbuddy-ai";
+export const WORKBUDDY_PROVIDER_NAMES = [WORKBUDDY_PROVIDER_NAME, WORKBUDDY_AI_PROVIDER_NAME] as const;
+
+/** Per-site managed provider identity (contract §16). */
+export function managedProvider(site: WorkBuddySiteId | WorkBuddySite): { name: string; apiKey: string } {
+  const id = typeof site === "string" ? site : site.id;
+  return id === "workbuddy-ai"
+    ? { name: WORKBUDDY_AI_PROVIDER_NAME, apiKey: WORKBUDDY_AI_API_KEY }
+    : { name: WORKBUDDY_PROVIDER_NAME, apiKey: WORKBUDDY_API_KEY };
+}
+
+/** Derive the site from a managed provider's name, marker key or fixed base URL. */
+export function workBuddySiteFromProvider(provider: any): WorkBuddySiteId {
+  const name = typeof provider?.name === "string" ? provider.name : "";
+  const key = typeof provider?.apiKey === "string" ? provider.apiKey
+    : typeof provider?.api_key === "string" ? provider.api_key : "";
+  const base = typeof provider?.baseUrl === "string" ? provider.baseUrl
+    : typeof provider?.api_base_url === "string" ? provider.api_base_url : "";
+  if (name === WORKBUDDY_AI_PROVIDER_NAME || key === WORKBUDDY_AI_API_KEY || /(^|\/\/)www\.workbuddy\.ai|www\.codebuddy\.ai/.test(base)) return "workbuddy-ai";
+  return "workbuddy";
+}
 export const WORKBUDDY_UA_VERSION = "5.5.6";
 export const WORKBUDDY_CHAT_UA = `WorkBuddy/${WORKBUDDY_UA_VERSION}`;
 export const WORKBUDDY_CONFIG_UA = `CLI/2.0.0 WorkBuddy/${WORKBUDDY_UA_VERSION}`;
@@ -25,8 +47,8 @@ const MAX_SOURCE_BYTES = 1024 * 1024;
 const SALT = randomBytes(16).toString("hex");
 
 /**
- * The two WorkBuddy builds (magpie SITES, P:L62-84). One CCR install holds at most one
- * site's credential at a time; the site is decided by which desktop login file is found.
+ * The two WorkBuddy builds (magpie SITES, P:L62-84). Since contract §16 both
+ * sites may be connected at once, each with its own account pool.
  */
 export type WorkBuddySiteId = "workbuddy" | "workbuddy-ai";
 export interface WorkBuddySite {
@@ -67,23 +89,55 @@ export const WORKBUDDY_CONFIG_URL = workBuddyConfigUrl(WORKBUDDY_SITES.workbuddy
 export type WorkBuddyStatus = "not_connected" | "connected" | "expired" | "sealed" | "source_missing" | "source_changed" | "error";
 /** Where the credential came from: the desktop login file or a browser sign-in. */
 export type WorkBuddyCredentialSource = "desktop" | "browser";
-export interface WorkBuddyCredential {
-  version: 1; kind: WorkBuddySiteId; uid: string; displayName: string; domain: string;
-  enterpriseId: string; accessToken: string; expiresAt: number; importedAt: string; source: WorkBuddyCredentialSource;
+export type WorkBuddyCooldownScope = "account" | "model";
+export interface WorkBuddyCooldown {
+  until: number;
+  scope: WorkBuddyCooldownScope;
+  model?: string;
+  code: number;
+}
+/** One account in a site pool (contract §16 v2). */
+export interface WorkBuddyAccount {
+  uid: string;
+  displayName: string;
+  enterpriseId: string;
+  domain: string;
+  source: WorkBuddyCredentialSource;
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt: number;
+  refreshExpiresAt?: number;
+  importedAt: string;
   /** Non-secret token type only. */
   tokenType?: string;
-  /**
-   * Browser sign-ins ONLY: CCR is the sole owner of this refresh token, so unlike a
-   * desktop credential (contract §14.3 — never stored, never spent) it is persisted
-   * in the 0600 private file and spent on near-expiry renewal.
-   */
-  refreshToken?: string;
-  refreshExpiresAt?: number;
+  cooldown?: WorkBuddyCooldown;
+}
+export interface WorkBuddySiteState {
+  hiddenModels: string[];
+  activeUid: string | null;
+  accounts: WorkBuddyAccount[];
+  /** Cumulative union of discovered model ids; hidden ones are filtered before registration. */
+  discoveredModels?: string[];
+  lastSyncAt?: string;
+  lastError?: string | null;
+}
+export interface WorkBuddyCredentialData {
+  version: 2;
+  sites: Partial<Record<WorkBuddySiteId, WorkBuddySiteState>>;
+}
+/**
+ * A single resolved credential (one pool account tagged with its site). This is
+ * the v1-era shape still consumed by the protocol helpers and the data plane.
+ */
+export interface WorkBuddyCredential extends WorkBuddyAccount {
+  version: 1;
+  kind: WorkBuddySiteId;
   lastSyncAt?: string;
 }
 export type WorkBuddySourceResult = { ok: true; credential: WorkBuddyCredential } |
   { ok: false; reason: "sealed" | "source_missing" | "source_invalid"; /** Which site's file was examined (for a precise message). */ site?: WorkBuddySiteId };
-export const isManagedWorkBuddy = (p: any): boolean => p?.name === WORKBUDDY_PROVIDER_NAME && p?.ccr_managed === true;
+export const isManagedWorkBuddy = (p: any): boolean =>
+  (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name) && p?.ccr_managed === true;
 /**
  * Runtime (data-plane) detection. The managed flag is carried from the config
  * provider into the registered LLMProvider (ProviderService spreads the
@@ -92,27 +146,35 @@ export const isManagedWorkBuddy = (p: any): boolean => p?.name === WORKBUDDY_PRO
  * real key. A generic config save cannot create this combination by accident,
  * because protectWorkBuddyConfig re-locks the managed entry's fields.
  */
-export const isWorkBuddyRuntime = (p: any): boolean =>
-  p?.name === WORKBUDDY_PROVIDER_NAME &&
-  (p?.workbuddyManaged === true || p?.apiKey === WORKBUDDY_API_KEY);
-export function lockWorkBuddyProvider(p: any): any {
-  const site = workBuddySite(p?.workbuddy_kind === "workbuddy-ai" ? "workbuddy-ai" : "workbuddy");
-  return { ...p, name: WORKBUDDY_PROVIDER_NAME, ccr_managed: true, workbuddy_kind: site.id,
+export const isWorkBuddyRuntime = (p: any): boolean => {
+  if (p?.workbuddyManaged === true && (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name)) return true;
+  return (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name) &&
+    (p?.apiKey === WORKBUDDY_API_KEY || p?.apiKey === WORKBUDDY_AI_API_KEY ||
+     p?.api_key === WORKBUDDY_API_KEY || p?.api_key === WORKBUDDY_AI_API_KEY);
+};
+export function lockWorkBuddyProvider(p: any, siteId?: WorkBuddySiteId): any {
+  const site = workBuddySite(siteId ?? (p?.workbuddy_kind === "workbuddy-ai" ? "workbuddy-ai" : "workbuddy"));
+  const id = managedProvider(site);
+  return { ...p, name: id.name, ccr_managed: true, workbuddy_kind: site.id,
     workbuddyManaged: true,
-    api_base_url: workBuddyChatUrl(site), api_key: WORKBUDDY_API_KEY, transformer: { use: ["workbuddy"] } };
+    api_base_url: workBuddyChatUrl(site), api_key: id.apiKey, transformer: { use: ["workbuddy"] } };
 }
 export function protectWorkBuddyConfig(config: any, previous?: any): void {
   for (const key of ["Providers", "providers"]) {
     if (!Array.isArray(config?.[key])) continue;
-    const old = (previous?.Providers || previous?.providers || []).find(isManagedWorkBuddy);
+    const olds = (previous?.Providers || previous?.providers || []).filter((p: any) => isManagedWorkBuddy(p));
     config[key] = config[key].map((p: any) => {
-      if (isManagedWorkBuddy(p) || (old && p?.name === WORKBUDDY_PROVIDER_NAME)) return lockWorkBuddyProvider(old ? { ...p, workbuddy_kind: old.workbuddy_kind } : p);
+      const old = olds.find((o: any) => o.workbuddy_kind === (p?.workbuddy_kind ?? (p?.name === WORKBUDDY_AI_PROVIDER_NAME ? "workbuddy-ai" : "workbuddy"))) ||
+        olds.find((o: any) => o?.name === p?.name);
+      if (isManagedWorkBuddy(p) || (old && (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name))) {
+        return lockWorkBuddyProvider(old ? { ...p, workbuddy_kind: old.workbuddy_kind } : p);
+      }
       return p;
     });
-    // A generic full-config save must not delete the managed provider by omission;
-    // removal is an explicit WorkBuddy disconnect (contract §13).
-    if (old && !config[key].some((p: any) => p?.name === WORKBUDDY_PROVIDER_NAME)) {
-      config[key].push(lockWorkBuddyProvider(old));
+    // A generic full-config save must not delete a managed provider by omission;
+    // removal is an explicit WorkBuddy disconnect (contract §13/§16).
+    for (const old of olds) {
+      if (!config[key].some((p: any) => p?.name === old.name)) config[key].push(lockWorkBuddyProvider(old));
     }
   }
 }
@@ -165,65 +227,322 @@ export function readWorkBuddySource(siteId: WorkBuddySiteId = "workbuddy"): Work
     return { ok: false, reason: error?.code === "ENOENT" ? "source_missing" : "source_invalid", site: siteId };
   } finally { if (fd !== undefined) closeSync(fd); }
 }
+const MODEL_ID_OK = /^[^\x00-\x1f\x7f,]{1,256}$/;
+function modelIdOk(value: unknown): value is string {
+  return typeof value === "string" && MODEL_ID_OK.test(value) && !value.includes(",");
+}
+function normalizeAccount(c: any, siteId: WorkBuddySiteId): WorkBuddyAccount {
+  if (!c || typeof c !== "object" ||
+    !headerValue(c.accessToken, MAX_SOURCE_BYTES, true) || !headerValue(c.uid, 253, true) ||
+    (c.source !== "desktop" && c.source !== "browser")) throw new Error();
+  const site = workBuddySite(siteId);
+  const account: WorkBuddyAccount = {
+    uid: c.uid,
+    displayName: headerValue(c.displayName, 253) ? c.displayName : "",
+    enterpriseId: headerValue(c.enterpriseId, 253) ? c.enterpriseId : "",
+    domain: validDomain(c.domain, site),
+    source: c.source,
+    accessToken: c.accessToken,
+    expiresAt: Number.isFinite(c.expiresAt) && c.expiresAt >= 0 ? Math.floor(c.expiresAt) : 0,
+    importedAt: typeof c.importedAt === "string" ? c.importedAt : "",
+    tokenType: typeof c.tokenType === "string" && headerValue(c.tokenType, 64) ? c.tokenType : undefined,
+  };
+  if (c.source === "browser" && headerValue(c.refreshToken, MAX_SOURCE_BYTES)) {
+    account.refreshToken = c.refreshToken;
+    if (Number.isFinite(c.refreshExpiresAt) && c.refreshExpiresAt > 0) account.refreshExpiresAt = Math.floor(c.refreshExpiresAt);
+  }
+  if (c.cooldown && typeof c.cooldown === "object" &&
+      Number.isFinite(c.cooldown.until) && c.cooldown.until > 0 &&
+      Number.isSafeInteger(Number(c.cooldown.code)) &&
+      (c.cooldown.scope === "account" ||
+        (c.cooldown.scope === "model" && modelIdOk(c.cooldown.model)))) {
+    account.cooldown = c.cooldown.scope === "account"
+      ? { until: Math.floor(c.cooldown.until), scope: "account", code: Number(c.cooldown.code) }
+      : { until: Math.floor(c.cooldown.until), scope: "model", model: c.cooldown.model, code: Number(c.cooldown.code) };
+  }
+  return account;
+}
+
 /** Atomic 0600 CCR-only copy. Test path injection is internal, never accepted by an HTTP API. */
 export class WorkBuddyCredentialStore {
   constructor(readonly path = join(HOME_DIR, "workbuddy-credentials.json")) {}
-  async load(): Promise<WorkBuddyCredential | null> {
+
+  /** The v1 backup path created once before the v1→v2 migration (contract §16). */
+  get backupV1Path(): string {
+    return this.path.endsWith(".json") ? this.path.slice(0, -5) + ".v1.bak" : this.path + ".v1.bak";
+  }
+
+  /** Read without version coercion. Returns the raw normalized v1 credential or v2 data. */
+  async readRaw(): Promise<WorkBuddyCredentialData | WorkBuddyCredential | null> {
     let file: Awaited<ReturnType<typeof fs.open>> | undefined;
     try {
       file = await fs.open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
       const stat = await file.stat();
       if (!stat.isFile() || stat.size > MAX_SOURCE_BYTES || (process.platform !== "win32" && (stat.mode & 0o077))) throw new Error();
       const c = JSON.parse(await file.readFile("utf8"));
-      return this.normalize(c);
+      if (c?.version === 2) return this.normalizeData(c);
+      return this.normalizeV1(c);
     } catch (e: any) {
       if (e?.code === "ENOENT") return null;
       throw new Error("WorkBuddy 私有登录态不可读，请重新导入");
     } finally { await file?.close(); }
   }
-  /** Whitelist normalization: unknown junk never survives a save/load round-trip. */
-  private normalize(c: any): WorkBuddyCredential {
-    if (!c || typeof c !== "object") throw new Error();
-    if (c.version !== 1 || !(c.kind === "workbuddy" || c.kind === "workbuddy-ai") ||
-      !headerValue(c.accessToken, MAX_SOURCE_BYTES, true) || !headerValue(c.uid, 253, true) ||
-      (c.source !== "desktop" && c.source !== "browser")) throw new Error();
-    const site = workBuddySite(c.kind);
-    const domain = validDomain(c.domain, site);
-    if (!headerValue(c.displayName ?? "", 253) || !headerValue(c.enterpriseId ?? "", 253)) throw new Error();
-    const next: WorkBuddyCredential = {
-      version: 1, kind: c.kind, uid: c.uid,
-      displayName: typeof c.displayName === "string" ? c.displayName : "",
-      domain,
-      enterpriseId: headerValue(c.enterpriseId, 253) ? c.enterpriseId : "",
-      accessToken: c.accessToken,
-      expiresAt: Number.isFinite(c.expiresAt) && c.expiresAt >= 0 ? Math.floor(c.expiresAt) : 0,
-      importedAt: typeof c.importedAt === "string" ? c.importedAt : "",
-      source: c.source,
-      tokenType: typeof c.tokenType === "string" && headerValue(c.tokenType, 64) ? c.tokenType : undefined,
-      lastSyncAt: typeof c.lastSyncAt === "string" ? c.lastSyncAt : undefined,
-    };
-    if (c.source === "browser" && headerValue(c.refreshToken, MAX_SOURCE_BYTES)) {
-      next.refreshToken = c.refreshToken;
-      if (Number.isFinite(c.refreshExpiresAt) && c.refreshExpiresAt > 0) next.refreshExpiresAt = Math.floor(c.refreshExpiresAt);
-    }
-    return next;
+
+  /**
+   * Migration-only read: parses v1 bytes without the mode check (a stray
+   * permissive v1 file must be CONVERTED to a 0600 v2 file, not brick the
+   * pool). Size/type/no-symlink bounds still apply.
+   */
+  private async readV1Lenient(): Promise<WorkBuddyCredential | null> {
+    let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      file = await fs.open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.size > MAX_SOURCE_BYTES) return null;
+      return this.normalizeV1(JSON.parse(await file.readFile("utf8")));
+    } catch {
+      return null;
+    } finally { await file?.close(); }
   }
 
-  async save(c: WorkBuddyCredential): Promise<void> {
-    let safe: WorkBuddyCredential;
-    try { safe = this.normalize(c); } catch { throw new Error("WorkBuddy 私有登录态保存失败"); }
-    await fs.mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
-    const temp = `${this.path}.${randomBytes(12).toString("hex")}.tmp`;
+  /**
+   * Load normalized v2 data. A legacy v1 file is migrated IN MEMORY only;
+   * use migrateV1() to back it up and convert the file on disk.
+   */
+  async loadData(): Promise<WorkBuddyCredentialData | null> {
+    const raw = await this.readRaw();
+    if (!raw) return null;
+    return raw.version === 2 ? raw : this.migrateV1Data(raw);
+  }
+
+  /** Whitelist normalization of a v1 single-credential file. */
+  private normalizeV1(c: any): WorkBuddyCredential {
+    if (!c || typeof c !== "object" || c.version !== 1 ||
+      !(c.kind === "workbuddy" || c.kind === "workbuddy-ai")) throw new Error();
+    const account = normalizeAccount({ ...c, version: undefined }, c.kind);
+    return { version: 1, ...account, kind: c.kind, lastSyncAt: typeof c.lastSyncAt === "string" ? c.lastSyncAt : undefined };
+  }
+
+  /** Whitelist normalization: unknown junk never survives a save/load round-trip. */
+  private normalizeData(c: any): WorkBuddyCredentialData {
+    if (!c || typeof c !== "object" || c.version !== 2 || !c.sites || typeof c.sites !== "object") throw new Error();
+    const sites: WorkBuddyCredentialData["sites"] = {};
+    for (const id of ["workbuddy", "workbuddy-ai"] as const) {
+      const s = c.sites[id];
+      if (!s) continue;
+      if (typeof s !== "object" || !Array.isArray(s.accounts)) throw new Error();
+      if (s.accounts.length === 0 || s.accounts.length > 64) throw new Error();
+      const accounts: WorkBuddyAccount[] = s.accounts.map((a: any) => normalizeAccount(a, id));
+      const uids = new Set(accounts.map((a) => a.uid));
+      if (uids.size !== accounts.length) throw new Error();
+      const hiddenRaw: unknown[] = Array.isArray(s.hiddenModels) ? s.hiddenModels : [];
+      const hiddenModels = [...new Set(hiddenRaw.filter(modelIdOk))];
+      const activeUid = s.activeUid === null ? null : (typeof s.activeUid === "string" && uids.has(s.activeUid) ? s.activeUid : accounts[0].uid);
+      const discoveredRaw: unknown[] | undefined = Array.isArray(s.discoveredModels) ? s.discoveredModels : undefined;
+      sites[id] = {
+        hiddenModels,
+        activeUid: accounts.some((a) => a.uid === activeUid) ? activeUid : null,
+        accounts,
+        discoveredModels: discoveredRaw ? [...new Set(discoveredRaw.filter(modelIdOk))] : undefined,
+        lastSyncAt: typeof s.lastSyncAt === "string" ? s.lastSyncAt : undefined,
+        lastError: typeof s.lastError === "string" && s.lastError.length <= 512 ? s.lastError : null,
+      };
+    }
+    if (!Object.keys(sites).length) throw new Error();
+    return { version: 2, sites };
+  }
+
+  private migrateV1Data(c: WorkBuddyCredential): WorkBuddyCredentialData {
+    const { version: _v, kind, lastSyncAt, ...account } = c;
+    return { version: 2, sites: { [kind]: { hiddenModels: [], activeUid: account.uid, accounts: [account], lastSyncAt: lastSyncAt ?? undefined } } };
+  }
+
+  /**
+   * Create workbuddy-credentials.v1.bak (0600) from the current v1 bytes and
+   * convert the file to v2. Called once, before any provider/Router migration
+   * (contract §16). The backup keeps the EXACT on-disk v1 bytes and is never
+   * overwritten on repeat calls.
+   */
+  async migrateV1(): Promise<{ data: WorkBuddyCredentialData; legacy: WorkBuddyCredential | null; backupCreated: boolean }> {
+    // A permissive/unreadable file must still migrate: read bytes leniently,
+    // back them up, then rewrite v2 at 0600 (which repairs the mode).
+    const legacy = await this.readV1Lenient();
+    if (!legacy) {
+      const raw = await this.readRaw();
+      if (raw?.version === 2) return { data: raw, legacy: null, backupCreated: false };
+      throw new Error("WorkBuddy 私有登录态迁移失败");
+    }
+    let backupCreated = false;
+    try {
+      await fs.access(this.backupV1Path, constants.O_RDONLY);
+    } catch {
+      const v1bytes = await fs.readFile(this.path);
+      await this.writePrivate(this.backupV1Path, v1bytes);
+      backupCreated = true;
+    }
+    const data = this.migrateV1Data(legacy);
+    await this.saveData(data);
+    return { data, legacy, backupCreated };
+  }
+
+  private async writePrivate(target: string, contents: Buffer | string): Promise<void> {
+    await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    const temp = `${target}.${randomBytes(12).toString("hex")}.tmp`;
     try {
       const file = await fs.open(temp, "wx", 0o600);
-      try { await file.writeFile(JSON.stringify(safe)); await file.sync(); } finally { await file.close(); }
-      await fs.rename(temp, this.path);
+      try { await file.writeFile(contents); await file.sync(); } finally { await file.close(); }
+      await fs.rename(temp, target);
+      if (process.platform !== "win32") await fs.chmod(target, 0o600);
     } catch { throw new Error("WorkBuddy 私有登录态保存失败"); }
     finally { await fs.unlink(temp).catch(() => {}); }
   }
+
+  async saveData(data: WorkBuddyCredentialData): Promise<void> {
+    let safe: WorkBuddyCredentialData;
+    try { safe = this.normalizeData(data); } catch { throw new Error("WorkBuddy 私有登录态保存失败"); }
+    await this.writePrivate(this.path, JSON.stringify(safe));
+  }
+
+  /**
+   * Upsert one account into its site pool: a repeated uid REPLACES that
+   * account's credentials (contract §16). Other sites are untouched. Returns
+   * the normalized v2 data written and whether the uid replaced an existing
+   * account. A legacy v1 file is backed up + converted on first v2 write.
+   */
+  async upsertAccount(c: WorkBuddyCredential): Promise<{ data: WorkBuddyCredentialData; replaced: boolean }> {
+    const migrated = await this.ensureV2OnDisk();
+    const current = migrated?.data ?? (await this.loadData()) ?? { version: 2 as const, sites: {} };
+    const { version: _v, kind, lastSyncAt, ...accountFields } = c;
+    const account = normalizeAccount(accountFields, kind);
+    const prev = current.sites[kind] ?? { hiddenModels: [], activeUid: null, accounts: [] };
+    const idx = prev.accounts.findIndex((a) => a.uid === account.uid);
+    const replaced = idx >= 0;
+    if (replaced) {
+      // Re-login keeps pool position, hidden list and the sticky active uid.
+      prev.accounts[idx] = { ...account, cooldown: undefined };
+    } else {
+      prev.accounts.push(account);
+    }
+    if (!prev.activeUid || !prev.accounts.some((a) => a.uid === prev.activeUid)) prev.activeUid = account.uid;
+    if (lastSyncAt) prev.lastSyncAt = lastSyncAt;
+    current.sites[kind] = prev;
+    await this.saveData(current);
+    return { data: current, replaced };
+  }
+
+  /** Sticky active selection. Rejects an unknown uid. */
+  async setActiveUid(site: WorkBuddySiteId, uid: string): Promise<WorkBuddyCredentialData> {
+    const current = await this.loadData();
+    const state = current?.sites[site];
+    if (!state || !state.accounts.some((a) => a.uid === uid)) throw new Error("workbuddy_account_not_found");
+    state.activeUid = uid;
+    await this.saveData(current!);
+    return current!;
+  }
+
+  /**
+   * Remove one pool account. Removing the active uid advances stickiness to
+   * the earliest-imported remaining account; an emptied pool leaves NO site
+   * state behind (the service then removes the provider but keeps Router).
+   */
+  async removeAccount(site: WorkBuddySiteId, uid: string): Promise<{ data: WorkBuddyCredentialData | null; removed: boolean; activeAdvancedTo: string | null }> {
+    const current = await this.loadData();
+    const state = current?.sites[site];
+    if (!state || !state.accounts.some((a) => a.uid === uid)) return { data: current ?? null, removed: false, activeAdvancedTo: null };
+    state.accounts = state.accounts.filter((a) => a.uid !== uid);
+    let activeAdvancedTo: string | null = null;
+    if (state.accounts.length === 0) {
+      delete current!.sites[site];
+      if (!Object.keys(current!.sites).length) { await this.delete(); return { data: null, removed: true, activeAdvancedTo: null }; }
+    } else if (state.activeUid === uid || !state.accounts.some((a) => a.uid === state.activeUid)) {
+      state.activeUid = [...state.accounts].sort((a, b) => (a.importedAt < b.importedAt ? -1 : a.importedAt > b.importedAt ? 1 : 0))[0].uid;
+      activeAdvancedTo = state.activeUid;
+    }
+    await this.saveData(current!);
+    return { data: current!, removed: true, activeAdvancedTo };
+  }
+
+  /** Merge a fresh discovered id set into the site's cumulative union. */
+  async mergeDiscoveredModels(site: WorkBuddySiteId, models: readonly string[]): Promise<WorkBuddyCredentialData> {
+    const current = await this.loadData();
+    if (!current?.sites[site]) throw new Error("workbuddy_not_connected");
+    const state = current.sites[site]!;
+    const union = new Set([...(state.discoveredModels ?? []), ...models.filter(modelIdOk)]);
+    state.discoveredModels = [...union];
+    await this.saveData(current);
+    return current;
+  }
+
+  /** Replace one site's hidden-model blacklist (values are validated/deduped). */
+  async setHiddenModels(site: WorkBuddySiteId, hiddenModels: readonly string[]): Promise<WorkBuddyCredentialData> {
+    const current = await this.loadData();
+    if (!current?.sites[site]) throw new Error("workbuddy_not_connected");
+    current.sites[site]!.hiddenModels = [...new Set(hiddenModels.filter(modelIdOk))];
+    await this.saveData(current);
+    return current;
+  }
+
+  /** Persist a failover cooldown on one pool account (or clear it with `cooldown === null`). */
+  async setAccountCooldown(site: WorkBuddySiteId, uid: string, cooldown: WorkBuddyCooldown | null): Promise<WorkBuddyCredentialData> {
+    const current = await this.loadData();
+    const account = current?.sites[site]?.accounts.find((a) => a.uid === uid);
+    if (!account) throw new Error("workbuddy_account_not_found");
+    if (cooldown === null) delete account.cooldown;
+    else account.cooldown = { ...cooldown, model: cooldown.scope === "model" ? cooldown.model : undefined };
+    await this.saveData(current!);
+    return current!;
+  }
+
+  /** Remove one site entirely (full disconnect). Deletes the file when no sites remain. */
+  async deleteSite(site: WorkBuddySiteId): Promise<boolean> {
+    const data = await this.loadData();
+    if (!data?.sites[site]) return false;
+    delete data.sites[site];
+    if (!Object.keys(data.sites).length) return this.delete();
+    await this.saveData(data);
+    return true;
+  }
+
+  /**
+   * If the on-disk file is still v1, perform the one-time backup + conversion
+   * before the first v2 write. Returns null when no v1 file needed migration.
+   */
+  private async ensureV2OnDisk(): Promise<{ data: WorkBuddyCredentialData; legacy: WorkBuddyCredential | null; backupCreated: boolean } | null> {
+    const lenient = await this.readV1Lenient();
+    if (lenient) return this.migrateV1();
+    const raw = await this.readRaw();
+    if (!raw) return null;
+    return raw.version === 2 ? { data: raw, legacy: null, backupCreated: false } : this.migrateV1();
+  }
+
   async delete(): Promise<boolean> {
     try { await fs.unlink(this.path); return true; }
     catch (e: any) { if (e?.code === "ENOENT") return false; throw new Error("WorkBuddy 私有登录态删除失败"); }
+  }
+
+  // ----------------------------------------------------------------
+  // Legacy single-credential compatibility shim — ONLY the still-single-site
+  // WorkBuddyAuthService uses these. Milestone B rewrites that service to the
+  // pool API (loadData/upsertAccount/...) and DELETES every method below.
+  // ----------------------------------------------------------------
+
+  /** @deprecated use loadData(); returns the active account when exactly one site is present. */
+  async load(): Promise<WorkBuddyCredential | null> {
+    const raw = await this.readRaw();
+    if (!raw) return null;
+    if (raw.version === 1) return raw;
+    const ids = Object.keys(raw.sites) as WorkBuddySiteId[];
+    if (!ids.length) return null;
+    // CN-first deterministic pick; multi-site correctness arrives with milestone B.
+    const id = (ids.includes("workbuddy") ? "workbuddy" : ids[0]) as WorkBuddySiteId;
+    const state = raw.sites[id]!;
+    const account = state.accounts.find((a) => a.uid === state.activeUid) ?? state.accounts[0];
+    return { version: 1, kind: id, ...account, lastSyncAt: state.lastSyncAt };
+  }
+
+  /** @deprecated use upsertAccount(); retained for the pre-§16 service. */
+  async save(c: WorkBuddyCredential): Promise<void> {
+    await this.upsertAccount(c);
   }
 }
 export const workBuddyCredentialStore = new WorkBuddyCredentialStore();
