@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createWorkBuddyLogin } from "../src/utils/workbuddy-login.ts";
+import { createWorkBuddyLogin, WORKBUDDY_POLL_TIMEOUT } from "../src/utils/workbuddy-login.ts";
 import type { WorkBuddyLoginPollResponse, WorkBuddyLoginStartResponse } from "../src/types.ts";
 
 const job = (): WorkBuddyLoginStartResponse => ({ ok: true, site: "workbuddy-ai", loginId: "mock-job", url: "https://example.invalid/official-login", expiresAt: Date.now() + 60_000 });
@@ -85,4 +85,66 @@ test("unsafe login URL never reaches the UI and its job is invalidated", async (
     cancelWorkBuddyLogin: async () => { cancels++; return { success: true }; },
   }, "workbuddy-ai", () => assert.fail("unsafe link displayed"));
   await assert.rejects(session.done); assert.equal(cancels, 1);
+});
+
+test("P3 a timed-out poll retries within the deadline and still connects", async () => {
+  let polls = 0;
+  const session = createWorkBuddyLogin({
+    startWorkBuddyLogin: async () => job(),
+    pollWorkBuddyLogin: async () => {
+      polls++;
+      if (polls <= 2) throw Object.assign(new Error("WorkBuddy request failed"), { reason: WORKBUDDY_POLL_TIMEOUT });
+      return connected;
+    },
+    cancelWorkBuddyLogin: async () => ({ success: true }),
+  }, "workbuddy-ai", () => {}, { intervalMs: 1, deadlineMs: 1_000 });
+  assert.deepEqual(await session.done, connected);
+  assert.equal(polls, 3);
+});
+
+test("P3 persistent timeouts stay bounded by the server job expiry, never infinite", async () => {
+  let polls = 0; let cancels = 0;
+  const session = createWorkBuddyLogin({
+    startWorkBuddyLogin: async () => ({ ...job(), expiresAt: Date.now() + 25 }),
+    pollWorkBuddyLogin: async () => {
+      polls++;
+      throw Object.assign(new Error("WorkBuddy request failed"), { reason: WORKBUDDY_POLL_TIMEOUT });
+    },
+    cancelWorkBuddyLogin: async () => { cancels++; return { success: true }; },
+  }, "workbuddy-ai", () => {}, { intervalMs: 1, deadlineMs: 30_000 });
+  await assert.rejects(session.done, { reason: "login_expired" });
+  assert.ok(polls > 0 && polls < 200, `polls bounded, got ${polls}`);
+  assert.equal(cancels, 1);
+});
+
+test("P3 explicit server failure/security rejections are never retried as timeouts", async () => {
+  let polls = 0;
+  const session = createWorkBuddyLogin({
+    startWorkBuddyLogin: async () => job(),
+    pollWorkBuddyLogin: async () => {
+      polls++;
+      throw Object.assign(new Error("WorkBuddy request failed"), { reason: "login_state_rejected" });
+    },
+    cancelWorkBuddyLogin: async () => ({ success: true }),
+  }, "workbuddy-ai", () => {}, { intervalMs: 1, deadlineMs: 1_000 });
+  await assert.rejects(session.done, { reason: "login_state_rejected" });
+  assert.equal(polls, 1);
+});
+
+test("P3 user cancellation during a timeout backoff still cancels cleanly", async () => {
+  let polls = 0; let cancels = 0;
+  const session = createWorkBuddyLogin({
+    startWorkBuddyLogin: async () => job(),
+    pollWorkBuddyLogin: async () => {
+      polls++;
+      throw Object.assign(new Error("WorkBuddy request failed"), { reason: WORKBUDDY_POLL_TIMEOUT });
+    },
+    cancelWorkBuddyLogin: async () => { cancels++; return { success: true }; },
+  }, "workbuddy-ai", () => {}, { intervalMs: 30_000, deadlineMs: 30_000 });
+  // Cancel while the helper is waiting out the post-timeout backoff interval.
+  await new Promise(resolve => setTimeout(resolve, 5));
+  await session.cancel();
+  assert.equal(await session.done, null);
+  assert.equal(polls, 1);
+  assert.equal(cancels, 1);
 });

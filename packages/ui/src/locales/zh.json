@@ -567,7 +567,7 @@
     "privacy": "密码仅在官方授权页面输入。凭据仅保存在 CCR 服务端私有文件（0600），不回传此浏览器、不写入普通供应商配置；令牌仅发送到所选 WorkBuddy 固定域名用于模型发现和推理。",
     "backup_warning": "配置备份不含凭据；恢复备份后请重新授权。",
     "encrypted_warning": "不解密、不支持新版已加密的本地登录文件。CCR 不自动刷新令牌：过期后请先在 WorkBuddy 重新登录，再明确重新导入。",
-    "routing_note": "登录、导入、同步和断开均不修改 Router、不自动选择默认模型。请手工选择 workbuddy,<模型>。",
+    "routing_note": "登录、导入、同步和断开均不修改 Router、不自动选择默认模型。只有显式隐藏模型才会清理指向它的 Router 引用。请手工选择 workbuddy,<模型>。",
     "account": "账号（UID 已脱敏）",
     "expires": "访问令牌过期时间",
     "model_count": "已注册模型",
@@ -599,7 +599,8 @@
       "source_missing": "未找到登录文件",
       "source_changed": "需要重新授权",
       "error": "错误",
-      "restricted": "账号受限"
+      "restricted": "账号受限",
+      "cooling": "冷却中"
     },
     "help": {
       "expired": "请在浏览器重新授权。桌面导入来源可先在桌面端续期，再明确重新导入。",
@@ -613,7 +614,6 @@
       "source_missing": "未在 CCR 服务端固定路径找到 WorkBuddy 登录文件，请先在该电脑的 WorkBuddy 客户端登录后重试。",
       "source_invalid": "CCR 服务端的 WorkBuddy 登录文件无效或不受支持，请在 WorkBuddy 重新登录后重试。旧模型保留。",
       "models_fetch_failed": "模型发现失败或返回空列表。旧模型保留，请重试同步或重新授权。",
-      "workbuddy_site_conflict": "已连接另一个 WorkBuddy 站点；请先断开，再授权当前站点。",
       "workbuddy_name_conflict": "已存在同名普通供应商“workbuddy”，请先改名或删除再授权；CCR 不会接管它。",
       "workbuddy_not_connected": "WorkBuddy 尚未连接，请先在浏览器授权登录。",
       "request_failed": "WorkBuddy 管理操作失败，未确认成功。保留已有模型显示，请明确重试。",
@@ -650,12 +650,46 @@
       "display": "已用 {{used}} / {{limit}}"
     },
     "browser_source": "浏览器授权由 CCR 管理和续期。可选的桌面导入属于独立来源：CCR 绝不复制或使用桌面端共享刷新凭据。",
-    "browser_login": "浏览器授权 / 登录",
+    "browser_login": "浏览器授权",
     "login_pending": "等待授权。请打开下方官方页面并完成登录。本次授权最多持续五分钟。",
     "open_login": "打开 {{site}} 官方授权页面 ↗",
     "source_browser": "登录来源：浏览器授权",
     "source_desktop": "登录来源：可选桌面导入",
     "source_unknown": "登录来源：未知",
-    "renewal_browser": "续期方式：浏览器。CCR 私有保存并刷新本次浏览器授权；续期失败时请重新授权。"
+    "renewal_browser": "续期方式：浏览器。CCR 私有保存并刷新本次浏览器授权；续期失败时请重新授权。",
+    "managed_provider": "托管供应商：{{name}}",
+    "add_account": "添加账号",
+    "accounts_label": "账号池（{{count}}）",
+    "active_account": "当前账号",
+    "inactive_account": "备用账号",
+    "active_badge": "当前",
+    "source_badge": {
+      "desktop": "桌面导入",
+      "browser": "浏览器"
+    },
+    "cooling_until": "冷却中（至 {{time}}）",
+    "restricted_until": "受限（至 {{time}}）",
+    "set_active": "设为当前",
+    "remove": "移除",
+    "account_remove_title": "移除此账号？",
+    "account_remove_warning": "仅从该站点账号池移除此账号的私有登录态；其 Router 引用保留，可能因此不可用。移除当前账号时会自动顺延到最早的剩余账号；移除最后一个账号等于断开该站点。",
+    "account_remove_confirm": "移除账号",
+    "account_switched": "已切换当前账号。",
+    "account_removed": "已移除账号 {{uid}}。",
+    "hide_model": "隐藏 {{model}}",
+    "hidden_models": "已隐藏模型（{{count}}）",
+    "restore": "恢复",
+    "restore_all": "恢复全部",
+    "hidden_toast": "已隐藏 {{model}}。",
+    "cleared_refs": "已从 Router 清理：{{refs}}",
+    "restored_toast": "已恢复 {{model}}，Router 引用未自动改写。",
+    "restored_all_toast": "已恢复 {{count}} 个隐藏模型，Router 引用未自动改写。",
+    "hidden_note": "隐藏的模型在同步和重新授权后保持隐藏，不会注册到托管供应商；可随时在此恢复。",
+    "router_path": {
+      "default": "默认路由",
+      "model_alias": "模型别名（{{name}}）",
+      "family_default": "模型族默认（{{family}}）",
+      "custom_route": "自定义路由（{{name}}）"
+    }
   }
 }

@@ -7,7 +7,8 @@ import { Button } from "@/components/ui/button";
 import { useConfig } from "./ConfigProvider";
 import { ProviderList } from "./ProviderList";
 import { useNavigate } from "react-router-dom";
-import { isManagedWorkBuddy } from "@/utils/workbuddy";
+import { isManagedWorkBuddy, workBuddyErrorKey, workBuddyKindOf } from "@/utils/workbuddy";
+import type { WorkBuddyKind } from "@/types";
 import {
   Dialog,
   DialogContent,
@@ -130,11 +131,15 @@ export function Providers() {
   const { config, refreshConfig } = useConfig();
   const [isSaving, setIsSaving] = useState(false);
   const navigate = useNavigate();
-  const showWorkBuddyManagement = () => {
-    navigate('/settings?tab=providers', { state: { workBuddyManagedNotice: true } });
+  const showWorkBuddyManagement = (site: WorkBuddyKind | null) => {
+    // §16: each site has its own card; land the user on the right one.
+    navigate('/settings?tab=providers', { state: { workBuddyManagedNotice: true, workBuddySite: site ?? undefined } });
   };
   const [editingProviderIndex, setEditingProviderIndex] = useState<number | null>(null);
   const [deletingProviderIndex, setDeletingProviderIndex] = useState<number | null>(null);
+  // §16: deleting a managed row is an explicit site-specific disconnect, never
+  // a generic config save that omits the entry (the backend resurrects that).
+  const [deletingManagedSite, setDeletingManagedSite] = useState<WorkBuddyKind | null>(null);
   const [hasFetchedModels, setHasFetchedModels] = useState<Record<number, boolean>>({});
   const [providerParamInputs, setProviderParamInputs] = useState<Record<string, {name: string, value: string}>>({});
   const [modelParamInputs, setModelParamInputs] = useState<Record<string, {name: string, value: string}>>({});
@@ -353,7 +358,7 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[index]);
     const provider = config.Providers[actualIndex];
-    if (isManagedWorkBuddy(provider)) { showWorkBuddyManagement(); return; }
+    if (isManagedWorkBuddy(provider)) { showWorkBuddyManagement(workBuddyKindOf(provider)); return; }
     if (isSaving) return;
     setEditingProviderIndex(actualIndex);
     setEditingProviderData(JSON.parse(JSON.stringify(provider))); // 深拷贝
@@ -373,7 +378,7 @@ export function Providers() {
     // identity, key, URL, model set or transformer, even if config refreshed.
     if (isManagedWorkBuddy(editingProviderData) ||
         (editingProviderIndex !== null && isManagedWorkBuddy(config.Providers[editingProviderIndex]))) {
-      showWorkBuddyManagement();
+      showWorkBuddyManagement(workBuddyKindOf(editingProviderData) ?? workBuddyKindOf(editingProviderIndex !== null ? config.Providers[editingProviderIndex] : null));
       return;
     }
     
@@ -481,8 +486,13 @@ export function Providers() {
 
   // Handle deletion by setting the correct index in the state
   const handleSetDeletingProviderIndex = (filteredIndex: number) => {
-    if (isManagedWorkBuddy(filteredProviders[filteredIndex])) { showWorkBuddyManagement(); return; }
     if (isSaving) return;
+    const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
+    const managedSite = workBuddyKindOf(config.Providers[actualIndex]);
+    // A managed provider's row IS its site. Keep the confirmation step, but
+    // carry the site so the confirmed action calls the site-specific
+    // `POST /api/workbuddy/disconnect {site}` instead of a global reset.
+    setDeletingManagedSite(managedSite);
     setDeletingProviderIndex(filteredIndex);
   };
 
@@ -491,8 +501,30 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     const deletedProvider = config.Providers[actualIndex];
-    if (isManagedWorkBuddy(deletedProvider)) { setDeletingProviderIndex(null); showWorkBuddyManagement(); return; }
+    const managedSite = workBuddyKindOf(deletedProvider);
+    setDeletingProviderIndex(null);
+    setDeletingManagedSite(null);
     if (isSaving) return;
+    if (managedSite) {
+      // Explicit disconnect for this site only: the backend keeps Router
+      // references and never touches the other site's pool.
+      setIsSaving(true);
+      try {
+        const response = await api.disconnectWorkBuddy(managedSite);
+        if (response?.success === false || response?.ok === false) {
+          setToast({ message: t(`workbuddy.errors.${workBuddyErrorKey(response)}`), type: 'error' });
+        } else {
+          setToast({ message: t('workbuddy.disconnected'), type: 'success' });
+        }
+        await refreshConfig();
+      } catch (e) {
+        setToast({ message: t(`workbuddy.errors.${workBuddyErrorKey(e)}`), type: 'error' });
+        await refreshConfig();
+      } finally {
+        setIsSaving(false);
+      }
+      return;
+    }
     const deletedModels = deletedProvider?.models || [];
     const deletedProviderName = deletedProvider?.name;
     const newProviders = [...config.Providers];
@@ -1669,17 +1701,19 @@ export function Providers() {
       </Dialog>
 
       {/* Delete Confirmation Dialog */}
-      <Dialog open={deletingProviderIndex !== null} onOpenChange={() => setDeletingProviderIndex(null)}>
+      <Dialog open={deletingProviderIndex !== null} onOpenChange={() => { setDeletingProviderIndex(null); setDeletingManagedSite(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t("providers.delete")}</DialogTitle>
+            <DialogTitle>{deletingManagedSite ? t("workbuddy.disconnect_title") : t("providers.delete")}</DialogTitle>
             <DialogDescription>
-              {t("providers.delete_provider_confirm")}
+              {deletingManagedSite ? t("workbuddy.disconnect_warning") : t("providers.delete_provider_confirm")}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeletingProviderIndex(null)}>{t("providers.cancel")}</Button>
-            <Button variant="destructive" onClick={() => deletingProviderIndex !== null && handleRemoveProvider(deletingProviderIndex)}>{t("providers.delete")}</Button>
+            <Button variant="outline" onClick={() => { setDeletingProviderIndex(null); setDeletingManagedSite(null); }}>{t("providers.cancel")}</Button>
+            <Button variant="destructive" onClick={() => deletingProviderIndex !== null && handleRemoveProvider(deletingProviderIndex)}>
+              {deletingManagedSite ? t("workbuddy.disconnect") : t("providers.delete")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

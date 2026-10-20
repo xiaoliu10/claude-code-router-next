@@ -12,6 +12,7 @@ import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
 import { WorkBuddyProvider } from "./WorkBuddyProvider";
 import { ProjectsPage } from "./ProjectsPage";
+import { isWorkBuddyKind } from "@/utils/workbuddy";
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { LogViewer } from '@/components/LogViewer';
 import type { ClientApplyResponse, ClientId, ClientStatus, StatusLineConfig, FallbackConfig } from "@/types";
@@ -453,7 +454,8 @@ export function SettingsPage() {
 
             <TabsContent value="providers" className="space-y-4">
               {location.state?.workBuddyManagedNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("workbuddy.managed_notice")}</p>}
-              <WorkBuddyProvider disabled={isSaving || isRestarting} onBusyChange={setWorkBuddyBusy} />
+              {/* §16: the dashboard's managed edit/delete lands on that site's card. */}
+              <WorkBuddyProvider disabled={isSaving || isRestarting} onBusyChange={setWorkBuddyBusy} focusSite={isWorkBuddyKind(location.state?.workBuddySite) ? location.state.workBuddySite : null} />
             </TabsContent>
 
             {/* General Tab */}
