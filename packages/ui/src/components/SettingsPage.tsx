@@ -442,8 +442,8 @@ export function SettingsPage() {
         <div className="w-full">
           <Tabs value={initialTab} onValueChange={tab => navigate(`/settings?tab=${tab}`, { replace: true })} className="w-full">
             <TabsList className="w-full justify-start mb-4">
-              <TabsTrigger value="providers">{t("settings.tabs.providers")}</TabsTrigger>
               <TabsTrigger value="general">{t("settings.tabs.general")}</TabsTrigger>
+              <TabsTrigger value="providers">{t("settings.tabs.providers")}</TabsTrigger>
               <TabsTrigger value="clients">{t("settings.tabs.clients")}</TabsTrigger>
               <TabsTrigger value="router">{t("settings.tabs.router")}</TabsTrigger>
               <TabsTrigger value="projects">{t("settings.tabs.projects")}</TabsTrigger>
