@@ -591,7 +591,9 @@ describe("WorkBuddy admin API (isolated mocks)", () => {
     await store.save(CRED);
     const res = await server.app.inject({ method: "POST", url: "http://localhost:3456/api/workbuddy/disconnect", payload: {} });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ success: true, removedProvider: true, deletedCredential: true });
+    // Legacy fields are preserved; §16 adds ok + the site the reset applied to
+    // (null = legacy full reset across every connected site).
+    expect(res.json()).toEqual({ ok: true, site: null, success: true, removedProvider: true, deletedCredential: true });
     expect(config.Providers.map((p: any) => p.name)).toEqual(["other"]);
     expect(config.Router).toEqual(router);
     const { existsSync } = await import("node:fs");

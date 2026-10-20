@@ -132,8 +132,18 @@ export interface WorkBuddyPoolStatus {
 }
 export interface WorkBuddyHideResult {
   success: boolean;
+  /** Router FIELD PATHS that were rewritten (e.g. "default", "scenario:think", "models:alias"). */
   clearedRefs: string[];
   models: string[];
+  /**
+   * The actual `provider,model` references that disappeared from Router (usually
+   * exactly one). clearedRefs tells the UI *where* it changed; this tells it
+   * *which model ref* is gone, so it can reconcile its local Router draft.
+   * Empty when nothing was routed through this provider/model.
+   */
+  removedModelRefs?: string[];
+  /** `Router.default` as persisted after the hide ("" when it was cleared). */
+  defaultFallback?: string | null;
   error?: string;
   message?: string | null;
 }
@@ -151,6 +161,8 @@ export interface WorkBuddyRemoveAccountResult {
   deletedCredential: boolean;
   notice?: string | null;
   error?: string;
+  /** Sanitized constant only (never a raw fs/upstream message). */
+  message?: string | null;
 }
 export interface WorkBuddyMigrationResult {
   success: boolean;
@@ -837,8 +849,9 @@ export class WorkBuddyAuthService {
         updatedState.lastSyncAt = new Date().toISOString();
         await this.store.saveData(updated);
       }
-    } catch (error: any) {
-      this.log.error?.({ err: error }, "[workbuddy] sync persist failed");
+    } catch {
+      // Sanitized constant: a raw fs/config error may carry local paths.
+      this.log.error?.("[workbuddy] sync persist failed");
       return {
         success: false,
         status: "error",
@@ -912,8 +925,8 @@ export class WorkBuddyAuthService {
       try {
         await writeConfigFile(config);
         this.reloadRuntime(config);
-      } catch (error: any) {
-        this.log.error?.({ err: error }, "[workbuddy] disconnect config write failed");
+      } catch {
+        this.log.error?.("[workbuddy] disconnect config write failed");
         throw new Error("WorkBuddy 断开失败；配置未写入");
       }
       if (JSON.stringify(config.Router ?? null) !== routerBefore) {
@@ -960,15 +973,27 @@ export class WorkBuddyAuthService {
           await writeConfigFile(config);
           this.reloadRuntime(config);
         }
-      } catch (error: any) {
+      } catch {
         try {
           await this.store.setHiddenModels(site, state.hiddenModels);
           if (providerIndex >= 0) { await writeConfigFile(previousConfig); this.reloadRuntime(previousConfig); }
         } catch { this.log.error?.("[workbuddy] hide rollback failed"); }
-        this.log.error?.({ err: error }, "[workbuddy] hide persist failed; rolled back");
-        return { success: false, clearedRefs: [], models: currentModels, error: "workbuddy_config_write_failed", message: "WorkBuddy 模型隐藏失败；已回滚" };
+        // Sanitized: the raw error object is never logged or returned (it may
+        // carry a filesystem path or an upstream body).
+        this.log.error?.("[workbuddy] hide persist failed; rolled back");
+        return { success: false, clearedRefs: [], models: currentModels, removedModelRefs: [], defaultFallback: null, error: "workbuddy_config_write_failed", message: "WorkBuddy 模型隐藏失败；已回滚" };
       }
-      return { success: true, clearedRefs: providerIndex >= 0 ? cleaned.clearedRefs : [], models: visible };
+      const clearedRefs = providerIndex >= 0 ? cleaned.clearedRefs : [];
+      // Integration seam (UI): the ref that actually left Router, plus the
+      // persisted Router.default so the caller can show/apply the new fallback.
+      const removedModelRefs = clearedRefs.length ? [`${managedProvider(site).name},${model}`] : [];
+      let defaultFallback: string | null = null;
+      if (clearedRefs.length) {
+        const persisted = await readConfigFileRaw().catch(() => null);
+        const value = persisted?.Router?.default;
+        defaultFallback = typeof value === "string" ? value : null;
+      }
+      return { success: true, clearedRefs, models: visible, removedModelRefs, defaultFallback };
     });
   }
 
@@ -1005,12 +1030,12 @@ export class WorkBuddyAuthService {
           await writeConfigFile(config);
           this.reloadRuntime(config);
         }
-      } catch (error: any) {
+      } catch {
         try {
           await this.store.setHiddenModels(site, state.hiddenModels);
           if (providerIndex >= 0) { await writeConfigFile(await this.readConfig()); }
         } catch { this.log.error?.("[workbuddy] restore rollback failed"); }
-        this.log.error?.({ err: error }, "[workbuddy] restore persist failed; rolled back");
+        this.log.error?.("[workbuddy] restore persist failed; rolled back");
         return { success: false, restored: [], models: [...union].filter((m) => state.hiddenModels.includes(m) === false), error: "workbuddy_config_write_failed", message: "WorkBuddy 模型恢复失败；已回滚" };
       }
       return { success: true, restored, models: visible };
@@ -1063,9 +1088,9 @@ export class WorkBuddyAuthService {
       try {
         await writeConfigFile(config);
         this.reloadRuntime(config);
-      } catch (error: any) {
+      } catch {
         try { await writeConfigFile(previousConfig); this.reloadRuntime(previousConfig); } catch { this.log.error?.("[workbuddy] migration rollback failed"); }
-        this.log.error?.({ err: error }, "[workbuddy] migration config write failed");
+        this.log.error?.("[workbuddy] migration config write failed");
         return { success: false, renamedProvider: false, renamedRefs: [], error: "workbuddy_config_write_failed", message: "WorkBuddy 迁移失败；已回滚" };
       }
       const expectedRouter = renamed.renamedRefs.length ? renamed.router : previousConfig.Router;
@@ -1427,10 +1452,11 @@ export class WorkBuddyAuthService {
         try {
           removedProvider = await this.removeSiteProvider(site);
           deletedCredential = removed.data === null;
-        } catch (error: any) {
+        } catch {
           if (snapshot) await this.store.saveData(snapshot);
           this.log.error?.("[workbuddy] account-remove provider write failed; pool restored");
-          return { success: false, poolEmpty: false, removedProvider: false, deletedCredential: false, error: "workbuddy_config_write_failed", message: error?.message };
+          // Sanitized constant: the raw write error may carry a local path.
+          return { success: false, poolEmpty: false, removedProvider: false, deletedCredential: false, error: "workbuddy_config_write_failed", message: "WorkBuddy 账号移除失败；已回滚" };
         }
       }
       return {

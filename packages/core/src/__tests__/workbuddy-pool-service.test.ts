@@ -290,7 +290,7 @@ describe("WorkBuddy pool selection and cooldowns", () => {
     expect(router.webSearch).toBe("");                   // AI m2 cleared
     expect(router.models).toEqual({});                   // both alias entries removed
     expect(router.default).toBe("other,m");              // unrelated default untouched
-    const data = await h.store.loadData()!;
+    const data = (await h.store.loadData())!;
     expect(data.sites.workbuddy!.hiddenModels).toEqual(["m1"]);
     expect(data.sites["workbuddy-ai"]!.hiddenModels).toEqual(["m2"]);
   });

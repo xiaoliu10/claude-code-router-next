@@ -173,14 +173,21 @@ export function protectWorkBuddyConfig(config: any, previous?: any): void {
       const old = olds.find((o: any) => o.workbuddy_kind === (p?.workbuddy_kind ?? (p?.name === WORKBUDDY_AI_PROVIDER_NAME ? "workbuddy-ai" : "workbuddy"))) ||
         olds.find((o: any) => o?.name === p?.name);
       if (isManagedWorkBuddy(p) || (old && (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name))) {
-        return lockWorkBuddyProvider(old ? { ...p, workbuddy_kind: old.workbuddy_kind } : p);
+        // Site derivation must survive a missing workbuddy_kind, otherwise a
+        // generic save would re-lock the INTERNATIONAL entry onto the CN
+        // origin/name (contract §16: protections cover both sites).
+        const siteId = old?.workbuddy_kind ?? p?.workbuddy_kind ?? workBuddySiteFromProvider(p);
+        return lockWorkBuddyProvider({ ...p, workbuddy_kind: siteId }, siteId);
       }
       return p;
     });
     // A generic full-config save must not delete a managed provider by omission;
     // removal is an explicit WorkBuddy disconnect (contract §13/§16).
     for (const old of olds) {
-      if (!config[key].some((p: any) => p?.name === old.name)) config[key].push(lockWorkBuddyProvider(old));
+      if (!config[key].some((p: any) => p?.name === old.name)) {
+        const siteId = old?.workbuddy_kind ?? workBuddySiteFromProvider(old);
+        config[key].push(lockWorkBuddyProvider({ ...old, workbuddy_kind: siteId }, siteId));
+      }
     }
   }
 }
