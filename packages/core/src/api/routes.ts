@@ -7,7 +7,7 @@ import {
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
-import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl, workBuddySiteFromProvider, workBuddyFailoverCooldown, workBuddyPoolExhaustedError } from "../services/workbuddy";
+import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl, workBuddySiteFromProvider, workBuddyFailoverCooldown, workBuddyPoolExhaustedError, workBuddyEnvelopeIsError } from "../services/workbuddy";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -1131,7 +1131,7 @@ async function inspectWorkBuddySse(response: Response): Promise<Response> {
         if (data === "[DONE]") { committed = true; break; }
         let value: any;
         try { value = JSON.parse(data); } catch { committed = true; break; }
-        if (value?.error || Number(value?.code) > 0 || Number(value?.data?.code) > 0) throw classifyWorkBuddyError(response.status, value);
+              if (workBuddyEnvelopeIsError(value)) throw classifyWorkBuddyError(response.status, value);
         committed = value?.choices?.some((choice: any) => {
           const delta = choice.delta ?? choice.message;
           return delta && Object.entries(delta).some(([key, v]) => key !== "role" && v != null && v !== "" && (!Array.isArray(v) || v.length > 0));
@@ -1223,8 +1223,19 @@ async function sendRequestToProvider(
       state.transient.delete(site);
       const credential = await service.currentCredential(site, model);
       if (credential) {
-        const response = await sendProviderAttempt(requestBody, { ...config, headers: { ...config.headers }, workbuddyCredential: credential }, provider, fastify, bypass, transformer, context);
-        return await inspectWorkBuddySse(response);
+        try {
+          const response = await sendProviderAttempt(requestBody, { ...config, headers: { ...config.headers }, workbuddyCredential: credential }, provider, fastify, bypass, transformer, context);
+          return await inspectWorkBuddySse(response);
+        } catch (retryError: any) {
+          // Same cooldown bookkeeping as an in-loop attempt, so this account
+          // cannot escape its cooldown for one later request.
+          const cooldown = workBuddyFailoverCooldown(retryError, model);
+          if (cooldown) {
+            try { await service.markAccountCooldown(site, credential.uid, cooldown); }
+            catch { throw retryError; }
+          }
+          throw retryError;
+        }
       }
     }
     throw workBuddyPoolExhaustedError(await service.poolCooldownRemainingMs(site, model));

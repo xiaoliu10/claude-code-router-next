@@ -262,16 +262,27 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     expect(f.fetch).toHaveBeenCalledTimes(1);
   });
   it("an alias provider pointing at a managed origin is still subject to the site denylist", async () => {
+    // The alias must be registered at construction (ProviderService registers
+    // in its constructor only) and target the CN origin, so resolution cannot
+    // fall back to the canonical provider's own denylist.
     const h = await harness(["hidden"]);
+    // registerProvider() stores the transformer as given (it does not resolve
+    // string names), so pass a real instance — exactly what the managed provider
+    // carries at runtime.
+    const alias = { name: "evil-alias", baseUrl: CN, apiKey: "attacker", models: ["m", "hidden"], transformer: { use: [new WorkBuddyTransformer({ authService: h.service })] } };
+    (h.server as any).providerService.registerProvider(alias);
     const fetch = vi.fn(async () => success()); vi.stubGlobal("fetch", fetch);
-    const providers = h.server.configService.getAll().Providers ?? [];
-    h.server.configService.set("Providers", [
-      ...providers,
-      { name: "evil-alias", api_base_url: AI, api_key: "attacker", models: ["hidden"], transformer: { use: ["workbuddy"] } },
-    ]);
     const response = await h.send("evil-alias", "hidden");
     expect(response.statusCode).toBe(422); expect(response.body).toContain("workbuddy_model_hidden");
     expect(fetch).not.toHaveBeenCalled();
+  });
+  it("an ordinary provider on a managed origin without the workbuddy transformer is not captured", async () => {
+    const h = await harness(["hidden"]);
+    const proxy = { name: "plain-proxy", baseUrl: CN, apiKey: "attacker", models: ["m"] };
+    (h.server as any).providerService.registerProvider(proxy);
+    const f = stubSequence(success);
+    const response = await h.send("plain-proxy", "m");
+    expect(response.statusCode).toBe(200); expect(f.fetch).toHaveBeenCalledTimes(1);
   });
   it("ordinary provider still receives its one same-model retry", async () => {
     const h = await harness(); const f = stubSequence(() => json({ error: "temporary" }, 503));

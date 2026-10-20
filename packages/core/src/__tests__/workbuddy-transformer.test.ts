@@ -210,6 +210,18 @@ describe("WorkBuddy non-stream aggregation (contract §13 Q1)", () => {
       .rejects.toMatchObject({ code: "workbuddy_account_restricted", statusCode: 400 });
   });
 
+  it("classifies a nested data.code envelope exactly like the flat error body", async () => {
+    const { transformer } = await harness();
+    const context: any = {};
+    await transformer.transformRequestIn({ ...baseRequest(), stream: false } as any, {} as any, context);
+    const body = [
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+      "data: {\"data\":{\"code\":6004,\"msg\":\"private-upstream-body\"}}\n\n",
+    ];
+    await expect(transformer.transformResponseOut(sse(body), context))
+      .rejects.toMatchObject({ code: "rate_limit" });
+  });
+
   it("throws on a data-less stream so fallback engages instead of an empty completion", async () => {
     const { transformer } = await harness();
     const context: any = {};

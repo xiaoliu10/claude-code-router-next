@@ -713,6 +713,22 @@ export function classifyWorkBuddyError(status: number, body?: any): Error & { co
 }
 export function sanitizeWorkBuddyError(_error: unknown): string { return "WorkBuddy 操作失败；请检查本机登录状态后重新导入"; }
 
+/**
+ * One shared predicate for the WorkBuddy `{code,msg,data}` error envelope
+ * (contract §5.4): an explicit `error`, a non-zero top-level `code`, or a
+ * non-zero nested `data.code`. The SSE prefix inspector (api/routes.ts) and both
+ * transformer stream paths use it, so envelope classification can never drift
+ * between the JSON and SSE surfaces.
+ */
+export function workBuddyEnvelopeIsError(value: any): boolean {
+  if (!value || typeof value !== "object") return false;
+  if (value.error) return true;
+  const flat = Number(value.code);
+  if (Number.isSafeInteger(flat) && flat > 0) return true;
+  const nested = Number(value?.data?.code);
+  return Number.isSafeInteger(nested) && nested > 0;
+}
+
 // ---- §16 ruling 3: in-request account failover -----------------------------
 
 /**

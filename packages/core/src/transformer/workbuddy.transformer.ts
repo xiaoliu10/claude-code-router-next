@@ -23,7 +23,7 @@ import { Transformer, TransformerContext } from "@/types/transformer";
 import { peekBodyForSSE, readBodyForSSE } from "./response-body";
 import type { WorkBuddyAuthService } from "@/services/workbuddy-auth";
 import { workBuddyChatUrl, workBuddySite, credentialHeaders, workBuddySiteFromProvider, type WorkBuddyCredential } from "@/services/workbuddy";
-import { classifyWorkBuddyError, conversationHeaders, getWorkBuddyAuthService } from "@/services/workbuddy";
+import { classifyWorkBuddyError, conversationHeaders, getWorkBuddyAuthService, workBuddyEnvelopeIsError } from "@/services/workbuddy";
 
 const NAME_OK = /^[A-Za-z0-9_-]+$/;
 /** Max body size we are willing to rewrite in memory. */
@@ -309,7 +309,7 @@ export class WorkBuddyTransformer implements Transformer {
       const chunk = this.parseOrNull(payload);
       if (chunk === null) continue;
       sawData = true;
-      if (chunk.error || (Number(chunk.code) > 0 && Number.isSafeInteger(Number(chunk.code))) || (Number(chunk?.data?.code) > 0 && Number.isSafeInteger(Number(chunk.data.code)))) { errorChunk = chunk; continue; }
+      if (workBuddyEnvelopeIsError(chunk)) { errorChunk = chunk; continue; }
       if (chunk.id) id = chunk.id;
       if (chunk.created) created = chunk.created;
       if (chunk.model) model = chunk.model;
@@ -406,7 +406,7 @@ export class WorkBuddyTransformer implements Transformer {
       } catch {
         return line; // malformed JSON — preserve verbatim
       }
-      if (data?.error || (Number(data?.code) > 0 && Number.isSafeInteger(Number(data?.code))) || (Number(data?.data?.code) > 0 && Number.isSafeInteger(Number(data.data.code)))) {
+      if (workBuddyEnvelopeIsError(data)) {
         const error = classifyWorkBuddyError(200, data);
         return "data: " + JSON.stringify({ error: { code: error.code, message: error.message } });
       }
