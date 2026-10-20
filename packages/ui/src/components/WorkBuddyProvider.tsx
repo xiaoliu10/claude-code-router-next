@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Coins, Globe2, RefreshCw, ShieldCheck } from "lucide-react";
+import { Coins, RefreshCw, ShieldCheck } from "lucide-react";
 import { api } from "@/lib/api";
 import type { WorkBuddyLoginStartResponse, WorkBuddyKind, WorkBuddyStatusResponse, WorkBuddyUsage } from "@/types";
 import { hasDiscoveredModels, isWorkBuddyKind, maskWorkBuddyUid, mergeWorkBuddyProvider, parseWorkBuddyUsage, workBuddyErrorKey, workBuddyImagesUnsupportedModels, workBuddyStateKey } from "@/utils/workbuddy";
@@ -8,7 +8,7 @@ import { createWorkBuddyLogin } from "@/utils/workbuddy-login";
 import { useConfig } from "./ConfigProvider";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
+import { Card } from "./ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Toast } from "./ui/toast";
 
@@ -161,93 +161,97 @@ export function WorkBuddyProvider({ disabled, onBusyChange }: WorkBuddyProviderP
   const visibleError = errorKey || (status?.lastError ? workBuddyErrorKey(status) : null);
 
   return (
-    <Card id="workbuddy-management" tabIndex={-1} className="mb-6 border-primary/25 bg-primary/5" aria-busy={busy}>
-      <CardHeader className="p-4 pb-2">
-        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{t("workbuddy.section")}</p>
-        <CardTitle className="flex flex-wrap items-center gap-2 text-lg">
-          <ShieldCheck className="h-5 w-5" aria-hidden="true" /> WorkBuddy
-          <Badge variant="outline">{t("workbuddy.builtin")}</Badge>
-          {status && isWorkBuddyKind(status.kind) && status.status !== "not_connected" && (
-            <Badge variant="outline" className="border-primary/40 text-primary">{t(`workbuddy.kind.${status.kind}`)}</Badge>
+    <Card id="workbuddy-management" tabIndex={-1} className="glass-card mb-4" aria-busy={busy}>
+      <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0 flex-1 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <ShieldCheck className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
+            <p className="text-lg font-bold tracking-tight text-foreground">WorkBuddy</p>
+            <Badge variant="outline">{t("workbuddy.builtin")}</Badge>
+            {status && isWorkBuddyKind(status.kind) && status.status !== "not_connected" && (
+              <Badge variant="outline" className="border-primary/40 text-primary">{t(`workbuddy.kind.${status.kind}`)}</Badge>
+            )}
+            <Badge variant="secondary" role="status">{t(`workbuddy.status.${state}`)}</Badge>
+          </div>
+          <p className="max-w-md truncate text-xs font-medium text-muted-foreground/60">
+            {status && status.status !== "not_connected" && status.site ? status.site : t("workbuddy.description_short")}
+          </p>
+          {status && status.status !== "not_connected" && (
+            <p className="text-xs text-muted-foreground">
+              {t("workbuddy.account_line", { account: status.displayName || t("workbuddy.unknown"), uid: maskWorkBuddyUid(status.uid), expires: date(status.expiresAt) })}
+            </p>
           )}
-          <Badge variant="secondary" role="status">{t(`workbuddy.status.${state}`)}</Badge>
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3 p-4 pt-2">
-        <p className="text-sm text-muted-foreground">{t("workbuddy.description")}</p>
-        <div className="space-y-1 rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-xs leading-relaxed">
-          <p className="font-semibold">{t("workbuddy.server_host")}</p>
-          <p>{t("workbuddy.privacy", { site: status?.site || t("workbuddy.privacy_selected") })}</p>
-          <p>{t("workbuddy.backup_warning")}</p>
-          <p>{t("workbuddy.browser_source")}</p>
-        </div>
-        <p className="text-xs text-muted-foreground">{t("workbuddy.routing_note")}</p>
-        {status && status.status !== "not_connected" && (
-          <dl className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
-            <div><dt className="text-muted-foreground">{t("workbuddy.account")}</dt><dd className="break-all">{status.displayName || t("workbuddy.unknown")} ({maskWorkBuddyUid(status.uid)})</dd></div>
-            <div><dt className="text-muted-foreground">{t("workbuddy.expires")}</dt><dd>{date(status.expiresAt)}</dd></div>
-            <div><dt className="text-muted-foreground">{t("workbuddy.site_origin")}</dt><dd className="break-all">{status.site || t("workbuddy.unknown")}</dd></div>
-            <div><dt className="text-muted-foreground">{t("workbuddy.model_count")}</dt><dd>{models.length}</dd></div>
-            <div><dt className="text-muted-foreground">{t("workbuddy.last_sync")}</dt><dd>{date(status.lastSyncAt)}</dd></div>
-          </dl>
-        )}
-        {status && status.status !== "not_connected" && (
-          <>
-            <p className="text-xs text-muted-foreground">{t(status.source === "browser" ? "workbuddy.source_browser" : status.source === "desktop" ? "workbuddy.source_desktop" : "workbuddy.source_unknown")}</p>
-            {status.renewalMode === "desktop" && <p className="text-xs text-muted-foreground">{t("workbuddy.renewal_desktop")}</p>}
-            {status.renewalMode === "browser" && <p className="text-xs text-muted-foreground">{t("workbuddy.renewal_browser")}</p>}
-          </>
-        )}
-        {imageUnsupported.length > 0 && (
-          <p role="note" className="rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700">{t("workbuddy.images_unsupported", { models: imageUnsupported.join(", ") })}</p>
-        )}
-        {usage && status?.status === "connected" && (
-          <dl className="grid grid-cols-1 gap-2 rounded-lg border p-3 text-xs sm:grid-cols-2">
-            <div><dt className="text-muted-foreground">{t("workbuddy.credits.plan")}</dt><dd className="break-all font-medium">{usage.plan}</dd></div>
-            <div><dt className="text-muted-foreground">{t("workbuddy.credits.title")}</dt><dd className="font-medium">{t("workbuddy.credits.display", { used: usage.used, limit: usage.limit })}</dd></div>
-          </dl>
-        )}
-        {models.length > 0 && (
-          <details className="text-xs"><summary className="cursor-pointer">{t("workbuddy.models", { count: models.length })}</summary>
-            <div className="mt-2 flex max-h-40 flex-wrap gap-1 overflow-auto">{models.map(model => <Badge className="max-w-full break-all whitespace-normal" key={model} variant="outline">{model}</Badge>)}</div>
+          {imageUnsupported.length > 0 && (
+            <p role="note" className="max-w-md rounded-lg border border-yellow-500/25 bg-yellow-500/10 px-3 py-2 text-[11px] font-medium text-yellow-600">
+              {t("workbuddy.images_unsupported", { models: imageUnsupported.join(", ") })}
+            </p>
+          )}
+          {usage && status?.status === "connected" && (
+            <p className="text-xs text-muted-foreground">{t("workbuddy.credits.line", { plan: usage.plan, used: usage.used, limit: usage.limit })}</p>
+          )}
+          {models.length > 0 && (
+            <div className="flex flex-wrap gap-2 pt-1">
+              {models.map(model => (
+                <Badge key={model} variant="secondary" className="max-w-full break-all whitespace-normal rounded-lg border-white/5 bg-white/5 px-2 py-0.5 text-[10px] font-bold text-muted-foreground">{model}</Badge>
+              ))}
+            </div>
+          )}
+          {!loading && status && !["connected", "not_connected"].includes(status.status) && (
+            <p className="text-xs text-yellow-600">{t(`workbuddy.help.${status.status}`)}</p>
+          )}
+          {visibleError && <p role="alert" className="max-w-md rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] font-medium text-red-500">{t(`workbuddy.errors.${visibleError}`)}</p>}
+          {login && <div role="status" className="max-w-md space-y-1.5 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs">
+            <p className="font-medium">{t("workbuddy.login_pending")}</p>
+            {!cancelling && <a href={login.url} target="_blank" rel="noopener noreferrer" className="block break-all text-primary underline">{t("workbuddy.open_login", { site: t(`workbuddy.site.${login.site}`) })}</a>}
+            <Button variant="outline" size="sm" className="h-7 px-2 text-xs" disabled={cancelling} onClick={() => {
+              setCancelling(true);
+              void loginSession.current?.cancel().catch(() => { if (mounted.current) setErrorKey("request_failed"); });
+            }}>{t(cancelling ? "workbuddy.working" : "app.cancel")}</Button>
+          </div>}
+          <details className="max-w-md text-xs text-muted-foreground">
+            <summary className="cursor-pointer select-none font-medium">{t("workbuddy.about")}</summary>
+            <div className="mt-2 space-y-1 leading-relaxed">
+              <p>{t("workbuddy.description")}</p>
+              <p>{t("workbuddy.server_host")}</p>
+              <p>{t("workbuddy.privacy", { site: status?.site || t("workbuddy.privacy_selected") })}</p>
+              <p>{t("workbuddy.backup_warning")}</p>
+              <p>{t("workbuddy.browser_source")}</p>
+              <p>{t("workbuddy.routing_note")}</p>
+              {status && status.status !== "not_connected" && (
+                <>
+                  <p>{t(status.source === "browser" ? "workbuddy.source_browser" : status.source === "desktop" ? "workbuddy.source_desktop" : "workbuddy.source_unknown")}</p>
+                  {status.renewalMode === "desktop" && <p>{t("workbuddy.renewal_desktop")}</p>}
+                  {status.renewalMode === "browser" && <p>{t("workbuddy.renewal_browser")}</p>}
+                </>
+              )}
+            </div>
           </details>
-        )}
-        {!loading && status && !["connected", "not_connected"].includes(status.status) && (
-          <p className="text-sm text-amber-600">{t(`workbuddy.help.${status.status}`)}</p>
-        )}
-        {visibleError && <p role="alert" className="rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-sm text-red-600">{t(`workbuddy.errors.${visibleError}`)}</p>}
-        <div role="radiogroup" aria-label={t("workbuddy.site.label")} className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-          {WORKBUDDY_SITES.map(value => (
-            <button key={value} type="button" role="radio" aria-checked={site === value} disabled={busy || disabled}
-              onClick={() => setSite(value)}
-              className={`rounded-lg border p-3 text-left transition-colors ${site === value ? "border-primary bg-primary/5" : "border-border hover:bg-muted/40"}`}>
-              <span className="flex items-center gap-1.5 text-sm font-medium"><Globe2 className="h-3.5 w-3.5" aria-hidden="true" />{t(`workbuddy.site.${value}`)}</span>
-              <span className="mt-1 block text-xs text-muted-foreground">{t(`workbuddy.site.${value}_note`)}</span>
-            </button>
-          ))}
+          {disabled && <p className="text-xs text-muted-foreground">{t("workbuddy.other_edit")}</p>}
         </div>
-        {login && <div role="status" className="space-y-2 rounded-lg border p-3 text-sm">
-          <p>{t("workbuddy.login_pending")}</p>
-          {!cancelling && <a href={login.url} target="_blank" rel="noopener noreferrer" className="block text-primary underline">{t("workbuddy.open_login", { site: t(`workbuddy.site.${login.site}`) })}</a>}
-          <Button variant="outline" size="sm" disabled={cancelling} onClick={() => {
-            setCancelling(true);
-            void loginSession.current?.cancel().catch(() => { if (mounted.current) setErrorKey("request_failed"); });
-          }}>{t(cancelling ? "workbuddy.working" : "app.cancel")}</Button>
-        </div>}
-        <div className="flex flex-wrap gap-2">
-          <Button size="sm" disabled={busy || disabled} onClick={() => void run("login")}>
+        <div className="flex shrink-0 flex-col gap-2 sm:w-[210px]">
+          <div role="radiogroup" aria-label={t("workbuddy.site.label")} className="flex gap-2">
+            {WORKBUDDY_SITES.map(value => (
+              <button key={value} type="button" role="radio" aria-checked={site === value} disabled={busy || disabled}
+                onClick={() => setSite(value)}
+                className={`flex-1 rounded-lg border px-2 py-1.5 text-xs font-medium transition-colors ${site === value ? "border-primary bg-primary/10 text-primary" : "border-white/10 text-muted-foreground hover:bg-white/10"}`}>
+                {t(`workbuddy.site.${value}`)}
+              </button>
+            ))}
+          </div>
+          <Button size="sm" className="h-8 w-full text-xs" disabled={busy || disabled} onClick={() => void run("login")}>
             {action === "login" ? t("workbuddy.working") : t("workbuddy.browser_login")}
           </Button>
-          <Button size="sm" variant="outline" disabled={busy || disabled || !canSync} onClick={() => void run("sync")}>
-            <RefreshCw className={`mr-1 h-3.5 w-3.5 ${action === "sync" ? "animate-spin" : ""}`} aria-hidden="true" />{t("workbuddy.sync")}
-          </Button>
-          <Button size="sm" variant="outline" disabled={busy || disabled || !canSync} onClick={() => void run("usage")} aria-busy={readingUsage}>
-            <Coins className={`mr-1 h-3.5 w-3.5 ${readingUsage ? "animate-pulse" : ""}`} aria-hidden="true" />{readingUsage ? t("workbuddy.credits.reading") : t("workbuddy.credits.action")}
-          </Button>
-          <Button size="sm" variant="outline" disabled={busy || disabled || !canDisconnect} onClick={() => setConfirm("disconnect")}>{t("workbuddy.disconnect")}</Button>
+          <div className="grid grid-cols-2 gap-2">
+            <Button size="sm" variant="outline" className="h-8 text-xs" disabled={busy || disabled || !canSync} onClick={() => void run("sync")}>
+              <RefreshCw className={`mr-1 h-3.5 w-3.5 ${action === "sync" ? "animate-spin" : ""}`} aria-hidden="true" />{t("workbuddy.sync")}
+            </Button>
+            <Button size="sm" variant="outline" className="h-8 text-xs" disabled={busy || disabled || !canSync} onClick={() => void run("usage")} aria-busy={readingUsage}>
+              <Coins className={`mr-1 h-3.5 w-3.5 ${readingUsage ? "animate-pulse" : ""}`} aria-hidden="true" />{readingUsage ? t("workbuddy.credits.reading") : t("workbuddy.credits.action")}
+            </Button>
+            <Button size="sm" variant="outline" className="col-span-2 h-8 text-xs" disabled={busy || disabled || !canDisconnect} onClick={() => setConfirm("disconnect")}>{t("workbuddy.disconnect")}</Button>
+          </div>
         </div>
-        {disabled && <p className="text-xs text-muted-foreground">{t("workbuddy.other_edit")}</p>}
-      </CardContent>
+      </div>
       <Dialog open={confirm !== null} onOpenChange={open => { if (!open && !action) setConfirm(null); }}>
         <DialogContent>
           <DialogHeader>

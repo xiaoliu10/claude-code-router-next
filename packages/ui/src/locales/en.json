@@ -558,6 +558,9 @@
   "workbuddy": {
     "section": "Built-in subscription providers",
     "builtin": "Built in",
+    "description_short": "Browser-authorized subscription provider managed by CCR.",
+    "about": "About & privacy",
+    "account_line": "{{account}} ({{uid}}) · token expires {{expires}}",
     "description": "Authorize your WorkBuddy subscription — CN or international (WorkBuddy AI) — in the browser and register discovered models. No desktop app, plugin or extra gateway is required. This manages a provider, not client takeover.",
     "server_host": "“Local” means the computer running the CCR server, not this browser’s computer.",
     "privacy_selected": "the selected fixed WorkBuddy origin",
@@ -638,6 +641,7 @@
       "privacy": "The access token is sent only to the fixed origin of the selected site: {{site}}. It never reaches this browser or the ordinary provider configuration."
     },
     "credits": {
+      "line": "{{plan}} · used {{used}} / {{limit}}",
       "action": "Read credits",
       "reading": "Reading…",
       "title": "Credits",

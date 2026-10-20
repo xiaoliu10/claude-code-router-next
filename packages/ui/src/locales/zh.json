@@ -558,6 +558,9 @@
   "workbuddy": {
     "section": "内置订阅供应商",
     "builtin": "内置",
+    "description_short": "浏览器授权的内置订阅供应商。",
+    "about": "说明与隐私",
+    "account_line": "{{account}}（{{uid}}）· 令牌过期 {{expires}}",
     "description": "在浏览器授权登录 WorkBuddy 订阅（中国版或国际版 WorkBuddy AI），自动发现并注册模型。无需桌面客户端、插件或额外网关。这是供应商管理，不是客户端接管。",
     "server_host": "“本机”指运行 CCR 服务的电脑，不是浏览器所在的电脑。",
     "privacy_selected": "所选 WorkBuddy 固定域名",
@@ -638,6 +641,7 @@
       "privacy": "访问令牌仅发送到所选站点的固定域名：{{site}}。令牌不会到达浏览器，也不会写入普通供应商配置。"
     },
     "credits": {
+      "line": "{{plan}} · 已用 {{used}} / {{limit}}",
       "action": "读取额度",
       "reading": "读取中…",
       "title": "额度",
