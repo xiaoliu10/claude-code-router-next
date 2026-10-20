@@ -149,6 +149,30 @@ describe("WorkBuddy admin pool status routes", () => {
     expect(denied.statusCode).toBe(403);
     expect(denied.json()).toEqual({ error: "workbuddy_unauthorized" });
   });
+
+  it("GET /status and /pool carry imagesUnsupportedModels and a CLASSIFIED lastError, never persisted text", async () => {
+    const h = await build({ Providers: [CN_PROVIDER(), AI_PROVIDER()], Router: { default: "workbuddy,glm-5.3" } });
+    await seedBothSites(h.store);
+    await h.store.mergeDiscoveredModels("workbuddy-ai", ["glm-5.3", "gpt-5.5"]);
+    // Poison the vestigial persisted field exactly as a future writer could.
+    const data = await h.store.loadData();
+    data!.sites["workbuddy-ai"]!.lastError = "RAW-SENTINEL-<script>alert(1)</script> /Users/jason/secrets.json";
+    await h.store.saveData(data!);
+    for (const path of ["/api/workbuddy/status", "/api/workbuddy/pool"]) {
+      const res = await h.server.app.inject({ method: "GET", url: h.url(path) });
+      expect(res.statusCode).toBe(200);
+      const json = res.json();
+      expect(json.sites["workbuddy-ai"]).toMatchObject({ lastError: "workbuddy_error", imagesUnsupportedModels: ["glm-5.3"] });
+      expect(json.sites.workbuddy).toMatchObject({ lastError: null, imagesUnsupportedModels: [] });
+      // No raw persisted text, path or HTML ever reaches an API body.
+      expect(res.body).not.toContain("RAW-SENTINEL");
+      expect(res.body).not.toContain("/Users/jason");
+      expect(res.body).not.toContain("<script>");
+    }
+    // The legacy flat mirror stays classified too (it mirrors the CN site here).
+    const flat = await h.server.app.inject({ method: "GET", url: h.url("/api/workbuddy/status") });
+    expect(flat.json().lastError ?? null).toBeNull();
+  });
 });
 
 describe("WorkBuddy admin account routes", () => {
@@ -160,7 +184,14 @@ describe("WorkBuddy admin account routes", () => {
       payload: { site: "workbuddy", uid: "cn-b" },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, site: "workbuddy", uid: "cn-b" });
+    // The UI's `run()` tail is `if (!result.success) setSiteError(...)` and the
+    // client type declares `success: boolean` REQUIRED: an exact 200 body must
+    // satisfy that predicate or a performed switch is reported as a failure
+    // (and the status refresh is skipped). Mirrors the client helper.
+    const body = res.json();
+    expect(body).toEqual({ ok: true, success: true, site: "workbuddy", uid: "cn-b" });
+    const uiSuccess = typeof body === "object" && body !== null && (body as { success?: unknown }).success === true;
+    expect(uiSuccess).toBe(true);
     expect((await h.store.loadData())!.sites.workbuddy!.activeUid).toBe("cn-b");
 
     // Unknown site id: rejected before it can reach the service.

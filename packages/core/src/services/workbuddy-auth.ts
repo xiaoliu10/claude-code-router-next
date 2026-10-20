@@ -49,6 +49,7 @@ import {
   workBuddyNeedsRenewal,
   workBuddySite,
   workBuddySiteFromProvider,
+  workBuddyImagesDropped,
   type WorkBuddyAccount,
   type WorkBuddyCooldown,
   type WorkBuddyCredential,
@@ -123,7 +124,16 @@ export interface WorkBuddySiteStatus {
   hiddenModels: string[];
   modelCount: number;
   lastSyncAt: string | null;
+  /**
+   * Fixed diagnostic CODE (never arbitrary persisted text). The v2 store keeps
+   * a legacy `lastError` string field that nothing writes any more; a
+   * poisoned/forged value must not become an echo channel through the admin
+   * API, so the pool seam exposes only its CLASSIFICATION and the UI keeps
+   * classify-only consumption (`workBuddyErrorKey`).
+   */
   lastError: string | null;
+  /** Models of this site whose image input the site drops anyway (GLM on AI). */
+  imagesUnsupportedModels: string[];
   renewalMode: "desktop" | "browser";
 }
 export interface WorkBuddyPoolStatus {
@@ -190,6 +200,26 @@ export interface WorkBuddyServiceOptions {
 
 const PROVIDER_KEYS = ["Providers", "providers"] as const;
 const CONFIG_TIMEOUT_MS = 15000;
+
+/**
+ * Fixed diagnostic codes the admin status/pool seams may expose. The UI's
+ * `workBuddyErrorKey` classifies the same two classes (restricted /
+ * channel_rejected); anything else is reported as the generic code.
+ */
+export type WorkBuddyLastErrorCode = "workbuddy_restricted" | "workbuddy_channel_rejected" | "workbuddy_error";
+
+/**
+ * Classify a persisted diagnostic into a FIXED code. The v2 store still
+ * normalizes a legacy per-site `lastError` string (nothing writes it any more),
+ * so this must stay a classifier: a forged value (paths, HTML, an upstream
+ * body) can never be echoed back through GET /status or GET /pool.
+ */
+export function workBuddyLastErrorCode(message: unknown): WorkBuddyLastErrorCode | null {
+  if (typeof message !== "string" || message.length === 0 || message.length > 512) return null;
+  if (/11140|restricted|unusual activity|账号存在异常行为/i.test(message)) return "workbuddy_restricted";
+  if (/unapproved channel|illegal api invocation|Illegal API invocation|illegal api/i.test(message)) return "workbuddy_channel_rejected";
+  return "workbuddy_error";
+}
 
 /** Split a `provider,model` routing reference; null when not that shape. */
 function refProviderModel(value: string): [string, string] | null {
@@ -417,12 +447,15 @@ export class WorkBuddyAuthService {
     let data: WorkBuddyCredentialData | null = null;
     try {
       data = await this.store.loadData();
-    } catch (error: any) {
-      const lastError = error?.message || "WorkBuddy 登录态不可读";
+    } catch {
+      // Constant label only: `readRaw()` collapses every unreadable/oversize/
+      // bad-mode file into its own constant error, but this catch must not depend
+      // on that — an error message can never reach the admin API body.
+      const lastError = "WorkBuddy 登录态不可读";
       return { sites: { workbuddy: {
         status: "error", site: "workbuddy", providerName: WORKBUDDY_PROVIDER_NAME,
         origin: WORKBUDDY_CHAT_ORIGIN, accounts: [], activeUid: null, models: [], hiddenModels: [],
-        modelCount: 0, lastSyncAt: null, lastError, renewalMode: "desktop",
+        modelCount: 0, lastSyncAt: null, lastError, imagesUnsupportedModels: [], renewalMode: "desktop",
       } }, connectedSites: [] };
     }
     if (!data) return { sites: {}, connectedSites: [] };
@@ -447,7 +480,10 @@ export class WorkBuddyAuthService {
         hiddenModels: [...state.hiddenModels],
         modelCount: models.length,
         lastSyncAt: state.lastSyncAt ?? null,
-        lastError: state.lastError ?? null,
+        // Classify, never echo: the persisted string is vestigial (nothing
+        // writes it) and a forged value must not traverse the API untouched.
+        lastError: workBuddyLastErrorCode(state.lastError),
+        imagesUnsupportedModels: models.filter((model) => workBuddyImagesDropped(id, model)),
         renewalMode: active.source === "browser" ? "browser" : "desktop",
       };
     }
@@ -507,7 +543,7 @@ export class WorkBuddyAuthService {
       lastError: site.lastError,
       source: active?.source ?? "desktop",
       renewalMode: site.renewalMode,
-      imagesUnsupportedModels: site.site === "workbuddy-ai" ? site.models.filter((model) => /^glm-/.test(model)) : [],
+      imagesUnsupportedModels: site.imagesUnsupportedModels,
     };
   }
 

@@ -624,7 +624,11 @@
       "login_state_rejected": "授权被拒绝或登录状态无效，请重新发起登录。",
       "login_account_failed": "无法确认授权账号，请重新发起登录。",
       "login_persist_failed": "无法私有保存授权登录态，请检查 CCR 服务端后重试。",
-      "login_expired": "本次授权已过期，请重新发起登录。"
+      "login_expired": "本次授权已过期，请重新发起登录。",
+      "workbuddy_account_not_found": "该账号已不在此站点的账号池中，请刷新列表后重新选择账号。",
+      "workbuddy_model_invalid": "模型 ID 被拒绝：不能为空、不能超过 256 字符、且不能包含逗号。请更换模型后重试。",
+      "workbuddy_config_write_failed": "因配置保存失败，本次更改已回滚。请检查 CCR 服务端配置后重试。",
+      "workbuddy_login_busy": "正在进行的 WorkBuddy 授权过多，请等待其结束后重新发起。"
     },
     "site_origin": "站点固定域名",
     "renewal_desktop": "续期方式：桌面端。过期后请在 WorkBuddy 桌面客户端重新登录，再回到此处明确重新导入。CCR 不调用刷新接口，也不保存刷新凭据。",

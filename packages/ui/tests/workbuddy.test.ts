@@ -220,6 +220,26 @@ test("errors only select allowlisted localised labels, never raw messages", () =
   assert.equal(workBuddyErrorKey({ lastError: "unapproved channel" }), "channel_rejected");
   assert.equal(workBuddyStateKey({ status: "error", lastError: "11140" } as WorkBuddySiteStatus), "restricted");
 });
+test("§16 server error codes are displayable, raw messages never are", () => {
+  for (const code of ["workbuddy_account_not_found", "workbuddy_model_invalid", "workbuddy_config_write_failed", "workbuddy_login_busy"]) {
+    assert.equal(workBuddyErrorKey({ reason: code, message: "RAW-SENTINEL" }), code);
+    assert.equal(workBuddyErrorKey({ error: code, message: "RAW-SENTINEL" }), code);
+  }
+  // Anything outside the allowlist still collapses to the generic code.
+  for (const code of ["workbuddy_login_cancelled", "workbuddy_request_failed", "raw upstream text", "<script>alert(1)</script>"]) {
+    assert.equal(workBuddyErrorKey({ reason: code, message: "raw" }), "request_failed");
+  }
+  // The §16 status/pool seam publishes a FIXED diagnostic code instead of any
+  // persisted text: classify it, never show it.
+  assert.equal(workBuddyErrorKey({ lastError: "workbuddy_restricted" }), "restricted");
+  assert.equal(workBuddyErrorKey({ lastError: "workbuddy_channel_rejected" }), "channel_rejected");
+  assert.equal(workBuddyErrorKey({ lastError: "workbuddy_error" }), "request_failed");
+  assert.equal(workBuddyErrorKey({ lastError: "RAW-SENTINEL-<script>alert(1)</script> /Users/jason/secrets.json" }), "request_failed");
+  // The two meaningful classifications keep working against older raw strings.
+  assert.equal(workBuddyErrorKey({ lastError: "11140 restricted secret" }), "restricted");
+  assert.equal(workBuddyErrorKey({ lastError: "unapproved channel" }), "channel_rejected");
+  assert.equal(workBuddyErrorKey({ lastError: "\u8d26\u53f7\u5b58\u5728\u5f02\u5e38\u884c\u4e3a" }), "restricted");
+});
 test("UID masked including short identifiers", () => {
   assert.equal(maskWorkBuddyUid("123456789"), "123…89"); assert.equal(maskWorkBuddyUid("123"), "•••"); assert.equal(maskWorkBuddyUid(null), "—");
 });
@@ -324,6 +344,41 @@ test("hide path labels are sanitized structurally and never treated as model ref
   assert.deepEqual(sanitizeWorkBuddyModelRefs(["default", "scenario:think", "custom:r1", "workbuddy,m1", "  workbuddy-ai,m2 ", "x,m3"]), ["workbuddy,m1", "workbuddy-ai,m2"]);
   assert.deepEqual(sanitizeWorkBuddyModelRefs("nope"), []);
   assert.equal(sanitizeWorkBuddyRouterPaths(Array.from({ length: 12 }, (_, index) => `models:alias-${index}`)).length, 8);
+});
+test("model ref sanitizer mirrors the server contract (256 chars, spaces/unicode) and stays separate from path labels", () => {
+  // Server: `parseWorkBuddyModel` + discovery accept 1-256 chars, rejecting only
+  // control characters and a comma. The client must accept exactly that set or
+  // the local Router reconciliation silently no-ops for an exotic valid id.
+  const long = `workbuddy,${"m".repeat(200)}`;
+  const spaced = "workbuddy-ai,glm 5.3 turbo";
+  const unicode = "workbuddy-ai,\u667a\u80fd\u4f53-\u00fcber";
+  const dotted = "workbuddy,model:v1.2@tenant/region";
+  assert.deepEqual(sanitizeWorkBuddyModelRefs([long, spaced, unicode, dotted]), [long, spaced, unicode, dotted]);
+  // Exact-equality semantics preserved: trimming, dedupe and the 8-item cap.
+  assert.deepEqual(sanitizeWorkBuddyModelRefs([`  ${long}  `, long]), [long]);
+  assert.equal(sanitizeWorkBuddyModelRefs(Array.from({ length: 12 }, (_, index) => `workbuddy,m${index}`)).length, 8);
+  // Still rejected: unknown provider, comma (would split into another ref),
+  // control characters, over-length ids, non-strings.
+  for (const bad of [
+    "other,m1", "workbuddy", "workbuddy,", ",m1", "workbuddy,m1,m2", "workbuddy,m\n1", "workbuddy,m\u00001",
+    // One char over the server's 256-char model bound (not the whole ref).
+    `workbuddy,${"m".repeat(257)}`, 42, null, undefined, {}, ["workbuddy,m1"],
+  ]) assert.equal(sanitizeWorkBuddyModelRefs([bad as unknown as string]).length, 0);
+  // Exactly 256 model chars is accepted, matching the server exactly.
+  assert.equal(sanitizeWorkBuddyModelRefs([`workbuddy,${"m".repeat(256)}`]).length, 1);
+  // A long/space/unicode ref must actually DRIVE the Router reconciliation
+  // (previously sanitized away, the hide cleanup silently no-opped).
+  const local = { Providers: [other], Router: { default: spaced, think: spaced, unrelated: "custom,keep" } } as unknown as Config;
+  const server = config([managed]);
+  server.Router = { ...local.Router, default: "", think: "" } as Config["Router"];
+  const merged = mergeWorkBuddyHiddenRefs(local, server, [spaced], "");
+  assert.equal(merged.Router.default, "");
+  assert.equal((merged.Router as { think: string }).think, "");
+  assert.equal((merged.Router as { unrelated: string }).unrelated, "custom,keep");
+  // The path-label sanitizer stays a separate, much stricter grammar: an
+  // exotic-but-valid model ref is NOT a Router path label.
+  assert.deepEqual(sanitizeWorkBuddyRouterPaths([spaced, long, unicode]), []);
+  assert.deepEqual(sanitizeWorkBuddyRouterPaths(["default", "scenario:think", "models:a", "families.f.default"]), ["default", "scenario:think", "models:a", "families.f.default"]);
 });
 test("sanitized Router path labels map to localized safe text", () => {
   const labels = {
@@ -475,6 +530,12 @@ test("EN/ZH WorkBuddy locale parity covers statuses, sites, credits and safe err
     assert.ok(locale.source_badge.desktop); assert.ok(locale.source_badge.browser);
     assert.ok(locale.cooling_until); assert.ok(locale.restricted_until); assert.ok(locale.account_remove_warning);
     assert.match(String(locale.renewal_desktop), /desktop|桌面/i);
+    // §16 management codes: every allowlisted route/service code has a
+    // localised string, so the UI never falls back to a raw key or message.
+    for (const code of ["workbuddy_account_not_found", "workbuddy_model_invalid", "workbuddy_config_write_failed", "workbuddy_login_busy"]) {
+      assert.ok(locale.errors[code], `missing ${code}`);
+      assert.doesNotMatch(locale.errors[code], /workbuddy_/);
+    }
     assert.doesNotMatch(JSON.stringify(locale.credits), /refreshToken/i);
   }
 });

@@ -179,12 +179,20 @@ export function workBuddyErrorKey(value: unknown): string {
   // so `workbuddy_site_conflict` is no longer an allowlisted code anywhere.
   const allowed = ["sealed", "source_missing", "source_invalid", "models_fetch_failed",
     "workbuddy_name_conflict", "workbuddy_not_connected",
-    "workbuddy_unauthorized", "login_state_rejected", "login_account_failed", "login_persist_failed", "login_expired"];
+    "workbuddy_unauthorized", "login_state_rejected", "login_account_failed", "login_persist_failed", "login_expired",
+    // §16 management codes (same set as the api.ts boundary allowlist).
+    "workbuddy_account_not_found", "workbuddy_model_invalid",
+    "workbuddy_config_write_failed", "workbuddy_login_busy"];
   if (typeof code === "string" && allowed.includes(code)) return code;
   // GET status may contain a server-sanitised diagnostic. Classify, do not show it.
   const message = typeof data.lastError === "string" ? data.lastError : "";
-  if (/11140|restricted|unusual activity/i.test(message)) return "restricted";
-  if (/unapproved channel|Illegal API invocation/i.test(message)) return "channel_rejected";
+  // §16 pool/status seams publish a FIXED code instead of any persisted text;
+  // map it directly. An older server's raw sanitised string still classifies
+  // through the same patterns below (classify-only, never rendered).
+  if (message === "workbuddy_channel_rejected") return "channel_rejected";
+  if (message === "workbuddy_restricted") return "restricted";
+  if (/11140|restricted|unusual activity|账号存在异常行为/i.test(message)) return "restricted";
+  if (/unapproved channel|illegal api invocation/i.test(message)) return "channel_rejected";
   return "request_failed";
 }
 
@@ -317,7 +325,17 @@ export function workBuddySiteStatus(response: WorkBuddyStatusResponse | null | u
   return null;
 }
 
-const WORKBUDDY_MODEL_REF_PATTERN = /^(?:workbuddy|workbuddy-ai),[A-Za-z0-9._:@/-]{1,120}$/;
+/**
+ * Provider/model reference grammar, mirroring the server exactly (route
+ * `parseWorkBuddyModel` + discovery `parseWorkBuddyModels`): a known provider
+ * prefix, then an id of 1-256 chars that is not a control character and never
+ * contains a comma (a comma would split into a different ref). Spaces, dots
+ * and unicode are valid upstream ids, so refusing them here would silently
+ * drop the client-side Router cleanup the server already performed.
+ * Values are only ever compared by exact string equality — never parsed,
+ * interpreted or rendered as HTML.
+ */
+const WORKBUDDY_MODEL_REF_PATTERN = /^(?:workbuddy|workbuddy-ai),[^\x00-\x1f\x7f,]{1,256}$/;
 
 /** Exact WorkBuddy provider/model references that may drive local Router cleanup. */
 export function sanitizeWorkBuddyModelRefs(value: unknown): string[] {

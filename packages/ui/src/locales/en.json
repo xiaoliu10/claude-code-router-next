@@ -624,7 +624,11 @@
       "login_state_rejected": "Authorization was rejected or the login state is invalid. Start a new login.",
       "login_account_failed": "Unable to confirm the authorized account. Start a new login.",
       "login_persist_failed": "Unable to save the authorized login privately. Check the CCR server and retry.",
-      "login_expired": "This authorization attempt expired. Start a new login."
+      "login_expired": "This authorization attempt expired. Start a new login.",
+      "workbuddy_account_not_found": "That WorkBuddy account no longer exists in this site's pool. Refresh the list and pick an account again.",
+      "workbuddy_model_invalid": "The model id was rejected. Model ids cannot be empty, longer than 256 characters, or contain a comma. Retry with a different model.",
+      "workbuddy_config_write_failed": "The change was rolled back because the configuration could not be saved. Check the CCR server config and retry.",
+      "workbuddy_login_busy": "Too many WorkBuddy authorization attempts are running. Wait for them to finish and start again."
     },
     "site_origin": "Site origin (fixed)",
     "renewal_desktop": "Renewal mode: desktop. Sign in again in the WorkBuddy desktop app and re-import here when expired. CCR calls no credential-refresh API and stores no refresh credential.",

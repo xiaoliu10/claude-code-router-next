@@ -113,6 +113,51 @@ test("§16 per-site pool requests carry exact bodies; hide passes clearedRefs th
   } finally { globalThis.fetch = original; }
 });
 
+test("P1 the exact successful account/switch 200 body satisfies the UI success predicate", async () => {
+  const client = new ApiClient("/mock-api", "mock-key");
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true, success: true, site: "workbuddy", uid: "uid-cn-1" }), { status: 200 })) as typeof fetch;
+  try {
+    // WorkBuddyProvider.run(): `if (!result.success) setSiteError(...)` — the
+    // typed contract (WorkBuddyMutationResponse.success: boolean) and every
+    // other mutating route both promise this field, so a 200 must satisfy it.
+    const result = await client.switchWorkBuddyAccount("workbuddy", "uid-cn-1");
+    assert.equal(result.success, true);
+    assert.deepEqual(result, { ok: true, success: true, site: "workbuddy", uid: "uid-cn-1" });
+  } finally { globalThis.fetch = original; }
+});
+
+test("\u00a716 management codes stay allowlisted end to end, unknown codes collapse safely", async () => {
+  const client = new ApiClient("/mock-api", "mock-key");
+  const original = globalThis.fetch;
+  let httpStatus = 500;
+  let payload: unknown = { error: "workbuddy_config_write_failed", message: "RAW-SENTINEL" };
+  globalThis.fetch = (async () => new Response(JSON.stringify(payload), { status: httpStatus })) as typeof fetch;
+  try {
+    for (const code of ["workbuddy_account_not_found", "workbuddy_model_invalid", "workbuddy_config_write_failed", "workbuddy_login_busy"]) {
+      httpStatus = 500;
+      payload = { error: code, message: "RAW-SENTINEL" };
+      await assert.rejects(client.switchWorkBuddyAccount("workbuddy", "uid"), error => {
+        assert.equal((error as { reason: string }).reason, code);
+        // No raw message ever crosses the boundary.
+        assert.doesNotMatch(String(error), /RAW-SENTINEL/);
+        return true;
+      });
+    }
+    // A code the server may return that the client does not localise still
+    // fails safe to the generic constant.
+    for (const unknown of ["workbuddy_account_switch_failed", "workbuddy_status_failed", "<script>"]) {
+      httpStatus = 500;
+      payload = { error: unknown, message: "RAW-SENTINEL" };
+      await assert.rejects(client.removeWorkBuddyAccount("workbuddy", "uid"), error => {
+        assert.equal((error as { reason: string }).reason, "request_failed");
+        assert.doesNotMatch(String(error), /RAW-SENTINEL/);
+        return true;
+      });
+    }
+  } finally { globalThis.fetch = original; }
+});
+
 test("full-config writes cannot overlap managed action and reconciliation", async () => {
   const client = new ApiClient("/mock-api"); const original = globalThis.fetch;
   let finish: ((value: Response) => void) | undefined;

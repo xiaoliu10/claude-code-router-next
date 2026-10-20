@@ -107,7 +107,9 @@ class ApiClient {
         // the browser's error object, console, toast or component state.
         const allowed = ['sealed', 'source_missing', 'source_invalid', 'models_fetch_failed',
           'workbuddy_name_conflict', 'workbuddy_not_connected',
-          'workbuddy_unauthorized', 'login_state_rejected', 'login_account_failed', 'login_persist_failed'];
+          'workbuddy_unauthorized', 'login_state_rejected', 'login_account_failed', 'login_persist_failed',
+          'workbuddy_account_not_found', 'workbuddy_model_invalid',
+          'workbuddy_config_write_failed', 'workbuddy_login_busy'];
         let code = 'request_failed';
         try {
           const data = await response.json();

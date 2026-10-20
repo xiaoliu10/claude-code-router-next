@@ -105,6 +105,79 @@ describe("WorkBuddy pool status (sanitized)", () => {
     const flat = await h.service.getStatus();
     expect(flat).toMatchObject({ status: "connected", kind: "workbuddy", uid: "cn-a", providerName: "workbuddy" });
   });
+
+  it("exposes per-site imagesUnsupportedModels (GLM image warning on the §16 seam)", async () => {
+    const h = harness();
+    await seedTwoSitePools(h);
+    await h.store.mergeDiscoveredModels("workbuddy", ["glm-5.3", "kimi-k3-1"]);
+    await h.store.mergeDiscoveredModels("workbuddy-ai", ["glm-5.3", "gpt-5.5"]);
+    const pool = await h.service.getPoolStatus();
+    // Same rule the site already uses to drop images (^glm- on the AI site only).
+    expect(pool.sites.workbuddy!.imagesUnsupportedModels).toEqual([]);
+    expect(pool.sites["workbuddy-ai"]!.imagesUnsupportedModels).toEqual(["glm-5.3"]);
+    // Hidden models never appear in either list.
+    await h.store.setHiddenModels("workbuddy-ai", ["glm-5.3"]);
+    const afterHide = await h.service.getPoolStatus();
+    expect(afterHide.sites["workbuddy-ai"]!.models).toEqual(["gpt-5.5"]);
+    expect(afterHide.sites["workbuddy-ai"]!.imagesUnsupportedModels).toEqual([]);
+    // The legacy flat mirror carries the connected site's value.
+    expect((await h.service.getStatus()).imagesUnsupportedModels).toEqual([]);
+  });
+
+  it("classifies a poisoned persisted lastError instead of echoing it", async () => {
+    const h = harness();
+    await seedTwoSitePools(h);
+    await h.store.mergeDiscoveredModels("workbuddy", ["glm-5.3"]);
+    // Nothing in the codebase writes this field, so forge it directly in the
+    // normalized store: a persisted arbitrary string must never traverse the
+    // status/pool payloads (defense-in-depth for any future/forked writer).
+    const data = await h.store.loadData();
+    data!.sites.workbuddy!.lastError = "RAW-SENTINEL-<script>alert(1)</script> /Users/jason/secrets.json";
+    // The store round-trip re-normalizes (≤512 chars survive), so persist the
+    // poisoned value exactly as a future/forked writer could.
+    await h.store.saveData(data!);
+    const pool = await h.service.getPoolStatus();
+    expect(pool.sites.workbuddy!.lastError).toBe("workbuddy_error");
+    expect(JSON.stringify(pool)).not.toContain("RAW-SENTINEL");
+    expect(JSON.stringify(pool)).not.toContain("/Users/jason");
+    // Classification still survives for the two meaningful classes.
+    for (const [message, code] of [
+      ["WorkBuddy 账号受限（11140），请在 WorkBuddy 内 Submit feedback 申诉", "workbuddy_restricted"],
+      ["unapproved channel or Illegal API invocation", "workbuddy_channel_rejected"],
+      ["", null],
+    ] as const) {
+      const poisoned = await h.store.loadData();
+      poisoned!.sites.workbuddy!.lastError = message;
+      await h.store.saveData(poisoned!);
+      expect((await h.service.getPoolStatus()).sites.workbuddy!.lastError).toBe(code);
+    }
+    // The legacy flat mirror classifies the same way (never a raw string).
+    const mirror = await h.store.loadData();
+    mirror!.sites.workbuddy!.lastError = "\u8d26\u53f7\u5b58\u5728\u5f02\u5e38\u884c\u4e3a RAW-SENTINEL-2";
+    await h.store.saveData(mirror!);
+    expect((await h.service.getStatus()).lastError).toBe("workbuddy_restricted");
+    // An empty classification clears the field entirely.
+    const cleared = await h.store.loadData();
+    cleared!.sites.workbuddy!.lastError = "";
+    await h.store.saveData(cleared!);
+    expect((await h.service.getStatus()).lastError).toBeNull();
+  });
+
+  it("an unreadable store reports a constant label, never an error message", async () => {
+    const h = harness();
+    await seedTwoSitePools(h);
+    await h.store.mergeDiscoveredModels("workbuddy", ["glm-5.3"]);
+    chmodSync(h.store.path, 0o000);
+    try {
+      const pool = await h.service.getPoolStatus();
+      expect(pool.sites.workbuddy).toMatchObject({ status: "error", activeUid: null, models: [], imagesUnsupportedModels: [] });
+      // A filesystem/syscall message must never reach the payload.
+      expect(pool.sites.workbuddy!.lastError).toBe("WorkBuddy 登录态不可读");
+      expect(JSON.stringify(pool)).not.toMatch(/EACCES|permission denied|operation not permitted/i);
+    } finally {
+      chmodSync(h.store.path, 0o600);
+    }
+  });
 });
 
 describe("WorkBuddy pool membership (add-or-replace, cross-site)", () => {

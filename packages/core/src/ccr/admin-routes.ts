@@ -1314,7 +1314,11 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       if (!site || !uid) { reply.status(422); return { ok: false, error: "source_invalid" }; }
       await ensureWorkBuddyMigration();
       await requireWorkBuddyService().switchAccount(site, uid);
-      return { ok: true, site, uid };
+      // `success` is REQUIRED by the client contract
+      // (WorkBuddyMutationResponse.success) and by every other mutating route
+      // here (remove/disconnect/hide/restore/sync): without it the UI's
+      // `!result.success` tail would report a performed switch as a failure.
+      return { ok: true, success: true, site, uid };
     } catch (error: any) {
       return workBuddyRouteError(error, reply, "account/switch", "workbuddy_account_switch_failed");
     }
