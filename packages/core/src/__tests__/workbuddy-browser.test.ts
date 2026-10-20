@@ -121,7 +121,16 @@ describe("browser-owned credentials", () => {
     await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
     const disconnect = h.service.disconnect();
     resolve(env({ accessToken: "stale-rotation", refreshToken: "stale-refresh", expiresIn: 3600 }));
-    expect(await pending).toBeNull(); await disconnect; expect(await h.store.load()).toBeNull();
+    await pending; await disconnect;
+    // The durable invariant is the STORE: the in-flight rotation must not
+    // resurrect the disconnected site's credential (disconnect's mutation runs
+    // after the refresh's save, and the save is skipped once the account is
+    // absent). Since review P2 dropped the per-site epoch comparison from this
+    // path — it also discarded rotations for UNRELATED accounts, leaving them
+    // with a token the upstream had already spent — the in-flight call itself
+    // may now resolve with the rotated credential; nothing is persisted.
+    expect(await h.store.load()).toBeNull();
+    expect(await h.store.loadData()).toBeNull();
   });
 });
 

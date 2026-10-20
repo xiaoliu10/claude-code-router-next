@@ -5,7 +5,7 @@
  * the idempotent AI provider rename migration. Transport retry and admin
  * routes are milestone C and deliberately out of scope here.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -442,5 +442,112 @@ describe("WorkBuddy AI provider rename migration (§16, crash-safe)", () => {
     expect(providers).toHaveLength(1);
     expect(providers[0]).toMatchObject({ name: "workbuddy-ai", api_key: "ccr-managed-workbuddy-ai" });
     expect(h.config().Router.default).toBe("workbuddy-ai,gpt-5.5");
+  });
+
+  it("lenient-migrates a PERMISSIVE (0644) v1 file and still renames the AI provider", async () => {
+    const h = harness(legacyConfig([], { default: "workbuddy,gpt-5.5" }));
+    const v1 = JSON.stringify(CRED({ kind: "workbuddy-ai", uid: "ai-a", domain: "www.workbuddy.ai", accessToken: "token-ai-a" }));
+    writeFileSync(h.store.path, v1);
+    // Group/other-readable: readRaw() rejects this on purpose, so a migration
+    // built on readRaw() would silently no-op and leave CN import name-blocked.
+    chmodSync(h.store.path, 0o644);
+    expect(statSync(h.store.path).mode & 0o777).toBe(0o644);
+
+    const result = await h.service.migrateLegacyProviderNaming();
+    expect(result).toMatchObject({ success: true, renamedProvider: true, renamedRefs: ["default"] });
+
+    // One-time backup: private 0600 and holding the EXACT v1 bytes.
+    const backup = h.store.backupV1Path;
+    expect(existsSync(backup)).toBe(true);
+    expect(statSync(backup).mode & 0o777).toBe(0o600);
+    expect(readFileSync(backup, "utf8")).toBe(v1);
+    // The live file is now v2 at 0600 — the permissive mode is repaired.
+    expect(statSync(h.store.path).mode & 0o777).toBe(0o600);
+    const data = (await h.store.loadData())!;
+    expect(data.version).toBe(2);
+    expect(data.sites["workbuddy-ai"]!.accounts.map((a) => a.uid)).toEqual(["ai-a"]);
+    // The AI identity is re-locked and its Router ref rewritten.
+    expect(h.config().Providers[0]).toMatchObject({ name: "workbuddy-ai", api_key: "ccr-managed-workbuddy-ai", workbuddy_kind: "workbuddy-ai" });
+    expect(h.config().Router.default).toBe("workbuddy-ai,gpt-5.5");
+    // Idempotent: the v2 file now reads back unchanged.
+    const again = await h.service.migrateLegacyProviderNaming();
+    expect(again).toMatchObject({ success: true, renamedProvider: false, renamedRefs: [] });
+  });
+});
+
+describe("Per-account browser refresh vs unrelated site mutations (review P2)", () => {
+  const BROWSER_A = (extra: Partial<WorkBuddyCredential> = {}) => CRED({
+    uid: "cn-a", source: "browser", accessToken: "token-a", refreshToken: "browser-refresh-a",
+    refreshExpiresAt: Date.now() + 86_400_000, expiresAt: Date.now() + 60_000,
+    importedAt: "2026-10-19T01:00:00.000Z", ...extra,
+  });
+
+  /**
+   * A fetch stub that holds the refresh request open until released, so the
+   * site epoch can be bumped while the refresh is genuinely IN FLIGHT (the only
+   * interleaving the removed epoch checks could ever have affected).
+   */
+  function gatedRefreshFetch(inner: ReturnType<typeof multiSiteFetch>) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const fetch = vi.fn(async (url: string, init?: any) => {
+      if (url.includes("auth/token/refresh")) await gate;
+      return inner(url, init);
+    });
+    return { fetch, release };
+  }
+
+  async function waitForRefreshInFlight(fetch: ReturnType<typeof vi.fn>) {
+    for (let i = 0; i < 500 && !fetch.mock.calls.some(([u]) => String(u).includes("auth/token/refresh")); i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(fetch.mock.calls.some(([u]) => String(u).includes("auth/token/refresh"))).toBe(true);
+  }
+
+  it("persists a rotated refresh token when an UNRELATED account is removed mid-refresh", async () => {
+    const h = harness();
+    const { fetch, release } = gatedRefreshFetch(multiSiteFetch({ cn: [], ai: [] }));
+    (h.service as any).options.fetch = fetch;
+    // A: browser account already inside the refresh lead window.
+    await h.store.upsertAccount(BROWSER_A());
+    // B: a healthy account whose removal must NOT invalidate A's refresh.
+    await h.store.upsertAccount(CRED({
+      uid: "cn-b", source: "browser", accessToken: "token-b", refreshToken: "browser-refresh-b",
+      expiresAt: Date.now() + 3_600_000, importedAt: "2026-10-19T02:00:00.000Z",
+    }));
+
+    const pending = h.service.currentCredential("workbuddy");
+    await waitForRefreshInFlight(fetch);
+    // removeAccount bumps the SITE epoch synchronously while A's refresh is open.
+    const removing = h.service.removeAccount("workbuddy", "cn-b");
+    release();
+    const renewed = await pending;
+    expect(await removing).toMatchObject({ success: true, poolEmpty: false });
+
+    expect(renewed?.accessToken).toBe("rotated-a");
+    const data = (await h.store.loadData())!;
+    expect(data.sites.workbuddy!.accounts.map((a) => a.uid)).toEqual(["cn-a"]);
+    const a = data.sites.workbuddy!.accounts[0]!;
+    // The rotation the upstream already performed is PERSISTED: A is not left
+    // holding a spent refresh token that would force a full re-login.
+    expect(a.accessToken).toBe("rotated-a");
+    expect(a.refreshToken).toBe("rotated-a");
+    expect(a.refreshExpiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it("still discards the refresh when the refreshed account ITSELF is removed mid-flight", async () => {
+    const h = harness();
+    const { fetch, release } = gatedRefreshFetch(multiSiteFetch({ cn: [], ai: [] }));
+    (h.service as any).options.fetch = fetch;
+    await h.store.upsertAccount(BROWSER_A({ uid: "cn-z", accessToken: "token-z", refreshToken: "browser-refresh-z" }));
+
+    const pending = h.service.currentCredential("workbuddy");
+    await waitForRefreshInFlight(fetch);
+    const removing = h.service.removeAccount("workbuddy", "cn-z");
+    release();
+    await pending;
+    expect(await removing).toMatchObject({ success: true, poolEmpty: true });
+    // The currentLive ABSENCE check (not the epoch) keeps a deleted account deleted.
+    expect(await h.store.loadData()).toBeNull();
   });
 });

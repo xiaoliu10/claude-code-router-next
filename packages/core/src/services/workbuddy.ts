@@ -560,9 +560,17 @@ export class WorkBuddyCredentialStore {
 
   /**
    * If the on-disk file is still v1, perform the one-time backup + conversion
-   * before the first v2 write. Returns null when no v1 file needed migration.
+   * before the first v2 write. Returns null when there is no credential file at
+   * all (the caller's no-op case).
+   *
+   * PUBLIC because the §16 provider-naming migration must not depend on a v2
+   * file already existing: readRaw() rejects a permissive (group/other-readable)
+   * v1 file, so a migration built on it would silently no-op — never creating
+   * the .v1.bak, never renaming the AI provider, and leaving CN import blocked by
+   * the name-conflict check until the user hand-edits config.json. This variant
+   * lenient-migrates such a file (exact-bytes 0600 backup + 0600 v2 rewrite).
    */
-  private async ensureV2OnDisk(): Promise<{ data: WorkBuddyCredentialData; legacy: WorkBuddyCredential | null; backupCreated: boolean } | null> {
+  async ensureV2OnDisk(): Promise<{ data: WorkBuddyCredentialData; legacy: WorkBuddyCredential | null; backupCreated: boolean } | null> {
     const lenient = await this.readV1Lenient();
     if (lenient) return this.migrateV1();
     const raw = await this.readRaw();

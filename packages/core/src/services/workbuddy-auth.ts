@@ -1057,10 +1057,12 @@ export class WorkBuddyAuthService {
    */
   async migrateLegacyProviderNaming(): Promise<WorkBuddyMigrationResult> {
     return this.enqueueMutation(async () => {
-      let data: WorkBuddyCredentialData | null = null;
-      const raw = await this.store.readRaw().catch(() => null);
-      if (raw && raw.version !== 2) data = (await this.store.migrateV1()).data;
-      else data = raw as WorkBuddyCredentialData | null;
+      // ensureV2OnDisk (NOT readRaw): a permissive 0644 v1 file must still be
+      // lenient-migrated here (exact-bytes 0600 .v1.bak + 0600 v2 rewrite),
+      // otherwise readRaw rejects it and this migration would silently no-op —
+      // leaving the AI provider misnamed and CN import blocked by the
+      // name-conflict check. null = no credential file = nothing to migrate.
+      const data = (await this.store.ensureV2OnDisk().catch(() => null))?.data ?? null;
       if (!data) return { success: true, renamedProvider: false, renamedRefs: [] };
       const config = await readConfigFileRaw();
       const previousConfig = structuredClone(config);
@@ -1378,7 +1380,6 @@ export class WorkBuddyAuthService {
       const key = `${target}|${selected.uid}|${generation}`;
       const existing = this.browserRefreshes.get(key);
       if (existing) return existing;
-      const epoch = this.epochOf(target);
       const task = this.enqueueMutation(async (): Promise<WorkBuddyCredential | null> => {
         const data = await this.store.loadData();
         const live = data?.sites[target]?.accounts.find((a) => a.uid === selected.uid);
@@ -1387,15 +1388,20 @@ export class WorkBuddyAuthService {
         }
         try {
           const renewed = await refreshWorkBuddyToken(this.withSite(target, live), (url, init) => this.directFetch(url, init), async (next) => {
-            if (epoch !== this.epochOf(target)) return;
             const current = await this.store.loadData();
             const currentLive = current?.sites[target]?.accounts.find((a) => a.uid === selected.uid);
+            // NO per-site epoch check here (review P2): removeAccount/disconnect/
+            // import bump the SITE epoch, so an unrelated account B being removed
+            // must not discard a refresh token the upstream already rotated for
+            // account A — that would leave A holding a spent token and force a
+            // full re-login. Absence of the account plus the generation equality
+            // check are the correct guards for THIS account.
             if (current && currentLive && this.credentialGeneration(this.withSite(target, currentLive)) === generation) {
               // Cooldown state rides along: upsertAccount preserves still-valid slots.
               await this.store.upsertAccount({ ...next, cooldown: currentLive.cooldown, modelCooldowns: currentLive.modelCooldowns });
             }
           });
-          return epoch === this.epochOf(target) ? renewed : null;
+          return renewed;
         } catch { return this.withSite(target, live); }
       }).finally(() => this.browserRefreshes.delete(key));
       this.browserRefreshes.set(key, task);
