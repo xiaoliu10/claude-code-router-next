@@ -224,9 +224,13 @@ describe("Gemini OAuth token/cache lifecycle", () => {
     expect(resolved).toBe(false);
     release(); expect(await token).toBe(ACCESS);
     expect((await h.store.load())!.account.refreshToken).toBe(ROTATED);
-    // A new service must load the durable identity and hit the ROTATED cache.
+    // Token state is per-service-instance (no module-global cache): a new
+    // service must load the durable ROTATED identity and refresh with it,
+    // never the pre-rotation REFRESH token.
     expect(await new GeminiOauthAuthService(h.options).getAccessToken()).toBe(ACCESS);
-    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(upstream).toHaveBeenCalledTimes(2);
+    const rotatedCall = decodeURIComponent(String(upstream.mock.calls[1][1]?.body ?? ""));
+    expect(rotatedCall).toContain(ROTATED); expect(rotatedCall).not.toContain(REFRESH);
   });
   it("fails rotation closed if the durable write fails, keeping the old identity", async () => {
     const h = await harness(); await h.store.save(credential()); await h.service.getProject();
