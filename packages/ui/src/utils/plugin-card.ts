@@ -18,6 +18,10 @@ export interface PluginCardMountProps {
   locales: Record<string, Record<string, unknown>>;
   plugin: { name: string; version: string | null };
   disabled: boolean;
+  /** Shared save/action mutex; null means a config write or managed action is active. */
+  acquireManagement?: () => (() => void) | null;
+  /** Reconcile server changes into the host draft without losing unrelated edits. */
+  refreshConfig?: (merge: (current: any, server: any) => any) => Promise<void>;
   /** Cards should report transient UI-busy state (gates the page save buttons). */
   onBusy?: (busy: boolean) => void;
   log: Pick<Console, "info" | "warn" | "error">;

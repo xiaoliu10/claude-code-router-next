@@ -11,7 +11,6 @@ import { useConfig } from "./ConfigProvider";
 import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
 import { WorkBuddyProvider } from "./WorkBuddyProvider";
-import { GeminiOauthProvider } from "./GeminiOauthProvider";
 import { PluginCardArea } from "./PluginCardArea";
 import { ProjectsPage } from "./ProjectsPage";
 import { isWorkBuddyKind } from "@/utils/workbuddy";
@@ -462,7 +461,6 @@ export function SettingsPage() {
               {location.state?.geminiOauthManagedNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("geminiOauth.managed_notice")}</p>}
               {/* §16: the dashboard's managed edit/delete lands on that site's card. */}
               <WorkBuddyProvider disabled={isSaving || isRestarting} onBusyChange={setWorkBuddyBusy} focusSite={isWorkBuddyKind(location.state?.workBuddySite) ? location.state.workBuddySite : null} />
-              <GeminiOauthProvider disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} />
               <PluginCardArea disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} />
             </TabsContent>
 

@@ -3,31 +3,6 @@ import type { GeminiOauthDisconnectResponse, GeminiOauthLoginPollResponse, Gemin
 import { sanitizePluginErrorCode } from '../utils/plugin-card.ts';
 import { WORKBUDDY_POLL_TIMEOUT } from '../utils/workbuddy-login.ts';
 
-// The Gemini subscription provider has its own frozen code list (contract
-// §1.6); unknown server text is never surfaced to the browser.
-const GEMINI_OAUTH_ERROR_CODES = new Set(['gemini_oauth_identity_blocked', 'gemini_oauth_validation_required',
-  'gemini_oauth_quota_exceeded', 'gemini_oauth_reauth_required', 'gemini_oauth_upstream_error',
-  'gemini_oauth_not_connected', 'gemini_oauth_login_busy', 'gemini_oauth_name_conflict',
-  'gemini_oauth_login_state_rejected', 'gemini_oauth_login_account_failed', 'gemini_oauth_login_persist_failed',
-  'gemini_oauth_models_fetch_failed', 'gemini_oauth_config_write_failed']);
-
-/** Codes the Gemini OAuth routes may report, keyed by route family. */
-const GEMINI_OAUTH_ROUTE_CODES: Record<string, string[]> = {
-  status: ['gemini_oauth_not_connected'],
-  login: ['gemini_oauth_login_busy', 'gemini_oauth_login_state_rejected', 'gemini_oauth_login_account_failed',
-    'gemini_oauth_login_persist_failed', 'gemini_oauth_name_conflict', 'gemini_oauth_reauth_required'],
-  sync: ['gemini_oauth_not_connected', 'gemini_oauth_reauth_required', 'gemini_oauth_models_fetch_failed',
-    'gemini_oauth_quota_exceeded', 'gemini_oauth_config_write_failed', 'gemini_oauth_upstream_error'],
-  disconnect: ['gemini_oauth_config_write_failed'],
-};
-
-function geminiOauthRouteFamily(endpoint: string): string {
-  if (endpoint.startsWith('/gemini-oauth/login/')) return 'login';
-  if (endpoint.startsWith('/gemini-oauth/sync')) return 'sync';
-  if (endpoint.startsWith('/gemini-oauth/disconnect')) return 'disconnect';
-  return 'status';
-}
-
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
   private baseUrl: string;
@@ -99,10 +74,9 @@ class ApiClient {
   private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number; plugin?: string } = {}): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
     const isWorkBuddy = endpoint.startsWith('/workbuddy/');
-    const isGeminiOauth = endpoint.startsWith('/gemini-oauth/');
     const pluginName = (options as any).plugin as string | undefined;
     const isPluginApi = typeof pluginName === 'string' && pluginName.length > 0;
-    const isManagedSubscription = isWorkBuddy || isGeminiOauth || isPluginApi;
+    const isManagedSubscription = isWorkBuddy;
     const { timeoutMs, plugin: _plugin, ...rest } = options;
 
     const config: RequestInit = {
@@ -129,7 +103,7 @@ class ApiClient {
         // We'll dispatch a custom event that the app can listen to
         window.dispatchEvent(new CustomEvent('unauthorized'));
         // Return a promise that never resolves to prevent further execution
-        if (isGeminiOauth) throw Object.assign(new Error('Gemini OAuth request failed'), { reason: 'request_failed' });
+        if (isPluginApi) throw Object.assign(new Error('Plugin request failed'), { reason: 'request_failed', plugin: pluginName });
         if (isWorkBuddy) throw Object.assign(new Error('workbuddy_unauthorized'), { reason: 'workbuddy_unauthorized' });
         return new Promise(() => {}) as Promise<T>;
       }
@@ -145,17 +119,6 @@ class ApiClient {
           if (candidate) code = candidate;
         } catch { /* use the safe default */ }
         throw Object.assign(new Error(`Plugin ${pluginName} request failed`), { reason: code, plugin: pluginName });
-      }
-
-      if (!response.ok && isGeminiOauth) {
-        let code = 'request_failed';
-        try {
-          const data = await response.json();
-          const candidate = data.reason || data.error;
-          if (typeof candidate === 'string' && GEMINI_OAUTH_ERROR_CODES.has(candidate)
-            && GEMINI_OAUTH_ROUTE_CODES[geminiOauthRouteFamily(endpoint)].includes(candidate)) code = candidate;
-        } catch { /* use the safe default */ }
-        throw Object.assign(new Error('Gemini OAuth request failed'), { reason: code });
       }
 
       if (!response.ok && isWorkBuddy) {
@@ -206,9 +169,8 @@ class ApiClient {
         const reason = error instanceof DOMException && error.name === 'TimeoutError'
           ? (isWorkBuddy ? WORKBUDDY_POLL_TIMEOUT : 'request_failed')
           : error && typeof error === 'object' && 'reason' in error && typeof error.reason === 'string'
-            && (!isGeminiOauth || GEMINI_OAUTH_ERROR_CODES.has(error.reason) || error.reason === 'request_failed')
             ? error.reason : 'request_failed';
-        throw Object.assign(new Error(isGeminiOauth ? 'Gemini OAuth request failed' : 'WorkBuddy request failed'), { reason });
+        throw Object.assign(new Error('WorkBuddy request failed'), { reason });
       }
       if (isPluginApi) {
         const reason = error instanceof DOMException && error.name === 'TimeoutError'
@@ -612,38 +574,35 @@ class ApiClient {
 
   // Local status only: no polling, no upstream call, no token field of any kind.
   getGeminiOauthStatus(): Promise<GeminiOauthStatusResponse> {
-    return this.get<GeminiOauthStatusResponse>(
-      '/gemini-oauth/status',
-      ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
-    );
+    return this.callPluginApi('gemini-oauth', '/status', { method: 'GET', timeoutMs: ApiClient.MANAGEMENT_READ_TIMEOUT_MS });
   }
 
   // Opens one loopback callback server with a 10 minute TTL. Called ONLY after
   // the user confirmed the risk dialog — never on mount, never automatically.
   startGeminiOauthLogin(): Promise<GeminiOauthLoginStartResponse> {
-    return this.post<GeminiOauthLoginStartResponse>('/gemini-oauth/login/start', {}, 30_000);
+    return this.callPluginApi('gemini-oauth', '/login/start', { method: 'POST', body: '{}', timeoutMs: 30_000 });
   }
 
   pollGeminiOauthLogin(loginId: string, signal: AbortSignal): Promise<GeminiOauthLoginPollResponse> {
-    return this.apiFetch('/gemini-oauth/login/poll', {
+    return this.callPluginApi('gemini-oauth', '/login/poll', {
       method: 'POST', body: JSON.stringify({ loginId }),
       signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
     });
   }
 
   cancelGeminiOauthLogin(loginId: string): Promise<{ ok?: boolean; success?: boolean }> {
-    return this.post('/gemini-oauth/login/cancel', { loginId }, 30_000);
+    return this.callPluginApi('gemini-oauth', '/login/cancel', { method: 'POST', body: JSON.stringify({ loginId }), timeoutMs: 30_000 });
   }
 
   // Re-reads the available model list; a failure keeps the previous models.
   syncGeminiOauthModels(): Promise<GeminiOauthSyncResponse> {
-    return this.post<GeminiOauthSyncResponse>('/gemini-oauth/sync', {}, 60_000);
+    return this.callPluginApi('gemini-oauth', '/sync', { method: 'POST', body: '{}', timeoutMs: 60_000 });
   }
 
   // Deletes the managed provider and the private credential file. Router
   // references are preserved and may stop working; CCR says so in the UI.
   disconnectGeminiOauth(): Promise<GeminiOauthDisconnectResponse> {
-    return this.post<GeminiOauthDisconnectResponse>('/gemini-oauth/disconnect', {}, 30_000);
+    return this.callPluginApi('gemini-oauth', '/disconnect', { method: 'POST', body: '{}', timeoutMs: 30_000 });
   }
 
   async probeProvider(providerName: string): Promise<ManualProbeResponse> {

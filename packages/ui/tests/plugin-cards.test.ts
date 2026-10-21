@@ -61,7 +61,7 @@ test("api.callPluginApi routes plugin paths with sanitization and format check",
 
 test("SettingsPage mounts the plugin card area after the built-in managed cards", () => {
   const src = read("components/SettingsPage.tsx");
-  const gemini = src.indexOf("<GeminiOauthProvider");
+  const gemini = src.indexOf("<WorkBuddyProvider");
   const pluginArea = src.indexOf("<PluginCardArea");
   assert.ok(gemini !== -1 && pluginArea !== -1 && pluginArea > gemini);
 });

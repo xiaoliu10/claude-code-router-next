@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { pluginLocaleOf, type PluginCardModule } from "../utils/plugin-card";
+import { useConfig } from "./ConfigProvider";
 import type { PluginInfo } from "../types";
 
 /**
@@ -11,6 +12,9 @@ import type { PluginInfo } from "../types";
  */
 export function PluginCardArea({ disabled, onBusyChange }: { disabled: boolean; onBusyChange?: (busy: boolean) => void }) {
   const { i18n } = useTranslation();
+  const { refreshConfig } = useConfig();
+  const currentProps = useRef({ disabled, refreshConfig, onBusyChange });
+  currentProps.current = { disabled, refreshConfig, onBusyChange };
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
   const [failed, setFailed] = useState(false);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -48,10 +52,12 @@ export function PluginCardArea({ disabled, onBusyChange }: { disabled: boolean; 
         locale,
         locales: plugin.locales ?? {},
         plugin: { name: plugin.name, version: plugin.version },
-        disabled,
+        get disabled() { return currentProps.current.disabled; },
+        acquireManagement: () => api.acquireWorkBuddyManagement(),
+        refreshConfig: merge => currentProps.current.refreshConfig(merge),
         onBusy: (busy: boolean) => {
           busyCountRef.current = Math.max(0, busyCountRef.current + (busy ? 1 : -1));
-          onBusyChange?.(busyCountRef.current > 0);
+          currentProps.current.onBusyChange?.(busyCountRef.current > 0);
         },
         log: console,
       });
@@ -83,6 +89,7 @@ export function PluginCardArea({ disabled, onBusyChange }: { disabled: boolean; 
         entry.el.remove();
       }
       busyCountRef.current = 0;
+      currentProps.current.onBusyChange?.(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [plugins, locale]);

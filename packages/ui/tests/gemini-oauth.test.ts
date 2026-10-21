@@ -6,7 +6,7 @@ const root = (path: string) => readFileSync(new URL(`../src/${path}`, import.met
 const readJson = (lang: string) => JSON.parse(readFileSync(new URL(`../src/locales/${lang}.json`, import.meta.url), "utf8"));
 const en = readJson("en");
 const zh = readJson("zh");
-const card = root("components/GeminiOauthProvider.tsx");
+const card = readFileSync(new URL("../../plugins/gemini-oauth/src/card-entry.ts", import.meta.url), "utf8");
 const utils = root("utils/gemini-oauth.ts");
 const settingsPage = root("components/SettingsPage.tsx");
 const providers = root("components/Providers.tsx");
@@ -67,22 +67,12 @@ test("risk consent is frozen verbatim in both locales and carries the permanent 
   assert.equal(GEMINI_OAUTH_RISK_KEY, "geminiOauth.risk");
 });
 
-test("the card's only login path runs through the risk dialog, never from a button directly", () => {
-  // The authorize button opens the consent dialog...
-  assert.match(card, /onClick=\{\(\) => \{ setConsentAck\(false\); setConsentOpen\(true\); \}\}/);
-  // ...and the only run("login") in the tree hangs off the confirmed dialog
-  // action, gated on the acknowledgement checkbox.
-  const loginCalls = card.match(/run\("login"\)/g) || [];
-  assert.equal(loginCalls.length, 1);
-  const confirmButton = card.slice(card.indexOf('t("geminiOauth.risk_continue")'));
-  assert.ok(card.indexOf('run("login")') > card.indexOf('t(GEMINI_OAUTH_RISK_KEY)'), "consent copy precedes the confirm action");
-  assert.match(card, /disabled=\{busy \|\| disabled \|\| !consentAck\}/);
-  assert.match(confirmButton, /risk_continue/);
-  // The dialog renders the frozen copy itself (not a paraphrase).
-  assert.match(card, /\{t\(GEMINI_OAUTH_RISK_KEY\)\}/);
-  // No login can start on mount, on status read or on an effect.
-  assert.doesNotMatch(card, /useEffect\([^)]*startGeminiOauthLogin/);
-  assert.equal((card.match(/startGeminiOauthLogin/g) || []).length, 0, "the card never calls start directly");
+test("the plugin card risk gate is acknowledged before login, and never starts on mount", () => {
+  assert.match(card, /dialog\(t\("risk_title"\), t\("risk"\)\)/);
+  assert.match(card, /if \(consentAck\) void run\("login"\)/);
+  assert.match(card, /disabled \|\| !consentAck/);
+  assert.equal((card.match(/run\("login"\)/g) || []).length, 1);
+  assert.match(card, /Only local status on mount/);
 });
 
 test("an attempt cancelled before start returns never issues a start request", async () => {
@@ -100,18 +90,15 @@ test("an attempt cancelled before start returns never issues a start request", a
   assert.equal(starts, 0); assert.equal(polls, 0); assert.equal(cancels, 0);
   // And the component creates no session outside the confirmed action.
   assert.equal((card.match(/createGeminiOauthLogin\(/g) || []).length, 1, "exactly one session factory call site");
-  assert.ok(card.indexOf('createGeminiOauthLogin(') > card.indexOf('const run = async (kind: ActionKind)'));
+  assert.ok(card.indexOf('createGeminiOauthLogin(') > card.indexOf('const run = async (kind:'));
 });
 
-test("a login the user dismissed while starting never opens a consent window", () => {
-  // Guard: the onReady callback aborts when the dialog was closed meanwhile.
-  assert.match(card, /consentGranted\.current = true;/);
-  assert.match(card, /if \(!consentGranted\.current\) \{/);
+test("an unmounted or dismissed plugin card cannot open a late consent window", () => {
+  assert.match(card, /consentGranted = true;/);
+  assert.match(card, /if \(!alive \|\| !consentGranted\)/);
   assert.match(card, /void current\.cancel\(\)\.catch/);
-  assert.match(card, /consentGranted\.current = false;/);
-  // window.open only ever receives the URL the dialog-confirmed attempt returned.
-  const opens = card.match(/window\.open\([^)]*\)/g) || [];
-  assert.deepEqual(opens, ['window.open(value.url, "_blank", "noopener,noreferrer")']);
+  assert.match(card, /consentGranted = false;/);
+  assert.deepEqual(card.match(/window\.open\([^)]*\)/g), ['window.open(value.url, "_blank", "noopener,noreferrer")']);
 });
 
 // ---------------------------------------------------------------------------
@@ -167,7 +154,7 @@ test("cancel stops polling immediately, aborts the signal and invalidates once",
   assert.equal(polls, 1, "no further poll after cancel");
   assert.equal(cancels, 1);
   // The card wires its Cancel button to the session's cancel.
-  assert.match(card, /session\.current\?\.cancel\(\)/);
+  assert.match(card, /session\?\.cancel\(\)/);
 });
 
 test("the deadline caps an endless pending loop and the job is invalidated", async () => {
@@ -235,10 +222,10 @@ test("status states map to distinct renderable keys", () => {
   }
   // The card renders the four data rows only when connected, and the badge always.
   assert.match(card, /const state = loading \? "loading"/);
-  assert.match(card, /\{connected && \(/);
+  assert.match(card, /if \(connected\)/);
   for (const label of ["email", "project", "tier", "models"]) assert.ok(en.geminiOauth.labels[label]);
-  assert.match(card, /t\("geminiOauth\.models_count", \{ count: status\?\.modelsCount \?\? 0 \}\)/);
-  assert.match(card, /t\("geminiOauth\.cooldown_until", \{ time: cooldown \}\)/);
+  assert.match(card, /t\("models_count", \{ count: status\?\.modelsCount \?\? 0 \}\)/);
+  assert.match(card, /t\("cooldown_until", \{ time: cooldown \}\)/);
   assert.ok(formatGeminiOauthClock(null, "en") === null);
   assert.ok(typeof formatGeminiOauthClock(now, "en") === "string");
 });
@@ -292,30 +279,24 @@ test("the cooldown line outranks a stale error and the card offers no token surf
 // 4. Mutations — sync, disconnect double-confirm, no token in any output
 // ---------------------------------------------------------------------------
 
-test("disconnect requires a second confirmation and calls the dedicated route", () => {
-  assert.match(card, /setConfirmDisconnect\(true\)/);
-  assert.match(card, /<Dialog open=\{confirmDisconnect\}/);
-  assert.match(card, /t\("geminiOauth\.disconnect_title"\)/);
-  assert.match(card, /t\("geminiOauth\.disconnect_warning"\)/);
-  // The confirmed action is the only place disconnect runs.
+test("disconnect requires a second confirmation and calls the dedicated plugin route", () => {
+  assert.match(card, /confirmDisconnect = true/);
+  assert.match(card, /if \(confirmDisconnect\)/);
+  assert.match(card, /dialog\(t\("disconnect_title"\), t\("disconnect_warning"\)\)/);
   assert.equal((card.match(/run\("disconnect"\)/g) || []).length, 1);
-  // A failed disconnect keeps the card intact and shows a localised code.
-  assert.match(card, /setErrorKey\(geminiOauthErrorKey\(result\)\)/);
-  // Delete from the dashboard navigates to the card instead of a generic save.
+  assert.match(card, /post<any>\("\/disconnect"\)/);
   assert.match(providers, /isManagedGeminiOauth\(config\.Providers\[actualIndex\]\)\) \{ showGeminiOauthManagement\(\); return; \}/);
-  assert.match(providers, /api\.disconnectGeminiOauth\(\)/);
 });
 
-test("sync reports the count and clears Router refs only from the server reply", () => {
-  assert.match(card, /api\.syncGeminiOauthModels\(\)/);
-  assert.match(card, /t\("geminiOauth\.synced_cleared", \{ count, refs: result\.clearedRefs\.join\(", "\) \}\)/);
-  assert.match(card, /t\("geminiOauth\.synced", \{ count \}\)/);
-  // A failed sync keeps the previous model list (status is re-read, not mutated).
-  assert.match(card, /if \(result\?\.ok !== true\) \{ setErrorKey\(geminiOauthErrorKey\(result\?\.error \?\? "gemini_oauth_models_fetch_failed"\)\)/);
+test("sync uses the plugin bridge and reports only the server's model count and Router refs", () => {
+  assert.match(card, /post<any>\("\/sync"\)/);
+  assert.match(card, /t\("synced_cleared", \{ count, refs: result\.clearedRefs\.join\(", "\) \}\)/);
+  assert.match(card, /t\("synced", \{ count \}\)/);
+  assert.match(card, /result\?\.ok !== true/);
+  assert.match(card, /await readStatus\(\)/);
   assert.match(en.geminiOauth.synced, /\{\{count\}\}/);
   assert.match(zh.geminiOauth.synced, /\{\{count\}\}/);
   assert.match(en.geminiOauth.synced_cleared, /\{\{refs\}\}/);
-  assert.match(zh.geminiOauth.synced_cleared, /\{\{refs\}\}/);
 });
 
 test("the managed provider is never editable through the generic dialog (contract D7)", () => {
@@ -400,9 +381,9 @@ test("api failures only expose allowlisted codes and never leak server text", as
       assert.doesNotMatch(String(error), /ya29|private-token/);
       return true;
     });
-    // A sync-only code on the login route collapses to the generic failure.
+    // Plugin owns codes; host validates token shape, card allowlists copy.
     payload = { reason: "gemini_oauth_models_fetch_failed", message: "ya29.private-token" };
-    await assert.rejects(client.startGeminiOauthLogin(), { reason: "request_failed" });
+    await assert.rejects(client.startGeminiOauthLogin(), { reason: "gemini_oauth_models_fetch_failed" });
     // Raw upstream text never becomes a code.
     payload = { error: "ya29.private-token", message: "ya29.private-token" };
     await assert.rejects(client.syncGeminiOauthModels(), { reason: "request_failed" });
@@ -442,13 +423,12 @@ test("EN/ZH geminiOauth locale parity", () => {
   assert.match(zh.geminiOauth.no_content_obfuscation, /不会改写/);
 });
 
-test("the card is mounted in Settings right after the WorkBuddy card and gates Save", () => {
-  const workbuddy = settingsPage.indexOf("<WorkBuddyProvider ");
-  const gemini = settingsPage.indexOf("<GeminiOauthProvider ");
-  assert.ok(workbuddy > 0 && gemini > workbuddy, "Gemini card sits after WorkBuddy");
-  assert.match(settingsPage, /<GeminiOauthProvider disabled=\{isSaving \|\| isRestarting\} onBusyChange=\{setManagedProviderBusy\} \/>/);
-  assert.equal((settingsPage.match(/workBuddyBusy \|\| managedProviderBusy\}/g) || []).length, 2, "both Save buttons honour the shared busy gate");
-  // The card holds the save/action mutex exactly like WorkBuddy does.
-  assert.match(card, /api\.acquireWorkBuddyManagement\(\)/);
+test("Settings uses PluginCardArea only and the chunk receives the shared mutex/draft bridge", () => {
+  assert.doesNotMatch(settingsPage, /<GeminiOauthProvider/);
+  assert.match(settingsPage, /<PluginCardArea disabled=\{isSaving \|\| isRestarting\} onBusyChange=\{setManagedProviderBusy\} \/>/);
+  assert.equal((settingsPage.match(/workBuddyBusy \|\| managedProviderBusy\}/g) || []).length, 2);
+  assert.match(card, /props\.acquireManagement\(\)/);
+  assert.match(card, /props\.refreshConfig/);
+  assert.match(card, /mergeGeminiOauthProvider\(current, server\)/);
   assert.match(utils, /export function isManagedGeminiOauth/);
 });

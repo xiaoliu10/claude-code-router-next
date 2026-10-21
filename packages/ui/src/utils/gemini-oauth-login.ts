@@ -104,7 +104,16 @@ export function createGeminiOauthLogin(
       }
       const started = await new Promise<GeminiOauthLoginStartResponse | null>((resolve, reject) => {
         voidScheduledStart = () => resolve(null);
-        api.startGeminiOauthLogin().then(resolve, reject).finally(() => { voidScheduledStart = null; });
+        api.startGeminiOauthLogin().then(started => {
+          // cancel() may already have resolved this scheduled start with null.
+          // A late server-created job still needs explicit invalidation or its
+          // callback socket survives the unmounted card for the full TTL.
+          if (settled && controller.signal.aborted && started?.loginId) {
+            job = started;
+            void invalidate().catch(() => {});
+          }
+          resolve(started);
+        }, reject).finally(() => { voidScheduledStart = null; });
       });
       const abandoned = controller.signal.aborted || cancelGeneration !== generationAtStart;
       if (started && typeof started.loginId === "string" && started.loginId) job = started;
