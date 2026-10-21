@@ -65,7 +65,10 @@ export const WORKBUDDY_SITES: Record<WorkBuddySiteId, WorkBuddySite> = {
   workbuddy: {
     id: "workbuddy", authId: "workbuddy-desktop",
     origin: "https://copilot.tencent.com",
-    domains: ["copilot.tencent.com", "www.codebuddy.cn"],
+    // The plugin API issues the browser auth URL on www.workbuddy.cn (verified
+    // live: POST /v2/plugin/auth/state returns https://www.workbuddy.cn/login?...),
+    // so the authorization host family must include it.
+    domains: ["copilot.tencent.com", "www.workbuddy.cn", "www.codebuddy.cn"],
   },
   "workbuddy-ai": {
     id: "workbuddy-ai", authId: "workbuddy-desktop-ai",
@@ -931,12 +934,12 @@ export async function createWorkBuddyLoginState(siteId: WorkBuddySiteId, fetchIm
   if (!loginStateOk(state) || typeof authUrl !== "string" || authUrl.length > 8192) throw new Error("workbuddy_login_state_failed");
   let url: URL;
   try { url = new URL(authUrl); } catch { throw new Error("workbuddy_login_state_failed"); }
-  const domains = siteId === "workbuddy" ? ["copilot.tencent.com", "codebuddy.cn"] : ["workbuddy.ai", "codebuddy.ai"];
+  // Reuse the site's own host family (single source of truth) so the
+  // authorization URL check can never drift from the site definition.
   if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443") ||
-      !domains.some((host) => url.hostname === host || url.hostname.endsWith("." + host))) {
+      !site.domains.some((host) => url.hostname === host || url.hostname.endsWith("." + host))) {
     throw new Error("workbuddy_login_state_failed");
-  }
-  url.searchParams.set("version", WORKBUDDY_APP_VERSION);
+  }  url.searchParams.set("version", WORKBUDDY_APP_VERSION);
   url.searchParams.set("loginSessionId", randomBytes(16).toString("hex"));
   return { state, url: url.toString(), expiresAt: Date.now() + WORKBUDDY_LOGIN_TTL_MS };
 }

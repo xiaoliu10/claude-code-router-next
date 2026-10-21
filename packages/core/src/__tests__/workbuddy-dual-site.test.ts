@@ -36,7 +36,7 @@ describe("WorkBuddy dual-site support (contract §14.1)", () => {
   it("defines both builds with their own origin, login file and domain allowlist", () => {
     expect(WORKBUDDY_SITES.workbuddy.origin).toBe("https://copilot.tencent.com");
     expect(WORKBUDDY_SITES.workbuddy.authId).toBe("workbuddy-desktop");
-    expect(WORKBUDDY_SITES.workbuddy.domains).toEqual(["copilot.tencent.com", "www.codebuddy.cn"]);
+    expect(WORKBUDDY_SITES.workbuddy.domains).toEqual(["copilot.tencent.com", "www.workbuddy.cn", "www.codebuddy.cn"]);
     expect(WORKBUDDY_SITES["workbuddy-ai"].origin).toBe("https://www.workbuddy.ai");
     expect(WORKBUDDY_SITES["workbuddy-ai"].authId).toBe("workbuddy-desktop-ai");
     expect(WORKBUDDY_SITES["workbuddy-ai"].domains).toEqual(["www.workbuddy.ai", "www.codebuddy.ai"]);

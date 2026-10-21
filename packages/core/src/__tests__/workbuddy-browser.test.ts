@@ -47,6 +47,16 @@ describe("WorkBuddy browser protocol", () => {
     expect(new URL(result.url).searchParams.get("version")).toBe("2.0.0");
     expect(new URL(result.url).searchParams.get("loginSessionId")).toMatch(/^[a-f0-9]{32}$/);
   });
+  it("accepts the CN site's real browser host www.workbuddy.cn", async () => {
+    // Verified live: POST https://copilot.tencent.com/v2/plugin/auth/state returns
+    // authUrl https://www.workbuddy.cn/login?platform=workbuddy&state=... (5/5 stable).
+    const fetch = vi.fn(async () => env({ state: "s", authUrl: "https://www.workbuddy.cn/login?platform=workbuddy&state=s" }));
+    const result = await createWorkBuddyLoginState("workbuddy", fetch);
+    const url = new URL(result.url);
+    expect(url.hostname).toBe("www.workbuddy.cn");
+    expect(url.searchParams.get("version")).toBe("2.0.0");
+    expect(url.searchParams.get("loginSessionId")).toMatch(/^[a-f0-9]{32}$/);
+  });
   it("rejects unsafe or unrelated authorization destinations", async () => {
     for (const url of ["http://www.codebuddy.cn/login", "https://evil.example/login", "https://codebuddy.cn.evil.example/", "https://u:p@www.codebuddy.cn/", "https://www.codebuddy.cn:9443/"]) {
       await expect(createWorkBuddyLoginState("workbuddy", async () => env({ state: "s", authUrl: url }))).rejects.toThrow("workbuddy_login_state_failed");
