@@ -18,7 +18,7 @@ import {
   workBuddyDesktopPath,
   workBuddySite,
   type WorkBuddyCredential,
-} from "../services/workbuddy";
+} from "../src/protocol";
 
 const CRED: WorkBuddyCredential = {
   version: 1,

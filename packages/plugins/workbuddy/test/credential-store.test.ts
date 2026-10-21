@@ -14,7 +14,7 @@ import {
   managedProvider,
   workBuddySiteFromProvider,
   type WorkBuddyCredential,
-} from "../services/workbuddy";
+} from "../src/protocol";
 
 const dirs: string[] = [];
 function newStore(): { store: WorkBuddyCredentialStore; dir: string; path: string; backup: string } {
