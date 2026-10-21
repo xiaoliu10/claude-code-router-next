@@ -17,6 +17,13 @@ export class ProviderService {
     this.initializeCustomProviders();
   }
 
+  /** Preserve the object decorated into every Fastify namespace. */
+  reload(): void {
+    const next = new ProviderService(this.configService, this.transformerService, this.logger);
+    this.providers = next.providers;
+    this.modelRoutes = next.modelRoutes;
+  }
+
   private initializeCustomProviders() {
     const providersConfig =
       this.configService.get<ConfigProvider[]>("providers");

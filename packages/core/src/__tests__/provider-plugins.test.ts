@@ -1,3 +1,4 @@
+import Fastify from "fastify";
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
@@ -65,14 +66,17 @@ const log = { info: () => {}, warn: () => {}, error: () => {} };
 
 describe("provider plugin loader & registry", () => {
   let configDir: string;
+  let routeHost: ReturnType<typeof Fastify>;
   beforeEach(() => {
+    routeHost = Fastify();
     configDir = mkdtempSync(join(tmpdir(), "ccr-plugins-"));
     clearPluginRegistry();
     (globalThis as any).__fakeCooling = false;
     (globalThis as any).__fakeNoted = undefined;
     (globalThis as any).__fakeRefreshed = false;
   });
-  afterEach(() => {
+  afterEach(async () => {
+    await routeHost.close();
     clearPluginRegistry();
     rmSync(configDir, { recursive: true, force: true });
     delete (globalThis as any).__fakeCooling;
@@ -82,7 +86,7 @@ describe("provider plugin loader & registry", () => {
 
   it("loads an installed plugin: runtime, protector, routes, card and locales", async () => {
     writePlugin(configDir, "fake-sub");
-    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ configService: { reload() {}, set() {}, get() { return true; } } }) });
+    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ app: routeHost, configService: { reload() {}, set() {}, get() { return true; } } }) });
     expect(result.loaded).toEqual(["fake-sub"]);
     expect(listLoadedPlugins()).toHaveLength(1);
 
@@ -110,7 +114,7 @@ describe("provider plugin loader & registry", () => {
       { name: "fake-sub", enabled: false },
       { name: "ghost", enabled: true },
     ]));
-    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ configService: { reload() {}, set() {}, get() { return true; } } }) });
+    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ app: routeHost, configService: { reload() {}, set() {}, get() { return true; } } }) });
     expect(result.loaded).toEqual([]);
     expect(result.skipped.map((s) => s.name)).toEqual(["fake-sub"]);
     expect(result.failed).toEqual([{ name: "ghost", error: "plugin.json missing or malformed" }]);
@@ -119,7 +123,7 @@ describe("provider plugin loader & registry", () => {
 
   it("rejects incompatible coreApi majors", async () => {
     writePlugin(configDir, "fake-sub", { coreApi: "2" });
-    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ configService: { reload() {}, set() {}, get() { return true; } } }) });
+    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ app: routeHost, configService: { reload() {}, set() {}, get() { return true; } } }) });
     expect(result.loaded).toEqual([]);
     expect(result.failed[0].error).toContain("incompatible");
   });
@@ -133,11 +137,14 @@ describe("provider plugin loader & registry", () => {
 
   it("registerAllPluginRoutes is a no-op-safe loop over activated routes", async () => {
     writePlugin(configDir, "fake-sub");
-    await loadInstalledPlugins({ configDir, log, getServer: () => undefined });
-    const registered: string[] = [];
-    const fakeApp = { get: (path: string) => registered.push(path) } as any;
-    registerAllPluginRoutes(fakeApp);
-    expect(registered).toEqual(["/api/fake-sub/ping"]);
+    await loadInstalledPlugins({ configDir, log, getServer: () => ({ app: routeHost }) });
+    // Route wiring is exercised with real Fastify in host-lifecycle.test.ts.
+    // This registry has no dependency on a live process-wide server.
+    const app = (await import("fastify")).default({ logger: false });
+    await registerAllPluginRoutes(app);
+    const response = await app.inject({ url: "/api/fake-sub/ping" });
+    expect(response.json()).toEqual({ pong: true, plugin: "fake-sub" });
+    await app.close();
   });
 
   it("plugin error helpers mark and carry the taxonomy", () => {

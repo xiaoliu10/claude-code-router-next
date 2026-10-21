@@ -12,27 +12,6 @@ interface TransformerConfig {
   }>;
 }
 
-/**
- * Runtime pointer to the live TransformerService. Plugins register transformer
- * classes through it (see plugins/transformer-hook.ts); server.ts sets it as
- * soon as the service exists. Mirrors the setWorkBuddyRuntime pattern.
- */
-let runtimeTransformerService: TransformerService | null = null;
-export function setTransformerRuntime(service: TransformerService): void {
-  runtimeTransformerService = service;
-}
-export function registerTransformerClass(cls: new () => any): void {
-  if (!runtimeTransformerService) throw new Error("transformer runtime is not ready yet");
-  const service = runtimeTransformerService;
-  if ("TransformerName" in cls && typeof (cls as any).TransformerName === "string") {
-    service.registerTransformer((cls as any).TransformerName, cls as any);
-    return;
-  }
-  const instance = new cls();
-  if (instance && typeof instance === "object") (instance as any).logger = (service as any).logger;
-  service.registerTransformer(instance.name!, instance as any);
-}
-
 export class TransformerService {
   private transformers: Map<string, Transformer | TransformerConstructor> =
     new Map();
@@ -41,6 +20,15 @@ export class TransformerService {
     private readonly configService: ConfigService,
     private readonly logger: any
   ) {}
+
+  /** Construct without mutation so plugin activation can validate every service first. */
+  preparePluginTransformer(cls: new () => any): Transformer | TransformerConstructor {
+    if (typeof (cls as any).TransformerName === "string") return cls as TransformerConstructor;
+    const instance = new cls();
+    if (!instance?.name) throw new Error("plugin transformer has no name");
+    instance.logger = this.logger;
+    return instance;
+  }
 
   registerTransformer(name: string, transformer: Transformer): void {
     this.transformers.set(name, transformer);

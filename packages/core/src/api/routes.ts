@@ -8,7 +8,7 @@ import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl, workBuddySiteFromProvider, workBuddyFailoverCooldown, workBuddyPoolExhaustedError, workBuddyEnvelopeIsError } from "../services/workbuddy";
-import { getManagedRuntimeFor } from "../provider-plugins/registry";
+import { type PluginRegistry, pluginErrorFrom, getManagedRuntimeFor } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "./plugin-request-state";
 import { pluginResponseError } from "./plugin-response-error";
 import {
@@ -162,6 +162,7 @@ export function normalizeResponsesBody(body: any): void {
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
   interface FastifyInstance {
+    pluginRegistry: PluginRegistry;
     configService: ConfigService;
     providerService: ProviderService;
     transformerService: TransformerService;
@@ -307,7 +308,7 @@ async function handleTransformerEndpoint(
     // client's original stream flag) that the response-phase transformers of
     // the SAME request must see; building a fresh object per phase silently
     // drops that state.
-    const transformerContext: any = { req, isCodexOnMessagesEndpoint };
+    const transformerContext: any = { req, isCodexOnMessagesEndpoint, pluginRegistry: fastify.pluginRegistry };
 
     // Process request transformer chain
     const { requestBody, config, bypass } = await processRequestTransformers(
@@ -759,6 +760,7 @@ async function handleFallback(
           // as the primary path): request-phase state must reach the
           // response-phase transformers of the same attempt.
           const fbContext: any = {
+            pluginRegistry: fastify.pluginRegistry,
             req: newReq,
             isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
           };
@@ -899,7 +901,7 @@ async function processRequestTransformers(
   // closed if absent/disabled; never send their marker to an upstream through
   // the ordinary-provider path (configuration and credential files stay intact).
   if (typeof provider.apiKey === "string" && provider.apiKey.startsWith("ccr-managed-") &&
-      !isWorkBuddyRuntime(provider) && !getManagedRuntimeFor(provider)) {
+      !isWorkBuddyRuntime(provider) && !context.pluginRegistry.getManagedRuntimeFor(provider)) {
     throw createApiError("Provider plugin missing or disabled; install and enable its provider plugin.", 503, "plugin_missing");
   }
   const runtime = getManagedRuntimeFor(provider);
@@ -1315,7 +1317,7 @@ async function sendProviderAttempt(
   // managed-subscription semantics (fixed upstream lock, cooling breaker, live
   // token injection, error taxonomy, 401-once-refresh) are contributed by the
   // provider's plugin — gemini-oauth included. The core only knows this seam.
-  const pluginRuntime = getManagedRuntimeFor(provider);
+  const pluginRuntime = fastify.pluginRegistry.getManagedRuntimeFor(provider);
   if (pluginRuntime) {
     // Circuit breaker before any network touch — including token refresh.
     await pluginRuntime.ensureUsable?.();
@@ -1736,7 +1738,7 @@ async function formatResponse(response: any, reply: FastifyReply, _body: any, fa
     reply.header("Connection", "keep-alive");
 
     // Debug: tee stream to log SSE chunks
-    if (fastify && !getManagedRuntimeFor(fastify.providerService.getProvider(reply.request.provider || "") as any)?.suppressDebugLog && isDebugLogEnabled(fastify.configService)) {
+    if (fastify && !fastify.pluginRegistry.getManagedRuntimeFor(fastify.providerService.getProvider(reply.request.provider || "") as any)?.suppressDebugLog && isDebugLogEnabled(fastify.configService)) {
       const [debugStream, clientStream] = response.body.tee();
       const options = getDebugLogOptions(fastify.configService);
       readStreamForDebug(debugStream, fastify.log, reply.request.id, options);

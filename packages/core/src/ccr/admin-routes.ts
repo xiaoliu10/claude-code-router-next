@@ -10,16 +10,14 @@ import { calculateTokenCount } from "../utils/router";
 import { TokenizerService } from "../services/tokenizer";
 import { getAllRateLimitInfo, initRateLimitPersistence } from "../services/rate-limit";
 import { getAllQuotaResults, initQuotaStorePersistence } from "../services/quota-store";
-import { ProviderService } from "../services/provider";
-import { startActiveProbe, resetActiveProbeService } from "../services/active-probe";
-import { resolveProviderProxyUrl, findInvalidProxyUrls } from "../services/proxy";
+import { findInvalidProxyUrls } from "../services/proxy";
 import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
 import { getHealthStore } from "../services/provider-health";
-import { reconcileHealthStore, clearProviderHealth } from "./health-reconcile";
+import { clearProviderHealth } from "./health-reconcile";
 import { WorkBuddyAuthService } from "../services/workbuddy-auth";
 import { protectWorkBuddyConfig } from "../services/workbuddy";
-import { applyPluginConfigProtectors, registerAllPluginRoutes, listLoadedPlugins } from "../provider-plugins/registry";
-import { describeInstalledPlugins, resolvePluginDir } from "../provider-plugins/loader";
+import { reloadProviderRuntime } from "../provider-plugins/host";
+import { describeInstalledPlugins } from "../provider-plugins/loader";
 import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
 import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
@@ -307,7 +305,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     // provider-plugins/types.ts) — the gemini-oauth plugin's protector re-locks
     // its fixed upstream URL, marker api_key and transformer list and restores
     // an omitted entry. A protector throws to veto.
-    applyPluginConfigProtectors(newConfig, previousConfig);
+    server.pluginRegistry.applyConfigProtectors(newConfig, previousConfig);
 
     await writeConfigFile(newConfig);
     let projectTakeoverSync: Awaited<ReturnType<typeof syncGlobalProjectTakeovers>> | undefined;
@@ -322,52 +320,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     } catch (syncError: any) {
       _app.log?.warn?.(`Config saved but global project takeover sync failed: ${syncError?.message || syncError}`);
     }
-    try {
-      const coreServer = (_app as any)._server;
-      if (coreServer?.configService) {
-        coreServer.configService.reload();
-        const nextProviders = newConfig?.Providers || newConfig?.providers;
-        if (Array.isArray(nextProviders)) {
-          coreServer.configService.set('providers', nextProviders);
-        }
-        if (ProviderService && coreServer.transformerService) {
-          coreServer.providerService = new ProviderService(
-            coreServer.configService,
-            coreServer.transformerService,
-            _app.log
-          );
-        }
-
-        // Prune health entries for models/providers removed by this save, so a
-        // renamed model can't leave a stale "failed" state behind in the UI.
-        reconcileHealthStore(newConfig, _app.log);
-
-        if (startActiveProbe && resetActiveProbeService) {
-          try {
-            resetActiveProbeService();
-          } catch {}
-
-          const probeConfig = {
-            enabled: coreServer.configService.get('ACTIVE_PROBE_ENABLED') ?? true,
-            quotaProbeIntervalMinutes: coreServer.configService.get('QUOTA_PROBE_INTERVAL_MINUTES') ?? 10,
-            probeTimeoutMs: coreServer.configService.get('PROBE_TIMEOUT_MS') ?? 15000,
-            slowThresholdMs: Number(coreServer.configService.get('PROBE_SLOW_THRESHOLD_MS')) || 3000,
-            initialDelayMs: coreServer.configService.get('PROBE_INITIAL_DELAY_MS') ?? 5000,
-            excludeProviders: coreServer.configService.get('EXCLUDE_PROBE_PROVIDERS') ?? [],
-          };
-
-          coreServer.activeProbeService = startActiveProbe(
-            () => coreServer.providerService.getProviders(),
-            probeConfig,
-            (provider: any) => resolveProviderProxyUrl(coreServer.configService, provider),
-            _app.log,
-            (key: string) => coreServer.configService.get(key)
-          );
-        }
-      }
-    } catch (reloadError: any) {
-      _app.log?.warn?.(`Config saved but runtime reload failed: ${reloadError?.message || reloadError}`);
-    }
+    reloadProviderRuntime(server, newConfig, _app.log);
     return { success: true, message: "Config saved successfully", projectTakeoverSync };
   });
 
@@ -1794,34 +1747,27 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
 
   // Install manifest for the UI: loaded plugins, their cards and locale bundles.
   _app.get("/api/plugins", async () => {
-    return { plugins: describeInstalledPlugins(HOME_DIR) };
+    return { plugins: describeInstalledPlugins(HOME_DIR, server.pluginRegistry) };
   });
 
-  // Serve a plugin's prebuilt UI chunk (card.js). Path-traversal safe: the name
-  // segment is validated and the resolved path must stay inside the plugin dir.
+  // Auth remains the normal CCR request pipeline. Only the explicitly declared,
+  // successfully activated single-file JS card is public content; no disk path
+  // from the request is opened, and private files/symlink swaps cannot leak.
   _app.get("/plugins/:name/:file", async (req: any, reply: any) => {
     const { name, file } = req.params as { name: string; file: string };
-    const pluginDir = resolvePluginDir(HOME_DIR, name);
-    if (!pluginDir || !/^[A-Za-z0-9._-]+$/.test(file)) {
-      return reply.status(404).send({ error: "plugin_not_found" });
-    }
-    const target = join(pluginDir, file);
-    if (!target.startsWith(pluginDir) || !existsSync(target) || !statSync(target).isFile()) {
-      return reply.status(404).send({ error: "file_not_found" });
-    }
-    const type = file.endsWith(".js") ? "application/javascript"
-      : file.endsWith(".json") ? "application/json"
-      : file.endsWith(".css") ? "text/css" : "application/octet-stream";
-    reply.header("Content-Type", type);
-    reply.header("Cache-Control", "no-cache");
-    return reply.send(createReadStream(target));
+    const card = server.pluginRegistry.getPublicCard(name, file);
+    if (!card) return reply.status(404).send({ error: "plugin_not_found" });
+    reply.header("Content-Type", "application/javascript; charset=utf-8");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("Cache-Control", "no-store");
+    return reply.send(card);
   });
 
   // Plugins that registered admin routes during activation hook in here —
   // after all built-in routes, so /api/<name>/* cannot shadow them. The
   // registrations run against the Fastify app (the Server wrapper has no
   // route methods).
-  registerAllPluginRoutes(server.app ?? server);
+  await server.pluginRegistry.registerAllRoutes(server.app ?? server);
 
   return server;
 }

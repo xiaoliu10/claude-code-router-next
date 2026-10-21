@@ -28,11 +28,8 @@ import {
   GEMINI_OAUTH_SSE_PATH,
   classifyGeminiOauthError,
   geminiOauthError,
-  getGeminiOauthAuthService,
   isGeminiOauthRuntime,
   protectGeminiOauthConfig,
-  setGeminiOauthDispatcherProvider,
-  setGeminiOauthRuntime,
   type GeminiOauthAuthServiceLike,
   type GeminiOauthErrorInfo,
 } from "./protocol";
@@ -49,18 +46,7 @@ export const manifest = {
   description: "Gemini OAuth (Antigravity) managed subscription provider: Code Assist data plane, browser OAuth login, model sync and admin routes.",
 };
 
-/** The service activate() built; the admin routes resolve through the shared
- *  runtime seam so tests can inject a stub the same way the former core
- *  routes resolved `server.geminiOauthAuthService`. */
-function activeService(): GeminiOauthAuthService | undefined {
-  return getGeminiOauthAuthService() as GeminiOauthAuthService | undefined;
-}
-
 async function activate(ctx: PluginContext): Promise<void> {
-  // Fixed Google origins must bypass configured proxies: hand the injected
-  // fetch the host's direct dispatcher.
-  setGeminiOauthDispatcherProvider(() => ctx.host.getDirectDispatcher());
-
   // Tokens live ONLY in the plugin's private 0600 file under the CCR config
   // dir — never in config.json, logs, admin responses or this bundle.
   const store = new GeminiOauthCredentialStore(join(ctx.host.configDir, "gemini-oauth-credentials.json"));
@@ -77,17 +63,13 @@ async function activate(ctx: PluginContext): Promise<void> {
     },
     logger: ctx.log,
   });
-  setGeminiOauthRuntime({ authService: service });
+  // Every activation owns its service, transformer and token state even when
+  // Node reuses the plugin module (CJS or a multi-module ESM dependency graph).
+  class ActivatedGeminiTransformer extends GeminiOauthTransformer {
+    constructor() { super({ authService: service }); }
+  }
 
-  const requireService = (): GeminiOauthAuthServiceLike => {
-    const resolved = getGeminiOauthAuthService();
-    if (!resolved) throw geminiOauthError({
-      code: "gemini_oauth_upstream_error",
-      message: "Gemini OAuth 认证服务未初始化",
-      httpStatus: 503,
-    });
-    return resolved;
-  };
+  const requireService = (): GeminiOauthAuthServiceLike => service;
 
   const runtime: ManagedRuntime = {
     name: "gemini-oauth",
@@ -145,9 +127,9 @@ async function activate(ctx: PluginContext): Promise<void> {
     suppressDebugLog: true,
   };
 
-  ctx.registerTransformer(GeminiOauthTransformer as unknown as new () => any);
+  ctx.registerTransformer(ActivatedGeminiTransformer as unknown as new () => any);
   ctx.registerManagedRuntime(runtime);
-  ctx.registerAdminRoutes((app) => registerGeminiOauthAdminRoutes(app, { getService: () => activeService() }));
+  ctx.registerAdminRoutes((app) => registerGeminiOauthAdminRoutes(app, { getService: () => service }));
   ctx.registerConfigProtector((next, prev) => protectGeminiOauthConfig(next, prev));
   ctx.registerUiCard({ cardPath: "card.js" });
   ctx.registerLocales(geminiOauthLocales);

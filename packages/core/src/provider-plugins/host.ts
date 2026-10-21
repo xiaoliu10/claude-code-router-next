@@ -1,4 +1,3 @@
-import { ProviderService } from "../services/provider";
 import { reconcileHealthStore } from "../ccr/health-reconcile";
 import * as activeProbe from "../services/active-probe";
 import { resolveProviderProxyUrl } from "../services/proxy";
@@ -14,11 +13,10 @@ export function reloadProviderRuntime(server: any, config: any, log: { info(msg:
   if (!server?.configService) return;
   try {
     server.configService.reload();
-    const nextProviders = config?.Providers || config?.providers;
-    if (Array.isArray(nextProviders)) server.configService.set("providers", nextProviders);
-    if (server.transformerService) {
-      // Re-resolve provider transformer instances after plugin activation or save.
-      server.providerService = new ProviderService(server.configService, server.transformerService, log);
+    if (server.reloadProviders) server.reloadProviders(config);
+    else {
+      server.configService.set("providers", config?.Providers ?? config?.providers ?? []);
+      server.providerService?.reload();
     }
     reconcileHealthStore(config, log);
     activeProbe.resetActiveProbeService();

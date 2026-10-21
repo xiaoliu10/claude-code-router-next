@@ -1,137 +1,125 @@
-import { existsSync, readFileSync } from "fs";
-import { dirname, join, resolve, sep } from "path";
-import { pathToFileURL } from "url";
+import { constants, lstatSync, realpathSync, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
+import { dirname, join, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { PluginManifest } from "./types";
 import { PLUGIN_CORE_API } from "./types";
-import { listLoadedPlugins, makePluginContext } from "./registry";
+import { getTestPluginRegistry, type PluginRegistry } from "./registry";
 import { reloadProviderRuntime } from "./host";
 import { readConfigFile, readConfigFileRaw, writeConfigFile } from "../ccr/config";
 import { getDirectDispatcher } from "@/services/proxy";
 
-/**
- * Plugin discovery and activation.
- *
- * Install layout (magpie-style, $CCR_CONFIG_DIR is the config dir):
- *   $CCR_CONFIG_DIR/plugins/plugins.json          — [{ name, enabled }] install record
- *   $CCR_CONFIG_DIR/plugins/<name>/plugin.json    — manifest
- *   $CCR_CONFIG_DIR/plugins/<name>/plugin.js      — prebuilt entry (ESM default-exporting
- *                                                    `{ manifest, activate }`)
- *   $CCR_CONFIG_DIR/plugins/<name>/card.js        — prebuilt UI card chunk (optional)
- *
- * The core NEVER imports provider code statically; a plugin that fails to load
- * is skipped with a warning so the router keeps working.
- */
-
-interface PluginInstallRecord {
-  name: string;
-  enabled: boolean;
-}
-
+interface PluginInstallRecord { name: string; enabled: boolean; }
 export interface PluginLoadResult {
   loaded: string[];
   failed: Array<{ name: string; error: string }>;
   skipped: Array<{ name: string; reason: string }>;
 }
 
-function pluginsRoot(configDir: string): string {
-  return join(configDir, "plugins");
-}
-
+const validName = (name: string) => /^[a-z0-9][a-z0-9-]*$/i.test(name);
+const pluginsRoot = (configDir: string) => join(configDir, "plugins");
 function readInstallRecords(configDir: string): PluginInstallRecord[] {
-  const file = join(pluginsRoot(configDir), "plugins.json");
-  if (!existsSync(file)) return [];
   try {
-    const raw = JSON.parse(readFileSync(file, "utf8"));
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((e: any) => e && typeof e.name === "string");
-  } catch {
-    return [];
-  }
+    const raw = JSON.parse(readFileSync(join(pluginsRoot(configDir), "plugins.json"), "utf8"));
+    return Array.isArray(raw) ? raw.filter(e => e && typeof e.name === "string") : [];
+  } catch { return []; }
 }
 
-function readManifest(pluginDir: string): PluginManifest | null {
-  const file = join(pluginDir, "plugin.json");
-  if (!existsSync(file)) return null;
-  try {
-    const m = JSON.parse(readFileSync(file, "utf8"));
-    if (m && typeof m.name === "string" && typeof m.version === "string") {
-      return { name: m.name, version: m.version, coreApi: String(m.coreApi ?? "1"), description: m.description };
-    }
-  } catch {
-    /* fallthrough */
-  }
-  return null;
-}
-
-/** Plugins dir for one name — validated, for the static card endpoint. */
+/** Reject symlinked directories, not just lexical traversal. */
 export function resolvePluginDir(configDir: string, name: string): string | null {
-  if (!/^[a-z0-9][a-z0-9-]*$/i.test(name)) return null;
-  const dir = resolve(pluginsRoot(configDir), name);
-  const root = resolve(pluginsRoot(configDir));
-  if (dir !== root && !dir.startsWith(root + sep)) return null;
-  return existsSync(dir) ? dir : null;
+  if (!validName(name)) return null;
+  try {
+    const base = realpathSync(configDir);
+    const root = join(base, "plugins");
+    const dir = join(root, name);
+    if (lstatSync(root).isSymbolicLink() || !lstatSync(root).isDirectory()) return null;
+    if (lstatSync(dir).isSymbolicLink() || !lstatSync(dir).isDirectory()) return null;
+    if (realpathSync(root) !== root || realpathSync(dir) !== dir || !dir.startsWith(root + sep)) return null;
+    return dir;
+  } catch { return null; }
+}
+
+/** Open only a direct regular file, compare the opened inode against the
+ * no-symlink path checks, then read by descriptor. Cards are snapshotted at
+ * activation; HTTP never reopens a potentially swapped filesystem path. */
+function readPluginFile(configDir: string, name: string, file: string): Buffer {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(file)) throw new Error("invalid plugin file");
+  const dir = resolvePluginDir(configDir, name);
+  if (!dir) throw new Error("unsafe plugin directory");
+  const target = join(dir, file);
+  const before = lstatSync(target);
+  if (before.isSymbolicLink() || !before.isFile() || realpathSync(target) !== target) throw new Error("unsafe plugin file");
+  const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = fstatSync(fd);
+    const after = lstatSync(target);
+    if (!opened.isFile() || after.isSymbolicLink() || opened.dev !== before.dev || opened.ino !== before.ino ||
+        opened.dev !== after.dev || opened.ino !== after.ino || resolvePluginDir(configDir, name) !== dir || realpathSync(target) !== target) {
+      throw new Error("plugin file changed while opening");
+    }
+    return readFileSync(fd);
+  } finally { closeSync(fd); }
 }
 
 export async function loadInstalledPlugins(deps: {
   configDir: string;
   log: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
   getServer: () => any;
+  registry?: PluginRegistry;
 }): Promise<PluginLoadResult> {
   const { configDir, log } = deps;
+  const registry: PluginRegistry = deps.registry ?? deps.getServer()?.pluginRegistry ?? getTestPluginRegistry();
   const host = {
     configDir,
     readConfig: () => readConfigFile(),
-    // Interpolation-free read: managed providers round-trip $VAR placeholders
-    // through read-modify-write, which readConfig() would bake in.
     readRawConfig: () => readConfigFileRaw(),
     writeConfig: (next: any) => writeConfigFile(next),
-    reloadRuntime: async (config?: any) =>
-      reloadProviderRuntime(deps.getServer(), config ?? (await readConfigFile()), log),
+    reloadRuntime: async (config?: any) => reloadProviderRuntime(deps.getServer(), config ?? (await readConfigFile()), log),
     getDirectDispatcher,
   };
   const result: PluginLoadResult = { loaded: [], failed: [], skipped: [] };
-  const records = readInstallRecords(configDir);
-
-  for (const record of records) {
-    if (record.enabled === false) {
-      result.skipped.push({ name: record.name, reason: "disabled" });
-      continue;
-    }
-    const pluginDir = resolvePluginDir(configDir, record.name);
-    if (!pluginDir) {
-      // Installed in plugins.json but the directory is gone — visible in the UI, not fatal.
-      result.skipped.push({ name: record.name, reason: "directory missing" });
-      continue;
-    }
-    const manifest = readManifest(pluginDir);
-    if (!manifest) {
-      result.failed.push({ name: record.name, error: "plugin.json missing or malformed" });
-      continue;
-    }
-    if (manifest.coreApi.split(".")[0] !== PLUGIN_CORE_API.split(".")[0]) {
-      result.failed.push({
-        name: record.name,
-        error: `coreApi ${manifest.coreApi} incompatible with core ${PLUGIN_CORE_API}`,
-      });
-      continue;
-    }
-
-    const context = makePluginContext(manifest, {
-      info: (msg) => log.info(`[plugin:${manifest.name}] ${msg}`),
-      warn: (msg) => log.warn(`[plugin:${manifest.name}] ${msg}`),
-      error: (msg) => log.error(`[plugin:${manifest.name}] ${msg}`),
-    }, host);
-
+  const seen = new Set<string>();
+  for (const record of readInstallRecords(configDir)) {
+    let transaction: ReturnType<PluginRegistry["beginActivation"]> | undefined;
     try {
-      const entry = join(pluginDir, "plugin.js");
-      if (!existsSync(entry)) throw new Error("plugin.js entry missing");
-      const mod = await import(pathToFileURL(entry).href);
+      if (!validName(record.name)) throw new Error("invalid plugin install name");
+      if (seen.has(record.name)) throw new Error(`duplicate plugin install record "${record.name}"`);
+      seen.add(record.name);
+      if (record.enabled === false) {
+        result.skipped.push({ name: record.name, reason: "disabled" });
+        continue;
+      }
+      const pluginDir = resolvePluginDir(configDir, record.name);
+      if (!pluginDir) {
+        result.skipped.push({ name: record.name, reason: "directory missing or unsafe" });
+        continue;
+      }
+      let manifest: PluginManifest;
+      try {
+        const raw = JSON.parse(readPluginFile(configDir, record.name, "plugin.json").toString("utf8"));
+        if (!raw || typeof raw.name !== "string" || typeof raw.version !== "string") throw new Error();
+        manifest = { name: raw.name, version: raw.version, coreApi: String(raw.coreApi ?? "1"), description: raw.description };
+      } catch { throw new Error("plugin.json missing or malformed"); }
+      if (manifest.name !== record.name) throw new Error("manifest name does not match install directory");
+      if (manifest.coreApi.split(".")[0] !== PLUGIN_CORE_API.split(".")[0]) throw new Error(`coreApi ${manifest.coreApi} incompatible with core ${PLUGIN_CORE_API}`);
+      const activation = registry.beginActivation(manifest, {
+        info: msg => log.info(`[plugin:${manifest.name}] ${msg}`),
+        warn: msg => log.warn(`[plugin:${manifest.name}] ${msg}`),
+        error: msg => log.error(`[plugin:${manifest.name}] ${msg}`),
+      }, host, pluginDir);
+      transaction = activation;
+      readPluginFile(configDir, record.name, "plugin.js"); // Validate entry before executing trusted plugin code.
+      // Trusted plugin modules may be cached by Node. Mutable credential/service
+      // state must be created inside activate(), never in a module singleton.
+      const mod = await import(pathToFileURL(join(pluginDir, "plugin.js")).href);
       const activate = mod?.activate ?? mod?.default?.activate;
       if (typeof activate !== "function") throw new Error("entry exports no activate()");
-      await activate(context);
+      await activate(activation.context);
+      const card = activation.cardPath ? readPluginFile(configDir, record.name, activation.cardPath) : undefined;
+      await activation.commit(card, deps.getServer()?.app);
       result.loaded.push(manifest.name);
       log.info(`plugin loaded: ${manifest.name}@${manifest.version}`);
     } catch (error: any) {
+      transaction?.abort();
       result.failed.push({ name: record.name, error: error?.message ?? String(error) });
       log.warn(`plugin ${record.name} failed to load: ${error?.message ?? String(error)}`);
     }
@@ -139,24 +127,16 @@ export async function loadInstalledPlugins(deps: {
   return result;
 }
 
-/** Everything the /api/plugins endpoint needs. */
-export function describeInstalledPlugins(configDir: string): Array<Record<string, unknown>> {
-  const loaded = new Map(listLoadedPlugins().map((p) => [p.name, p]));
-  const out: Array<Record<string, unknown>> = [];
-  for (const record of readInstallRecords(configDir)) {
-    const live = loaded.get(record.name);
-    if (live) {
-      out.push({ ...live, enabled: record.enabled !== false });
-    } else {
-      out.push({
-        name: record.name,
-        version: null,
-        enabled: record.enabled !== false,
-        error: "plugin missing or failed to load — its providers are unavailable until it is reinstalled",
-      });
-    }
-  }
-  return out;
+/** Production must pass the host registry; default retained only for isolated loader tests. */
+export function describeInstalledPlugins(configDir: string, registry: PluginRegistry = getTestPluginRegistry()): Array<Record<string, unknown>> {
+  const loaded = new Map(registry.listLoadedPlugins().map(p => [p.name, p]));
+  return readInstallRecords(configDir).map(record => {
+    const live = record.enabled !== false ? loaded.get(record.name) : undefined;
+    return live ? { ...live, enabled: true } : {
+      name: record.name, version: null, enabled: record.enabled !== false,
+      error: "plugin missing or failed to load — its providers are unavailable until it is reinstalled",
+    };
+  });
 }
 
 export { dirname };

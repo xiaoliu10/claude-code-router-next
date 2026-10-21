@@ -34,9 +34,7 @@ import { startPinoLogRetention } from "./pino-retention";
 import { startLegacyTokenSpeedCleanup } from "../plugins/output/temp-file-retention";
 import { registerPluginsFromConfig } from "./plugin-registration";
 import { registerAdminRoutes } from "./admin-routes";
-import { setTransformerRuntime } from "../services/transformer";
 import { loadInstalledPlugins } from "../provider-plugins/loader";
-import { listLoadedPlugins } from "../provider-plugins/registry";
 import { reloadProviderRuntime } from "../provider-plugins/host";
 import { registerRequestPipeline, createCcrPreHandlerCallbacks } from "./request-pipeline";
 import { reconcileHealthStore } from "./health-reconcile";
@@ -173,110 +171,116 @@ export async function createCcrServer(options: CcrRunOptions = {}) {
     },
     logger: loggerConfig,
   });
-  await serverInstance.ready();
+  try {
+    await serverInstance.ready();
 
-  // Provider plugins (docs/design/provider-plugins.md): the transformer
-  // runtime pointer first (plugins may register transformer classes), then
-  // activate installed plugins, then wire their admin routes. A plugin that
-  // fails to load is skipped with a warning — the router keeps working.
-  setTransformerRuntime((serverInstance as any).transformerService);
-  const pluginLoad = await loadInstalledPlugins({
-    configDir: HOME_DIR,
-    getServer: () => serverInstance,
-    log: {
-      info: (msg) => serverInstance.app?.log?.info?.(msg),
-      warn: (msg) => serverInstance.app?.log?.warn?.(msg),
-      error: (msg) => serverInstance.app?.log?.error?.(msg),
-    },
-  });
-  if (pluginLoad.failed.length) {
-    serverInstance.app?.log?.warn?.(
-      `plugins failed to load: ${pluginLoad.failed.map((f) => `${f.name} (${f.error})`).join("; ")}`
+    // Provider plugins are owned by this Server: stage/commit contributions, then
+    // activate installed plugins, then wire their admin routes. A plugin that
+    // fails to load is skipped with a warning — the router keeps working.
+    const pluginLoad = await loadInstalledPlugins({
+      configDir: HOME_DIR,
+      registry: serverInstance.pluginRegistry,
+      getServer: () => serverInstance,
+      log: {
+        info: (msg) => serverInstance.app?.log?.info?.(msg),
+        warn: (msg) => serverInstance.app?.log?.warn?.(msg),
+        error: (msg) => serverInstance.app?.log?.error?.(msg),
+      },
+    });
+    if (pluginLoad.failed.length) {
+      serverInstance.app?.log?.warn?.(
+        `plugins failed to load: ${pluginLoad.failed.map((f) => `${f.name} (${f.error})`).join("; ")}`
+      );
+    }
+    if (serverInstance.pluginRegistry.listLoadedPlugins().length) {
+      serverInstance.app?.log?.info?.(`provider plugins active: ${serverInstance.pluginRegistry.listLoadedPlugins().map((p) => `${p.name}@${p.version}`).join(", ")}`);
+    }
+
+    // Plugins must activate BEFORE admin route registration; providers constructed
+    // before activation must then re-resolve plugin-contributed transformers.
+    if (pluginLoad.loaded.length) reloadProviderRuntime(serverInstance, config, serverInstance.app.log);
+    await registerAdminRoutes(serverInstance, config);
+
+    // Set up usage recording callback for fallback failures in core
+    serverInstance.recordUsage = (data: any) => {
+      try {
+        const clientType = data.req ? (data.req.clientType || detectClientType(data.req)) : "unknown";
+        appendUsage({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          sessionId: data.sessionId || "",
+          provider: data.provider || "",
+          originalModel: data.originalModel || "",
+          model: data.model || "",
+          modelFamily: data.modelFamily || "",
+          scenarioType: data.scenarioType || "default",
+          clientType,
+          stream: data.stream ?? false,
+          inputTokens: data.inputTokens || 0,
+          outputTokens: 0,
+          cacheReadInputTokens: data.cacheReadInputTokens || 0,
+          cacheCreationInputTokens: data.cacheCreationInputTokens || 0,
+          ttft: null,
+          tokensPerSecond: null,
+          durationMs: 0,
+          status: "error",
+          errorMessage: data.errorMessage,
+          responseBody: undefined,
+        });
+      } catch (e) {
+        // Usage tracking must not affect the response
+        console.error("Fallback usage tracking error:", e);
+      }
+    };
+
+    // Register global timing/onSend/onResponse hooks before namespaces so the
+    // same lifecycle applies to both main and preset routes.
+    registerRequestPipeline(serverInstance, config);
+
+    // Install explicit pre-handler callbacks before any namespace is registered.
+    serverInstance.ccrPreHandlerCallbacks = createCcrPreHandlerCallbacks(config);
+
+    // Register preset namespaces. Surface registration failures instead of
+    // letting a malformed preset disappear silently while startup reports success.
+    const presetResults = await Promise.allSettled(
+      presets.map(async preset => await serverInstance.registerNamespace(`/preset/${preset.name}`, preset.config))
     );
+    presetResults.forEach((result, i) => {
+      if (result.status === "rejected") {
+        const preset = presets[i];
+        const msg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        serverInstance.app?.log?.error?.(`Failed to register preset "${preset?.name}": ${msg}`);
+      }
+    });
+
+    // Register and configure plugins from config
+    await registerPluginsFromConfig(serverInstance, config);
+
+    // Prune orphaned circuit-breaker entries (renamed/removed models or deleted
+    // providers) so stale "failed" states don't linger across restarts.
+    reconcileHealthStore(config, serverInstance.app?.log);
+
+    // Add per-instance process handlers and remove them when the Fastify app closes.
+    // This keeps repeated createCcrServer() calls from leaking handlers in tests,
+    // embedding scenarios, and failed startup retries.
+    const handleUncaughtException = (err: Error) => {
+      serverInstance.app.log.error({ err }, "Uncaught exception");
+    };
+    const handleUnhandledRejection = (reason: unknown, promise: Promise<unknown>) => {
+      serverInstance.app.log.error({ reason, promise }, "Unhandled rejection");
+    };
+    process.on("uncaughtException", handleUncaughtException);
+    process.on("unhandledRejection", handleUnhandledRejection);
+    serverInstance.app.addHook("onClose", async () => {
+      process.off("uncaughtException", handleUncaughtException);
+      process.off("unhandledRejection", handleUnhandledRejection);
+    });
+
+    return serverInstance;
+  } catch (error) {
+    // Failed composition must not retain credentials, contributions or handlers.
+    serverInstance.pluginRegistry.dispose();
+    await serverInstance.app.close().catch(() => {});
+    throw error;
   }
-  if (listLoadedPlugins().length) {
-    serverInstance.app?.log?.info?.(`provider plugins active: ${listLoadedPlugins().map((p) => `${p.name}@${p.version}`).join(", ")}`);
-  }
-
-  // Plugins must activate BEFORE admin route registration; providers constructed
-  // before activation must then re-resolve plugin-contributed transformers.
-  if (pluginLoad.loaded.length) reloadProviderRuntime(serverInstance, config, serverInstance.app.log);
-  await registerAdminRoutes(serverInstance, config);
-
-  // Set up usage recording callback for fallback failures in core
-  serverInstance.recordUsage = (data: any) => {
-    try {
-      const clientType = data.req ? (data.req.clientType || detectClientType(data.req)) : "unknown";
-      appendUsage({
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        timestamp: new Date().toISOString(),
-        sessionId: data.sessionId || "",
-        provider: data.provider || "",
-        originalModel: data.originalModel || "",
-        model: data.model || "",
-        modelFamily: data.modelFamily || "",
-        scenarioType: data.scenarioType || "default",
-        clientType,
-        stream: data.stream ?? false,
-        inputTokens: data.inputTokens || 0,
-        outputTokens: 0,
-        cacheReadInputTokens: data.cacheReadInputTokens || 0,
-        cacheCreationInputTokens: data.cacheCreationInputTokens || 0,
-        ttft: null,
-        tokensPerSecond: null,
-        durationMs: 0,
-        status: "error",
-        errorMessage: data.errorMessage,
-        responseBody: undefined,
-      });
-    } catch (e) {
-      // Usage tracking must not affect the response
-      console.error("Fallback usage tracking error:", e);
-    }
-  };
-
-  // Register global timing/onSend/onResponse hooks before namespaces so the
-  // same lifecycle applies to both main and preset routes.
-  registerRequestPipeline(serverInstance, config);
-
-  // Install explicit pre-handler callbacks before any namespace is registered.
-  serverInstance.ccrPreHandlerCallbacks = createCcrPreHandlerCallbacks(config);
-
-  // Register preset namespaces. Surface registration failures instead of
-  // letting a malformed preset disappear silently while startup reports success.
-  const presetResults = await Promise.allSettled(
-    presets.map(async preset => await serverInstance.registerNamespace(`/preset/${preset.name}`, preset.config))
-  );
-  presetResults.forEach((result, i) => {
-    if (result.status === "rejected") {
-      const preset = presets[i];
-      const msg = result.reason instanceof Error ? result.reason.message : String(result.reason);
-      serverInstance.app?.log?.error?.(`Failed to register preset "${preset?.name}": ${msg}`);
-    }
-  });
-
-  // Register and configure plugins from config
-  await registerPluginsFromConfig(serverInstance, config);
-
-  // Prune orphaned circuit-breaker entries (renamed/removed models or deleted
-  // providers) so stale "failed" states don't linger across restarts.
-  reconcileHealthStore(config, serverInstance.app?.log);
-
-  // Add per-instance process handlers and remove them when the Fastify app closes.
-  // This keeps repeated createCcrServer() calls from leaking handlers in tests,
-  // embedding scenarios, and failed startup retries.
-  const handleUncaughtException = (err: Error) => {
-    serverInstance.app.log.error({ err }, "Uncaught exception");
-  };
-  const handleUnhandledRejection = (reason: unknown, promise: Promise<unknown>) => {
-    serverInstance.app.log.error({ reason, promise }, "Unhandled rejection");
-  };
-  process.on("uncaughtException", handleUncaughtException);
-  process.on("unhandledRejection", handleUnhandledRejection);
-  serverInstance.app.addHook("onClose", async () => {
-    process.off("uncaughtException", handleUncaughtException);
-    process.off("unhandledRejection", handleUnhandledRejection);
-  });
-
-  return serverInstance;
 }

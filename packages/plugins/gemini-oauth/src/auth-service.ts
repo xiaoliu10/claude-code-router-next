@@ -53,6 +53,7 @@ import {
   antigravityWireModel,
   buildAuthorizeUrl,
   clearGeminiOauthTokenCaches,
+  createGeminiOauthTokenState,
   createPkcePair,
   discoverAntigravityProject,
   exchangeCodeForTokens,
@@ -422,6 +423,7 @@ export class GeminiOauthAuthService {
   private pending: PendingLogin | null = null;
   private loginStarting = 0;
   /** In-memory account snapshot; the 0600 file is the source of truth. */
+  private readonly tokenState = createGeminiOauthTokenState();
   private account: GeminiOauthAccount | null = null;
   private rawModelIds: string[] = [];
   private loaded = false;
@@ -831,7 +833,7 @@ export class GeminiOauthAuthService {
     }
 
     // The new refresh identity is now the only one future refreshes may use.
-    clearGeminiOauthTokenCaches();
+    clearGeminiOauthTokenCaches(this.tokenState);
     job.result = { status: "success", email };
     if (this.pending === job) this.pending = null;
     return job.result;
@@ -989,7 +991,7 @@ export class GeminiOauthAuthService {
       this.rawModelIds = [];
       this.loaded = false;
       this.refreshFlight = null;
-      clearGeminiOauthTokenCaches();
+      clearGeminiOauthTokenCaches(this.tokenState);
       void removedProvider;
       return { ok: true as const, removedModelRefs, defaultFallback };
     });
@@ -1008,12 +1010,20 @@ export class GeminiOauthAuthService {
     if (!account) throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
     const key = `${account.refreshToken}|${account.importedAt}`;
     if (this.refreshFlight?.key === key) return this.refreshFlight.promise;
+    const epoch = this.epoch;
     const promise = refreshAccessToken(
       account.refreshToken,
       (url, init) => this.directFetch(url, init),
       Date.now(),
-      (rotated: string) => this.persistRotatedRefreshToken(rotated)
-    ).catch((error) => {
+      (rotated: string) => this.persistRotatedRefreshToken(rotated, account.refreshToken, epoch),
+      this.tokenState
+    ).then(token => {
+      if (this.epoch !== epoch) {
+        clearGeminiOauthTokenCaches(this.tokenState);
+        throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
+      }
+      return token;
+    }).catch((error) => {
       if (this.refreshFlight?.key === key) this.refreshFlight = null;
       throw error;
     });
@@ -1029,10 +1039,12 @@ export class GeminiOauthAuthService {
   }
 
   /** Durably persist a rotated refresh token before the cache switches to it. */
-  private persistRotatedRefreshToken(rotated: string): Promise<void> {
+  private persistRotatedRefreshToken(rotated: string, expected: string, epoch: number): Promise<void> {
     return this.enqueueMutation(async () => {
       const current = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
-      if (!current) throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
+      if (!current || this.epoch !== epoch || current.account.refreshToken !== expected) {
+        throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
+      }
       const next: GeminiOauthCredentialData = {
         ...current,
         account: { ...current.account, refreshToken: rotated },
@@ -1045,7 +1057,7 @@ export class GeminiOauthAuthService {
   /** The 401 seam's one forced re-send: drop the cached access token. */
   async forceTokenRefresh(): Promise<void> {
     const account = this.account ?? (await this.ensureLoaded());
-    invalidateGeminiOauthAccessToken(account?.refreshToken);
+    invalidateGeminiOauthAccessToken(account?.refreshToken, this.tokenState);
   }
 
   async getProject(): Promise<string> {

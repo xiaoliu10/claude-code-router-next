@@ -22,7 +22,7 @@ import { execFileSync } from "node:child_process";
 import { build } from "esbuild";
 import { clearPluginRegistry, getManagedRuntimeFor, applyPluginConfigProtectors, listLoadedPlugins, registerAllPluginRoutes } from "../provider-plugins/registry";
 import { loadInstalledPlugins } from "../provider-plugins/loader";
-import { setTransformerRuntime } from "../services/transformer";
+
 
 const PLUGIN_PKG = join(__dirname, "../../../plugins/gemini-oauth");
 
@@ -32,15 +32,18 @@ const log = { info: () => {}, warn: () => {}, error: () => {} };
 
 let configDir = "";
 let pluginDir = "";
+let routeHost: ReturnType<typeof Fastify>;
 
 beforeEach(() => {
+  routeHost = Fastify();
   configDir = mkdtempSync(join(tmpdir(), "ccr-gemini-plugin-"));
   pluginDir = join(configDir, "plugins", "gemini-oauth");
   mkdirSync(pluginDir, { recursive: true });
   clearPluginRegistry();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await routeHost.close();
   clearPluginRegistry();
   activeProbe.resetActiveProbeService();
   vi.restoreAllMocks(); vi.unstubAllGlobals();
@@ -81,7 +84,7 @@ const hostServer = {
 };
 
 async function load(): Promise<void> {
-  const result = await loadInstalledPlugins({ configDir, log, getServer: () => hostServer });
+  const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ ...hostServer, app: routeHost }) });
   expect(result.loaded).toEqual(["gemini-oauth"]);
   expect(result.failed).toEqual([]);
 }
@@ -183,15 +186,10 @@ describe("gemini-oauth provider plugin: discovery, runtime, protector and routes
     await installPlugin();
     process.env.GEMINI_OAUTH_CLIENT_ID = "dummy-client-id";
     process.env.GEMINI_OAUTH_CLIENT_SECRET = "dummy-client-secret";
-    // A bare transformer runtime so registerTransformer succeeds.
-    const registered = new Map<string, unknown>();
-    setTransformerRuntime({ registerTransformer: (name: string, cls: unknown) => { registered.set(name, cls); } } as any);
     try {
       await load();
-      expect(registered.has("gemini-oauth")).toBe(true);
-
       const app = Fastify({ logger: false });
-      registerAllPluginRoutes(app);
+      await registerAllPluginRoutes(app);
       // Inject against the default-port authority: the guard reads the bound
       // address (null pre-listen) and falls back to 3456.
       const base = "http://localhost:3456";
@@ -215,7 +213,7 @@ describe("gemini-oauth provider plugin: discovery, runtime, protector and routes
       expect((await post("/api/gemini-oauth/disconnect")).json()).toEqual({ ok: true, removedModelRefs: [], defaultFallback: null });
       await app.close();
     } finally {
-      setTransformerRuntime(undefined as any);
+      // The isolated loader registry is disposed by afterEach.
     }
   });
 });
@@ -243,7 +241,6 @@ it("installs an independent tarball and routes admin + inference without core Ge
     providers: [provider], ACTIVE_PROBE_ENABLED: false,
   } });
   await app.ready();
-  setTransformerRuntime(app.transformerService);
   const calls: Array<{ url: string; init: any }> = [];
   vi.stubGlobal("fetch", vi.fn(async (url: any, init: any) => {
     calls.push({ url: String(url), init });
@@ -261,6 +258,7 @@ it("installs an independent tarball and routes admin + inference without core Ge
     reloadProviderRuntime(app, config, log);
     await registerAdminRoutes(app, config);
     await app.registerNamespace("/");
+    await app.registerNamespace("/preset/gemini", { Providers: [provider], Router: {}, ACTIVE_PROBE_ENABLED: false });
     const status = await app.app.inject({ method: "GET", url: "http://localhost:3456/api/gemini-oauth/status" });
     expect(status.statusCode).toBe(200); expect(status.json().connected).toBe(true);
     const started = await app.app.inject({ method: "POST", url: "http://localhost:3456/api/gemini-oauth/login/start" });
@@ -283,13 +281,22 @@ it("installs an independent tarball and routes admin + inference without core Ge
     const response = await app.app.inject({ method: "POST", url: "/v1/chat/completions", payload: {
       model: "gemini-oauth,gemini-3-flash", messages: [{ role: "user", content: "hello" }], stream: false,
     } });
-    expect(response.statusCode).toBe(200); expect(response.body).toContain("plugin healthy");
+    expect(response.statusCode, response.body).toBe(200); expect(response.body).toContain("plugin healthy");
     expect(response.body).not.toContain("ya29."); expect(status.body).not.toContain("fixture-refresh");
     expect(calls).toHaveLength(2);
     expect(calls[1].url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
     expect(new Headers(calls[1].init.headers).get("authorization")).toBe("Bearer ya29.test-live");
     expect(calls[1].init.redirect).toBe("error");
-    clearPluginRegistry();
+    const presetResponse = await app.app.inject({ method: "POST", url: "/preset/gemini/v1/chat/completions", payload: {
+      model: "gemini-oauth,gemini-3-flash", messages: [{ role: "user", content: "preset hello" }], stream: false,
+    } });
+    expect(presetResponse.statusCode, presetResponse.body).toBe(200);
+    expect(presetResponse.body).toContain("plugin healthy");
+    const presetWire = JSON.parse(calls.at(-1)!.init.body);
+    expect(presetWire.project).toBe("fixture-project");
+    expect(presetWire.request.contents).toBeTruthy();
+    expect(presetWire.messages).toBeUndefined();
+    app.pluginRegistry.dispose();
     calls.length = 0;
     const missing = await app.app.inject({ method: "POST", url: "/v1/chat/completions", payload: {
       model: "gemini-oauth,gemini-3-flash", messages: [{ role: "user", content: "hello" }],

@@ -1,10 +1,6 @@
-import { registerTransformerClass } from "../services/transformer";
+import type { PluginContext } from "./types";
 
-/**
- * Bridge between plugin-contributed transformer classes and the live
- * TransformerService (set by server.ts). Kept in its own module so the plugin
- * registry can lazy-import it without a static cycle.
- */
-export function registerTransformerFromPlugin(cls: new () => any): void {
-  registerTransformerClass(cls);
+/** Explicit activation context; never a process-wide pointer to a live server. */
+export function registerTransformerFromPlugin(context: PluginContext, cls: new () => any): void {
+  context.registerTransformer(cls);
 }

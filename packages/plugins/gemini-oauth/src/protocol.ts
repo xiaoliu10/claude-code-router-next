@@ -429,11 +429,16 @@ export async function exchangeCodeForTokens(params: {
 
 interface CachedAccessToken { accessToken: string; expiresAt: number }
 const REFRESH_LEAD_MS = 2 * 60 * 1000;
-const tokenCache = new Map<string, CachedAccessToken>();
-const tokenInflight = new Map<string, Promise<string>>();
+export function createGeminiOauthTokenState() {
+  return { tokenCache: new Map<string, CachedAccessToken>(), tokenInflight: new Map<string, Promise<string>>() };
+}
+export type GeminiOauthTokenState = ReturnType<typeof createGeminiOauthTokenState>;
+// Legacy protocol unit-test state; activated services always supply their own.
+const testTokenState = createGeminiOauthTokenState();
 
 /** Test seam: clear the in-memory token caches. */
-export function clearGeminiOauthTokenCaches(): void {
+export function clearGeminiOauthTokenCaches(state: GeminiOauthTokenState = testTokenState): void {
+  const { tokenCache, tokenInflight } = state;
   tokenCache.clear();
   tokenInflight.clear();
 }
@@ -445,8 +450,10 @@ export async function refreshAccessToken(
   /** Called with the ROTATED refresh token BEFORE the cache identity switches,
    *  so the caller can durably persist it first (contract §1: never assume the
    *  refresh token never rotates). A thrown callback fails the whole refresh. */
-  onRotation?: (newRefreshToken: string) => Promise<void> | void
+  onRotation?: (newRefreshToken: string) => Promise<void> | void,
+  state: GeminiOauthTokenState = testTokenState
 ): Promise<string> {
+  const { tokenCache, tokenInflight } = state;
   const cached = tokenCache.get(refreshToken);
   if (cached && cached.expiresAt - now > REFRESH_LEAD_MS) return cached.accessToken;
   const inflight = tokenInflight.get(refreshToken);
@@ -511,7 +518,8 @@ export async function refreshAccessToken(
 /** Drop the cached access token for one refresh token so the next
  *  refreshAccessToken call goes to the network (the routes seam's single
  *  forced re-send after a 401). */
-export function invalidateGeminiOauthAccessToken(refreshToken: string | undefined): void {
+export function invalidateGeminiOauthAccessToken(refreshToken: string | undefined, state: GeminiOauthTokenState = testTokenState): void {
+  const { tokenCache, tokenInflight } = state;
   if (typeof refreshToken === "string" && refreshToken) {
     tokenCache.delete(refreshToken);
     tokenInflight.delete(refreshToken);

@@ -7,8 +7,7 @@ import Server from "../../../core/src/server";
 import ts from "typescript";
 import { activate, manifest } from "../src/plugin";
 import { getGeminiOauthAuthService } from "../src/protocol";
-import { makePluginContext, clearPluginRegistry } from "../../../core/src/provider-plugins/registry";
-import { setTransformerRuntime } from "../../../core/src/services/transformer";
+import { clearPluginRegistry } from "../../../core/src/provider-plugins/registry";
 import { getDirectDispatcher } from "../../../core/src/services/proxy";
 import { reloadProviderRuntime } from "../../../core/src/provider-plugins/host";
 import { registerAdminRoutes } from "../../../core/src/ccr/admin-routes";
@@ -71,8 +70,7 @@ async function build(config: any = { Providers: [provider(), ordinary], Router: 
   cleanups.push(async () => { await server.app.close(); rmSync(dir, { recursive: true, force: true }); });
   await server.ready();
   const log = { info: () => {}, warn: () => {}, error: () => {} };
-  setTransformerRuntime(server.transformerService);
-  const ctx = makePluginContext(manifest, log, {
+  const tx = server.pluginRegistry.beginActivation(manifest, log, {
     configDir: dir,
     readConfig: () => configModule.readConfigFile(),
     readRawConfig: () => configModule.readConfigFileRaw(),
@@ -80,10 +78,13 @@ async function build(config: any = { Providers: [provider(), ordinary], Router: 
     reloadRuntime: async cfg => reloadProviderRuntime(server, cfg ?? live.current, log),
     getDirectDispatcher,
   });
+  const ctx = tx.context;
   await activate(ctx);
+  await tx.commit(undefined, server.app);
   await ctx.host.reloadRuntime(config);
   if (admin) await registerAdminRoutes(server, { ...config, PORT: 3456 });
-  const service = getGeminiOauthAuthService() as GeminiOauthAuthService;
+  const OwnedTransformer = server.transformerService.getTransformer("gemini-oauth") as any;
+  const service = new OwnedTransformer().resolveAuthService() as GeminiOauthAuthService;
   await server.registerNamespace("/"); await server.app.ready();
   const noTokens = (body: string) => { expect(body).not.toContain(ACCESS); expect(body).not.toContain(REFRESH); };
   const request = async (path: string, payload?: any, extra: any = {}) => {

@@ -25,11 +25,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Server from "../../../core/src/server";
 import * as configModule from "../../../core/src/ccr/config";
 import * as activeProbe from "../../../core/src/services/active-probe";
-import { setTransformerRuntime } from "../../../core/src/services/transformer";
 import { getDirectDispatcher } from "../../../core/src/services/proxy";
 import { getHealthStore } from "../../../core/src/services/provider-health";
 import { reloadProviderRuntime } from "../../../core/src/provider-plugins/host";
-import { makePluginContext, clearPluginRegistry } from "../../../core/src/provider-plugins/registry";
+import { clearPluginRegistry } from "../../../core/src/provider-plugins/registry";
 import { manifest, activate } from "../src/plugin";
 import { GeminiOauthCredentialStore, type GeminiOauthAuthService } from "../src/auth-service";
 import { getGeminiOauthAuthService } from "../src/protocol";
@@ -95,8 +94,7 @@ async function build(config: any = { Providers: [provider(), ordinary], Router: 
   // uses exactly this context shape; bundle loading itself is covered by the
   // core-side gemini-oauth-plugin suite). The plugin then owns the managed
   // runtime, the transformer and the service.
-  setTransformerRuntime((server as any).transformerService);
-  const ctx = makePluginContext(manifest, noopLog, {
+  const tx = server.pluginRegistry.beginActivation(manifest, noopLog, {
     configDir: dir,
     readConfig: () => configModule.readConfigFile(),
     readRawConfig: () => configModule.readConfigFileRaw(),
@@ -104,12 +102,15 @@ async function build(config: any = { Providers: [provider(), ordinary], Router: 
     reloadRuntime: async (cfg?: any) => reloadProviderRuntime(server, cfg ?? (await configModule.readConfigFile()), noopLog),
     getDirectDispatcher,
   });
+  const ctx = tx.context;
   await activate(ctx);
+  await tx.commit(undefined, server.app);
   // Re-resolve provider transformer instances after plugin registration.
   await ctx.host.reloadRuntime(config);
 
   await server.registerNamespace("/"); await server.app.ready();
-  const service = getGeminiOauthAuthService() as GeminiOauthAuthService;
+  const OwnedTransformer = server.transformerService.getTransformer("gemini-oauth") as any;
+  const service = new OwnedTransformer().resolveAuthService() as GeminiOauthAuthService;
   const noTokens = (body: string) => { expect(body).not.toContain(ACCESS); expect(body).not.toContain(REFRESH); };
   const send = async (messages: any[] = [{ role: "user", content: "hello" }], extra: any = {}) => {
     const response = await server.app.inject({ method: "POST", url: "/v1/chat/completions", payload: {
