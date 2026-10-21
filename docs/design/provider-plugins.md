@@ -1,6 +1,6 @@
 # Provider 插件化架构（供应商插件系统 + Codex 首个插件）
 
-> 日期：2026-10-21　状态：设计稿，三个决策点待用户拍板（§7）
+> 日期：2026-10-21　状态：已获实施授权；决策已确认（§7），Gemini 样板迁移进行中。
 > 决策背景：用户已拍板「先插件化，Codex 当第一个插件交付」。
 > 依据：magpie 插件体系一手参照（magpie-community/plugins + `plugin add`）；Codex 调研两份（`~/.pi/.../codex/{codex-auth,codex-dataplane}.md`，含 openai/codex 官方源对照）；CCR 现有 WorkBuddy/Gemini 两套「受管订阅 provider」的重复模式。
 
@@ -10,8 +10,8 @@
 
 1. **动机不止体积**：主包 12.3MB 中订阅 provider 自身只占 ~300-500KB（大头是依赖），但插件化同时买到：审计面收窄（企业可不装调用腾讯/Google 内部端点的代码）、风险隔离（某家被官方打击时可独立撤插件不发主包）、迭代解耦。
 2. **架构**：core 定义 `ProviderPlugin` 接口（transformer / 受管运行时 / admin 路由 / config 锁 / UI 卡 / locale 六个注册点）；插件装在 `~/.claude-code-router/plugins/<name>/`，`plugins.json` 为安装事实源（magpie 同款）；`ccr plugin add` 安装；UI 卡由 core 静态服务 + 前端动态 import。
-3. **首个插件 = Codex**（调研已完备，§5 有完整规格）；WorkBuddy 与 Gemini-OAuth 作为「内置捆绑插件」同架构迁移，行为零变化。
-4. **三个待拍板**（§7）：① 过渡策略（捆绑 vs 硬切）；② 迁移范围（本 PR 只搭系统+Codex，还是连 WorkBuddy/Gemini 一起迁）；③ UI 卡加载方式。
+3. **首个新增供应商插件 = Codex**（§5）；Gemini 与 WorkBuddy 先作为迁移样板，P1 内全部迁出，主包不再捆绑。保留既有配置与凭证，不自动安装插件。
+4. **三项已确认决策**（§7）：直接硬切外部安装；P1 一次迁两家；Codex v1 仅浏览器授权（含回调降级），不导入官方 CLI 登录。
 
 ---
 
@@ -26,7 +26,9 @@
 
 ## 2. 插件 API 设计（core 侧新增）
 
-### 2.1 插件接口（`packages/core/src/plugins/types.ts`，新文件）
+### 2.1 插件接口（`packages/core/src/provider-plugins/types.ts`）
+
+`src/plugins/` 是既有输出插件体系（token-speed）；供应商插件使用独立命名空间。下列片段为最初概念草案，准确运行时类型以 `provider-plugins/types.ts` 为准：当前实现拆分为 `ensureUsable` / `lockUpstream` / `signRequest` / `classifyError`，并通过 `ctx.host` 注入配置读写、重载和 dispatcher，禁止打包宿主有状态模块。
 
 ```ts
 export interface ProviderPlugin {
@@ -69,12 +71,12 @@ export interface ManagedRuntime {
 - 事实源：`$CCR_CONFIG_DIR/plugins/plugins.json`（`[{name, enabled}]`）。
 - CLI：`ccr plugin add <npm-spec|本地路径>`（npm pack 下载解包 / 直接拷贝）、`ccr plugin list`、`ccr plugin remove`、`ccr plugin enable/disable`。
 - 启动加载：core 按 plugins.json 顺序 `await import(entry)`，失败只告警不炸主服务；`/api/plugins` 返回清单（含 UI 卡地址与 locale 包）。
-- **内置捆绑插件**（过渡期，见 §7 决策①）：主包内 `bundled-plugins/{workbuddy,gemini-oauth,codex}/`，与外部插件走同一 activate 接口，默认启用、可 disable——这是「架构先落地、体积后兑现」的关键。
+- **不捆绑插件**（§7 已确认）：供应商分别构建为可安装包，主包不静态导入、不以依赖或 bundled-plugins 目录夹带。缺包/禁用时报告 plugin missing，禁止携带 marker api_key 出网；保留 Router 与凭证，重新安装后可恢复。
 
 ### 2.3 UI 卡加载
 
 - core 增加静态端点 `GET /plugins/:name/*`（白名单校验后从插件目录读文件，拒绝路径穿越）。
-- SettingsPage 供应商区：内置卡之后渲染「插件卡区」，从 `/api/plugins` 拿清单，`import(/* webpackIgnore */ cardUrl)` 动态加载组件；locale 由 `/api/plugins` 一并下发合并。
+- SettingsPage 供应商区渲染「插件卡区」，从 `/api/plugins` 拿清单，通过 `import(/* @vite-ignore */ cardUrl)` 加载自包含 `mount/unmount` 模块；宿主提供认证 API bridge、locale、disabled 与 busy 回调。迁移完成后不保留两家的静态卡，缺失/加载失败需明确显示。
 - 无 JS 卡的插件可以只声明声明式描述（按钮/字段 JSON），由通用渲染器画——MVP 允许只用 JS 卡（三个订阅 provider 都需要富交互）。
 
 ### 2.4 安全边界（红线继承）
@@ -89,20 +91,22 @@ export interface ManagedRuntime {
 
 | 阶段 | 内容 | 交付物 |
 |---|---|---|
-| **P1 插件系统** | §2 全部 core 接缝 + 懒加载 + `/api/plugins` + UI 动态卡区 + `ccr plugin` CLI；**Gemini-OAuth 迁出为第一个插件**（测试最全，当迁移样板） | 分支 `feat/provider-plugins`，PR OPEN |
-| **P2 双迁移** | WorkBuddy 迁出为插件；主包改为捆绑 `bundled-plugins/`（行为零变化） | 叠在 P1 上 |
-| **P3 Codex 插件** | §5 规格，作为**第一个只能以插件形态安装**的新 provider | 叠在 P2 上 |
-| **P4 体积兑现**（单独发版窗口） | 主包停止捆绑（或 `--omit=optional`），发布 `ccr-provider-*` 独立包，升级公告 + `ccr plugin add` 迁移指引 | major/minor 版本决策时 |
+| **P1-A 插件系统** | core API、加载器、宿主能力、数据面接缝、`/api/plugins`、动态卡区 | 分支 `feat/provider-plugins` |
+| **P1-B/C 双迁移** | Gemini 先作为样板，接着迁 WorkBuddy；均为独立包，不捆绑 | P1 内完成两家迁移 |
+| **P1-D 安装与体积验收** | `ccr plugin add/list/remove/enable/disable`、包布局、缺插件明确报错、主包不含两家实现与供应商专属依赖的检查 | 构建/tarball 实测，升级迁移说明 |
+| **P1-E 审查交付** | 全量验证、独立审查、自动审查跟进 | PR OPEN，不自动合并/发布 |
+| **P2 Codex 插件** | §5，首个新增的独立供应商插件，仅浏览器授权 | 依赖 P1 验证通过，独立 PR |
 
-> 阶段顺序反映依赖：P1 的接口由 P3 的真实需求校验（Codex 的 session 头/instructions 替换/模型拉取是最苛刻的消费者）；P2 是机械迁移；P4 是发布策略，不阻塞代码。
+> 代码硬切不等于发布：用户数据和在线服务保持不动，合并、版本号与发布仍须明确授权。体积以同条件 tarball/产物实测，不以源码行数估算宣称达标。
 
 ---
 
 ## 4. 各阶段验收
 
-- P1：gemini 插件装/卸/禁用全链可用；现有 core+UI 测试全绿；卸载 gemini 插件后其 provider 在 config 里被标记 `plugin missing`（UI 明示，不静默删除）。
-- P2：WorkBuddy 全部 163+ 测试迁后全绿；config 升级兼容（老配置零改动可用）。
-- P3：见 §5 验收清单。
+- P1：Gemini/WorkBuddy 插件装、卸、禁用全链可用；迁移前后的 core+UI+插件用例行为等价。缺插件时 UI 与数据面明确报 plugin missing，不静默删除配置/Router/凭证，不拿 marker key 出网。
+- tsc：保留无关历史诊断；按文件/错误码/内容对比准确基线，不只比总行数。插件包自身 tsc/build 必须通过。
+- 包级集成：独立构建产物在临时目录安装后，验证动态加载→transformer 注册→admin 路由→请求数据面；不得只测 registry 孤立函数。
+- P2 Codex：见 §5 验收清单。
 - 通用：每个 PR 独立 review；主包版本号按 semver 纪律小步走。
 
 ---
@@ -130,9 +134,9 @@ export interface ManagedRuntime {
 
 官方 client 直连路径，**无 Antigravity 式红色横幅**；但按 magpie 维护者口径给「不能保证不判定违规」的普通免责文案；若未来提供 UA/instructions 定制开关，必须强制风险提示（那是主要风控信号面）。UI 卡定位为「实验性」档。
 
-### 5.4 验收（P3）
+### 5.4 验收（P2 Codex）
 
-- 浏览器授权全链（1455 占用→paste 降级）+ 导入 `~/.codex/auth.json` 两条入口；真实账号冒烟：流式回复、prompt 缓存命中（`cached_prompt_tokens`>0 证明 session 头生效）、模型列表按 plan 拉取。
+- v1 仅浏览器授权全链（1455 占用→paste 降级）；不提供导入 `~/.codex/auth.json`，不接管官方 CLI 凭证。真实账号冒烟：流式回复、prompt 缓存命中、模型列表按 plan 拉取；未做真机验证则如实标注。
 - 刷新三纪律各有测试；401-要求刷新、`usage_limit_reached`、流内 error 事件三类错误分类；mutation-verified。
 - 全量 core/UI 绿 + 独立对抗审查（令牌零泄漏 / 其他 provider 不变 / 插件卸载行为）。
 
@@ -147,8 +151,8 @@ export interface ManagedRuntime {
 
 ---
 
-## 7. 待拍板（阻塞实施）
+## 7. 已确认决策（替代原建议，作为实施依据）
 
-1. **过渡策略**：主包继续捆绑三个插件（用户零感知，体积后兑现，P4 再切）vs 本轮就硬切外部安装（体积立即兑现，现有用户升级后必须 `ccr plugin add` 才能继续用订阅 provider）。**建议捆绑过渡**。
-2. **P1 迁移范围**：P1 只搭系统 + Gemini 迁出（样板），WorkBuddy 放 P2（建议）vs P1 一次性迁两家（diff 大一倍）。
-3. **Codex 登录入口**：v1 只做浏览器授权（1455）+ 粘贴降级（建议），还是同时做「导入 ~/.codex/auth.json 接管」入口（多一条验证分支，但老用户零浏览器操作）。
+1. **直接硬切外部安装**：不捆绑过渡；主包只提供路由与通用插件能力，订阅供应商按需安装。安装/启用/重启须显式执行，迁移开发不修改真实环境。
+2. **P1 一次迁两家**：Gemini 先完成样板，随后 WorkBuddy；两家都迁出且独立产物验证通过才算 P1 完成。
+3. **Codex v1 只浏览器授权**：保留回调降级路径，不导入、不接管官方 CLI 登录。调研里的凭证共管仅作参考，不是本次授权范围。
