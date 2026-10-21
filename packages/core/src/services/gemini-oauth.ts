@@ -136,7 +136,8 @@ export type GeminiOauthErrorCode =
   | "gemini_oauth_quota_exceeded"
   | "gemini_oauth_reauth_required"
   | "gemini_oauth_upstream_error"
-  | "gemini_oauth_transient";
+  | "gemini_oauth_transient"
+  | "gemini_oauth_account_cooling";
 
 export interface GeminiOauthErrorInfo {
   code: GeminiOauthErrorCode;
@@ -228,9 +229,10 @@ export function sanitizeValidationUrl(value: unknown): string | undefined {
   try {
     const u = new URL(value);
     if (u.protocol !== "https:" || u.port || u.username || u.password || !u.hostname) return undefined;
-    for (const k of u.searchParams.keys()) {
-      if (/token|secret|code|credential/i.test(k)) u.searchParams.delete(k);
-    }
+    // Collect first, then delete: mutating searchParams while iterating its keys
+    // skips the entry after each removal (?token=a&secret=b used to keep secret).
+    const sensitive = [...u.searchParams.keys()].filter((k) => /token|secret|code|credential/i.test(k));
+    for (const k of sensitive) u.searchParams.delete(k);
     u.hash = "";
     return u.toString();
   } catch { return undefined; }
@@ -240,6 +242,8 @@ export function sanitizeValidationUrl(value: unknown): string | undefined {
 export function scrubUpstreamMessage(message: string): string {
   return message
     .replace(/ya29\.[A-Za-z0-9._-]+/g, "[redacted]")
+    // Google refresh tokens look like 1//0<long base64url run>.
+    .replace(/\b1\/\/[A-Za-z0-9._-]{16,}/g, "[redacted]")
     .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]")
     .replace(/\b(access_token|refresh_token|id_token)"?\s*[:=]\s*"?([A-Za-z0-9._~-]{8,})"?/gi, '$1: [redacted]');
 }

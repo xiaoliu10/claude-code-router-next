@@ -133,7 +133,16 @@ export class GeminiOauthTransformer implements Transformer {
 
     const geminiBody = buildRequestBody(request);
     applyAntigravityQuirks(geminiBody, request.model, (request as any)?.max_tokens);
-    const envelope = buildCodeAssistEnvelope({ geminiBody, model: request.model, project });
+    // The provider's model list holds collapsed family ids (gemini-3.7-flash);
+    // the wire wants a concrete variant (gemini-3.7-flash-high). resolveWireModel
+    // maps family -> variant using the raw ids saved at sync time.
+    let wireModel = request.model;
+    try {
+      wireModel = (await service.resolveWireModel?.(request.model, (request as any)?.reasoning_effort)) ?? request.model;
+    } catch {
+      // Fall back to the requested id rather than failing the request.
+    }
+    const envelope = buildCodeAssistEnvelope({ geminiBody, model: wireModel, project });
 
     // Remember what the CLIENT asked for so transformResponseOut can aggregate
     // the always-streaming upstream back into one JSON completion (contract §1.2).

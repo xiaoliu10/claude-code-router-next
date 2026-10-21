@@ -1252,6 +1252,17 @@ async function sendRequestToProvider(
   throw Object.assign(new Error("WorkBuddy 未导入登录态，请先在管理页导入"), { workbuddy: true, nonRetryable: true, statusCode: 409, code: "workbuddy_not_connected" });
 }
 
+/**
+ * Only the SYSTEM text decides the identity-block heuristic (contract §1.6).
+ * Scanning the whole body would let a user message containing the marker words
+ * trip a 6h account cooldown on an ordinary quota 429.
+ */
+function geminiSystemText(requestBody: any): string {
+  const parts = requestBody?.request?.systemInstruction?.parts ?? requestBody?.systemInstruction?.parts;
+  if (!Array.isArray(parts)) return "";
+  return parts.map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("\n");
+}
+
 async function sendProviderAttempt(
   requestBody: any,
   config: any,
@@ -1292,6 +1303,16 @@ async function sendProviderAttempt(
   if (geminiOauthManaged) {
     geminiOauthService = getGeminiOauthAuthService();
     if (!geminiOauthService) throw new Error("Gemini OAuth 服务未初始化");
+    // An account under cooldown (identity block, quota, verification) is a
+    // circuit breaker, not a display state: stop before touching the network.
+    if (await geminiOauthService.isAccountCooling?.()) {
+      throw geminiOauthError({
+        code: "gemini_oauth_account_cooling",
+        message: "Gemini OAuth 账号处于冷却期（配额/验证/风控拦截），请稍后再试或重新授权。",
+        httpStatus: 429,
+        retryable: false,
+      });
+    }
     config.url = new URL(GEMINI_OAUTH_SSE_PATH, GEMINI_OAUTH_DATA_PLANE).toString();
     // Never follow a redirect away from the fixed origin.
     config.redirect = "error";
@@ -1444,9 +1465,9 @@ async function sendProviderAttempt(
       const info = classifyGeminiOauthError({
         status: response.status,
         body: parsedError ?? errorText,
-        systemText: JSON.stringify(requestBody ?? {}),
+        systemText: geminiSystemText(requestBody),
       });
-      await geminiOauthService?.noteUpstreamError(info).catch(() => undefined);
+      await geminiOauthService?.noteUpstreamError?.(info);
       fastify.log.error(
         `[provider_response_error] Gemini OAuth provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
       );
@@ -1517,8 +1538,8 @@ async function sendProviderAttempt(
               throw wbError;
             }
             if (geminiOauthManaged) {
-              const info = classifyGeminiOauthError({ status: response.status, body: bodyJson, systemText: JSON.stringify(requestBody ?? {}) });
-              await geminiOauthService?.noteUpstreamError(info).catch(() => undefined);
+              const info = classifyGeminiOauthError({ status: response.status, body: bodyJson, systemText: geminiSystemText(requestBody) });
+              await geminiOauthService?.noteUpstreamError?.(info);
               fastify.log.error(
                 `[provider_response_error] Gemini OAuth hidden error from provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
               );
@@ -1572,7 +1593,7 @@ async function sendProviderAttempt(
     const bodyText = await cloned.text();
     logProviderResponse(fastify.log, context.req.id, {
       status: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
+      headers: Object.fromEntries(Array.from(response.headers as any)),
       body: bodyText,
     });
   }
