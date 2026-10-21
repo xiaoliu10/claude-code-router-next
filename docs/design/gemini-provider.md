@@ -1,6 +1,6 @@
 # Gemini 订阅账号 Provider 设计（复刻 magpie 路线）
 
-> 日期：2026-10-21　状态：设计稿，待拍板，未实施
+> 日期：2026-10-21　状态：用户已授权实施，M1 开发中；核实修订见实施契约
 > 方法：auto-research 四阶段。Phase 1 本项目代码本地直读；Phase 2 三个并行调研子代理经 `gh api` 直读 `yetone/magpie`（Go）源码与 issue 一手原文（材料存档：
 > `~/.pi/agent/sessions/desktop/subagent-artifacts/outputs/36a3d25a-1ca0-4929-9815-8179441b78fe/research/{magpie-gemini-oauth,magpie-gemini-risk,magpie-upstream-fit}.md`）；
 > Phase 3 交叉验证时，关键接缝事实（`routes.ts:1281`、`routes.ts:1313-1319`、`provider.ts:106-108`）已由主 agent 二次亲自核对。
@@ -14,7 +14,7 @@
 2. **技术上可行性高**：CCR 的 transformer 已支持 `config.url` / `config.headers` 覆写与受管 provider 模式（WorkBuddy 全套先例），翻译层是「填空」不是「改造」。
 3. **真正的成本在协议长尾与风控面，不在代码**：Code Assist 信封的 body 怪癖（thought-signature 哨兵、functionResponse 配平、首尾 model turn 补丁、UA 指纹）需要像 magpie 一样 issue 驱动逐步补齐；Google 已明文定性 ToS 违规并在数据面做主动客户端识别，执法梯度为「首次封禁 1–2 天可申诉恢复、二次永久、按账号信誉降权」。
 4. **建议形态**：实验性 provider，仅支持 Antigravity 账号（个人号唯一活路，`事实`：Gemini CLI 个人池 2026-06-18 被官方关停），v1 单账号、无自动轮换、无任何内容混淆，风险文案强制明示，可一键整体禁用。
-5. **红线（继承 magpie 自身立场）**：不做零宽空格/身份行改写等规避功能（magpie #2139 维护者原话拒绝入核心）；伪装 429 与真 429 必须分流；`VALIDATION_REQUIRED` + `validation_url` 必须原样透传。
+5. **红线（继承 magpie 自身立场）**：不做零宽空格/身份行改写等规避功能（magpie #2139 维护者原话拒绝入核心）；伪装 429 与真 429 必须分流；`VALIDATION_REQUIRED` 须保留恢复路径，validationUrl 经官方 HTTPS host 校验后独立返回，不转发整个错误体。
 
 ---
 
@@ -48,7 +48,7 @@
 全仓库 grep `oauth|OAuth|PKCE|code_verifier` 零命中（`事实`）。要新建的协议层：
 
 1. OAuth 授权码 + PKCE + loopback 本地回调（含降级「粘贴 URL」模式）；
-2. token 内存刷新（2 分钟提前量，refresh token 不轮换假设）；
+2. token 内存刷新（2 分钟提前量，兼容 refresh token 替换并安全持久化）；
 3. Code Assist 管理面：`loadCodeAssist` → `onboardUser`（项目/套餐发现）；
 4. `{model, project, request}` 信封封装与 SSE `{response}` 剥壳；
 5. UA persona（`GeminiCLI/0.61.0/<model> (platform; arch; terminal)` / `antigravity/hub/<ver>`）；
@@ -75,7 +75,7 @@
 ### 3.3 数据面（`internal/gateway/codeassist.go`、`gateway.go`）
 
 - 端点恒为 `{base}/v1internal:streamGenerateContent?alt=sse`（即使非流式请求也流式打再聚合）。
-- 请求体 = Gemini 原生体（`contents/systemInstruction/tools/generationConfig`）包 `{model, project, request}` 信封；发送前账号侧补：Gemini 系 `user_prompt_id`（随机 12 字节）+ 实验旗标改写模型 id；Antigravity 系 `userAgent:"antigravity"` + `requestType:"agent"` + `requestId:"agent-<rand>"` + `request.sessionId`（首条 user 文本 SHA256 前 8 字节，会话内稳定）。
+- 请求体 = Gemini 原生体（`contents/systemInstruction/tools/generationConfig`）包 `{model, project, request}` 信封；发送前账号侧补：Gemini 系 `user_prompt_id`（随机 12 字节）+ 实验旗标改写模型 id；Antigravity 系 `userAgent:"antigravity"` + `requestType:"agent"` + `requestId:"agent-<rand>"` + `request.sessionId`（首条 user 文本 SHA256 前 8 字节经 63-bit mask，会话内稳定）。
 - 响应 SSE data 行 = `{response: <Gemini chunk>}` 或 `{error:{message}}`（**流式错误无 HTTP status，只能按消息文本分类**）。
 - 怪癖集（magpie 已踩平，逐条有测试）：functionCall 必带 `thoughtSignature`（Gemini 3 的用真值，其余可填哨兵 `"skip_thought_signature_validator"`）；functionResponse 与 functionCall 数量必须配平（未答补合成结果）；历史不得以 model turn 开头/结尾；Antigravity 上 Claude 系 `maxOutputTokens` 必填；`default_api:` 工具名命名空间。
 
@@ -93,7 +93,7 @@ UA 数据面带本次模型 id（`GeminiCLI/0.61.0/gemini-2.5-pro (darwin; arm64
 | 4.2 | **多账号轮换是执法加速面** | magpie #1649：同类切号工具 aio-coding-hub 用户报告封了两个号；维护者承认池化功能无法担保 | v1 单账号，不内建自动轮换；后续如做多账号，默认关闭 + 独立风险确认 |
 | 4.3 | **内容混淆红线** | magpie #2139 维护者原话拒绝做伪装网关（"违反对方的使用条款，也可能让您的账号被封"）；antigravity-cloak 插件自承 "Google can ban the account for it" | **CCR 不做任何零宽空格/身份行改写**；CCR 自身注入上游的身份文本（如有）保持中性并纳入回归测试 |
 | 4.4 | 伪装 429（身份拦截冒充配额） | #666：Antigravity 对 systemInstruction 带 Claude Code 标记的请求恒回 429 "Resource has been exhausted"，与配额无关；Google 按提示词内容主动识别客户端 | 错误分类必须区分「身份拦截型 429」与真配额 429；前者账号级熔断 + 明示非额度问题，不走自动换号重试 |
-| 4.5 | VALIDATION_REQUIRED 403 | #152：Google AI Pro 付费号 6 连 403 "Verify your account to continue"；magpie v0.1.304 起解析 `error.details` 的 `VALIDATION_REQUIRED` + `validation_url`，账号休息 30 分钟 | 错误体 `error.details` 必须原样透传（现有 `gemini.util` 错误转换只取 message 会丢恢复路径）；该信号视为账号熔断而非可重试错误 |
+| 4.5 | VALIDATION_REQUIRED 403 | #152：Google AI Pro 付费号 6 连 403 "Verify your account to continue"；magpie v0.1.304 起解析 `error.details` 的 `VALIDATION_REQUIRED` + `validation_url`，账号休息 30 分钟 | 仅提取 reason 与经官方 HTTPS host 校验的 validationUrl，不转发任意 details/原文；该信号视为账号熔断而非可重试错误 |
 | 4.6 | 通道持续降权 | 官方公告 #22970：加强检测 + 按 account standing 优先级调度 + 免费档模型收紧 | 产品定位只能是「实验性、风险自担」，不得作为默认/推荐供应商 |
 
 ---
@@ -118,7 +118,7 @@ UA 数据面带本次模型 id（`GeminiCLI/0.61.0/gemini-2.5-pro (darwin; arm64
 | `services/provider.ts` | `initializeFromProvidersArray` 透传新标记（对齐 `provider.ts:106-108`） |
 | `ccr/admin-routes.ts` | ① config 保存处追加 `protectGeminiOauthConfig`；② 新增 `/api/gemini-oauth/{status,login/start,login/poll,login/cancel,sync,disconnect}`，复用本地守卫与错误码映射骨架（`assertLocalWorkBuddyRequest` 可抽公共） |
 | `server.ts` | 实例化 + `setGeminiOauthRuntime({authService})`（对齐 `server.ts:136-144`） |
-| `api/routes.ts` | **v1 数据面零改动**（config.url/headers 机制已够；URL 固定锁定可后补 WorkBuddy 式二次加固） |
+| `api/routes.ts` | **最小专用接缝必需**：HTTP 错误在 transformer 前已被通用分支消费；须提前分类/脱敏、更新状态，401 至多一次强制刷新重发；发送前锁定 URL/header、拒绝重定向。响应提交后不重试，其他 provider 行为不变 |
 | UI 四件套 | `types.ts`（`GeminiOauthKind` + 状态/轮询类型，照 WorkBuddy 段抄形）、`lib/api.ts`（客户端方法）、新 `GeminiOauthProvider.tsx` 管理卡（挂 `SettingsPage.tsx` 供应商区）、`locales/{en,zh}.json`（`geminiOauth.*`，**含风险提示文案**） |
 
 ### 5.3 切片顺序（风险前置）
@@ -126,7 +126,7 @@ UA 数据面带本次模型 id（`GeminiCLI/0.61.0/gemini-2.5-pro (darwin; arm64
 - **切片 A（数据面最小闭环，~4 文件，零 UI/零 OAuth 流程）**：瘦 `gemini-oauth.ts`（常量+refresh+project+信封+剥壳）→ transformer → 注册表 → 测试。手工验证：凭证文件临时放入外部工具导出的 refresh_token（对齐 magpie 导入语义）→ config 手写 provider → curl `/v1/chat/completions` 拿到真实流式回复。数据面是唯一无现成骨架的部分，必须最先验证。
 - **切片 B（OAuth + 管理面）**：login 状态机 + admin 路由 + config 保护锁 + server 装配。全程套 WorkBuddy 同构骨架。
 - **切片 C（UI 卡片 + 风险文案 + locale）**。
-- **切片 D（可选，后议）**：gemini-cli kind（Standard/Enterprise）、配额适配器（注意 `getQuotaAdapter` 按 hostname 匹配，订阅 host 需 marker 分支）、伪装 429 的账号熔断进 routes（先在 transformer/服务层分类）。
+- **切片 D（可选，后议）**：gemini-cli kind（Standard/Enterprise）、配额适配器（注意 `getQuotaAdapter` 按 hostname 匹配，订阅 host 需 marker 分支）；HTTP 分类/脱敏接缝为 M1 必需项，不推迟到 D。
 
 ---
 

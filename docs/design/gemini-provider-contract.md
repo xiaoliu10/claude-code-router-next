@@ -10,7 +10,7 @@
 
 1. **token 不落可见处**：refresh/access token 只存 0600 的 `$CCR_CONFIG_DIR/gemini-oauth-credentials.json`；绝不进 config.json、`/api/config` 响应、日志、错误消息、admin 响应体。config.json 里 provider 的 `api_key` 是常量标记 `"ccr-managed-gemini-oauth"`。
 2. **不做内容混淆**：不改写任何系统提示词/身份行；只做错误识别与分类。
-3. **错误分类是一等公民**（见 §2.5 表），错误码对外稳定。
+3. **错误分类是一等公民**（见 §1.6 表），错误码对外稳定。
 4. 所有回归测试 **mutation-verified**（破坏实现→测试必须失败）；测试全 mock 上游，不触真实 Google。
 5. commit 不带任何 AI trailer；里程碑必须 commit（子代理超时可从 commit 恢复）。
 
@@ -25,19 +25,19 @@ userinfo   https://www.googleapis.com/oauth2/v2/userinfo?alt=json
 dataPlane  https://daily-cloudcode-pa.googleapis.com        (antigravity 数据面)
 mgmtProd   https://cloudcode-pa.googleapis.com               (loadCodeAssist)
 ssePath    /v1internal:streamGenerateContent?alt=sse
-clientId   (Antigravity installed-app client —— 实现时用 gh api 从 magpie `internal/provider/google.go` 的 `antigravityApp` 现读，不在本仓库任何文件落明文)
-clientSec  (同上，installed-app 公开凭据，官方客户端内置；实现中分段拼装 + 注释标明来源，避免 GitHub push protection 误报)
+clientId   process.env.GEMINI_OAUTH_CLIENT_ID
+clientSec  process.env.GEMINI_OAUTH_CLIENT_SECRET
 scopes     cloud-platform, userinfo.email, userinfo.profile, cclog, experimentsandconfigs
 redirect   http://localhost:<随机端口>/oauth-callback        (bind 127.0.0.1:0)
 UA         antigravity/hub/2.9.1 <os>/<arch>   (os: darwin/win32/linux, arch: x64/arm64; 版本 v1 硬编码，可被 env GEMINI_OAUTH_ANTIGRAVITY_VERSION 覆盖)
 authParams response_type=code, access_type=offline, prompt=consent, state=<rand24>, code_challenge(S256), code_challenge_method=S256
 ```
 
-> 注意：上述两个 OAuth client 常量是官方客户端内置的公开凭据（非机密），但为避免本仓库触发 GitHub push protection，**文档与源码均不写明文**：实现时 gh api 从 magpie 源码核对真值，代码里以分段字符串拼装并注释来源（magpie `internal/provider/google.go` `antigravityApp`）。
+> M1 核实修订：OAuth client 参考来源为 magpie `google.go/antigravityApp`，本实现通过以上环境变量配置；缺失时返回稳定的配置未就绪错误，不回显值。禁止字符串拆分/编码绕过 GitHub Push Protection。未来若提交被拦截的公开常量，须由维护者走 GitHub 官方审查/allow 流程。M1 提交后暂停，独立审查通过再进入 M2。
 
 - OAuth：授权码 + PKCE(S256)；code 换 token POST form（grant_type=authorization_code, client_id, client_secret, code_verifier, code, redirect_uri）。**登录回调服务器 10 分钟超时**。
-- token 刷新：内存缓存按 refresh_token 键；有效期 >2min 复用；否则 grant_type=refresh_token 刷新；单飞（并发请求共享同一次刷新）；刷新失败→错误码 `gemini_oauth_reauth_required`。假设 refresh token 不轮换，持久层只存首次的 refresh_token。
-- 项目发现：POST `{mgmtProd}/v1internal:loadCodeAssist`，body `{metadata:{ideType:"ANTIGRAVITY", ideName:"antigravity", ideVersion:"2.9.1"}}`；回复 `currentTier.cloudaicompanionProject` 直接用；否则取 `allowedTiers` default tier 调 `{dataPlane}/v1internal:onboardUser`（snake_case：`{tier_id, metadata:{ide_type, ide_name, ide_version}}`），LRO 轮询 2s×5 次。**实现前必须 gh api 读 magpie `internal/provider/google.go` 的 `geminiProject`/`antigravityProject`/`onboard`/`entitlements`（约 L600-742）核对细节**。
+- token 刷新：内存缓存按 refresh_token 键；有效期 >2min 复用；否则 grant_type=refresh_token 刷新；单飞（并发请求共享同一次刷新）；刷新失败→错误码 `gemini_oauth_reauth_required`。未返回 refresh_token 时保留原值；若返回替换值须安全持久化后更新缓存身份，不能假设永不轮换。
+- 项目发现：POST `{mgmtProd}/v1internal:loadCodeAssist`，body `{metadata:{ideType:"ANTIGRAVITY"}}`；读取回复顶层 `cloudaicompanionProject`（不从 currentTier 内读取）；否则取 `allowedTiers` default tier 调 `{dataPlane}/v1internal:onboardUser`（snake_case：`{tier_id, metadata:{ide_type, ide_name, ide_version}}`），LRO 轮询 2s×5 次。**实现前必须 gh api 读 magpie `internal/provider/google.go` 的 `geminiProject`/`antigravityProject`/`onboard`/`entitlements`（约 L600-742）核对细节**。
 - 模型发现：`fetchAvailableModels`（同管理面）；失败回退静态表。**静态表必须从 magpie 源码抄真实模型 ID**（`google.go` `antigravityModels`/`fallbackModels` 约 L1145-1156 与 `antigravity_models.go` 全文——含模型 ID 变体折叠规则），禁止发明模型名。
 
 ## 1.1 数据面请求（transformer）
@@ -55,7 +55,7 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
 }
 ```
 
-- `sessionId`：首条 user 消息文本 SHA256 前 8 字节按大端取无符号整数、前缀 `"-"`（会话内多轮稳定）。
+- `sessionId`：首条 user 消息文本 SHA256 前 8 字节按大端读取，再经 `0x7fffffffffffffff` 掩码得到 63-bit 整数、前缀 `"-"`（会话内多轮稳定）。
 - config.url = `{dataPlane}/v1internal:streamGenerateContent?alt=sse`；headers 只注入 `Authorization: Bearer <live access token>` 与 `User-Agent`（transformer 返回的 config.headers 会覆盖默认 Bearer，次序已验证 `routes.ts:1313-1319`）。
 - **transformer 不设 endPoint**（`workbuddy.transformer.ts:7-11` 同因：避免端点撞车）。
 - body 怪癖补丁（实现前必须 gh api 读 magpie `internal/gateway/codeassist.go` 对应行段，忠实移植 + 用其测试用例形状写单测）：
@@ -66,6 +66,8 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
   - 响应解码 L838-945：SSE data 行 `{"response":<gemini chunk>}` 剥壳 / `{"error":{"message"}}` 错误帧；`default_api:` 工具名命名空间清理。
 
 ## 1.2 响应 seam（关键，先读后写）
+
+M1 修订：授权 `api/routes.ts` 最小 Gemini OAuth 专用接缝。HTTP 错误须在通用消费/日志之前分类、脱敏和更新状态；401 至多一次强制刷新后重发。发送前锁定 URL/header、拒绝重定向，令牌不得泄漏。响应已向客户端提交后不透明重试，SSE 错误不能静默吞掉；其他 provider 与 WorkBuddy 行为保持不变。
 
 先完整读 `transformer/gemini.transformer.ts`、`utils/gemini.util.ts`、`api/routes.ts` 的响应路径（SSE 与非流式），**完全复用 gemini.transformer 的响应处理 seam**，只插入信封剥壳。SSE 逐帧 `data:` JSON → 剥 `response` → 交给与现有 gemini 相同的下游转换。WorkBuddy 的流式处理（`workbuddy.transformer.ts` 的 rewriteStream/aggregateSSE）可作为「transformer 内做流式改写」的先例参照。
 
@@ -115,14 +117,14 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
 
 | 上游信号 | 分类码 | 行为 |
 |---|---|---|
-| 429 且请求含 Claude 身份标记（`x-anthropic-billing-header:` 或 `You are a Claude agent, built on Anthropic's Claude Agent SDK`，对**发往上游的** system 文本做检测） | `gemini_oauth_identity_blocked` | 回客户端 400 语义、文案明示「非额度问题」；账号 cooldown 6h |
-| 403 + `error.details` 含 `VALIDATION_REQUIRED`（附 `validation_url`） | `gemini_oauth_validation_required` | 账号 cooldown 30min；错误体透传 validationUrl 字段（不透 token） |
-| 429（无身份标记） | `gemini_oauth_quota_exceeded` | 账号 cooldown（能解析重置时间用之，否则 15min） |
+| HTTP 429 + 对应 `Resource has been exhausted` 错误文本 + 请求含 Claude 身份标记（`x-anthropic-billing-header:` 或 `You are a Claude agent, built on Anthropic's Claude Agent SDK`，对**发往上游的** system 文本做检测） | `gemini_oauth_identity_blocked` | 联合启发式识别，客户端 400 语义、提示疑似身份拦截；账号 cooldown 6h；不能只凭身份标记判定 |
+| 403 + `error.details` 含 `VALIDATION_REQUIRED`（附 `validation_url`） | `gemini_oauth_validation_required` | 账号 cooldown 30min；只返回经官方 HTTPS host 校验的 validationUrl，不透传整个 details 或令牌 |
+| 429（不满足身份拦截联合条件） | `gemini_oauth_quota_exceeded` | 账号 cooldown（能解析重置时间用之，否则 15min） |
 | 401（刷新重试一次后仍 401） | `gemini_oauth_reauth_required` | 账号置 needs-relogin，不自动轮换 |
-| SSE 帧 `{"error":{"message":...}}` | 按消息文本归入上表；无法归类→`gemini_oauth_upstream_error` 原样透传 message |
-| 网络/5xx | transient | 单次重试后仍失败则原样上抛 |
+| SSE 帧 `{"error":{"message":...}}` | 按可用结构与文本分类，证据不足→`gemini_oauth_upstream_error`；使用固定安全文案，不透传任意原文、不静默成功 |
+| 网络/5xx | transient | 仅在未提交响应前有界重试一次；耗尽返回脱敏错误，不输出 raw error 或令牌 |
 
-**`error.details` 必须解析并保留 validationUrl**——现有 `gemini.util` 错误转换只取 message，不够用。
+**`error.details` 只用于提取 reason 与经验证的 validationUrl，不原样透传**——现有 `gemini.util` 错误转换只取 message，不够用。
 
 ## 2. UI 契约（SettingsPage 供应商区新增卡片，参照 WorkBuddyProvider 卡）
 
@@ -142,4 +144,4 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
 
 ## 4. 验收
 
-core 新增测试全绿 + 全量 core 测试不回归（基线 679/679）+ `tsc --noEmit` 无新增 gemini-oauth 诊断 + 根目录 `CI=true pnpm build` 绿。UI：vitest 全绿 + tsc 干净。风险：先读 magpie 源码段再写实现，禁止凭本文档臆测协议细节；文档与源码冲突时以源码为准并回报差异。
+core 新增测试全绿 + 全量 core 测试不回归（基线 679/679）+ `tsc --noEmit` 无新增 gemini-oauth 诊断 + 根目录 `CI=true pnpm build` 绿。UI：实际 node:test 套件全绿 + tsc 干净。风险：先读 magpie 源码段再写实现，禁止凭本文档臆测协议细节；文档与源码冲突时以源码为准并回报差异。
