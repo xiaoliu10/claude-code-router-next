@@ -1189,6 +1189,20 @@ async function sendRequestToProvider(
   requestBody: any, config: any, provider: any, fastify: FastifyInstance,
   bypass: boolean, transformer: any, context: any
 ): Promise<Response> {
+  // Runtime-owned bounded dispatch (docs/design/provider-plugins.md §2.2): a
+  // wrapper rotates its own local credentials around the core's ordinary
+  // single attempt; the generic same-model retry and fallback chains stay in
+  // this module and are never re-implemented by the wrapper.
+  const dispatchRuntime = fastify.pluginRegistry.getManagedRuntimeFor(provider);
+  if (dispatchRuntime?.dispatchRequest) {
+    return dispatchRuntime.dispatchRequest({
+      attempt: () => sendProviderAttempt(requestBody, config, provider, fastify, bypass, transformer, context),
+      requestBody,
+      config,
+      provider,
+      req: context?.req,
+    });
+  }
   if (!isWorkBuddyRuntime(provider)) return sendProviderAttempt(requestBody, config, provider, fastify, bypass, transformer, context);
   const service = getWorkBuddyAuthService();
   if (!service) throw new Error("WorkBuddy 认证服务未初始化");
@@ -1372,8 +1386,10 @@ async function sendProviderAttempt(
     Object.assign(requestHeaders, credentialHeaders(config.workbuddyCredential));
   }
   if (pluginRuntime) {
-    // Body is final here: body-derived headers (Codex session-id) work.
-    requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider });
+    // Body is final here: body-derived headers (Codex session-id) work. The
+    // per-attempt config lets dispatch wrappers re-sign with the credential
+    // they selected for THIS attempt.
+    requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider, config });
   }
   stampUpstreamSessionId(requestHeaders, context?.req);
 
@@ -1422,7 +1438,7 @@ async function sendProviderAttempt(
         ? await getWorkBuddyAuthService()?.diagnoseReset(config.workbuddyCredential) : null;
       if (reauth) throw reauth;
     }
-    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody));
+    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), { errorName: sendError?.name });
     throw sendError;
   }
 
@@ -1516,6 +1532,14 @@ async function sendProviderAttempt(
           return response;
         }
         const bodyJson = JSON.parse(bodyText);
+        // Plugin HTTP-200 envelope detection — the SECONDARY net (see
+        // provider-plugins/types.ts): runtimes with a dispatch wrapper must
+        // classify such envelopes INSIDE the wrapper (before the response is
+        // returned) so rotation still happens; this only catches bodies a
+        // wrapper already returned.
+        if (pluginRuntime?.isErrorEnvelope?.(bodyJson)) {
+          throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody));
+        }
         // Check if the response contains an error object
         if (workbuddyManaged && (Number(bodyJson?.code) > 0 || Number(bodyJson?.data?.code) > 0)) throw classifyWorkBuddyError(response.status, bodyJson);
         if (bodyJson && typeof bodyJson === 'object' && bodyJson.error) {

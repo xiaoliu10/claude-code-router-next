@@ -36,6 +36,32 @@ export interface PluginClassifiedError {
 }
 
 /**
+ * Input for a runtime-owned bounded dispatch wrapper (`dispatchRequest`). The
+ * core supplies its ordinary single-attempt dispatch as `attempt()` — every
+ * generic seam (ensureUsable/lockUpstream/signRequest/classifyError/
+ * noteUpstreamError, the 401-once refresh budget, response-error
+ * confidentiality) runs INSIDE each attempt; the wrapper only owns the loop
+ * around it (e.g. rotating local credentials). The generic same-model retry
+ * and fallback chains stay in the core and are never re-implemented by a
+ * wrapper.
+ */
+export interface PluginDispatchInput {
+  /** One ordinary core dispatch attempt. May be called several times, always
+   *  within the runtime's own hard bound (≤ its credential count and ≤ a
+   *  constant cap). */
+  attempt(): Promise<Response>;
+  /** Finalized request body (body-derived account selection works). */
+  requestBody: any;
+  /** The per-provider request config; a wrapper may attach per-attempt state
+   *  that lockUpstream/signRequest read back on the same object. */
+  config: any;
+  provider: LLMProvider;
+  /** The originating request object (shared identity across retry/fallback
+   *  spreads) for per-request wrapper state. */
+  req?: any;
+}
+
+/**
  * Managed-subscription semantics for one provider family. Everything the data
  * plane needs to talk to a subscription upstream without the core knowing it:
  * fixed upstream, token injection, error taxonomy, cooling circuit breaker.
@@ -51,12 +77,17 @@ export interface ManagedRuntime {
   /**
    * Final header injection — called AFTER the request body is finalized, so
    * body-derived headers (e.g. Codex session-id from prompt_cache_key) work.
-   * Returns the headers object to send.
+   * Returns the headers object to send. `config` is the per-attempt request
+   * config (optional for backward compatibility): a dispatch wrapper can
+   * select per-attempt credential material on it and the final header
+   * injection reads it back; hosts that predate the field leave wrappers to
+   * their own lockUpstream-saved state.
    */
   signRequest(input: {
     headers: Record<string, string>;
     requestBody: any;
     provider: LLMProvider;
+    config?: any;
   }): Promise<Record<string, string>>;
   /**
    * Classify an upstream failure into the shared taxonomy. Return null to let
@@ -65,6 +96,24 @@ export interface ManagedRuntime {
   classifyError?(status: number, body: unknown, systemText: string): PluginClassifiedError | null;
   /** Persist a classified error (cooldown, lastError). Must never throw into the response path. */
   noteUpstreamError?(info: PluginClassifiedError): Promise<void>;
+  /**
+   * Generic HTTP-200 hidden-error-envelope detector. When present, the core
+   * runs it against every parsed JSON 200 body and throws through the shared
+   * classification seam when it returns true — BEFORE the generic `error`
+   * field check, because some upstreams carry `{code,msg,data}` envelopes
+   * without an `error` key. This is a SECONDARY safety net for runtimes with
+   * a dispatch wrapper: rotation on such envelopes must happen inside the
+   * wrapper (before the response is returned); this hook only catches bodies
+   * a wrapper has already returned.
+   */
+  isErrorEnvelope?(body: unknown): boolean;
+  /**
+   * Optional bounded multi-attempt dispatcher (see PluginDispatchInput). When
+   * present the core calls it instead of performing its single attempt and
+   * forwards the returned response to the client. The wrapper MUST enforce a
+   * hard attempt bound and must never swallow client aborts.
+   */
+  dispatchRequest?(input: PluginDispatchInput): Promise<Response>;
   /**
    * Opt-in 401 handling: when set, the core performs ONE forced refresh and
    * re-dispatch on 401 before classifying. `refresh` must persist rotated

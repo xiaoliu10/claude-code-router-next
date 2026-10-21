@@ -6,18 +6,21 @@
  * (contract §6 milestones):
  *   - M1: credential store + protocol + auth service (host-coupled only via
  *     ctx.host), config protector;
- *   - M2: managed runtime (dual-site §16 account pool, fixed-origin lock,
- *     error taxonomy) + transformer + admin routes;
+ *   - M2: managed runtime (dual-site §16 account pool via the generic
+ *     dispatchRequest seam), transformer, admin routes;
  *   - M3: registerUiCard + registerLocales (self-contained card.js).
  *
  * Everything stateful goes through ctx.host: config reads/writes, the runtime
  * reload sequence, the config dir for the private 0600 credential file and the
  * direct dispatcher for the fixed WorkBuddy origins. The plugin bundles no
- * core module. Every activation owns its service and credential store, even
- * when Node reuses the plugin module.
+ * core module. Every activation owns its service, store, transformer class and
+ * runtime, even when Node reuses the plugin module.
  */
 import { join } from "node:path";
 import { WorkBuddyAuthService, type WorkBuddyAuthServiceLike } from "./auth-service";
+import { createWorkBuddyManagedRuntime } from "./managed-runtime";
+import { WorkBuddyTransformer } from "./transformer";
+import { registerWorkBuddyAdminRoutes } from "./admin-routes";
 import {
   protectWorkBuddyConfig,
   WorkBuddyCredentialStore,
@@ -60,6 +63,19 @@ async function activate(ctx: PluginContext): Promise<void> {
   });
   activeService = service;
 
+  // Every activation owns its transformer instance wiring (service injected,
+  // never the module-global handle the former core transformer resolved).
+  class ActivatedWorkBuddyTransformer extends WorkBuddyTransformer {
+    constructor() { super({ authService: service }); }
+  }
+
+  ctx.registerTransformer(ActivatedWorkBuddyTransformer as unknown as new () => any);
+  ctx.registerManagedRuntime(createWorkBuddyManagedRuntime({
+    service,
+    getDirectDispatcher: () => ctx.host.getDirectDispatcher(),
+    log: ctx.log,
+  }));
+  ctx.registerAdminRoutes((app) => registerWorkBuddyAdminRoutes(app, { getService: () => service }));
   ctx.registerConfigProtector((next, prev) => protectWorkBuddyConfig(next, prev));
 
   ctx.log.info(`workbuddy plugin active (${WORKBUDDY_PROVIDER_NAME}, ${WORKBUDDY_AI_PROVIDER_NAME})`);

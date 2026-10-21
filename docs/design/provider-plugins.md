@@ -60,6 +60,22 @@ export interface ManagedRuntime {
 }
 ```
 
+> 运行期接口以 `provider-plugins/types.ts` 为准（上面是最初概念草案）。WorkBuddy
+> 迁移（2026-10）新增了三个可选成员，`coreApi` 仍为 `"1"`（可选方法不升 major）：
+>  - `dispatchRequest?(input: PluginDispatchInput): Promise<Response>` —— 有界多
+>    次尝试的 dispatch 包装器。core 把"普通单次尝试"作为 `attempt()` 交给插件；
+>    wrapper 只拥有循环（如本地凭据轮换），通用重试/fallback 链留在 core。循环
+>    必须有硬上限（≤凭据数且 ≤ 常量上限），client abort 不得吞掉。
+>  - `signRequest` 入参新增可选 `config` —— dispatch wrapper 为每次尝试选择的
+>    凭据经 config 传给最终头注入；旧 host 不传时插件退回 lockUpstream 存的
+>    状态（或 sticky 选择）。
+>  - `isErrorEnvelope?(body: unknown): boolean` —— HTTP-200 隐藏错误信封检测。
+>    对带 dispatch wrapper 的 runtime 这只是次级保险（wrapper 已返回的 body）；
+>    §16 轮换必须在 wrapper 内、响应返回前发生。
+> 另：`pluginResponseError`（core 内部）在错误对象上标注 `upstreamStatus`
+> （0 = 发送层失败）与 `upstreamErrorName`（AbortError/TimeoutError 区分），
+> 供 wrapper 实现大请求 edge-reset 探测等语义；不属于公共接口。
+
 设计要点：
 - `prepareRequest` 在 **body 定稿后**调用——Codex 的 `session-id/thread-id` 头要从最终 body 的 `prompt_cache_key` 算（magpie `codexSign(req, body)` 同构），这是现有两条内联分支做不到、泛化后才能做到的事。
 - 错误分类从 routes.ts 的 per-provider if 块变为插件自带 `classifyError`；core 只保留通用顺序：**插件分类 → workbuddy/gemini 兼容期保留 → 通用分支**。

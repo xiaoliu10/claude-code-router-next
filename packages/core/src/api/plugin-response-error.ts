@@ -7,6 +7,7 @@ export async function pluginResponseError(
   status: number,
   body: unknown,
   systemText: string,
+  transport?: { errorName?: string },
 ): Promise<Error & Record<string, any>> {
   let classified: PluginClassifiedError | null | undefined;
   try { classified = runtime.classifyError?.(status, body, systemText); } catch { /* safe fallback */ }
@@ -26,5 +27,12 @@ export async function pluginResponseError(
   try { await runtime.noteUpstreamError?.(info); } catch { /* bookkeeping cannot leak/mask the safe error */ }
   const error = pluginErrorFrom(runtime.name, info);
   error.isRateLimit = info.httpStatus === 429;
+  // Transport classification for dispatch wrappers: status 0 marks a
+  // send-level failure (no HTTP response at all) so a wrapper can run the
+  // edge-reset probe; errorName preserves the AbortError/TimeoutException
+  // distinction, which client-abort semantics depend on. Classification only —
+  // never the raw error message.
+  error.upstreamStatus = status;
+  if (transport?.errorName) error.upstreamErrorName = transport.errorName;
   return error;
 }

@@ -1,22 +1,41 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+/**
+ * WorkBuddy §16 request account rotation — MOVED + ADAPTED from the former
+ * core test `workbuddy-failover.test.ts`: the pool orchestration now lives in
+ * the plugin's managed runtime and is dispatched through the core's GENERIC
+ * `dispatchRequest` seam (real registry, real core Server; upstream always a
+ * stub). Equivalence contract pinned here (migration contract §1 items 1–5):
+ * rotation bound, cooldown booking order, per-site isolation, terminal
+ * classes (10085/reauth/model-hidden), transient semantics, SSE envelope
+ * inspection, edge-reset probe, ordinary-provider immunity.
+ */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import Server from "../server";
-import { WorkBuddyAuthService } from "../services/workbuddy-auth";
+import Server from "../../../core/src/server";
+// Dual-run bridge: the core's static transformer resolves its service through
+// this handle until the hard cut deletes the core transformer; the injected
+// instance is the PLUGIN's service, exactly what the flipped seam will use.
+import { setWorkBuddyRuntime } from "../../../core/src/services/workbuddy";
+import { getHealthStore } from "../../../core/src/services/provider-health";
+import { WorkBuddyAuthService } from "../src/auth-service";
 import {
-  WorkBuddyCredentialStore, setWorkBuddyRuntime, classifyWorkBuddyError,
+  WorkBuddyCredentialStore, classifyWorkBuddyError,
   workBuddyFailoverCooldown, nextWorkBuddyQuotaReset, type WorkBuddyCredential,
-} from "../services/workbuddy";
-import { getHealthStore } from "../services/provider-health";
-import { WorkBuddyTransformer } from "../transformer/workbuddy.transformer";
+} from "../src/protocol";
+import { WorkBuddyTransformer } from "../src/transformer";
+import { createWorkBuddyManagedRuntime, workBuddyFailoverCooldownFromInfo } from "../src/managed-runtime";
+import { manifest } from "../src/plugin";
+import { clearPluginRegistry } from "../../../core/src/provider-plugins/registry";
 
 const CN = "https://copilot.tencent.com/v2/chat/completions";
 const AI = "https://www.workbuddy.ai/v2/chat/completions";
 const cleanups: Array<() => Promise<void>> = [];
+const noopLog = { info: () => {}, warn: () => {}, error: () => {} };
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
   setWorkBuddyRuntime(null);
+  clearPluginRegistry();
   vi.restoreAllMocks(); vi.unstubAllGlobals();
 });
 const credential = (uid: string, kind: "workbuddy" | "workbuddy-ai" = "workbuddy"): WorkBuddyCredential => ({
@@ -49,19 +68,41 @@ async function harness(hiddenModels: string[] = []) {
   const server = new Server({ logger: false, useJsonFile: false, initialConfig: { providers, HOST: "127.0.0.1", PORT: 0 } });
   await server.ready();
   const service = new WorkBuddyAuthService({
-    store, configService: server.configService, getServer: () => server,
+    store, configService: server.configService,
     readSource: () => { throw new Error("must never read real credentials"); },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    host: {
+      readRawConfig: async () => { throw new Error("config writes are not part of the data plane"); },
+      writeConfig: async () => { throw new Error("config writes are not part of the data plane"); },
+      reloadRuntime: () => {},
+      getDirectDispatcher: () => undefined,
+    },
   });
-  (server as any).workBuddyAuthService = service;
   setWorkBuddyRuntime({ authService: service });
+  // Activate the §16 managed runtime through the core's REAL plugin registry:
+  // the dispatch wrapper (account pool + SSE inspection + edge guard) runs via
+  // the generic dispatchRequest seam, not via any WorkBuddy-named core branch.
+  const tx = server.pluginRegistry.beginActivation(manifest, noopLog, {
+    configDir: dir,
+    readConfig: async () => { throw new Error("unused"); },
+    writeConfig: async () => { throw new Error("unused"); },
+    reloadRuntime: async () => {},
+    getDirectDispatcher: () => undefined,
+  } as any);
+  const runtime = createWorkBuddyManagedRuntime({
+    service,
+    getDirectDispatcher: () => undefined,
+    log: noopLog,
+  });
+  tx.context.registerManagedRuntime(runtime);
+  await tx.commit();
   await server.registerNamespace("/"); await server.app.ready();
   cleanups.push(async () => { await server.app.close(); rmSync(dir, { recursive: true, force: true }); });
   const send = (provider = "workbuddy", model = "m", stream = false, content = "hi") => server.app.inject({
     method: "POST", url: "/v1/chat/completions",
     payload: { model: `${provider},${model}`, messages: [{ role: "user", content }], stream },
   });
-  return { store, service, server, send };
+  return { store, service, server, runtime, send };
 }
 function stubSequence(first: () => Response, second: () => Response = success) {
   const headers: Headers[] = [], urls: string[] = [];
@@ -76,7 +117,17 @@ function stubSequence(first: () => Response, second: () => Response = success) {
 describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () => {
   it("active-sticky b receives 6004; a succeeds with fresh auth; model cooldown persisted", async () => {
     const h = await harness();
-    const auth = vi.spyOn(WorkBuddyTransformer.prototype, "auth");
+    // The per-attempt credential reaches the final header injection through
+    // the runtime's signRequest — the generic seam's channel of record (the
+    // former inline branch used the transformer auth() hook). The uid is
+    // captured at call time: the wrapper reuses one shared config object, so
+    // inspecting recorded args after the fact would only see the last value.
+    const seenUids: (string | undefined)[] = [];
+    const originalSign = h.runtime.signRequest.bind(h.runtime);
+    (h.runtime as any).signRequest = async (input: any) => {
+      seenUids.push(input.config?.workbuddyCredential?.uid);
+      return originalSign(input);
+    };
     const f = stubSequence(() => json({ code: 6004, msg: "private-upstream-body" }, 429));
     const before = Date.now();
     const recordCooldown = vi.spyOn(h.service, "markAccountCooldown");
@@ -85,7 +136,7 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     expect(recordCooldown.mock.invocationCallOrder[0]).toBeLessThan(f.fetch.mock.invocationCallOrder[1]);
     expect(f.headers.map(headers => headers.get("x-user-id"))).toEqual(["b", "a"]);
     expect(f.headers.map(headers => headers.get("authorization"))).toEqual(["Bearer secret-b", "Bearer secret-a"]);
-    expect(auth.mock.calls.map(call => call[2]?.config?.workbuddyCredential?.uid)).toEqual(["b", "a"]);
+    expect(seenUids).toEqual(["b", "a"]);
     const state = (await h.store.loadData())!.sites.workbuddy!;
     expect(state.activeUid).toBe("b");
     expect(state.accounts.find(a => a.uid === "b")!.modelCooldowns!.m.until).toBeGreaterThanOrEqual(before + 900_000);
@@ -111,7 +162,10 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     const h = await harness();
     const f = stubSequence(() => json({ code: 10085, accessToken: "secret-b" }, 400));
     const response = await h.send(); expect(response.statusCode).toBe(400);
-    expect(f.fetch).toHaveBeenCalledTimes(1); expect(response.body).toContain("10085");
+    expect(f.fetch).toHaveBeenCalledTimes(1);
+    // Plugin-seam surface: the client sees the fixed safe message carrying the
+    // CLASS code, never the raw upstream body or numeric code.
+    expect(response.body).toContain("workbuddy_protocol_error");
     expect(response.body).not.toContain("secret-");
     expect((await h.store.loadData())!.sites.workbuddy!.accounts.every(a => !a.cooldown && !a.modelCooldowns)).toBe(true);
   });
@@ -167,6 +221,17 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     expect(f.urls).toEqual([AI]); expect(f.headers[0].get("x-user-id")).toBe("ai");
     const auth = await new WorkBuddyTransformer({ authService: h.service }).auth({ model: "m" }, { name: "workbuddy-ai" });
     expect(auth.config.headers.Authorization).toBe("Bearer secret-ai");
+  });
+  it("code-only 200 JSON envelopes (no error key) rotate through the generic envelope hook", async () => {
+    // The plugin's isErrorEnvelope is what makes the core hidden-error check
+    // fire for {code,msg,data} envelopes; the wrapper still performs the
+    // rotation because the classified throw happens INSIDE attempt().
+    const h = await harness();
+    const f = stubSequence(() => json({ code: 6004, msg: "private-upstream-body" }), () => success());
+    const response = await h.send();
+    expect(response.statusCode).toBe(200); expect(response.body).toContain("healthy");
+    expect(f.fetch).toHaveBeenCalledTimes(2);
+    expect(response.body).not.toContain("private-upstream-body");
   });
   it("200 JSON error envelopes rotate exactly like ordinary HTTP errors", async () => {
     const h = await harness(); const f = stubSequence(() => json({ error: { code: 6004, message: "private-upstream-body" } }));
@@ -287,6 +352,30 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
   it("ordinary provider still receives its one same-model retry", async () => {
     const h = await harness(); const f = stubSequence(() => json({ error: "temporary" }, 503));
     const response = await h.send("ordinary"); expect(response.statusCode).toBe(200); expect(f.fetch).toHaveBeenCalledTimes(2);
+  });
+  it("classified-surface cooldown mapper matches the protocol mapper class-by-class", () => {
+    const now = Date.now();
+    // rotate classes
+    for (const [status, body] of [[429, { code: 6004 }], [403, { code: 14018 }], [403, { code: 11140 }]] as const) {
+      const inline = workBuddyFailoverCooldown(classifyWorkBuddyError(status, body), "m", now);
+      const upstreamCode = (body as any).code;
+      const classCode = upstreamCode === 6004 ? "rate_limit" : upstreamCode === 14018 ? "insufficient_quota" : "workbuddy_account_restricted";
+      const cooldownMs = (classifyWorkBuddyError(status, body) as any).cooldownSeconds * 1000;
+      const seam = workBuddyFailoverCooldownFromInfo({ code: classCode, cooldownMs, statusCode: status }, "m", now);
+      expect(seam).toEqual(inline);
+      if (classCode === "rate_limit") expect(seam).toMatchObject({ scope: "model", model: "m", code: 6004 });
+      if (classCode === "insufficient_quota") expect(seam!.until).toBe(inline!.until);
+      if (classCode === "workbuddy_account_restricted") expect(seam!.until).toBe(now + 7_200_000);
+    }
+    // terminal/transient classes never rotate on either surface
+    for (const code of ["workbuddy_reauth", "workbuddy_protocol_error", "permission_error", "invalid_request_error", "provider_response_error"]) {
+      expect(workBuddyFailoverCooldownFromInfo({ code, statusCode: 500 }, "m", now)).toBeNull();
+    }
+    // rate limit without a model falls back to the account scope, like inline
+    const inlineNoModel = workBuddyFailoverCooldown(classifyWorkBuddyError(429, { code: 6004 }));
+    const seamNoModel = workBuddyFailoverCooldownFromInfo({ code: "rate_limit", cooldownMs: 900_000, statusCode: 429 });
+    expect(seamNoModel).toMatchObject({ scope: "account" });
+    expect(inlineNoModel).toMatchObject({ scope: "account" });
   });
   it("HTTP429 without known numeric code rotates, explicit terminal identities always win", () => {
     expect(workBuddyFailoverCooldown(classifyWorkBuddyError(429, { code: 99999 }), "m")).toMatchObject({ scope: "model", model: "m", code: 6004 });

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkBuddyTransformer } from "../transformer/workbuddy.transformer";
-import { WorkBuddyAuthService, type WorkBuddyFetch } from "../services/workbuddy-auth";
-import { WorkBuddyCredentialStore, type WorkBuddyCredential } from "../services/workbuddy";
+import { WorkBuddyTransformer } from "../src/transformer";
+import { WorkBuddyAuthService, type WorkBuddyFetch } from "../src/auth-service";
+import { WorkBuddyCredentialStore, type WorkBuddyCredential } from "../src/protocol";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,16 +14,21 @@ const CRED: WorkBuddyCredential = {
 };
 
 /**
- * Async harness: the credential is saved up-front because transformRequestIn
+ * Async harness (plugin-package copy of the former core workbuddy-transformer suite): the credential is saved up-front because transformRequestIn
  * injects the WorkBuddy auth headers for the non-bypass pipeline path.
  */
 async function harness() {
   const dir = mkdtempSync(join(tmpdir(), "wb-tr-"));
   const store = new WorkBuddyCredentialStore(join(dir, "creds.json"));
   const authService = new WorkBuddyAuthService({
-    configService: { get: () => undefined, getAll: () => ({}), reload: vi.fn(), set: vi.fn() },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     fetch: (async () => new Response("{}")) as WorkBuddyFetch,
+    host: {
+      readRawConfig: async () => ({ Providers: [] }),
+      writeConfig: async () => {},
+      reloadRuntime: () => {},
+      getDirectDispatcher: () => undefined,
+    },
     store,
   });
   dirs.push(dir);

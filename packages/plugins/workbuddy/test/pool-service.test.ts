@@ -9,9 +9,9 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkBuddyAuthService, clearWorkBuddyRouterRefs, renameWorkBuddyAiRouterRefs } from "../services/workbuddy-auth";
-import { WorkBuddyCredentialStore, type WorkBuddyCredential } from "../services/workbuddy";
-import * as configModule from "../ccr/config";
+import { WorkBuddyAuthService, clearWorkBuddyRouterRefs, renameWorkBuddyAiRouterRefs } from "../src/auth-service";
+import { WorkBuddyCredentialStore, type WorkBuddyCredential } from "../src/protocol";
+import * as configModule from "../../../core/src/ccr/config";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -51,7 +51,12 @@ function harness(config: any = { Providers: [], Router: { default: "other,model"
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     store,
     readSource: () => ({ ok: false, reason: "source_missing" }),
-    getServer: () => undefined,
+    host: {
+      readRawConfig: () => configModule.readConfigFileRaw(),
+      writeConfig: (next: any) => configModule.writeConfigFile(next),
+      reloadRuntime: () => {},
+      getDirectDispatcher: () => undefined,
+    },
   });
   return { dir, store, service, write, config: () => configs.get("current") };
 }

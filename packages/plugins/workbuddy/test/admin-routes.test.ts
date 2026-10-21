@@ -16,11 +16,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import Server from "../server";
-import { registerAdminRoutes } from "../ccr/admin-routes";
-import { WorkBuddyAuthService } from "../services/workbuddy-auth";
-import { WorkBuddyCredentialStore, type WorkBuddyCredential } from "../services/workbuddy";
-import * as configModule from "../ccr/config";
+import Server from "../../../core/src/server";
+import { registerWorkBuddyAdminRoutes } from "../src/admin-routes";
+import { WorkBuddyAuthService } from "../src/auth-service";
+import { protectWorkBuddyConfig, WorkBuddyCredentialStore, type WorkBuddyCredential } from "../src/protocol";
+import * as configModule from "../../../core/src/ccr/config";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -79,7 +79,9 @@ async function build(config: any) {
     initialConfig: { providers: config.Providers, Router: config.Router, HOST: "127.0.0.1", PORT: 0 },
   });
   await server.ready();
-  await registerAdminRoutes(server, config);
+  // The plugin owns its route section; register ONLY it against the app (the
+  // core's built-in section is gone once the migration hard-cut lands).
+  registerWorkBuddyAdminRoutes(server.app as any, { getService: () => service });
   await server.registerNamespace("/");
   await server.app.ready();
   const service = new WorkBuddyAuthService({
@@ -92,9 +94,13 @@ async function build(config: any) {
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     store,
     readSource: () => ({ ok: false, reason: "source_missing" }),
-    getServer: () => server,
+    host: {
+      readRawConfig: () => configModule.readConfigFileRaw(),
+      writeConfig: (next: any) => configModule.writeConfigFile(next),
+      reloadRuntime: () => {},
+      getDirectDispatcher: () => undefined,
+    },
   });
-  (server as any).workBuddyAuthService = service;
   const url = (path: string) => `http://localhost:3456${path}`;
   return { server, store, service, dir, url, config: () => live.current };
 }
@@ -445,23 +451,24 @@ describe("WorkBuddy generic config protections cover both sites", () => {
   it("a generic save cannot rewrite or drop either managed provider", async () => {
     const h = await build({ Providers: [CN_PROVIDER(), AI_PROVIDER()], Router: { default: "workbuddy,glm-5.3" } });
     await seedBothSites(h.store);
-    // Hostile generic save: both managed entries redirected and omitted.
-    const res = await h.server.app.inject({
-      method: "POST", url: h.url("/api/config"),
-      payload: {
-        Providers: [{ name: "workbuddy", api_base_url: "https://attacker.example/v1", api_key: "attacker", models: ["evil"] }],
-        Router: { default: "workbuddy,glm-5.3" },
-      },
-    });
-    expect(res.statusCode).toBe(200);
-    const providers = h.config().Providers;
+    // Hostile generic save: both managed entries redirected and omitted. The
+    // core POST /api/config route invokes exactly this protector through the
+    // plugin registry before writing; drive it directly here (the route
+    // itself is core surface covered by the core suite).
+    const next: any = {
+      Providers: [{ name: "workbuddy", api_base_url: "https://attacker.example/v1", api_key: "attacker", models: ["evil"] }],
+      Router: { default: "workbuddy,glm-5.3" },
+    };
+    protectWorkBuddyConfig(next, structuredClone(h.config()));
+    h.config; // (config holder untouched: the protector mutates the draft only)
+    const providers = next.Providers;
     const cn = providers.find((p: any) => p.name === "workbuddy");
     const ai = providers.find((p: any) => p.name === "workbuddy-ai");
     // CN entry re-locked to the fixed identity/origin, AI entry resurrected.
     expect(cn).toMatchObject({ ccr_managed: true, api_key: "ccr-managed-workbuddy", api_base_url: "https://copilot.tencent.com/v2/chat/completions" });
     expect(cn.transformer).toEqual({ use: ["workbuddy"] });
     expect(ai).toMatchObject({ ccr_managed: true, api_key: "ccr-managed-workbuddy-ai", api_base_url: "https://www.workbuddy.ai/v2/chat/completions" });
-    expect(h.config().Providers.some((p: any) => p.api_base_url === "https://attacker.example/v1")).toBe(false);
+    expect(next.Providers.some((p: any) => p.api_base_url === "https://attacker.example/v1")).toBe(false);
   });
 });
 
