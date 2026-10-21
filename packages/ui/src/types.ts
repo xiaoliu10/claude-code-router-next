@@ -379,7 +379,7 @@ export interface WorkBuddyLoginStartResponse {
 export type WorkBuddyLoginPollResponse =
   | { status: "pending" | "none" | "expired" }
   | { status: "failed"; reason: WorkBuddyFailureReason }
-  | (WorkBuddyMutationResponse & { status: "connected"; success: true; models: string[] });
+  | (WorkBuddyMutationResponse & { status: "connected"; success: true; models: string[]; accountChange?: "added" | "updated"; accountCount?: number });
 
 export interface WorkBuddyImportRequest {
   site: WorkBuddyKind;
@@ -419,6 +419,10 @@ export interface WorkBuddyMutationResponse {
   removedProvider?: boolean;
   deletedCredential?: boolean;
   error?: string;
+  /** §16 outcome metadata when a login/import committed an account upsert: a new pool row was added, or an existing uid was replaced in place. */
+  accountChange?: "added" | "updated";
+  /** Committed pool size for the site after that upsert. */
+  accountCount?: number;
 }
 
 export interface ManualProbeResponse {

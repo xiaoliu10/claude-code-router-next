@@ -464,3 +464,60 @@ describe("WorkBuddy generic config protections cover both sites", () => {
     expect(h.config().Providers.some((p: any) => p.api_base_url === "https://attacker.example/v1")).toBe(false);
   });
 });
+
+describe("WorkBuddy browser login through the real admin routes", () => {
+  const AI_JOBS = [
+    { state: "state-a", uid: "ai-a", displayName: "Account A", accessToken: "token-a" },
+    { state: "state-b", uid: "ai-b", displayName: "Account B", accessToken: "token-b" },
+  ];
+  /** Real login flow fetch (state → token → account → discovery), distinct per started job. */
+  const env = (data: any, url: string) => {
+    const r = new Response(JSON.stringify({ code: 0, data, msg: "" }), { status: 200, headers: { "content-type": "application/json" } });
+    Object.defineProperty(r, "url", { value: url });
+    return r;
+  };
+  const aiLoginFetch = () => {
+    let issued = 0;
+    return vi.fn(async (url: any, init: any) => {
+      const origin = "https://www.workbuddy.ai";
+      const u = String(url);
+      if (u.startsWith(origin) && u.includes("auth/state")) {
+        const next = AI_JOBS[issued++];
+        return env({ state: next.state, authUrl: "https://www.codebuddy.ai/login?state=" + next.state }, u);
+      }
+      if (u.startsWith(origin)) {
+        const state = new URL(u).searchParams.get("state") ?? "";
+        const account = AI_JOBS.find((j) => j.state === state) ?? AI_JOBS[0];
+        if (u.includes("auth/token?")) return env({ accessToken: account.accessToken, refreshToken: "refresh-" + account.uid, expiresIn: 3600 }, u);
+        if (u.includes("login/account")) return env({ uid: account.uid, nickname: account.displayName, type: "personal" }, u);
+        return env({ agents: [{ name: "cli", models: ["gpt-5.5"] }], models: [{ id: "gpt-5.5" }] }, u);
+      }
+      throw new Error("unexpected fetch " + u);
+    });
+  };
+  const browserLogin = async (h: Awaited<ReturnType<typeof build>>, site: string) => {
+    const start = await h.server.app.inject({ method: "POST", url: h.url("/api/workbuddy/login/start"), payload: { site } });
+    expect(start.statusCode).toBe(200);
+    expect(start.json()).toMatchObject({ ok: true, site });
+    const poll = await h.server.app.inject({ method: "POST", url: h.url("/api/workbuddy/login/poll"), payload: { site, loginId: start.json().loginId } });
+    expect(poll.statusCode).toBe(200);
+    return poll.json();
+  };
+
+  it("AI A then AI B through /login/start + /login/poll => GET /status sites[workbuddy-ai].accounts 2, poll carries outcome metadata", async () => {
+    const h = await build({ Providers: [], Router: {} });
+    vi.stubGlobal("fetch", aiLoginFetch());
+    const a = await browserLogin(h, "workbuddy-ai");
+    expect(a).toMatchObject({ status: "connected", success: true, accountChange: "added", accountCount: 1 });
+    const b = await browserLogin(h, "workbuddy-ai");
+    expect(b).toMatchObject({ status: "connected", success: true, accountChange: "added", accountCount: 2 });
+    // The exact endpoint the UI refreshes after login reports BOTH rows.
+    const status = await h.server.app.inject({ method: "GET", url: h.url("/api/workbuddy/status") });
+    expect(status.statusCode).toBe(200);
+    const accounts = status.json().sites["workbuddy-ai"].accounts;
+    expect(accounts.map((x: any) => x.uid)).toEqual(["ai-a", "ai-b"]);
+    // Tokens/refresh material never leak through the poll or status bodies.
+    expect(status.body).not.toContain("token-a");
+    expect(JSON.stringify([a, b])).not.toContain("refresh-");
+  });
+});

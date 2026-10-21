@@ -235,3 +235,86 @@ describe("browser login jobs", () => {
     expect(h.write).not.toHaveBeenCalled();
   });
 });
+
+// Regression: two REAL sequential same-site browser flows (the exact path the
+// "Add account" button drives). Existing pool tests only cover import
+// duplicates against a pre-seeded store; these drive the full
+// state→token→account→discovery→upsert pipeline per job with distinct upstream
+// state+token+uid, and assert what the store, the pool status and the poll
+// result report afterwards. No real upstream, no real user store.
+describe("second same-site browser account (real sequential flows)", () => {
+  type Job = { state: string; uid: string; displayName: string; accessToken: string };
+  const aiLoginFetch = (jobs: Job[]) => {
+    let issued = 0;
+    return vi.fn(async (url: string, init: any) => {
+      const origin = "https://www.workbuddy.ai";
+      expect(url.startsWith(origin + "/")).toBe(true); expect(init.redirect).toBe("error"); expect(init.dispatcher).toBeDefined();
+      if (url.includes("auth/state")) {
+        const next = jobs[issued++];
+        return env({ state: next.state, authUrl: "https://www.codebuddy.ai/login?state=" + next.state }, url);
+      }
+      const state = new URL(url).searchParams.get("state") ?? "";
+      const account = jobs.find((j) => j.state === state) ?? jobs[0];
+      if (url.includes("auth/token?")) return env({ accessToken: account.accessToken, refreshToken: "refresh-" + account.uid, expiresIn: 3600 }, url);
+      if (url.includes("login/account")) return env({ uid: account.uid, nickname: account.displayName, type: "personal" }, url);
+      return env({ agents: [{ name: "cli", models: ["glm-5.3"] }], models: [{ id: "glm-5.3" }] }, url);
+    });
+  };
+  const login = async (h: ReturnType<typeof harness>, site: WorkBuddySiteId) => {
+    const start = await h.service.startBrowserLogin(site);
+    const poll = await h.service.pollBrowserLogin(site, start.loginId);
+    expect(poll.status).toBe("connected");
+    return poll;
+  };
+
+  it("distinct upstream state+token+uid per job: AI A then AI B => store has both, status reports 2", async () => {
+    const fetch = aiLoginFetch([
+      { state: "state-a", uid: "ai-a", displayName: "Account A", accessToken: "token-a" },
+      { state: "state-b", uid: "ai-b", displayName: "Account B", accessToken: "token-b" },
+    ]);
+    const h = harness(fetch);
+    const a = await login(h, "workbuddy-ai");
+    const b = await login(h, "workbuddy-ai");
+    // Distinct upstream states were actually issued per job.
+    expect(fetch.mock.calls.filter(([url]) => String(url).includes("auth/state"))).toHaveLength(2);
+    // The committed store carries BOTH rows; the first login stays sticky-active.
+    const ai = (await h.store.loadData())?.sites["workbuddy-ai"];
+    expect(ai?.accounts.map((x) => x.uid)).toEqual(["ai-a", "ai-b"]);
+    expect(ai?.accounts.map((x) => x.accessToken)).toEqual(["token-a", "token-b"]);
+    expect(ai?.activeUid).toBe("ai-a");
+    // The same pipeline the admin GET /status route reads reports both rows.
+    const pool = await h.service.getPoolStatus();
+    expect(pool.sites["workbuddy-ai"]?.accounts.map((x) => x.uid)).toEqual(["ai-a", "ai-b"]);
+    // Outcome metadata: both jobs ADDED a row; counts are the committed sizes.
+    expect((a as any).result?.accountChange).toBe("added");
+    expect((a as any).result?.accountCount).toBe(1);
+    expect((b as any).result?.accountChange).toBe("added");
+    expect((b as any).result?.accountCount).toBe(2);
+  });
+
+  it("same uid again (A then A) => explicit replacement: 1 row, sticky active/hidden/still-valid cooldown preserved", async () => {
+    const fetch = aiLoginFetch([
+      { state: "state-1", uid: "ai-a", displayName: "Account A", accessToken: "token-a1" },
+      { state: "state-2", uid: "ai-a", displayName: "Account A", accessToken: "token-a2" },
+    ]);
+    const h = harness(fetch);
+    const first = await login(h, "workbuddy-ai");
+    // Site-level hidden model and a STILL-VALID account cooldown on the row.
+    const before = (await h.store.loadData())!;
+    before.sites["workbuddy-ai"]!.hiddenModels = ["glm-5.3"];
+    before.sites["workbuddy-ai"]!.accounts[0].cooldown = { until: Date.now() + 60_000, scope: "account", code: 14018 };
+    await h.store.saveData(before);
+    const second = await login(h, "workbuddy-ai");
+    const ai = (await h.store.loadData())?.sites["workbuddy-ai"];
+    expect(ai?.accounts).toHaveLength(1);
+    expect(ai?.accounts[0]?.accessToken).toBe("token-a2");
+    expect(ai?.activeUid).toBe("ai-a");
+    expect(ai?.hiddenModels).toEqual(["glm-5.3"]);
+    expect(ai?.accounts[0]?.cooldown?.until).toBe(before.sites["workbuddy-ai"]!.accounts[0].cooldown!.until);
+    expect((await h.service.getPoolStatus()).sites["workbuddy-ai"]?.accounts).toHaveLength(1);
+    // The re-login is reported as an UPDATE of the existing row, not a new one.
+    expect((first as any).result?.accountChange).toBe("added");
+    expect((second as any).result?.accountChange).toBe("updated");
+    expect((second as any).result?.accountCount).toBe(1);
+  });
+});

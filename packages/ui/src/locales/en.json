@@ -588,6 +588,8 @@
     "working": "Working…",
     "disconnected": "WorkBuddy disconnected. Router references were preserved; update them manually.",
     "synced": "Registered {{count}} WorkBuddy models. Router unchanged.",
+    "account_added": "New account added: this site now has {{count}} account(s) in CCR. This was a new account, not a duplicate. To add another one, sign in on the official site with a different account.",
+    "account_updated": "Existing account updated (not a duplicate): this site has {{count}} account(s) in CCR. To add another one, sign in on the official site with a different account.",
     "other_edit": "Finish the current provider edit/save before managing WorkBuddy.",
     "managed_notice": "Manage WorkBuddy in Settings → Providers. Generic edit/delete cannot change its name, URL, credentials or transformer. Use Disconnect here to remove it; Router is unchanged.",
     "status": {

@@ -588,6 +588,8 @@
     "working": "正在处理…",
     "disconnected": "WorkBuddy 已断开。Router 引用已保留，请手工修改。",
     "synced": "已注册 {{count}} 个 WorkBuddy 模型，Router 未变更。",
+    "account_added": "已添加新账号：CCR 中本站现有 {{count}} 个账号。这是新增账号，并非重复。如需再添加一个，请在官方网站上使用另一个账号登录授权。",
+    "account_updated": "已更新现有账号（并非重复添加）：CCR 中本站现有 {{count}} 个账号。如需再添加一个，请在官方网站上使用另一个账号登录授权。",
     "other_edit": "请先完成当前供应商编辑或保存，再管理 WorkBuddy。",
     "managed_notice": "请在设置 → 供应商管理 WorkBuddy。普通编辑/删除无法修改其名称、地址、凭据或转换器；请在此断开连接以移除，Router 不变。",
     "status": {

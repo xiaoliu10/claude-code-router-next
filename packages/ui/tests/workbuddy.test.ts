@@ -5,7 +5,8 @@ import {
   formatWorkBuddyClock, hasDiscoveredModels, isManagedWorkBuddy, isWorkBuddyConnected, isWorkBuddyKind,
   labelWorkBuddyRouterPath, maskWorkBuddyUid, mergeWorkBuddyHiddenRefs, mergeWorkBuddyProvider, parseWorkBuddyUsage,
   sanitizeWorkBuddyModelRefs, sanitizeWorkBuddyRouterPaths, workBuddyAccountCooling, workBuddyAccountRestricted, workBuddyErrorKey,
-  workBuddyImagesUnsupportedModels, workBuddyKindOf, workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
+  workBuddyImagesUnsupportedModels, workBuddyKindOf, workBuddyLoginOutcome, workBuddySettle, workBuddySiteStatus,
+  workBuddyStateKey, workBuddyVisibleErrorKey,
 } from "../src/utils/workbuddy.ts";
 import type { Config, Provider, WorkBuddyAccountSummary, WorkBuddyMutationResponse, WorkBuddySiteStatus, WorkBuddyStatusResponse } from "../src/types.ts";
 
@@ -526,6 +527,10 @@ test("EN/ZH WorkBuddy locale parity covers statuses, sites, credits and safe err
     assert.ok(locale.credits.action); assert.ok(locale.credits.display); assert.ok(locale.renewal_desktop); assert.ok(locale.images_unsupported);
     // §16 additions.
     assert.ok(locale.add_account); assert.ok(locale.managed_provider); assert.ok(locale.hidden_models);
+    // §16 login outcome messages: distinct added/updated copy, count interpolated, never duplicate-silent.
+    assert.match(String(locale.account_added), /\{\{count\}\}/); assert.match(String(locale.account_updated), /\{\{count\}\}/);
+    assert.match(String(locale.account_added), /not a duplicate|并非重复/);
+    assert.match(String(locale.account_updated), /not a duplicate|并非重复/);
     assert.ok(locale.cleared_refs); assert.ok(locale.restore_all); assert.ok(locale.set_active); assert.ok(locale.remove);
     assert.ok(locale.source_badge.desktop); assert.ok(locale.source_badge.browser);
     assert.ok(locale.cooling_until); assert.ok(locale.restricted_until); assert.ok(locale.account_remove_warning);
@@ -551,4 +556,44 @@ test("settings owns management; dashboard only navigates managed edit/delete", (
   assert.match(settings, /focusSite=\{isWorkBuddyKind\(location\.state\?\.workBuddySite\)/);
   assert.equal((settings.match(/disabled=\{isSaving \|\| isRestarting \|\| workBuddyBusy\}/g) || []).length, 2);
   assert.match(settings, /workbuddy.managed_notice/);
+});
+
+test("login wiring uses the committed-upsert outcome and settle sequencing", () => {
+  assert.match(component, /workBuddyLoginOutcome\(connected\)/);
+  assert.match(component, /workBuddySettle\(/);
+  assert.doesNotMatch(component, /t\("workbuddy\.synced", \{ count: connected/);
+});
+
+test("login completion message derives NEW row vs re-authorization from committed metadata, with a safe fallback", () => {
+  // New second account: distinct key + committed pool count.
+  assert.deepEqual(workBuddyLoginOutcome({ models: ["m"], accountChange: "added", accountCount: 2 }), { key: "workbuddy.account_added", values: { count: 2 } });
+  // Same-uid re-login: explicit update wording, count stays the committed size.
+  assert.deepEqual(workBuddyLoginOutcome({ models: ["m"], accountChange: "updated", accountCount: 1 }), { key: "workbuddy.account_updated", values: { count: 1 } });
+  // Safe fallbacks: older server (no metadata) keeps the legacy model-sync message.
+  assert.deepEqual(workBuddyLoginOutcome({ models: ["a", "b"] }), { key: "workbuddy.synced", values: { count: 2 } });
+  assert.deepEqual(workBuddyLoginOutcome({ modelCount: 3 }), { key: "workbuddy.synced", values: { count: 3 } });
+  assert.deepEqual(workBuddyLoginOutcome(null), { key: "workbuddy.synced", values: { count: 0 } });
+  assert.deepEqual(workBuddyLoginOutcome(undefined), { key: "workbuddy.synced", values: { count: 0 } });
+  // Implausible metadata never reaches the message: wrong type / non-integer /
+  // out-of-bounds count degrades to the generic message instead of lying.
+  for (const bad of [{ accountChange: "added", accountCount: "2" }, { accountChange: "added", accountCount: 2.5 }, { accountChange: "added", accountCount: 0 }, { accountChange: "added", accountCount: -1 }, { accountChange: "added", accountCount: 100_001 }, { accountChange: "added" }]) {
+    assert.deepEqual(workBuddyLoginOutcome(bad), { key: "workbuddy.synced", values: { count: 0 } });
+  }
+  // No credential material is ever part of the outcome.
+  const outcome = workBuddyLoginOutcome({ models: ["m"], accountChange: "added", accountCount: 1 });
+  assert.equal(JSON.stringify(outcome).includes("token"), false);
+});
+
+test("post-action settle refreshes pool status even when the unrelated config draft refresh fails", async () => {
+  let statusReads = 0;
+  const ok = await workBuddySettle(async () => {}, async () => { statusReads++; return "status-ok"; });
+  assert.deepEqual(ok, { status: "status-ok", configReconciled: true });
+  assert.equal(statusReads, 1);
+  // Config refresh failure (unrelated to the persisted WorkBuddy mutation)
+  // must NOT suppress the status refresh; the failure stays surfaced as
+  // configReconciled=false (ConfigProvider shows the config error itself).
+  let readsAfterFailure = 0;
+  const degraded = await workBuddySettle(async () => { throw new Error("Configuration refresh failed"); }, async () => { readsAfterFailure++; return "status-after-failure"; });
+  assert.deepEqual(degraded, { status: "status-after-failure", configReconciled: false });
+  assert.equal(readsAfterFailure, 1);
 });

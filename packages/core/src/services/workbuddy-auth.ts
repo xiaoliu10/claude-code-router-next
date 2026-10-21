@@ -94,6 +94,16 @@ export interface WorkBuddyMutationResult {
   modelsUnchanged?: boolean;
   reason?: WorkBuddyFailureReason;
   error?: string;
+  /**
+   * Login/import outcome metadata (§16 pool): how the committed upsert
+   * changed this site's pool — a NEW account row was added, or an existing
+   * uid was replaced in place (a re-authorization, never a second row).
+   * Absent on results that never committed an account upsert (failures,
+   * plain syncs), so existing clients stay compatible.
+   */
+  accountChange?: "added" | "updated";
+  /** Committed pool size for the site AFTER the upsert (sanitized count). */
+  accountCount?: number;
 }
 
 /** Sanitized per-account line for the admin pool status (contract §16). Never carries tokens. */
@@ -688,8 +698,9 @@ export class WorkBuddyAuthService {
 
     if (!isCurrent()) return cancelled();
     let wroteCredential = false;
+    let committed: { data: WorkBuddyCredentialData; replaced: boolean } | null = null;
     try {
-      await this.store.upsertAccount(candidate);
+      committed = await this.store.upsertAccount(candidate);
       wroteCredential = true;
       if (!isCurrent()) throw new Error("workbuddy_login_cancelled");
       await this.upsertManagedProvider(models, candidate.kind, isCurrent);
@@ -709,7 +720,15 @@ export class WorkBuddyAuthService {
         modelsUnchanged: true,
       };
     }
-    return this.mutation("connected", models, candidate.displayName, connectedMessage);
+    // §16 outcome metadata: let the UI tell a NEW pool row from an in-place
+    // re-authorization of the same uid. Counts come from the committed data,
+    // never from a pre-read. No token/state/uid material, only the size.
+    const result = this.mutation("connected", models, candidate.displayName, connectedMessage);
+    if (committed) {
+      result.accountChange = committed.replaced ? "updated" : "added";
+      result.accountCount = committed.data.sites[candidate.kind]?.accounts.length ?? 0;
+    }
+    return result;
   }
 
   // ------------------------------------------------------- browser login ----

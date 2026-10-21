@@ -1219,7 +1219,14 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       if (typeof loginId !== "string" || !/^[a-f0-9]{48}$/.test(loginId)) { reply.status(422); return { status: "failed", reason: "source_invalid" }; }
       const result = await requireWorkBuddyService().pollBrowserLogin(site, loginId);
       if (result.status === "connected") {
-        return { status: "connected", success: true, models: result.result.models, modelCount: result.result.modelCount, displayName: result.result.displayName };
+        // Additive §16 outcome metadata (added vs updated row + committed pool
+        // size). Absent when the service did not supply it, so existing
+        // clients keep parsing this payload unchanged.
+        return {
+          status: "connected", success: true, models: result.result.models, modelCount: result.result.modelCount, displayName: result.result.displayName,
+          ...(result.result.accountChange ? { accountChange: result.result.accountChange } : {}),
+          ...(typeof result.result.accountCount === "number" ? { accountCount: result.result.accountCount } : {}),
+        };
       }
       if (result.status === "failed") {
         reply.status(422);

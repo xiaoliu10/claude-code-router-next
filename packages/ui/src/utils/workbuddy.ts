@@ -287,6 +287,48 @@ function isWorkBuddySiteStatus(value: unknown): value is WorkBuddySiteStatus {
 }
 
 /**
+ * Settled completion message for an explicit browser authorization, from the
+ * server's committed upsert metadata (§16). `accountChange` + `accountCount`
+ * let the UI tell a NEW pool row from an in-place re-authorization of the
+ * same uid — previously both showed the generic model-sync toast, so a second
+ * account was indistinguishable from a silent replacement. Safe fallback: any
+ * absent or implausible metadata degrades to the legacy model-sync message;
+ * only bounded positive integers are ever interpolated.
+ */
+export interface WorkBuddyLoginOutcomeMessage {
+  key: "workbuddy.synced" | "workbuddy.account_added" | "workbuddy.account_updated";
+  values: { count: number };
+}
+
+export function workBuddyLoginOutcome(result: { models?: string[]; modelCount?: number; accountChange?: unknown; accountCount?: unknown } | null | undefined): WorkBuddyLoginOutcomeMessage {
+  const count = result?.accountCount;
+  const safeCount = typeof count === "number" && Number.isInteger(count) && count >= 1 && count <= 10_000 ? count : null;
+  if (result?.accountChange === "added" && safeCount !== null) return { key: "workbuddy.account_added", values: { count: safeCount } };
+  if (result?.accountChange === "updated" && safeCount !== null) return { key: "workbuddy.account_updated", values: { count: safeCount } };
+  const models = Array.isArray(result?.models) ? result!.models!.length : typeof result?.modelCount === "number" ? result.modelCount : 0;
+  return { key: "workbuddy.synced", values: { count: models } };
+}
+
+/**
+ * Final sequencing after a mutating WorkBuddy action. The local config draft
+ * refresh may fail for reasons UNRELATED to the WorkBuddy mutation, which has
+ * already persisted server-side. A failed draft reconciliation must not
+ * suppress the per-site status refresh or the settled message — the persisted
+ * success stays visible. `configReconciled: false` marks the failed draft
+ * merge (ConfigProvider surfaces that error itself), so this never claims
+ * full reconciliation success.
+ */
+export async function workBuddySettle<Status>(refreshConfig: () => Promise<void>, readStatus: () => Promise<Status>): Promise<{ status: Status; configReconciled: boolean }> {
+  let configReconciled = true;
+  try {
+    await refreshConfig();
+  } catch {
+    configReconciled = false;
+  }
+  return { status: await readStatus(), configReconciled };
+}
+
+/**
  * Per-site status for one card. §16: `sites` is the source of truth; the
  * legacy flat fields (mirror of the only connected site) are used only as a
  * one-version fallback. Malformed shapes degrade to "not connected" instead

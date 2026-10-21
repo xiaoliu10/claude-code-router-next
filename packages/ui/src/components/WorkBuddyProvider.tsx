@@ -7,7 +7,7 @@ import {
   formatWorkBuddyClock, isWorkBuddyConnected, labelWorkBuddyRouterPath, maskWorkBuddyUid, mergeWorkBuddyHiddenRefs,
   mergeWorkBuddyProvider, parseWorkBuddyUsage, sanitizeWorkBuddyModelRefs, sanitizeWorkBuddyRouterPaths,
   workBuddyAccountCooling, workBuddyAccountRestricted, workBuddyErrorKey, workBuddyImagesUnsupportedModels,
-  workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
+  workBuddyLoginOutcome, workBuddySettle, workBuddySiteStatus, workBuddyStateKey, workBuddyVisibleErrorKey,
 } from "@/utils/workbuddy";
 import { createWorkBuddyLogin } from "@/utils/workbuddy-login";
 import { useConfig } from "./ConfigProvider";
@@ -95,8 +95,15 @@ export function WorkBuddyProvider({ disabled, onBusyChange, focusSite = null }: 
   // the Router-draft-preserving variant; only the explicitly authorized hide
   // passes its §16 Router reconciliation (see mergeWorkBuddyHiddenRefs).
   const finish = async (site: WorkBuddyKind, id: number, message: string, options: { clearUsage?: boolean; dropUsageUid?: string; merge?: (local: Config, server: Config) => Config } = {}) => {
-    await refreshConfig(options.merge ?? mergeWorkBuddyProvider);
-    const updated = await api.getWorkBuddyStatus();
+    // A config draft refresh can fail for reasons unrelated to the WorkBuddy
+    // mutation, which already persisted server-side. workBuddySettle keeps
+    // the per-site status refresh and the settled message running in that
+    // case (the persisted success stays visible); ConfigProvider surfaces the
+    // draft reconciliation error, so no full reconciliation is claimed here.
+    const { status: updated } = await workBuddySettle(
+      () => refreshConfig(options.merge ?? mergeWorkBuddyProvider),
+      () => api.getWorkBuddyStatus(),
+    );
     if (!mounted.current || generation.current !== id) return;
     setStatus(updated);
     setLoadFailed(false);
@@ -151,7 +158,12 @@ export function WorkBuddyProvider({ disabled, onBusyChange, focusSite = null }: 
         setLogin(null);
         if (!connected) return; // cancelled or superseded by a newer action
         if (!isWorkBuddyConnected(connected)) { setSiteError(site, "models_fetch_failed"); return; }
-        await finish(site, id, t("workbuddy.synced", { count: connected.models?.length ?? 0 }), { clearUsage: true });
+        // Outcome metadata from the committed upsert (§16): a NEW pool row vs
+        // an in-place re-authorization, with the committed account count.
+        // Older servers without metadata keep the generic model-sync message.
+        // The card refreshes the pool status below (finish) so both rows show.
+        const outcome = workBuddyLoginOutcome(connected);
+        await finish(site, id, t(outcome.key, outcome.values), { clearUsage: true });
         return;
       }
       if (kind === "sync") {
