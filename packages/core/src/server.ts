@@ -41,6 +41,8 @@ import { initQuotaStorePersistence } from "./services/quota-store";
 import { closeProxyDispatchers, resolveProviderProxyUrl } from "./services/proxy";
 import { WorkBuddyAuthService } from "./services/workbuddy-auth";
 import { setWorkBuddyRuntime } from "./services/workbuddy";
+import { GeminiOauthAuthService } from "./services/gemini-oauth-auth";
+import { setGeminiOauthRuntime } from "./services/gemini-oauth";
 import { applyClientAdapter } from "./clients/adapters";
 import { normalizeResponsesBody } from "./api/routes";
 import type { CcrPreHandlerCallbacks } from "./ccr/request-pipeline";
@@ -91,6 +93,8 @@ class Server {
   activeProbeService?: ActiveProbeService;
   /** WorkBuddy managed-provider auth service (token never leaves this object). */
   workBuddyAuthService?: WorkBuddyAuthService;
+  /** Gemini OAuth (Antigravity) managed-provider auth service. */
+  geminiOauthAuthService?: GeminiOauthAuthService;
   recordUsage?: (data: any) => void;
   private readonly readiness: Promise<void>;
   private mainNamespaceRegistered = false;
@@ -142,6 +146,15 @@ class Server {
     });
     // Let the transformer resolve this service without constructor options.
     setWorkBuddyRuntime({ authService: this.workBuddyAuthService });
+
+    // Gemini OAuth (Antigravity) managed provider: same shape as WorkBuddy.
+    // Construction is lazy (no network/disk in the constructor).
+    this.geminiOauthAuthService = new GeminiOauthAuthService({
+      configService: this.configService,
+      logger: this.app.log,
+      getServer: () => this,
+    });
+    setGeminiOauthRuntime({ authService: this.geminiOauthAuthService });
 
     // Readiness is explicit and fail-fast: namespaces and listen must wait until
     // transformer, provider, and tokenizer initialization have all completed.
