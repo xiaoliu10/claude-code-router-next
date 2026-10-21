@@ -1,0 +1,104 @@
+import type { FastifyInstance } from "fastify";
+import type { LLMProvider } from "@/types/llm";
+
+/**
+ * Provider plugin API (docs/design/provider-plugins.md).
+ *
+ * A plugin ships subscription-provider code out of the main package: a
+ * transformer, a managed runtime (upstream lock, token injection, error
+ * taxonomy), admin routes, a config protector and a UI card. The core only
+ * knows this interface — never the provider internals.
+ *
+ * Lives in `src/provider-plugins/` deliberately: `src/plugins/` is the older
+ * output-plugin system (token-speed) and must not mix namespaces.
+ *
+ * `coreApi` is a semver-ish compatibility marker. The core refuses plugins
+ * whose major does not match its own, so the public contract can evolve
+ * without silently breaking third parties.
+ */
+export const PLUGIN_CORE_API = "1";
+
+export interface PluginManifest {
+  name: string;
+  version: string;
+  coreApi: string;
+  description?: string;
+}
+
+/** A classified upstream error, shared shape across providers (contract §1.6). */
+export interface PluginClassifiedError {
+  code: string;
+  message: string;
+  httpStatus: number;
+  cooldownMs?: number;
+  validationUrl?: string;
+  retryable?: boolean;
+}
+
+/**
+ * Managed-subscription semantics for one provider family. Everything the data
+ * plane needs to talk to a subscription upstream without the core knowing it:
+ * fixed upstream, token injection, error taxonomy, cooling circuit breaker.
+ */
+export interface ManagedRuntime {
+  /** Provider family name, e.g. "codex". Used for logging and 401 bookkeeping keys. */
+  name: string;
+  isManaged(provider: LLMProvider): boolean;
+  /** Circuit breaker before any network touch (Gemini lesson: must run BEFORE token refresh). */
+  ensureUsable?(): Promise<void>;
+  /** Lock the upstream: mutate config.url / redirect / dispatcher. Runs once per attempt. */
+  lockUpstream?(config: any, provider: LLMProvider): Promise<void>;
+  /**
+   * Final header injection — called AFTER the request body is finalized, so
+   * body-derived headers (e.g. Codex session-id from prompt_cache_key) work.
+   * Returns the headers object to send.
+   */
+  signRequest(input: {
+    headers: Record<string, string>;
+    requestBody: any;
+    provider: LLMProvider;
+  }): Promise<Record<string, string>>;
+  /**
+   * Classify an upstream failure into the shared taxonomy. Return null to let
+   * the next handler (built-in branches, then generic) deal with it.
+   */
+  classifyError?(status: number, body: unknown, systemText: string): PluginClassifiedError | null;
+  /** Persist a classified error (cooldown, lastError). Must never throw into the response path. */
+  noteUpstreamError?(info: PluginClassifiedError): Promise<void>;
+  /**
+   * Opt-in 401 handling: when set, the core performs ONE forced refresh and
+   * re-dispatch on 401 before classifying. `refresh` must persist rotated
+   * refresh tokens before the in-memory identity switches.
+   */
+  authRefresh?: {
+    forceRefresh(): Promise<void>;
+  };
+  /** Suppress the request/response debug logs for this provider (token hygiene). */
+  suppressDebugLog?: boolean;
+}
+
+export interface PluginContext {
+  readonly manifest: PluginManifest;
+  readonly log: {
+    info(msg: string): void;
+    warn(msg: string): void;
+    error(msg: string): void;
+  };
+  registerTransformer(cls: new () => any): void;
+  registerManagedRuntime(rt: ManagedRuntime): void;
+  registerAdminRoutes(fn: (app: FastifyInstance) => void): void;
+  registerConfigProtector(fn: (next: any, prev: any) => void): void;
+  /** Path to the prebuilt card chunk, relative to the plugin directory. */
+  registerUiCard(def: { cardPath: string }): void;
+  registerLocales(bundle: Record<string, Record<string, unknown>>): void;
+}
+
+export interface LoadedPluginInfo {
+  name: string;
+  version: string;
+  enabled: true;
+  /** Served by the core at this URL for the UI to dynamic-import. */
+  cardUrl?: string;
+  locales?: Record<string, Record<string, unknown>>;
+  error?: string;
+}

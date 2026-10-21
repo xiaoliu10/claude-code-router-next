@@ -20,6 +20,9 @@ import { WorkBuddyAuthService } from "../services/workbuddy-auth";
 import { protectWorkBuddyConfig } from "../services/workbuddy";
 import { GeminiOauthAuthService } from "../services/gemini-oauth-auth";
 import { protectGeminiOauthConfig } from "../services/gemini-oauth";
+import { applyPluginConfigProtectors, registerAllPluginRoutes, listLoadedPlugins } from "../provider-plugins/registry";
+import { describeInstalledPlugins, resolvePluginDir } from "../provider-plugins/loader";
+import { HOME_DIR } from "@wengine-ai/claude-code-router-shared";
 import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
 import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
@@ -307,6 +310,10 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     // save must not rewrite its fixed upstream URL, marker api_key or
     // transformer list, nor drop the entry by omission.
     protectGeminiOauthConfig(newConfig, previousConfig);
+
+    // Installed provider plugins protect their own managed entries the same
+    // way (see provider-plugins/types.ts). A protector throws to veto.
+    applyPluginConfigProtectors(newConfig, previousConfig);
 
     await writeConfigFile(newConfig);
     let projectTakeoverSync: Awaited<ReturnType<typeof syncGlobalProjectTakeovers>> | undefined;
@@ -1978,6 +1985,39 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     const manifest = JSON.parse(entry.getData().toString('utf-8')) as ManifestFile;
     return manifestToPresetFile(manifest);
   }
+
+  // ---------------------------------------------------------------------
+  // Provider plugins (docs/design/provider-plugins.md)
+  // ---------------------------------------------------------------------
+
+  // Install manifest for the UI: loaded plugins, their cards and locale bundles.
+  _app.get("/api/plugins", async () => {
+    return { plugins: describeInstalledPlugins(HOME_DIR) };
+  });
+
+  // Serve a plugin's prebuilt UI chunk (card.js). Path-traversal safe: the name
+  // segment is validated and the resolved path must stay inside the plugin dir.
+  _app.get("/plugins/:name/:file", async (req: any, reply: any) => {
+    const { name, file } = req.params as { name: string; file: string };
+    const pluginDir = resolvePluginDir(HOME_DIR, name);
+    if (!pluginDir || !/^[A-Za-z0-9._-]+$/.test(file)) {
+      return reply.status(404).send({ error: "plugin_not_found" });
+    }
+    const target = join(pluginDir, file);
+    if (!target.startsWith(pluginDir) || !existsSync(target) || !statSync(target).isFile()) {
+      return reply.status(404).send({ error: "file_not_found" });
+    }
+    const type = file.endsWith(".js") ? "application/javascript"
+      : file.endsWith(".json") ? "application/json"
+      : file.endsWith(".css") ? "text/css" : "application/octet-stream";
+    reply.header("Content-Type", type);
+    reply.header("Cache-Control", "no-cache");
+    return reply.send(createReadStream(target));
+  });
+
+  // Plugins that registered admin routes during activation hook in here —
+  // after all built-in routes, so /api/<name>/* cannot shadow them.
+  registerAllPluginRoutes(server);
 
   return server;
 }

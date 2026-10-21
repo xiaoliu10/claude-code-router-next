@@ -34,6 +34,9 @@ import { startPinoLogRetention } from "./pino-retention";
 import { startLegacyTokenSpeedCleanup } from "../plugins/output/temp-file-retention";
 import { registerPluginsFromConfig } from "./plugin-registration";
 import { registerAdminRoutes } from "./admin-routes";
+import { setTransformerRuntime } from "../services/transformer";
+import { loadInstalledPlugins } from "../provider-plugins/loader";
+import { listLoadedPlugins } from "../provider-plugins/registry";
 import { registerRequestPipeline, createCcrPreHandlerCallbacks } from "./request-pipeline";
 import { reconcileHealthStore } from "./health-reconcile";
 import { append as appendUsage } from "./usage-store";
@@ -171,6 +174,28 @@ export async function createCcrServer(options: CcrRunOptions = {}) {
   });
   await serverInstance.ready();
   await registerAdminRoutes(serverInstance, config);
+
+  // Provider plugins (docs/design/provider-plugins.md): the transformer
+  // runtime pointer first (plugins may register transformer classes), then
+  // activate installed plugins, then wire their admin routes. A plugin that
+  // fails to load is skipped with a warning — the router keeps working.
+  setTransformerRuntime((serverInstance as any).transformerService);
+  const pluginLoad = await loadInstalledPlugins({
+    configDir: HOME_DIR,
+    log: {
+      info: (msg) => serverInstance.app?.log?.info?.(msg),
+      warn: (msg) => serverInstance.app?.log?.warn?.(msg),
+      error: (msg) => serverInstance.app?.log?.error?.(msg),
+    },
+  });
+  if (pluginLoad.failed.length) {
+    serverInstance.app?.log?.warn?.(
+      `plugins failed to load: ${pluginLoad.failed.map((f) => `${f.name} (${f.error})`).join("; ")}`
+    );
+  }
+  if (listLoadedPlugins().length) {
+    serverInstance.app?.log?.info?.(`provider plugins active: ${listLoadedPlugins().map((p) => `${p.name}@${p.version}`).join(", ")}`);
+  }
 
   // Set up usage recording callback for fallback failures in core
   serverInstance.recordUsage = (data: any) => {

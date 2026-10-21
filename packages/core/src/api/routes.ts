@@ -16,6 +16,7 @@ import {
   getGeminiOauthAuthService,
   isGeminiOauthRuntime,
 } from "../services/gemini-oauth";
+import { getManagedRuntimeFor, pluginErrorFrom } from "../provider-plugins/registry";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -1318,6 +1319,15 @@ async function sendProviderAttempt(
     config.redirect = "error";
     config.dispatcher = getDirectDispatcher();
   }
+
+  // Generic provider-plugin runtime (docs/design/provider-plugins.md): the same
+  // managed-subscription semantics as above, contributed by an installed plugin.
+  const pluginRuntime = getManagedRuntimeFor(provider);
+  if (pluginRuntime) {
+    // Circuit breaker before any network touch — including token refresh.
+    await pluginRuntime.ensureUsable?.();
+    await pluginRuntime.lockUpstream?.(config, provider);
+  }
   const url = config.url || new URL(provider.baseUrl);
 
   // Apply timeout from config
@@ -1354,7 +1364,7 @@ async function sendProviderAttempt(
 
   // Send HTTP request
   // Prepare headers
-  const requestHeaders: Record<string, string> = {
+  let requestHeaders: Record<string, string> = {
     Authorization: `Bearer ${provider.apiKey}`,
     ...(config?.headers || {}),
   };
@@ -1374,6 +1384,10 @@ async function sendProviderAttempt(
     }
     requestHeaders.Authorization = `Bearer ${await geminiOauthService!.getAccessToken()}`;
   }
+  if (pluginRuntime) {
+    // Body is final here: body-derived headers (Codex session-id) work.
+    requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider });
+  }
   stampUpstreamSessionId(requestHeaders, context?.req);
 
   for (const key in requestHeaders) {
@@ -1388,7 +1402,7 @@ async function sendProviderAttempt(
   }
 
   // Debug: log outgoing request to provider
-  if (!workbuddyManaged && !geminiOauthManaged && isDebugLogEnabled(fastify.configService)) {
+  if (!workbuddyManaged && !geminiOauthManaged && !pluginRuntime?.suppressDebugLog && isDebugLogEnabled(fastify.configService)) {
     logProviderRequest(fastify.log, context.req.id, {
       url: String(url),
       headers: requestHeaders,
@@ -1403,10 +1417,10 @@ async function sendProviderAttempt(
     {
       ...config,
       headers: JSON.parse(JSON.stringify(requestHeaders)),
-      httpsProxy: workbuddyManaged || geminiOauthManaged ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
+      httpsProxy: workbuddyManaged || geminiOauthManaged || pluginRuntime ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
     },
     context,
-    workbuddyManaged || geminiOauthManaged ? undefined : fastify.log
+    workbuddyManaged || geminiOauthManaged || pluginRuntime ? undefined : fastify.log
   );
   try {
     response = await dispatchUpstream();
@@ -1440,6 +1454,20 @@ async function sendProviderAttempt(
     if (response.status === 401) (context.req as any).__retryAttempted = true;
   }
 
+  // Provider-plugin 401 handling: one forced refresh + one re-dispatch, same
+  // discipline as the gemini branch below. A second 401 is terminal.
+  if (!response.ok && pluginRuntime?.authRefresh && response.status === 401 && !(context.req as any)?.__plugin401Retried) {
+    (context.req as any).__plugin401Retried = true;
+    try {
+      await pluginRuntime.authRefresh.forceRefresh();
+      requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider });
+      response = await dispatchUpstream();
+    } catch {
+      // Refresh failed: fall through to classification of the original 401.
+    }
+    if (response.status === 401) (context.req as any).__retryAttempted = true;
+  }
+
   // Handle request errors
   if (!response.ok) {
     const errorText = await response.text();
@@ -1447,6 +1475,18 @@ async function sendProviderAttempt(
     // BEFORE any log or client-facing error is built. A raw WorkBuddy envelope
     // must never reach the log stream, and a WorkBuddy access token must never
     // be recoverable from an error message.
+    // Installed plugin runtimes classify first: the taxonomy belongs to the
+    // plugin, the core only turns it into a thrown error.
+    if (pluginRuntime?.classifyError) {
+      const info = pluginRuntime.classifyError(response.status, errorText, geminiSystemText(requestBody));
+      if (info) {
+        await pluginRuntime.noteUpstreamError?.(info)?.catch(() => undefined);
+        fastify.log.error(
+          `[provider_response_error] Plugin(${pluginRuntime.name}) provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
+        );
+        throw pluginErrorFrom(pluginRuntime.name, info);
+      }
+    }
     if (isWorkBuddyRuntime(provider)) {
       const wbError = classifyWorkBuddyError(response.status, errorText);
       fastify.log.error(
