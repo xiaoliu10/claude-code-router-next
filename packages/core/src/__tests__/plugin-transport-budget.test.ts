@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Server from "../server";
-import { clearPluginRegistry, makePluginContext } from "../provider-plugins/registry";
+import type { PluginRegistry } from "../provider-plugins/registry";
 import { getHealthStore } from "../services/provider-health";
 import type { ManagedRuntime } from "../provider-plugins/types";
 import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "../api/plugin-request-state";
@@ -28,10 +28,13 @@ async function host(rt: ManagedRuntime, fallback = false) {
     ], Router: { enableFallback: fallback }, fallback: { default: ["sub,m", "sub,other"] },
   } });
   closed.push(server); await server.ready();
-  makePluginContext({ name: "fake", version: "1.0.0", coreApi: "1" }, log, {
+  const host = {
     configDir: "/unused-synthetic", readConfig: async () => ({}), writeConfig: async () => {},
     reloadRuntime: async () => {}, getDirectDispatcher: () => undefined,
-  }).registerManagedRuntime(rt);
+  };
+  const tx = server.pluginRegistry.beginActivation({ name: "fake", version: "1.0.0", coreApi: "1" }, log, host as any);
+  tx.context.registerManagedRuntime(rt);
+  await tx.commit();
   await server.registerNamespace("/");
   return server;
 }
@@ -39,12 +42,12 @@ const send = (server: Server, model: string) => server.app.inject({ method: "POS
   model, stream: false, messages: [{ role: "user", content: "hello" }],
 } });
 beforeEach(() => {
-  clearPluginRegistry(); getHealthStore().clear(); logs.length = 0;
+  getHealthStore().clear(); logs.length = 0;
   vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("network must be mocked"); }));
 });
 afterEach(async () => {
   for (const s of closed.splice(0)) await s.app.close();
-  clearPluginRegistry(); getHealthStore().clear(); vi.unstubAllGlobals(); vi.restoreAllMocks();
+  getHealthStore().clear(); vi.unstubAllGlobals(); vi.restoreAllMocks();
 });
 
 describe("plugin response confidentiality and request-wide account budget", () => {

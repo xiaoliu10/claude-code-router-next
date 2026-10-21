@@ -8,7 +8,7 @@ import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl, workBuddySiteFromProvider, workBuddyFailoverCooldown, workBuddyPoolExhaustedError, workBuddyEnvelopeIsError } from "../services/workbuddy";
-import { type PluginRegistry, pluginErrorFrom, getManagedRuntimeFor } from "../provider-plugins/registry";
+import { type PluginRegistry, pluginErrorFrom } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "./plugin-request-state";
 import { pluginResponseError } from "./plugin-response-error";
 import {
@@ -399,7 +399,7 @@ async function handleTransformerEndpoint(
     // often resolve on a second attempt, avoiding unnecessary model switches.
     // WorkBuddy pool/terminal errors already exhausted their bounded account
     // budget; generic transient errors (5xx/empty stream/network) keep one retry.
-    const terminalPluginFailure = rememberPluginFailure(req, getManagedRuntimeFor(provider), error);
+    const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error);
     if (!terminalPluginFailure && !(req as any).__retryAttempted && error?.code !== "workbuddy_reauth" && !isTerminalWorkBuddyError(error)) {
       (req as any).__retryAttempted = true;
       try {
@@ -736,7 +736,7 @@ async function handleFallback(
         continue;
       }
 
-      const fallbackRuntime = getManagedRuntimeFor(configuredFallback.provider);
+      const fallbackRuntime = fastify.pluginRegistry.getManagedRuntimeFor(configuredFallback.provider);
       if (fallbackRuntime && pluginAttemptBudget(req, fallbackRuntime).terminalError) continue;
       let fallbackError: any;
       for (let attempt = 1; attempt <= 2; attempt++) {
@@ -904,7 +904,7 @@ async function processRequestTransformers(
       !isWorkBuddyRuntime(provider) && !context.pluginRegistry.getManagedRuntimeFor(provider)) {
     throw createApiError("Provider plugin missing or disabled; install and enable its provider plugin.", 503, "plugin_missing");
   }
-  const runtime = getManagedRuntimeFor(provider);
+  const runtime = context.pluginRegistry.getManagedRuntimeFor(provider);
   if (runtime) {
     const terminal = pluginAttemptBudget(context.req, runtime).terminalError;
     if (terminal) throw terminal;
