@@ -129,9 +129,35 @@ export class GeminiOauthTransformer implements Transformer {
     context?: TransformerContext
   ): Promise<Record<string, any>> {
     const service = this.resolveAuthService();
+    // Check before refreshing credentials: the route's later send guard alone
+    // cannot stop a token-endpoint request initiated by this transformer.
+    if (await service.isAccountCooling?.()) {
+      throw geminiOauthError({
+        code: "gemini_oauth_account_cooling",
+        message: "Gemini OAuth 账号处于冷却期（配额/验证/风控拦截），请稍后再试或重新授权。",
+        httpStatus: 429,
+        retryable: false,
+      });
+    }
+    // The shared API-key Gemini builder flattens system messages into user
+    // turns. Antigravity needs the original system instruction structurally
+    // separate, both for its semantics and the system-only identity classifier.
+    // Move text without rewriting it; never scan user turns for identity words.
+    const systemText = request.messages
+      .filter((message) => message.role === "system")
+      .map((message) => typeof message.content === "string"
+        ? message.content
+        : Array.isArray(message.content)
+          ? message.content.filter((part) => part.type === "text").map((part: any) => part.text ?? "").join("\n")
+          : "")
+      .join("\n");
+    const geminiBody = buildRequestBody({
+      ...request,
+      messages: request.messages.filter((message) => message.role !== "system"),
+    });
+    if (systemText) geminiBody.systemInstruction = { parts: [{ text: systemText }] };
     const [token, project] = await Promise.all([service.getAccessToken(), service.getProject()]);
 
-    const geminiBody = buildRequestBody(request);
     applyAntigravityQuirks(geminiBody, request.model, (request as any)?.max_tokens);
     // The provider's model list holds collapsed family ids (gemini-3.7-flash);
     // the wire wants a concrete variant (gemini-3.7-flash-high). resolveWireModel
