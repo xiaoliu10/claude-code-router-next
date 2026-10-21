@@ -82,7 +82,7 @@ describe("provider plugin loader & registry", () => {
 
   it("loads an installed plugin: runtime, protector, routes, card and locales", async () => {
     writePlugin(configDir, "fake-sub");
-    const result = await loadInstalledPlugins({ configDir, log });
+    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ configService: { reload() {}, set() {}, get() { return true; } } }) });
     expect(result.loaded).toEqual(["fake-sub"]);
     expect(listLoadedPlugins()).toHaveLength(1);
 
@@ -110,7 +110,7 @@ describe("provider plugin loader & registry", () => {
       { name: "fake-sub", enabled: false },
       { name: "ghost", enabled: true },
     ]));
-    const result = await loadInstalledPlugins({ configDir, log });
+    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ configService: { reload() {}, set() {}, get() { return true; } } }) });
     expect(result.loaded).toEqual([]);
     expect(result.skipped.map((s) => s.name)).toEqual(["fake-sub"]);
     expect(result.failed).toEqual([{ name: "ghost", error: "plugin.json missing or malformed" }]);
@@ -119,7 +119,7 @@ describe("provider plugin loader & registry", () => {
 
   it("rejects incompatible coreApi majors", async () => {
     writePlugin(configDir, "fake-sub", { coreApi: "2" });
-    const result = await loadInstalledPlugins({ configDir, log });
+    const result = await loadInstalledPlugins({ configDir, log, getServer: () => ({ configService: { reload() {}, set() {}, get() { return true; } } }) });
     expect(result.loaded).toEqual([]);
     expect(result.failed[0].error).toContain("incompatible");
   });
@@ -133,7 +133,7 @@ describe("provider plugin loader & registry", () => {
 
   it("registerAllPluginRoutes is a no-op-safe loop over activated routes", async () => {
     writePlugin(configDir, "fake-sub");
-    await loadInstalledPlugins({ configDir, log });
+    await loadInstalledPlugins({ configDir, log, getServer: () => undefined });
     const registered: string[] = [];
     const fakeApp = { get: (path: string) => registered.push(path) } as any;
     registerAllPluginRoutes(fakeApp);

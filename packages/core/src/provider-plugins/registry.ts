@@ -4,6 +4,7 @@ import type {
   ManagedRuntime,
   PluginClassifiedError,
   PluginContext,
+  PluginHostCapabilities,
   PluginManifest,
 } from "./types";
 import { PLUGIN_CORE_API } from "./types";
@@ -73,7 +74,8 @@ export function getPluginDirectoryBasename(name: string): string | undefined {
 /** Build the activation context handed to one plugin. */
 export function makePluginContext(
   manifest: PluginManifest,
-  log: { info(msg: string): void; warn(msg: string): void; error(msg: string): void }
+  log: { info(msg: string): void; warn(msg: string): void; error(msg: string): void },
+  host: PluginHostCapabilities
 ): PluginContext {
   const registered: RegisteredPlugin = {
     manifest,
@@ -92,6 +94,7 @@ export function makePluginContext(
   return {
     manifest,
     log,
+    host,
     registerTransformer(cls) {
       guard("registerTransformer", () => {
         // Imported lazily to avoid a static cycle with the transformer registry.

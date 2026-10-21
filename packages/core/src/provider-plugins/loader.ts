@@ -4,6 +4,9 @@ import { pathToFileURL } from "url";
 import type { PluginManifest } from "./types";
 import { PLUGIN_CORE_API } from "./types";
 import { listLoadedPlugins, makePluginContext } from "./registry";
+import { reloadProviderRuntime } from "./host";
+import { readConfigFile, writeConfigFile } from "../ccr/config";
+import { getDirectDispatcher } from "@/services/proxy";
 
 /**
  * Plugin discovery and activation.
@@ -72,8 +75,17 @@ export function resolvePluginDir(configDir: string, name: string): string | null
 export async function loadInstalledPlugins(deps: {
   configDir: string;
   log: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
+  getServer: () => any;
 }): Promise<PluginLoadResult> {
   const { configDir, log } = deps;
+  const host = {
+    configDir,
+    readConfig: () => readConfigFile(),
+    writeConfig: (next: any) => writeConfigFile(next),
+    reloadRuntime: async (config?: any) =>
+      reloadProviderRuntime(deps.getServer(), config ?? (await readConfigFile()), log),
+    getDirectDispatcher,
+  };
   const result: PluginLoadResult = { loaded: [], failed: [], skipped: [] };
   const records = readInstallRecords(configDir);
 
@@ -105,7 +117,7 @@ export async function loadInstalledPlugins(deps: {
       info: (msg) => log.info(`[plugin:${manifest.name}] ${msg}`),
       warn: (msg) => log.warn(`[plugin:${manifest.name}] ${msg}`),
       error: (msg) => log.error(`[plugin:${manifest.name}] ${msg}`),
-    });
+    }, host);
 
     try {
       const entry = join(pluginDir, "plugin.js");

@@ -77,6 +77,22 @@ export interface ManagedRuntime {
   suppressDebugLog?: boolean;
 }
 
+/**
+ * Host capabilities handed to a plugin at activation. Plugins must use THESE
+ * for anything stateful (config reads/writes, runtime reload, directories) —
+ * bundling a copy of a core module would fork its in-process state.
+ */
+export interface PluginHostCapabilities {
+  /** CCR config dir ($CCR_CONFIG_DIR), for the plugin's private credential file. */
+  configDir: string;
+  readConfig(): Promise<any>;
+  writeConfig(next: any): Promise<void>;
+  /** Re-resolve providers/transformers after a config write (server reload). */
+  reloadRuntime(): Promise<void>;
+  /** undici Agent that bypasses CCR/proxy env routing (for fixed subscription origins). */
+  getDirectDispatcher(): unknown;
+}
+
 export interface PluginContext {
   readonly manifest: PluginManifest;
   readonly log: {
@@ -84,6 +100,7 @@ export interface PluginContext {
     warn(msg: string): void;
     error(msg: string): void;
   };
+  readonly host: PluginHostCapabilities;
   registerTransformer(cls: new () => any): void;
   registerManagedRuntime(rt: ManagedRuntime): void;
   registerAdminRoutes(fn: (app: FastifyInstance) => void): void;
