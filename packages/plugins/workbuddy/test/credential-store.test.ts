@@ -251,7 +251,7 @@ describe("WorkBuddy per-site managed provider markers (contract §16)", () => {
   it("recognizes both runtimes by name/marker and derives site from name/url", () => {
     expect(isWorkBuddyRuntime({ name: "workbuddy", apiKey: WORKBUDDY_API_KEY })).toBe(true);
     expect(isWorkBuddyRuntime({ name: "workbuddy-ai", apiKey: WORKBUDDY_AI_API_KEY })).toBe(true);
-    expect(isWorkBuddyRuntime({ name: "workbuddy-ai", workbuddyManaged: true })).toBe(true);
+    expect(isWorkBuddyRuntime({ name: "workbuddy-ai", pluginManaged: true })).toBe(true);
     expect(isWorkBuddyRuntime({ name: "workbuddy", apiKey: "real-user-key" })).toBe(false);
     // A hand-edited cross-marker pair is still treated as managed (name decides the site);
     // lockWorkBuddyProvider always writes consistent pairs, so this only widens the

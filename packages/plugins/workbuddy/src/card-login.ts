@@ -1,7 +1,7 @@
 /**
  * Card-local copy of the sequential browser-login helper, MOVED VERBATIM from
  * the former `packages/ui/src/utils/workbuddy-login.ts` (see card-shared.ts
- * for the dual-run drift pin).
+ * for the migration origin).
  */
 import type { WorkBuddyKind, WorkBuddyLoginPollResponse, WorkBuddyLoginStartResponse, WorkBuddyMutationResponse } from "./card-types";
 

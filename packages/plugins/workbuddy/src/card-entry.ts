@@ -19,7 +19,7 @@ import type {
   WorkBuddyAccountSummary, WorkBuddyKind, WorkBuddyLoginStartResponse,
   WorkBuddyMutationResponse, WorkBuddySiteStatus, WorkBuddyStatusResponse, WorkBuddyUsage,
 } from "./card-types";
-import { createWorkBuddyLogin } from "./card-login";
+import { createWorkBuddyLogin, WORKBUDDY_POLL_TIMEOUT } from "./card-login";
 import {
   formatWorkBuddyClock, isWorkBuddyConnected, labelWorkBuddyRouterPath, maskWorkBuddyUid,
   mergeWorkBuddyHiddenRefs, mergeWorkBuddyProvider, parseWorkBuddyUsage,
@@ -188,7 +188,17 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       if (kind === "login") {
         const session = createWorkBuddyLogin({
           startWorkBuddyLogin: async (s) => post<WorkBuddyLoginStartResponse>("/login/start", { site: s }),
-          pollWorkBuddyLogin: async (s, loginId, signal) => post<any>("/login/poll", { site: s, loginId }, signal),
+          pollWorkBuddyLogin: async (s, loginId, signal) => {
+            try { return await post<any>("/login/poll", { site: s, loginId }, signal); }
+            catch (error: any) {
+              // Timeout classification is generic in the host; the plugin owns
+              // its sequential-login retry sentinel. Cancellation never retries.
+              if (!signal.aborted && error?.timedOut === true) {
+                throw Object.assign(new Error("Login poll timed out"), { reason: WORKBUDDY_POLL_TIMEOUT });
+              }
+              throw error;
+            }
+          },
           cancelWorkBuddyLogin: async (s, loginId) => post<{ success: boolean }>("/login/cancel", { site: s, loginId }),
         }, site, value => {
           if (!alive || generation !== id) { void session.cancel().catch(() => {}); return; }

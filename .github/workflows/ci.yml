@@ -33,3 +33,14 @@ jobs:
 
       - name: Build all packages
         run: pnpm build
+
+      - name: Verify WorkBuddy provider plugin (including npm artifact and real loader)
+        env:
+          CI: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          sandbox="$(mktemp -d "${RUNNER_TEMP}/ccr-workbuddy.XXXXXX")"
+          mkdir -p "$sandbox/home" "$sandbox/tmp"
+          export HOME="$sandbox/home" CCR_CONFIG_DIR="$sandbox/home" TMPDIR="$sandbox/tmp"
+          pnpm --filter @wengine-ai/ccr-provider-workbuddy verify

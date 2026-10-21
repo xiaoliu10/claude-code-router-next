@@ -414,3 +414,41 @@ test("pluginLocaleOf stays in sync with the controller locale contract", () => {
   assert.equal(pluginLocaleOf("zh-CN"), "zh");
   assert.equal(pluginLocaleOf("en-US"), "en");
 });
+
+// Generic capabilities formerly covered only by one built-in provider's API.
+test("provider management lease excludes full-config writes in both directions", async () => {
+  const client = new ApiClient("/api"); const original = globalThis.fetch;
+  let finish!: (response: Response) => void;
+  globalThis.fetch = (() => new Promise<Response>(resolve => { finish = resolve; })) as typeof fetch;
+  try {
+    const release = client.acquireProviderManagement(); assert.ok(release);
+    assert.equal(client.acquireProviderManagement(), null);
+    assert.deepEqual(await client.updateConfig({} as never), { success: false });
+    release();
+    const pending = client.updateConfig({} as never);
+    assert.equal(client.acquireProviderManagement(), null);
+    finish(new Response('{"success":true}')); await pending;
+    const next = client.acquireProviderManagement(); assert.ok(next); next();
+  } finally { globalThis.fetch = original; }
+});
+
+test("plugin API sends authenticated exact bodies and carries only sanitized local timeout classification", async () => {
+  const client = new ApiClient("/api", "mock-key"); const original = globalThis.fetch;
+  const controller = new AbortController(); let sent: RequestInit | undefined;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    assert.equal(url, "/api/synthetic/login/poll"); sent = init;
+    assert.equal((init?.headers as Record<string, string>)["X-API-Key"], "mock-key");
+    assert.equal(init?.body, '{"loginId":"job"}');
+    throw new DOMException("private-error-marker", "TimeoutError");
+  }) as typeof fetch;
+  try {
+    await assert.rejects(client.callPluginApi("synthetic", "/login/poll", {
+      method: "POST", body: '{"loginId":"job"}', signal: controller.signal, timeoutMs: 10000,
+    }), error => {
+      assert.equal((error as any).timedOut, true); assert.equal((error as any).reason, "request_failed");
+      assert.doesNotMatch(String(error), /private-error-marker/); return true;
+    });
+    assert.notEqual(sent?.signal, controller.signal); // timeout + caller signal
+    controller.abort(); assert.equal(sent?.signal?.aborted, true);
+  } finally { globalThis.fetch = original; }
+});

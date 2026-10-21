@@ -1,7 +1,6 @@
-import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyAccountRemoveRequest, WorkBuddyAccountSwitchRequest, WorkBuddyLoginStartResponse, WorkBuddyLoginPollResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyModelHideRequest, WorkBuddyModelHideResponse, WorkBuddyModelRestoreRequest, WorkBuddyModelRestoreResponse, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageRequest, WorkBuddyUsageResponse } from '@/types';
+import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse } from '@/types';
 import type { GeminiOauthDisconnectResponse, GeminiOauthLoginPollResponse, GeminiOauthLoginStartResponse, GeminiOauthStatusResponse, GeminiOauthSyncResponse, PluginInfo } from '@/types';
 import { isSameOriginCardUrl, sanitizePluginErrorCode } from '../utils/plugin-card.ts';
-import { WORKBUDDY_POLL_TIMEOUT } from '../utils/workbuddy-login.ts';
 
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
@@ -9,14 +8,14 @@ class ApiClient {
   private apiKey: string;
   private tempApiKey: string | null;
   private configWrites = 0;
-  private workBuddyManagementBusy = false;
+  private managedProviderBusy = false;
 
   // Shared with top-level Save: a stale full-config write must not race a
   // managed import/disconnect, including the subsequent config reconciliation.
-  acquireWorkBuddyManagement(): (() => void) | null {
-    if (this.workBuddyManagementBusy || this.configWrites > 0) return null;
-    this.workBuddyManagementBusy = true;
-    return () => { this.workBuddyManagementBusy = false; };
+  acquireProviderManagement(): (() => void) | null {
+    if (this.managedProviderBusy || this.configWrites > 0) return null;
+    this.managedProviderBusy = true;
+    return () => { this.managedProviderBusy = false; };
   }
 
   constructor(baseUrl: string = '/api', apiKey: string = '') {
@@ -73,10 +72,8 @@ class ApiClient {
   // milliseconds so a hung server can't leave the caller pending forever.
   private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number; plugin?: string } = {}): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
-    const isWorkBuddy = endpoint.startsWith('/workbuddy/');
     const pluginName = (options as any).plugin as string | undefined;
     const isPluginApi = typeof pluginName === 'string' && pluginName.length > 0;
-    const isManagedSubscription = isWorkBuddy;
     const { timeoutMs, plugin: _plugin, ...rest } = options;
 
     const config: RequestInit = {
@@ -87,8 +84,9 @@ class ApiClient {
       },
     };
 
-    if (timeoutMs && config.signal === undefined) {
-      config.signal = AbortSignal.timeout(timeoutMs);
+    if (timeoutMs) {
+      const timeout = AbortSignal.timeout(timeoutMs);
+      config.signal = config.signal ? AbortSignal.any([config.signal, timeout]) : timeout;
     }
 
     try {
@@ -104,7 +102,6 @@ class ApiClient {
         window.dispatchEvent(new CustomEvent('unauthorized'));
         // Return a promise that never resolves to prevent further execution
         if (isPluginApi) throw Object.assign(new Error('Plugin request failed'), { reason: 'request_failed', plugin: pluginName });
-        if (isWorkBuddy) throw Object.assign(new Error('workbuddy_unauthorized'), { reason: 'workbuddy_unauthorized' });
         return new Promise(() => {}) as Promise<T>;
       }
 
@@ -119,23 +116,6 @@ class ApiClient {
           if (candidate) code = candidate;
         } catch { /* use the safe default */ }
         throw Object.assign(new Error(`Plugin ${pluginName} request failed`), { reason: code, plugin: pluginName });
-      }
-
-      if (!response.ok && isWorkBuddy) {
-        // Retain only known codes. Raw server/upstream messages must never enter
-        // the browser's error object, console, toast or component state.
-        const allowed = ['sealed', 'source_missing', 'source_invalid', 'models_fetch_failed',
-          'workbuddy_name_conflict', 'workbuddy_not_connected',
-          'workbuddy_unauthorized', 'login_state_rejected', 'login_account_failed', 'login_persist_failed',
-          'workbuddy_account_not_found', 'workbuddy_model_invalid',
-          'workbuddy_config_write_failed', 'workbuddy_login_busy'];
-        let code = 'request_failed';
-        try {
-          const data = await response.json();
-          const candidate = data.reason || data.error;
-          if (allowed.includes(candidate)) code = candidate;
-        } catch { /* use the safe default */ }
-        throw Object.assign(new Error('WorkBuddy request failed'), { reason: code });
       }
 
       if (!response.ok) {
@@ -160,24 +140,13 @@ class ApiClient {
       return text ? JSON.parse(text) : ({} as T);
 
     } catch (error) {
-      if (isManagedSubscription) {
-        // Network / JSON exceptions can include unsafe text too.
-        // A local request timeout is NOT a server verdict: tag it so the
-        // sequential login helper can retry within its deadline. The thrown
-        // value stays fully sanitized either way — the original DOMException
-        // text never leaves this boundary.
-        const reason = error instanceof DOMException && error.name === 'TimeoutError'
-          ? (isWorkBuddy ? WORKBUDDY_POLL_TIMEOUT : 'request_failed')
-          : error && typeof error === 'object' && 'reason' in error && typeof error.reason === 'string'
-            ? error.reason : 'request_failed';
-        throw Object.assign(new Error('WorkBuddy request failed'), { reason });
-      }
       if (isPluginApi) {
         const reason = error instanceof DOMException && error.name === 'TimeoutError'
           ? 'request_failed'
           : error && typeof error === 'object' && 'reason' in error && typeof error.reason === 'string'
             ? error.reason : 'request_failed';
-        throw Object.assign(new Error(`Plugin ${pluginName} request failed`), { reason, plugin: pluginName });
+        throw Object.assign(new Error(`Plugin ${pluginName} request failed`), { reason, plugin: pluginName,
+          timedOut: error instanceof DOMException && error.name === 'TimeoutError' });
       }
       console.error('API request error:', error);
       throw error;
@@ -282,7 +251,7 @@ class ApiClient {
 
   // Update entire configuration
   async updateConfig(config: Config): Promise<{ success: boolean; message?: string }> {
-    if (this.workBuddyManagementBusy) return { success: false };
+    if (this.managedProviderBusy) return { success: false };
     this.configWrites += 1;
     try {
       return await this.post<{ success: boolean; message?: string }>('/config', config);
@@ -508,95 +477,6 @@ class ApiClient {
       '/providers/quota',
       ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
     );
-  }
-
-  // ========== WorkBuddy built-in provider API methods ==========
-
-  // Management reads are local (no upstream call): the status endpoint only
-  // reports the saved provider + credential file summary. It must never read
-  // the WorkBuddy desktop login file — only an explicit import does that once.
-  getWorkBuddyStatus(): Promise<WorkBuddyStatusResponse> {
-    return this.get<WorkBuddyStatusResponse>(
-      '/workbuddy/status',
-      ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
-    );
-  }
-
-  // Explicit user action: read the fixed local login file of the explicitly
-  // selected site once (the selector makes the international site work even
-  // when both desktop files exist), register the managed provider and run
-  // model discovery. Never auto-invoked. Later near-expiry inference may do
-  // one bounded same-site/same-account desktop re-read in memory. CCR never
-  // stores a credential-refresh secret or calls a credential-refresh API.
-  // Generous timeout: this performs an upstream config fetch.
-  importWorkBuddy(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
-    const body: WorkBuddyImportRequest = { site };
-    return this.post<WorkBuddyMutationResponse>('/workbuddy/import', body, 60_000);
-  }
-
-  startWorkBuddyLogin(site: WorkBuddyKind): Promise<WorkBuddyLoginStartResponse> {
-    return this.post('/workbuddy/login/start', { site }, 30_000);
-  }
-
-  pollWorkBuddyLogin(site: WorkBuddyKind, loginId: string, signal: AbortSignal): Promise<WorkBuddyLoginPollResponse> {
-    return this.apiFetch('/workbuddy/login/poll', {
-      method: 'POST', body: JSON.stringify({ site, loginId }),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
-    });
-  }
-
-  cancelWorkBuddyLogin(site: WorkBuddyKind, loginId: string): Promise<{ success: boolean }> {
-    return this.post('/workbuddy/login/cancel', { site, loginId }, 30_000);
-  }
-
-  // §16 per-site pool management. Every body carries the site; CN and the
-  // international site are fully independent pools and never conflict.
-  syncWorkBuddyModels(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
-    return this.post<WorkBuddyMutationResponse>('/workbuddy/sync', { site }, 60_000);
-  }
-
-  // Disconnects the WHOLE site (its provider + account pool). Router
-  // references are preserved server-side (§14 semantics).
-  disconnectWorkBuddy(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
-    return this.post<WorkBuddyMutationResponse>('/workbuddy/disconnect', { site }, 30_000);
-  }
-
-  switchWorkBuddyAccount(site: WorkBuddyKind, uid: string): Promise<WorkBuddyMutationResponse> {
-    const body: WorkBuddyAccountSwitchRequest = { site, uid };
-    return this.post<WorkBuddyMutationResponse>('/workbuddy/account/switch', body, 30_000);
-  }
-
-  // Removing the last account disconnects the site server-side (§16).
-  removeWorkBuddyAccount(site: WorkBuddyKind, uid: string): Promise<WorkBuddyMutationResponse> {
-    const body: WorkBuddyAccountRemoveRequest = { site, uid };
-    return this.post<WorkBuddyMutationResponse>('/workbuddy/account/remove', body, 30_000);
-  }
-
-  // Explicit user action only: read subscription credits once for the site
-  // (uid defaults to the active account server-side). Never polled
-  // automatically. Failures are non-critical and quietly hide the display in
-  // the component — no raw quota errors are surfaced.
-  getWorkBuddyUsage(site: WorkBuddyKind, uid?: string): Promise<WorkBuddyUsageResponse> {
-    const body: WorkBuddyUsageRequest = uid ? { site, uid } : { site };
-    return this.post<WorkBuddyUsageResponse>(
-      '/workbuddy/usage',
-      body,
-      ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
-    );
-  }
-
-  // §16: hiding a model removes it from the managed provider, keeps it hidden
-  // across sync/re-login, and lets the server clear Router references that
-  // point at it. The cleared references come back for a UI toast.
-  hideWorkBuddyModel(site: WorkBuddyKind, model: string): Promise<WorkBuddyModelHideResponse> {
-    const body: WorkBuddyModelHideRequest = { site, model };
-    return this.post<WorkBuddyModelHideResponse>('/workbuddy/models/hide', body, 30_000);
-  }
-
-  // Restoring never rewrites Router references (§16); model omitted = all.
-  restoreWorkBuddyModel(site: WorkBuddyKind, model?: string): Promise<WorkBuddyModelRestoreResponse> {
-    const body: WorkBuddyModelRestoreRequest = model ? { site, model } : { site };
-    return this.post<WorkBuddyModelRestoreResponse>('/workbuddy/models/restore', body, 30_000);
   }
 
   // ========== Gemini subscription (Antigravity OAuth) provider API methods ==========

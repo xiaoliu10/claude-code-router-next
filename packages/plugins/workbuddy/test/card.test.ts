@@ -58,7 +58,7 @@ function harness(overrides: Record<string, any> = {}, disabled = false, heldLeas
     if (path === "/sync") return { success: true, status: "connected", models: ["glm-5.3", "kimi-k3-1"], modelCount: 2 };
     return { ok: true, success: true };
   });
-  // Mirrors ApiClient.acquireWorkBuddyManagement: null while a managed action
+  // Mirrors ApiClient.acquireProviderManagement: null while a managed action
   // or config write holds the shared lease; the release is a spy.
   let lock = false;
   const release = vi.fn(() => { lock = false; });
@@ -136,6 +136,31 @@ describe("self-contained WorkBuddy plugin card", () => {
     expect(h.host.text()).toContain(en.cleared_refs.replace("{{refs}}", "Default route"));
   });
 
+  it("switch and remove send exact per-site uid bodies and reconcile after successful routes", async () => {
+    const uid = "backup-123456789";
+    const h = harness({ "/status": { sites: { workbuddy: siteStatus({ accounts: [
+      { uid, source: "desktop", active: false, displayName: "Backup" },
+    ] }) } } });
+    await tick();
+    h.host.card("workbuddy").click(en.set_active); await tick();
+    expect(h.callApi.mock.calls.some(([path, init]) => path === "/account/switch" && init.method === "POST" && init.body === JSON.stringify({ site: "workbuddy", uid }))).toBe(true);
+    expect(h.refreshConfig).toHaveBeenCalled();
+    h.host.card("workbuddy").click(en.remove);
+    expect(h.host.text()).toContain(en.account_remove_warning);
+    h.host.click(en.account_remove_confirm); await tick();
+    expect(h.callApi.mock.calls.some(([path, init]) => path === "/account/remove" && init.body === JSON.stringify({ site: "workbuddy", uid }))).toBe(true);
+  });
+  it("hidden models restore singly or all with exact site bodies, never Router adoption", async () => {
+    const h = harness({ "/status": { sites: { workbuddy: siteStatus({ hiddenModels: ["hidden"] }) } } });
+    await tick();
+    h.host.card("workbuddy").click(en.restore); await tick();
+    h.host.card("workbuddy").click(en.restore_all); await tick();
+    expect(h.callApi.mock.calls.filter(([path]) => path === "/models/restore").map(([, init]) => JSON.parse(init.body)))
+      .toEqual([{ site: "workbuddy", model: "hidden" }, { site: "workbuddy" }]);
+    const merge = h.refreshConfig.mock.calls.at(-1)![0];
+    const router = { default: "local,draft" };
+    expect(merge({ Providers: [], Router: router }, { Providers: [], Router: { default: "server,different" } }).Router).toBe(router);
+  });
   it("credits are an explicit per-account read whose failure hides the line", async () => {
     const h = harness({ "/usage": { usage: { plan: "Pro", used: 1, limit: 10, unit: "credits" } } });
     await tick();
@@ -166,6 +191,23 @@ describe("self-contained WorkBuddy plugin card", () => {
     expect(h.callApi.mock.calls.some(([path]) => path === "/login/cancel")).toBe(true);
   });
 
+  it("local host poll timeouts retry within the authorization deadline, never expose raw text", async () => {
+    vi.useFakeTimers();
+    try {
+      let polls = 0;
+      const h = harness({ "/login/poll": () => {
+        if (++polls === 1) throw Object.assign(new Error("private-marker"), { timedOut: true });
+        return { status: "connected", success: true, models: ["m"], accountCount: 2, accountChange: "added" };
+      } });
+      await tick();
+      h.host.card("workbuddy").button(en.add_account).onclick!();
+      await tick();
+      expect(polls).toBe(1); expect(h.host.text()).not.toContain("private-marker");
+      await vi.advanceTimersByTimeAsync(1200); await tick();
+      expect(polls).toBe(2);
+      expect(h.host.text()).toContain(en.account_added.replace("{{count}}", "2"));
+    } finally { vi.useRealTimers(); }
+  });
   it("a connected login settles with the committed-upsert outcome message", async () => {
     const h = harness({
       "/login/start": { ok: true, site: "workbuddy-ai", loginId: "b".repeat(48), url: "https://www.workbuddy.ai/login", expiresAt: Date.now() + 60_000 },

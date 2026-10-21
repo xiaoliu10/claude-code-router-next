@@ -52,6 +52,13 @@ import {
   type WorkBuddyCredential,
 } from "./protocol";
 
+/** Exactly the former core terminal-code list; generic host semantics consume
+ * pluginClassified + nonRetryable, never provider-specific field names. */
+export const WORKBUDDY_TERMINAL_CODES = new Set([
+  "workbuddy_reauth", "workbuddy_protocol_error", "workbuddy_model_hidden",
+  "workbuddy_not_connected", "rate_limit", "insufficient_quota", "workbuddy_account_restricted",
+]);
+
 /** Numeric upstream codes behind the classified classes that permit rotation. */
 export const WORKBUDDY_ROTATE_CLASS_CODES = {
   insufficientQuota: 14018,
@@ -307,7 +314,7 @@ export function createWorkBuddyManagedRuntime(options: WorkBuddyRuntimeOptions):
       // generic same-model retry and fallback chains. Unmapped upstream codes,
       // permission and request-shape classes keep the generic one-shot retry,
       // exactly like the inline branch did.
-      const terminal = ["rate_limit", "insufficient_quota", "workbuddy_account_restricted", "workbuddy_protocol_error"].includes(error.code);
+      const terminal = WORKBUDDY_TERMINAL_CODES.has(error.code);
       return {
         code: error.code,
         // The core replaces the message with its fixed safe client text; the
@@ -362,6 +369,12 @@ export function createWorkBuddyManagedRuntime(options: WorkBuddyRuntimeOptions):
           const response = await attempt();
           return await inspectWorkBuddySse(response);
         } catch (error: any) {
+          // SSE inspection throws the protocol surface directly (outside the
+          // core classifier); attach the SAME generic terminal semantics.
+          if (error?.workbuddy === true && !error.pluginClassified) {
+            withManagedMarkers(error);
+            error.nonRetryable = WORKBUDDY_TERMINAL_CODES.has(error.code);
+          }
           await probeEdgeReset(error, credential, requestBody);
           const cooldown = workBuddyFailoverCooldownFromInfo(error, model);
           if (!cooldown) {
@@ -402,6 +415,10 @@ export function createWorkBuddyManagedRuntime(options: WorkBuddyRuntimeOptions):
               const response = await attempt();
               return await inspectWorkBuddySse(response);
             } catch (retryError: any) {
+              if (retryError?.workbuddy === true && !retryError.pluginClassified) {
+                withManagedMarkers(retryError);
+                retryError.nonRetryable = WORKBUDDY_TERMINAL_CODES.has(retryError.code);
+              }
               await probeEdgeReset(retryError, credential, requestBody);
               // Same cooldown bookkeeping as an in-loop attempt, so this
               // account cannot escape its cooldown for one later request.

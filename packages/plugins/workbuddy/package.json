@@ -5,8 +5,9 @@
   "type": "module",
   "main": "dist/plugin.js",
   "scripts": {
-    "build": "tsx scripts/build.ts",
+    "build": "node --import tsx scripts/build.ts",
     "test": "vitest run",
+    "verify": "tsc --noEmit && vitest run",
     "test:watch": "vitest"
   },
   "keywords": [

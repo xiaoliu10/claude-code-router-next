@@ -524,3 +524,37 @@ test("login wiring uses the committed-upsert outcome and settle sequencing", () 
   assert.match(card, /workBuddySettle\(/);
   assert.doesNotMatch(card, /t\("synced", \{ count: connected/);
 });
+
+test("login completion message derives NEW row vs re-authorization from committed metadata, with a safe fallback", () => {
+  // New second account: distinct key + committed pool count.
+  assert.deepEqual(workBuddyLoginOutcome({ models: ["m"], accountChange: "added", accountCount: 2 }), { key: "workbuddy.account_added", values: { count: 2 } });
+  // Same-uid re-login: explicit update wording, count stays the committed size.
+  assert.deepEqual(workBuddyLoginOutcome({ models: ["m"], accountChange: "updated", accountCount: 1 }), { key: "workbuddy.account_updated", values: { count: 1 } });
+  // Safe fallbacks: older server (no metadata) keeps the legacy model-sync message.
+  assert.deepEqual(workBuddyLoginOutcome({ models: ["a", "b"] }), { key: "workbuddy.synced", values: { count: 2 } });
+  assert.deepEqual(workBuddyLoginOutcome({ modelCount: 3 }), { key: "workbuddy.synced", values: { count: 3 } });
+  assert.deepEqual(workBuddyLoginOutcome(null), { key: "workbuddy.synced", values: { count: 0 } });
+  assert.deepEqual(workBuddyLoginOutcome(undefined), { key: "workbuddy.synced", values: { count: 0 } });
+  // Implausible metadata never reaches the message: wrong type / non-integer /
+  // out-of-bounds count degrades to the generic message instead of lying.
+  for (const bad of [{ accountChange: "added", accountCount: "2" }, { accountChange: "added", accountCount: 2.5 }, { accountChange: "added", accountCount: 0 }, { accountChange: "added", accountCount: -1 }, { accountChange: "added", accountCount: 100_001 }, { accountChange: "added" }]) {
+    assert.deepEqual(workBuddyLoginOutcome(bad), { key: "workbuddy.synced", values: { count: 0 } });
+  }
+  // No credential material is ever part of the outcome.
+  const outcome = workBuddyLoginOutcome({ models: ["m"], accountChange: "added", accountCount: 1 });
+  assert.equal(JSON.stringify(outcome).includes("token"), false);
+});
+
+test("post-action settle refreshes pool status even when the unrelated config draft refresh fails", async () => {
+  let statusReads = 0;
+  const ok = await workBuddySettle(async () => {}, async () => { statusReads++; return "status-ok"; });
+  assert.deepEqual(ok, { status: "status-ok", configReconciled: true });
+  assert.equal(statusReads, 1);
+  // Config refresh failure (unrelated to the persisted WorkBuddy mutation)
+  // must NOT suppress the status refresh; the failure stays surfaced as
+  // configReconciled=false (ConfigProvider shows the config error itself).
+  let readsAfterFailure = 0;
+  const degraded = await workBuddySettle(async () => { throw new Error("Configuration refresh failed"); }, async () => { readsAfterFailure++; return "status-after-failure"; });
+  assert.deepEqual(degraded, { status: "status-after-failure", configReconciled: false });
+  assert.equal(readsAfterFailure, 1);
+});

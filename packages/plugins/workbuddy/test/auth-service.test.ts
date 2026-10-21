@@ -2,9 +2,9 @@ import { mkdtempSync, rmSync, readFileSync, statSync, existsSync, writeFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { WorkBuddyCredentialStore, WORKBUDDY_CHAT_URL, parseWorkBuddySource, type WorkBuddyCredential } from "../services/workbuddy";
-import { WorkBuddyAuthService } from "../services/workbuddy-auth";
-import * as configModule from "../ccr/config";
+import { WorkBuddyCredentialStore, WORKBUDDY_CHAT_URL, parseWorkBuddySource, type WorkBuddyCredential } from "../src/protocol";
+import { WorkBuddyAuthService } from "../src/auth-service";
+import * as configModule from "../../../core/src/ccr/config";
 
 const TOKEN = "super-secret-access-token";
 const CRED: WorkBuddyCredential = {
@@ -66,11 +66,10 @@ function harness(options: { source?: string | null; fetch?: any; config?: any } 
       return { ok: false, reason: e?.code === "ENOENT" ? "source_missing" : "source_invalid" } as const;
     }
   };
-  const service = new WorkBuddyAuthService({
+  const service = new WorkBuddyAuthService({ host: { readRawConfig: () => configModule.readConfigFileRaw(), writeConfig: (next: any) => configModule.writeConfigFile(next), reloadRuntime: () => {}, getDirectDispatcher: () => undefined }, 
     configService: { get: (k: string) => (config as any)[k], getAll: () => config, reload: vi.fn(), set: vi.fn() },
     logger: noopLog(),
     fetch: options.fetch,
-    getServer: () => undefined,
     store,
     readSource,
   });
@@ -113,7 +112,7 @@ describe("WorkBuddy credential store", () => {
     expect((loaded as any)?.refreshToken).toBeUndefined();
     expect(loaded?.tokenType).toBe("Bearer");
     // currentCredential must not call the network for a token that is not near expiry.
-    const service = new WorkBuddyAuthService({ configService: { get: () => undefined, getAll: () => ({}) }, logger: { info() {}, warn() {}, error() {} }, store: s, fetch: (async () => { throw new Error("no upstream call allowed"); }) as any });
+    const service = new WorkBuddyAuthService({ host: { readRawConfig: () => configModule.readConfigFileRaw(), writeConfig: (next: any) => configModule.writeConfigFile(next), reloadRuntime: () => {}, getDirectDispatcher: () => undefined },  configService: { get: () => undefined, getAll: () => ({}) }, logger: { info() {}, warn() {}, error() {} }, store: s, fetch: (async () => { throw new Error("no upstream call allowed"); }) as any });
     expect(await service.currentCredential()).toMatchObject({ accessToken: CRED.accessToken });
   });
 

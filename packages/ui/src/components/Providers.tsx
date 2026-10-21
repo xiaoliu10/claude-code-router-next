@@ -7,9 +7,7 @@ import { Button } from "@/components/ui/button";
 import { useConfig } from "./ConfigProvider";
 import { ProviderList } from "./ProviderList";
 import { useNavigate } from "react-router-dom";
-import { isManagedWorkBuddy, workBuddyErrorKey, workBuddyKindOf } from "@/utils/workbuddy";
 import { geminiOauthErrorKey, isManagedGeminiOauth } from "@/utils/gemini-oauth";
-import type { WorkBuddyKind } from "@/types";
 import {
   Dialog,
   DialogContent,
@@ -127,15 +125,17 @@ function cleanUpConfigModels(config: any, deletedModels: string[], providerName?
   return newConfig;
 }
 
+// The host knows only generic managed signals, never a plugin's site names.
+const isManagedProvider = (provider: ProviderType | null | undefined) =>
+  provider?.ccr_managed === true || provider?.api_key?.startsWith("ccr-managed-") === true;
+
 export function Providers() {
   const { t } = useTranslation();
   const { config, refreshConfig } = useConfig();
   const [isSaving, setIsSaving] = useState(false);
   const navigate = useNavigate();
-  const showWorkBuddyManagement = (site: WorkBuddyKind | null) => {
-    // §16: each site has its own card; land the user on the right one.
-    navigate('/settings?tab=providers', { state: { workBuddyManagedNotice: true, workBuddySite: site ?? undefined } });
-  };
+  // Plugin-owned managed entries are edited/disconnected on their own cards.
+  const showManagedProviderManagement = () => navigate('/settings?tab=providers');
   // Contract D7: the Gemini subscription provider is managed on its Settings
   // card; the generic dialog never edits it.
   const showGeminiOauthManagement = () => {
@@ -143,9 +143,6 @@ export function Providers() {
   };
   const [editingProviderIndex, setEditingProviderIndex] = useState<number | null>(null);
   const [deletingProviderIndex, setDeletingProviderIndex] = useState<number | null>(null);
-  // §16: deleting a managed row is an explicit site-specific disconnect, never
-  // a generic config save that omits the entry (the backend resurrects that).
-  const [deletingManagedSite, setDeletingManagedSite] = useState<WorkBuddyKind | null>(null);
   const [hasFetchedModels, setHasFetchedModels] = useState<Record<number, boolean>>({});
   const [providerParamInputs, setProviderParamInputs] = useState<Record<string, {name: string, value: string}>>({});
   const [modelParamInputs, setModelParamInputs] = useState<Record<string, {name: string, value: string}>>({});
@@ -364,7 +361,7 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[index]);
     const provider = config.Providers[actualIndex];
-    if (isManagedWorkBuddy(provider)) { showWorkBuddyManagement(workBuddyKindOf(provider)); return; }
+    if (isManagedProvider(provider)) { showManagedProviderManagement(); return; }
     if (isManagedGeminiOauth(provider)) { showGeminiOauthManagement(); return; }
     if (isSaving) return;
     setEditingProviderIndex(actualIndex);
@@ -383,9 +380,9 @@ export function Providers() {
     if (!editingProviderData || isSaving) return;
     // Defense in depth: never allow the generic editor to mutate a managed
     // identity, key, URL, model set or transformer, even if config refreshed.
-    if (isManagedWorkBuddy(editingProviderData) ||
-        (editingProviderIndex !== null && isManagedWorkBuddy(config.Providers[editingProviderIndex]))) {
-      showWorkBuddyManagement(workBuddyKindOf(editingProviderData) ?? workBuddyKindOf(editingProviderIndex !== null ? config.Providers[editingProviderIndex] : null));
+    if (isManagedProvider(editingProviderData) ||
+        (editingProviderIndex !== null && isManagedProvider(config.Providers[editingProviderIndex]))) {
+      showManagedProviderManagement();
       return;
     }
     if (isManagedGeminiOauth(editingProviderData) ||
@@ -500,14 +497,10 @@ export function Providers() {
   const handleSetDeletingProviderIndex = (filteredIndex: number) => {
     if (isSaving) return;
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
-    const managedSite = workBuddyKindOf(config.Providers[actualIndex]);
+    if (isManagedProvider(config.Providers[actualIndex])) { showManagedProviderManagement(); return; }
     // Contract D7: the Gemini subscription row is removed on its own card, so
     // delete navigates there instead of opening the generic confirmation.
     if (isManagedGeminiOauth(config.Providers[actualIndex])) { showGeminiOauthManagement(); return; }
-    // A managed provider's row IS its site. Keep the confirmation step, but
-    // carry the site so the confirmed action calls the site-specific
-    // `POST /api/workbuddy/disconnect {site}` instead of a global reset.
-    setDeletingManagedSite(managedSite);
     setDeletingProviderIndex(filteredIndex);
   };
 
@@ -516,9 +509,8 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     const deletedProvider = config.Providers[actualIndex];
-    const managedSite = workBuddyKindOf(deletedProvider);
+    if (isManagedProvider(deletedProvider)) { showManagedProviderManagement(); return; }
     setDeletingProviderIndex(null);
-    setDeletingManagedSite(null);
     if (isSaving) return;
     if (isManagedGeminiOauth(deletedProvider)) {
       // Defense in depth for a config that changed under the dialog: explicit
@@ -534,26 +526,6 @@ export function Providers() {
         setToast({ message: t(`geminiOauth.errors.${geminiOauthErrorKey(e)}`), type: 'error' });
       } finally {
         await refreshConfig();
-        setIsSaving(false);
-      }
-      return;
-    }
-    if (managedSite) {
-      // Explicit disconnect for this site only: the backend keeps Router
-      // references and never touches the other site's pool.
-      setIsSaving(true);
-      try {
-        const response = await api.disconnectWorkBuddy(managedSite);
-        if (response?.success === false || response?.ok === false) {
-          setToast({ message: t(`workbuddy.errors.${workBuddyErrorKey(response)}`), type: 'error' });
-        } else {
-          setToast({ message: t('workbuddy.disconnected'), type: 'success' });
-        }
-        await refreshConfig();
-      } catch (e) {
-        setToast({ message: t(`workbuddy.errors.${workBuddyErrorKey(e)}`), type: 'error' });
-        await refreshConfig();
-      } finally {
         setIsSaving(false);
       }
       return;
@@ -1734,18 +1706,18 @@ export function Providers() {
       </Dialog>
 
       {/* Delete Confirmation Dialog */}
-      <Dialog open={deletingProviderIndex !== null} onOpenChange={() => { setDeletingProviderIndex(null); setDeletingManagedSite(null); }}>
+      <Dialog open={deletingProviderIndex !== null} onOpenChange={() => { setDeletingProviderIndex(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{deletingManagedSite ? t("workbuddy.disconnect_title") : t("providers.delete")}</DialogTitle>
+            <DialogTitle>{t("providers.delete")}</DialogTitle>
             <DialogDescription>
-              {deletingManagedSite ? t("workbuddy.disconnect_warning") : t("providers.delete_provider_confirm")}
+              {t("providers.delete_provider_confirm")}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => { setDeletingProviderIndex(null); setDeletingManagedSite(null); }}>{t("providers.cancel")}</Button>
+            <Button variant="outline" onClick={() => { setDeletingProviderIndex(null); }}>{t("providers.cancel")}</Button>
             <Button variant="destructive" onClick={() => deletingProviderIndex !== null && handleRemoveProvider(deletingProviderIndex)}>
-              {deletingManagedSite ? t("workbuddy.disconnect") : t("providers.delete")}
+              {t("providers.delete")}
             </Button>
           </DialogFooter>
         </DialogContent>

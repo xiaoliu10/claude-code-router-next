@@ -40,7 +40,7 @@ export function PluginCardArea({ disabled, onBusyChange }: { disabled: boolean; 
       origin: (typeof location !== "undefined" && location && location.origin) || "",
       getDisabled: () => currentProps.current.disabled,
       callPluginApi: (plugin, path, init) => api.callPluginApi(plugin, path, init),
-      acquireManagement: () => api.acquireWorkBuddyManagement(),
+      acquireManagement: () => api.acquireProviderManagement(),
       refreshConfig: (merge) => currentProps.current.refreshConfig(merge),
       onBusyChange: (busy) => currentProps.current.onBusyChange?.(busy),
       log: console,

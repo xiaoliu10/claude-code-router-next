@@ -1,5 +1,5 @@
 /** WorkBuddy protocol (CN + international). Source: magpie-community/plugins@ab38da681af7716ea9a7609f045ca91d2ad9988a
- * packages/workbuddy/index.mjs (MIT); see ../../../core/THIRD_PARTY_NOTICES.md.
+ * packages/workbuddy/index.mjs (MIT); see ../THIRD_PARTY_NOTICES.md.
  * No browser login, no prompt rewriting, no static model fallback, no source-file writes.
  * No daily check-in/reward task: free credits are server-side daily packages (D11).
  * Browser authorization (§15) does not require a desktop installation.
@@ -164,7 +164,9 @@ export const isManagedWorkBuddy = (p: any): boolean =>
  * because protectWorkBuddyConfig re-locks the managed entry's fields.
  */
 export const isWorkBuddyRuntime = (p: any): boolean => {
-  if (p?.workbuddyManaged === true && (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name)) return true;
+  // The core carries the generic `pluginManaged` flag (config `ccr_managed`)
+  // on registered LLMProviders; the fixed name narrows it to this plugin.
+  if ((p?.pluginManaged === true || p?.ccr_managed === true || p?.workbuddyManaged === true) && (WORKBUDDY_PROVIDER_NAMES as readonly string[]).includes(p?.name)) return true;
   // A locally-registered alias pointing at a managed origin is still that site's
   // upstream (§16 ruling 4): the denylist and the fixed-origin locks must apply
   // to it exactly as they do to the canonical managed provider.

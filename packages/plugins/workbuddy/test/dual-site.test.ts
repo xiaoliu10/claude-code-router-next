@@ -15,7 +15,7 @@ import {
   workBuddyNeedsRenewal,
   workBuddySite,
   type WorkBuddyCredential,
-} from "../services/workbuddy";
+} from "../src/protocol";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); vi.unstubAllGlobals(); });

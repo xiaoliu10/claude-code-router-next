@@ -1,10 +1,5 @@
-/**
- * Card-local copies of the pure WorkBuddy UI helpers, MOVED VERBATIM from the
- * former `packages/ui/src/utils/workbuddy.ts` (which the UI deletes at the
- * hard cut). During the dual-run window a build-identity pin test asserts this
- * file stays byte-identical to the UI source apart from the rewired type
- * import, so the two implementations cannot drift.
- */
+/** Pure WorkBuddy card helpers moved from the former UI implementation.
+ * The plugin owns the sole copy after the migration hard cut. */
 import type {
   WorkBuddyAccountSummary, WorkBuddyKind, WorkBuddyMutationResponse, WorkBuddySiteStatus,
   WorkBuddyStatus, WorkBuddyStatusResponse, WorkBuddyUsage,

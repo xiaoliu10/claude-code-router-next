@@ -8,7 +8,7 @@ export const GEMINI_OAUTH_DEFAULT_KIND: GeminiOauthKind = "antigravity";
 
 /**
  * Managed-provider detection for the Gemini subscription provider (contract
- * §1.4 + D7 parity with WorkBuddy). The strict `gemini_oauth_managed === true`
+ * §1.4 + D7 managed-provider parity). The strict `gemini_oauth_managed === true`
  * flag is authoritative; an entry persisted before the flag existed is still
  * ours when it carries CCR's own marker key, and a `gemini_oauth_kind` alone
  * proves ownership too. A user provider that merely reuses the name with a
@@ -131,7 +131,7 @@ export const GEMINI_OAUTH_RISK_KEY = "geminiOauth.risk";
 
 /**
  * Merge the managed provider into the local draft after a status/sync change,
- * mirroring `mergeWorkBuddyProvider`: only entries CCR manages are added,
+ * following managed-provider reconciliation: only entries CCR manages are added,
  * replaced or removed; Router, drafts and ordinary providers always survive.
  */
 export function mergeGeminiOauthProvider<C extends { Providers?: Provider[] }, S extends { Providers?: Provider[] }>(local: C, server: S): C {

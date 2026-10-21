@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { WorkBuddyAuthService } from "../services/workbuddy-auth";
-import { WorkBuddyCredentialStore, createWorkBuddyLoginState, fetchWorkBuddyLoginAccount, pollWorkBuddyLoginToken, refreshWorkBuddyToken, type WorkBuddyCredential, type WorkBuddySiteId } from "../services/workbuddy";
-import * as configModule from "../ccr/config";
+import { WorkBuddyAuthService } from "../src/auth-service";
+import { WorkBuddyCredentialStore, createWorkBuddyLoginState, fetchWorkBuddyLoginAccount, pollWorkBuddyLoginToken, refreshWorkBuddyToken, type WorkBuddyCredential, type WorkBuddySiteId } from "../src/protocol";
+import * as configModule from "../../../core/src/ccr/config";
 
 const dirs: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -24,7 +24,7 @@ function harness(fetch: any, reader = vi.fn(() => ({ ok: false, reason: "source_
   vi.spyOn(configModule, "readConfigFileRaw").mockImplementation(async () => structuredClone(config));
   const write = vi.spyOn(configModule, "writeConfigFile").mockImplementation(async (next) => { config = structuredClone(next); });
   const store = new WorkBuddyCredentialStore(join(dir, "private.json"));
-  const service = new WorkBuddyAuthService({ store, fetch, readSource: reader as any, logger: { warn: vi.fn(), error: vi.fn() }, configService: { getAll: () => config, get: (key: string) => config[key] } });
+  const service = new WorkBuddyAuthService({ host: { readRawConfig: () => configModule.readConfigFileRaw(), writeConfig: (next: any) => configModule.writeConfigFile(next), reloadRuntime: () => {}, getDirectDispatcher: () => ({}) as any },  store, fetch, readSource: reader as any, logger: { warn: vi.fn(), error: vi.fn() }, configService: { getAll: () => config, get: (key: string) => config[key] } });
   return { service, store, write, reader, config: () => config };
 }
 const flowFetch = (site: WorkBuddySiteId = "workbuddy") => vi.fn(async (url: string, init: any) => {

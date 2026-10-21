@@ -6,7 +6,7 @@ import { resolveProviderProxyUrl } from "../services/proxy";
 /**
  * The canonical POST-/api-config runtime reload sequence, owned by the core
  * and handed to plugins via PluginContext.host.reloadRuntime. Before this
- * existed, every managed provider (WorkBuddy, Gemini OAuth) carried its own
+ * existed, every managed subscription provider carried its own
  * copy — the plugin API exists to end exactly that kind of duplication.
  */
 export function reloadProviderRuntime(server: any, config: any, log: { info(msg: string): void; warn(msg: string): void; error(msg: string): void }): void {

@@ -3,29 +3,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 /**
  * WorkBuddy §16 request account rotation — MOVED + ADAPTED from the former
- * core test `workbuddy-failover.test.ts`: the pool orchestration now lives in
- * the plugin's managed runtime and is dispatched through the core's GENERIC
- * `dispatchRequest` seam (real registry, real core Server; upstream always a
- * stub). Equivalence contract pinned here (migration contract §1 items 1–5):
+ * core test `workbuddy-failover.test.ts`: the pool orchestration lives in the
+ * plugin's managed runtime and is dispatched through the core's GENERIC
+ * `dispatchRequest` seam (real registry, real core Server, FULL plugin
+ * activation — runtime + transformer + admin routes; upstream always a stub).
+ * Equivalence contract pinned here (migration contract §1 items 1–5):
  * rotation bound, cooldown booking order, per-site isolation, terminal
  * classes (10085/reauth/model-hidden), transient semantics, SSE envelope
  * inspection, edge-reset probe, ordinary-provider immunity.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Server from "../../../core/src/server";
-// Dual-run bridge: the core's static transformer resolves its service through
-// this handle until the hard cut deletes the core transformer; the injected
-// instance is the PLUGIN's service, exactly what the flipped seam will use.
-import { setWorkBuddyRuntime } from "../../../core/src/services/workbuddy";
 import { getHealthStore } from "../../../core/src/services/provider-health";
-import { WorkBuddyAuthService } from "../src/auth-service";
+import { reloadProviderRuntime } from "../../../core/src/provider-plugins/host";
+import { WorkBuddyTransformer } from "../src/transformer";
 import {
   WorkBuddyCredentialStore, classifyWorkBuddyError,
   workBuddyFailoverCooldown, nextWorkBuddyQuotaReset, type WorkBuddyCredential,
 } from "../src/protocol";
-import { WorkBuddyTransformer } from "../src/transformer";
-import { createWorkBuddyManagedRuntime, workBuddyFailoverCooldownFromInfo } from "../src/managed-runtime";
-import { manifest } from "../src/plugin";
+import { WORKBUDDY_TERMINAL_CODES, workBuddyFailoverCooldownFromInfo } from "../src/managed-runtime";
+import { activate, getActivatedWorkBuddyService, manifest } from "../src/plugin";
 import { clearPluginRegistry } from "../../../core/src/provider-plugins/registry";
 
 const CN = "https://copilot.tencent.com/v2/chat/completions";
@@ -34,7 +31,6 @@ const cleanups: Array<() => Promise<void>> = [];
 const noopLog = { info: () => {}, warn: () => {}, error: () => {} };
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
-  setWorkBuddyRuntime(null);
   clearPluginRegistry();
   vi.restoreAllMocks(); vi.unstubAllGlobals();
 });
@@ -55,7 +51,9 @@ function sse(chunks: string[]) {
 const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
 async function harness(hiddenModels: string[] = []) {
   const dir = mkdtempSync(join(tmpdir(), "wb-failover-"));
-  const store = new WorkBuddyCredentialStore(join(dir, "credentials.json"));
+  // Same path the plugin activation chose (ctx.host.configDir): the harness
+  // seeds the pool through its own store handle; the service reads from disk.
+  const store = new WorkBuddyCredentialStore(join(dir, "workbuddy-credentials.json"));
   await store.saveData({ version: 2, sites: {
     workbuddy: { activeUid: "b", hiddenModels, discoveredModels: ["m", "hidden"], accounts: [credential("a"), credential("b")] },
     "workbuddy-ai": { activeUid: "ai", hiddenModels: [], accounts: [credential("ai", "workbuddy-ai")] },
@@ -67,42 +65,29 @@ async function harness(hiddenModels: string[] = []) {
   ];
   const server = new Server({ logger: false, useJsonFile: false, initialConfig: { providers, HOST: "127.0.0.1", PORT: 0 } });
   await server.ready();
-  const service = new WorkBuddyAuthService({
-    store, configService: server.configService,
-    readSource: () => { throw new Error("must never read real credentials"); },
-    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    host: {
-      readRawConfig: async () => { throw new Error("config writes are not part of the data plane"); },
-      writeConfig: async () => { throw new Error("config writes are not part of the data plane"); },
-      reloadRuntime: () => {},
-      getDirectDispatcher: () => undefined,
-    },
-  });
-  setWorkBuddyRuntime({ authService: service });
-  // Activate the §16 managed runtime through the core's REAL plugin registry:
-  // the dispatch wrapper (account pool + SSE inspection + edge guard) runs via
-  // the generic dispatchRequest seam, not via any WorkBuddy-named core branch.
+  // FULL plugin activation through the core's REAL registry: the managed
+  // runtime (dispatch wrapper: account pool + SSE inspection + edge guard),
+  // the plugin transformer and the admin routes all come from the plugin.
   const tx = server.pluginRegistry.beginActivation(manifest, noopLog, {
     configDir: dir,
-    readConfig: async () => { throw new Error("unused"); },
-    writeConfig: async () => { throw new Error("unused"); },
-    reloadRuntime: async () => {},
+    readConfig: async () => { throw new Error("unused by the data plane"); },
+    writeConfig: async () => { throw new Error("unused by the data plane"); },
+    reloadRuntime: async (cfg?: any) => reloadProviderRuntime(server, cfg ?? { Providers: providers }, noopLog),
     getDirectDispatcher: () => undefined,
   } as any);
-  const runtime = createWorkBuddyManagedRuntime({
-    service,
-    getDirectDispatcher: () => undefined,
-    log: noopLog,
-  });
-  tx.context.registerManagedRuntime(runtime);
-  await tx.commit();
+  await activate(tx.context);
+  await tx.commit(undefined, server.app);
+  const service = getActivatedWorkBuddyService()!;
+  const runtime = server.pluginRegistry.getManagedRuntimeFor({ name: "workbuddy", apiKey: "ccr-managed-workbuddy" } as any)!;
+  // Re-resolve provider transformer instances after plugin registration.
+  await reloadProviderRuntime(server, { Providers: providers }, noopLog);
   await server.registerNamespace("/"); await server.app.ready();
   cleanups.push(async () => { await server.app.close(); rmSync(dir, { recursive: true, force: true }); });
   const send = (provider = "workbuddy", model = "m", stream = false, content = "hi") => server.app.inject({
     method: "POST", url: "/v1/chat/completions",
     payload: { model: `${provider},${model}`, messages: [{ role: "user", content }], stream },
   });
-  return { store, service, server, runtime, send };
+  return { store, dir, service, server, runtime, send };
 }
 function stubSequence(first: () => Response, second: () => Response = success) {
   const headers: Headers[] = [], urls: string[] = [];
@@ -158,6 +143,60 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
       expect(new Date(cooldown.until).getMinutes()).toBe(5);
     } else expect(cooldown.until).toBeGreaterThanOrEqual(before + 7_200_000);
   });
+  it.each([
+    [10085, "workbuddy_protocol_error", false], [6004, "rate_limit", false],
+    [14018, "insufficient_quota", false], [11140, "workbuddy_account_restricted", false],
+    [11150, "invalid_request_error", true], [11153, "invalid_request_error", true],
+    [11133, "invalid_request_error", true], [99999, "provider_response_error", true],
+  ])("classifier code %s maps to %s with retryable=%s", async (upstreamCode, code, retryable) => {
+    const h = await harness();
+    expect(h.runtime.classifyError!(400, { code: upstreamCode }, "")).toMatchObject({ code, retryable });
+  });
+  it("the complete former terminal list is pinned, including wrapper-only errors", () => {
+    expect([...WORKBUDDY_TERMINAL_CODES]).toEqual([
+      "workbuddy_reauth", "workbuddy_protocol_error", "workbuddy_model_hidden",
+      "workbuddy_not_connected", "rate_limit", "insufficient_quota", "workbuddy_account_restricted",
+    ]);
+  });
+  it("pre-content SSE protocol terminal cannot be retried by the generic host", async () => {
+    const h = await harness();
+    const f = stubSequence(() => sse([event({ code: 10085 })]));
+    const response = await h.send();
+    expect(response.statusCode).toBe(400);
+    expect(response.body).toContain("workbuddy_protocol_error");
+    expect(f.fetch).toHaveBeenCalledTimes(1);
+  });
+  it("pre-content SSE exhaustion cannot restart the pool on a fallback model", async () => {
+    const h = await harness();
+    h.server.configService.set("Router", { enableFallback: true });
+    h.server.configService.set("fallback", { default: ["workbuddy,hidden", "ordinary,m"] });
+    vi.spyOn(getHealthStore(), "isAvailable").mockReturnValue(true);
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: any) => {
+      urls.push(String(url));
+      return String(url).includes("ordinary.invalid") ? success() : sse([event({ code: 6004 })]);
+    }));
+    expect((await h.send()).statusCode).toBe(200);
+    expect(urls).toEqual([CN, CN, "https://ordinary.invalid/v1/chat/completions"]);
+  });
+  it("empty pool returns the original not-connected surface without any fetch", async () => {
+    const h = await harness();
+    await h.store.delete();
+    const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
+    const response = await h.send();
+    expect(response.statusCode).toBe(409); expect(response.body).toContain("workbuddy_not_connected");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it.each(["AbortError", "TimeoutError"])("%s cannot trigger the large-body diagnostic probe", async name => {
+    const h = await harness();
+    const fetch = vi.fn(async () => { throw new DOMException("private-body", name); });
+    vi.stubGlobal("fetch", fetch);
+    const response = await h.send("workbuddy", "m", false, "x".repeat(2 * 1024 * 1024 + 1));
+    expect(response.body).not.toContain("private-body");
+    // Generic transient retry remains allowed, but neither attempt probes billing.
+    expect(fetch.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(fetch.mock.calls.every(args => String(args[0]).includes("chat/completions"))).toBe(true);
+  });
   it("10085 is terminal, no retry and no cooldown", async () => {
     const h = await harness();
     const f = stubSequence(() => json({ code: 10085, accessToken: "secret-b" }, 400));
@@ -189,6 +228,26 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     expect(fetch).toHaveBeenCalledTimes(2); expect(response.body).not.toMatch(/private-upstream-body|secret-/);
     expect((await h.store.loadData())!.sites.workbuddy!.accounts.every(a => a.modelCooldowns?.m)).toBe(true);
     const again = await h.send(); expect(again.statusCode).toBe(429); expect(fetch).toHaveBeenCalledTimes(2);
+  });
+  it("a large pool never exceeds the constant cap of 8 and never reuses a uid", async () => {
+    const h = await harness();
+    const accounts = Array.from({ length: 12 }, (_, i) => credential(`pool-${i}`));
+    await h.store.saveData({ version: 2, sites: { workbuddy: { activeUid: "pool-11", accounts } } });
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: any) => {
+      seen.push(new Headers(init.headers).get("x-user-id")!);
+      return json({ code: 6004 }, 429);
+    }));
+    expect((await h.send()).statusCode).toBe(429);
+    expect(seen).toHaveLength(8); expect(new Set(seen).size).toBe(8);
+    expect(seen[0]).toBe("pool-11");
+  });
+  it("a misbehaving selection service cannot re-use an already attempted uid", async () => {
+    const h = await harness();
+    vi.spyOn(h.service as any, "currentCredential").mockResolvedValue(credential("b"));
+    const fetch = vi.fn(async () => json({ code: 6004 }, 429)); vi.stubGlobal("fetch", fetch);
+    expect((await h.send()).statusCode).toBe(429);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
   it("transient failure after rotation cannot reset the account attempt cap", async () => {
     const h = await harness();

@@ -2,11 +2,40 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import Server from "../server";
-import { registerAdminRoutes } from "../ccr/admin-routes";
-import { WorkBuddyTransformer } from "../transformer/workbuddy.transformer";
-import { WorkBuddyCredentialStore, type WorkBuddyCredential } from "../services/workbuddy";
-import * as configModule from "../ccr/config";
+import Server from "../../../core/src/server";
+import { registerAdminRoutes } from "../../../core/src/ccr/admin-routes";
+import { WorkBuddyTransformer } from "../src/transformer";
+import { WorkBuddyCredentialStore, type WorkBuddyCredential } from "../src/protocol";
+import { createWorkBuddyManagedRuntime } from "../src/managed-runtime";
+import { registerWorkBuddyAdminRoutes } from "../src/admin-routes";
+import { protectWorkBuddyConfig } from "../src/protocol";
+import { manifest } from "../src/plugin";
+import { reloadProviderRuntime } from "../../../core/src/provider-plugins/host";
+import * as configModule from "../../../core/src/ccr/config";
+
+// The former built-in integration suite now installs the SAME contributions
+// through the real registry, with an injected temp-source reader. Full default
+// activate() and tarball-loader paths are independently covered by seam suites.
+const noopLog = { info() {}, warn() {}, error() {} };
+const serviceHost = (server: Server) => ({
+  readRawConfig: () => configModule.readConfigFileRaw(),
+  writeConfig: (next: any) => configModule.writeConfigFile(next),
+  reloadRuntime: (config: any) => reloadProviderRuntime(server, config, noopLog),
+  getDirectDispatcher: () => ({}) as any,
+});
+async function installContributions(server: Server, service: any, config: any) {
+  const tx = server.pluginRegistry.beginActivation(manifest, noopLog, {} as any);
+  class ActivatedTransformer extends WorkBuddyTransformer { constructor() { super({ authService: service }); } }
+  tx.context.registerTransformer(ActivatedTransformer as any);
+  tx.context.registerManagedRuntime(createWorkBuddyManagedRuntime({ service, log: noopLog, getDirectDispatcher: () => ({}) as any }) as any);
+  tx.context.registerConfigProtector(protectWorkBuddyConfig);
+  tx.context.registerAdminRoutes(app => registerWorkBuddyAdminRoutes(app as any, { getService: () => service }));
+  await tx.commit(undefined, server.app);
+  reloadProviderRuntime(server, config, noopLog);
+  await registerAdminRoutes(server, config);
+  await server.registerNamespace("/");
+  await server.app.ready();
+}
 
 const TOKEN = "chat-access-token";
 const CRED: WorkBuddyCredential = {
@@ -47,21 +76,16 @@ async function buildProviderServer(providers: any[], router: any = {}) {
     initialConfig: { providers, Router: router, HOST: "127.0.0.1", PORT: 0 },
   });
   await server.ready();
-  await registerAdminRoutes(server, config);
-  await server.registerNamespace("/");
-  await server.app.ready();
   // Install an isolated credential store on the runtime service so the data
   // plane resolves a mock credential instead of the real CCR private file.
-  const { WorkBuddyAuthService } = await import("../services/workbuddy-auth");
+  const { WorkBuddyAuthService } = await import("../src/auth-service");
   const service = new WorkBuddyAuthService({
     configService: server.configService,
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     store,
-    getServer: () => server,
+    host: serviceHost(server),
   });
-  (server as any).workBuddyAuthService = service;
-  const { setWorkBuddyRuntime } = await import("../services/workbuddy");
-  setWorkBuddyRuntime({ authService: service });
+  await installContributions(server, service, config);
   return { server, dir, store, config };
 }
 
@@ -153,7 +177,8 @@ describe("WorkBuddy data plane (isolated mocks)", () => {
     // The token and the raw upstream envelope never reach the client.
     expect(failRes.body).not.toContain(TOKEN);
     expect(failRes.body).not.toContain("unusual activity");
-    expect(failRes.body).toContain("11140");
+    // Generic plugin errors expose a fixed safe code, never upstream text.
+    expect(failRes.body).toContain("workbuddy_account_restricted");
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -318,19 +343,14 @@ describe("WorkBuddy data plane (isolated mocks)", () => {
       initialConfig: { providers, Router: { default: "workbuddy,glm-5.3" }, HOST: "127.0.0.1", PORT: 0 },
     });
     await server.ready();
-    await registerAdminRoutes(server, { PORT: 0, Providers: providers, Router: {} });
-    await server.registerNamespace("/");
-    await server.app.ready();
-    const { WorkBuddyAuthService } = await import("../services/workbuddy-auth");
+    const { WorkBuddyAuthService } = await import("../src/auth-service");
     const service = new WorkBuddyAuthService({
       configService: server.configService,
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
-      getServer: () => server,
+      host: serviceHost(server),
     });
-    (server as any).workBuddyAuthService = service;
-    const { setWorkBuddyRuntime } = await import("../services/workbuddy");
-    setWorkBuddyRuntime({ authService: service });
+    await installContributions(server, service, { Providers: providers, Router: {} });
     vi.spyOn(configModule, "readConfigFileRaw").mockResolvedValue({ Providers: providers, Router: {} });
 
     const fetchMock = vi.fn(async () => sseResponse([
@@ -428,11 +448,8 @@ describe("WorkBuddy admin API (isolated mocks)", () => {
       initialConfig: { providers: config.Providers, Router: config.Router, HOST: "127.0.0.1", PORT: 0 },
     });
     await server.ready();
-    await registerAdminRoutes(server, config);
-    await server.registerNamespace("/");
-    await server.app.ready();
-    const { WorkBuddyAuthService } = await import("../services/workbuddy-auth");
-    const { parseWorkBuddySource } = await import("../services/workbuddy");
+    const { WorkBuddyAuthService } = await import("../src/auth-service");
+    const { parseWorkBuddySource } = await import("../src/protocol");
     const { readFileSync } = await import("node:fs");
     const service = new WorkBuddyAuthService({
       configService: server.configService,
@@ -442,9 +459,9 @@ describe("WorkBuddy admin API (isolated mocks)", () => {
         try { return parseWorkBuddySource(readFileSync(join(dir, "src.info"), "utf8"), Date.now(), site); }
         catch { return { ok: false, reason: "source_missing" } as const; }
       },
-      getServer: () => server,
+      host: serviceHost(server),
     });
-    (server as any).workBuddyAuthService = service;
+    await installContributions(server, service, config);
     return { server, dir, store, config, service };
   }
 

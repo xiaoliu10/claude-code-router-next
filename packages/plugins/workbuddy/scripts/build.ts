@@ -50,6 +50,7 @@ await esbuild.build({
 });
 
 copyFileSync(join(root, "plugin.json"), join(dist, "plugin.json"));
+copyFileSync(join(root, "THIRD_PARTY_NOTICES.md"), join(dist, "THIRD_PARTY_NOTICES.md"));
 writeFileSync(join(dist, "package.json"), JSON.stringify({ type: "module" }, null, 2) + "\n");
 
 console.log("workbuddy plugin built into dist/");

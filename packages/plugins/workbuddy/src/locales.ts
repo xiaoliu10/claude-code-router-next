@@ -3,8 +3,7 @@
  * (`workbuddy.*` sections) — the plugin owns its copy because the hard cut
  * removes every workbuddy string from packages/ui/src. The bundle travels to
  * the card through /api/plugins (registerLocales) and doubles as the card's
- * fallback when the host manifest omits it. During the dual-run window a
- * build-identity pin test asserts byte-parity with the UI sections.
+ * fallback when the host manifest omits it. The plugin suite pins EN/ZH key parity and the card build identity.
  */
 
 export const workbuddyLocales: Record<string, Record<string, unknown>> = {

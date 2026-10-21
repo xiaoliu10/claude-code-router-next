@@ -37,8 +37,8 @@ export function sendUnifiedRequest(
     headers: headers,
     body: JSON.stringify(request),
     signal: combinedSignal,
-    // Managed WorkBuddy requests set redirect:"error" so the fixed HTTPS origin
-    // can never be bounced to another host.
+    // Managed subscription-plugin requests set redirect:"error" so the fixed
+    // HTTPS origin can never be bounced to another host.
     ...(config.redirect ? { redirect: config.redirect } : {}),
   };
 

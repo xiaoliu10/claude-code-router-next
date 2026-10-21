@@ -85,9 +85,23 @@ test("api.fetchPluginCardSource keeps the card lane authenticated and same-origi
   assert.doesNotMatch(src, new RegExp("cardUrl[^\\n]*apiKey"));
 });
 
-test("SettingsPage mounts the plugin card area after the built-in managed cards", () => {
+test("SettingsPage mounts only the generic plugin card area", () => {
   const src = read("components/SettingsPage.tsx");
-  const gemini = src.indexOf("<WorkBuddyProvider");
   const pluginArea = src.indexOf("<PluginCardArea");
-  assert.ok(gemini !== -1 && pluginArea !== -1 && pluginArea > gemini);
+  assert.ok(pluginArea !== -1);
+  assert.doesNotMatch(src, /<WorkBuddyProvider/);
+});
+
+test("generic managed provider edit/save/delete navigate to Settings, never omission-save or inline disconnect", () => {
+  const providers = read("components/Providers.tsx");
+  assert.match(providers, /provider\?\.ccr_managed === true/);
+  assert.match(providers, /api_key\?\.startsWith\("ccr-managed-"\)/);
+  assert.match(providers, /showManagedProviderManagement = \(\) => navigate\('\/settings\?tab=providers'\)/);
+  for (const [start, end] of [["const handleEditProvider", "const handleSaveProvider"],
+    ["const handleSaveProvider", "// Validate name"],
+    ["const handleSetDeletingProviderIndex", "const handleRemoveProvider"],
+    ["const handleRemoveProvider", "const deletedModels"]]) {
+    const body = providers.slice(providers.indexOf(start), providers.indexOf(end, providers.indexOf(start) + 1));
+    assert.match(body, /isManagedProvider\(/); assert.match(body, /showManagedProviderManagement\(\)/);
+  }
 });
