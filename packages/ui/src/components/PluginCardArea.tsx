@@ -26,11 +26,16 @@ type ManifestState =
  * failures and broken card modules are rendered as visible recovery notices —
  * a provider must never silently disappear from the settings page.
  */
-export function PluginCardArea({ disabled, onBusyChange }: { disabled: boolean; onBusyChange?: (busy: boolean) => void }) {
+export function PluginCardArea({ disabled, onBusyChange, focusKey }: { disabled: boolean; onBusyChange?: (busy: boolean) => void; focusKey?: string | null }) {
   const { i18n, t } = useTranslation();
   const { refreshConfig } = useConfig();
   const currentProps = useRef({ disabled, refreshConfig, onBusyChange });
   currentProps.current = { disabled, refreshConfig, onBusyChange };
+  // A deep-linked focus key is consumed exactly once by the owning card: the
+  // area clears it after handing it to a sync, so a later re-render (locale or
+  // gate change) never re-triggers the scroll/focus.
+  const pendingFocus = useRef<string | null>(focusKey ?? null);
+  if (focusKey != null) pendingFocus.current = focusKey;
   const [manifest, setManifest] = useState<ManifestState>({ status: "loading" });
   const [issues, setIssues] = useState<PluginCardHostIssue[]>([]);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -68,7 +73,9 @@ export function PluginCardArea({ disabled, onBusyChange }: { disabled: boolean; 
       controller.dispose();
       return;
     }
-    void controller.sync(manifest.status === "failed" ? null : manifest.entries, locale, host);
+    const focus = pendingFocus.current;
+    pendingFocus.current = null;
+    void controller.sync(manifest.status === "failed" ? null : manifest.entries, locale, host, focus);
     return () => { controller.dispose(); };
   }, [controller, manifest, locale]);
 

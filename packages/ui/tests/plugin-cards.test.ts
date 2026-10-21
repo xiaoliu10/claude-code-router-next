@@ -96,12 +96,39 @@ test("generic managed provider edit/save/delete navigate to Settings, never omis
   const providers = read("components/Providers.tsx");
   assert.match(providers, /provider\?\.ccr_managed === true/);
   assert.match(providers, /api_key\?\.startsWith\("ccr-managed-"\)/);
-  assert.match(providers, /showManagedProviderManagement = \(\) => navigate\('\/settings\?tab=providers'\)/);
+  assert.match(providers, /showManagedProviderManagement = \(providerName\?: string\) =>/);
+  assert.match(providers, /navigate\('\/settings\?tab=providers', \{/);
   for (const [start, end] of [["const handleEditProvider", "const handleSaveProvider"],
     ["const handleSaveProvider", "// Validate name"],
     ["const handleSetDeletingProviderIndex", "const handleRemoveProvider"],
     ["const handleRemoveProvider", "const deletedModels"]]) {
     const body = providers.slice(providers.indexOf(start), providers.indexOf(end, providers.indexOf(start) + 1));
-    assert.match(body, /isManagedProvider\(/); assert.match(body, /showManagedProviderManagement\(\)/);
+    assert.match(body, /isManagedProvider\(/); assert.match(body, /showManagedProviderManagement\(/);
   }
+});
+
+test("the CCR self provider stays editable/deletable; marker-managed rows keep the card guard", () => {
+  const providers = read("components/Providers.tsx");
+  // Mirror of shared isCcrSelfProvider: name==="ccr" + ccr_managed (real admin key).
+  assert.match(providers, /const isCcrSelfProvider = \(provider: ProviderType \| null \| undefined\): boolean =>/);
+  assert.match(providers, /provider\.name === "ccr" && provider\.ccr_managed === true/);
+  assert.match(providers, /!isCcrSelfProvider\(provider\) &&/);
+  // Marker-managed rows still navigate to the owning card.
+  assert.match(providers, /provider\?\.ccr_managed === true \|\| provider\?\.api_key\?\.startsWith\("ccr-managed-"\) === true/);
+});
+
+test("managed row navigation carries a generic focus key and the area renders the generic notice", () => {
+  const providers = read("components/Providers.tsx");
+  assert.match(providers, /state: \{ managedProviderNotice: true, managedProviderFocus: providerName \?\? null \}/);
+  const settings = read("components/SettingsPage.tsx");
+  assert.match(settings, /location\.state\?\.managedProviderNotice && <p role="note"/);
+  assert.match(settings, /t\("pluginCards\.managed_notice"\)/);
+  assert.match(settings, /focusKey=\{\(location\.state as \{ managedProviderFocus\?: string \| null \} \| null\)\?\.managedProviderFocus \?\? null\}/);
+  const area = read("components/PluginCardArea.tsx");
+  assert.match(area, /focusKey\?: string \| null/);
+  // One-shot: consumed before the sync hands it to cards, never re-triggered.
+  assert.match(area, /pendingFocus\.current = null;/);
+  const contract = read("utils/plugin-card.ts");
+  assert.match(contract, /focusKey\?: string \| null;/);
+  assert.match(contract, /sync\(entries: PluginInfo\[\] \| null, locale: string, host: HTMLElement, focusKey\?: string \| null\)/);
 });

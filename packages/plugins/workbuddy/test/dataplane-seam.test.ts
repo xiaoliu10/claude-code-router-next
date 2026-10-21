@@ -296,6 +296,49 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     const h = await harness(); const f = stubSequence(() => json({ error: { code: 6004, message: "private-upstream-body" } }));
     const response = await h.send(); expect(response.statusCode).toBe(200); expect(f.fetch).toHaveBeenCalledTimes(2);
   });
+  it("a CN terminal failure falls through to the independent international subscription", async () => {
+    // d1afba6 baseline behavior (review probe): CN 10085/6004 → AI origin still
+    // requested and answers. Cross-site independence must survive the generic
+    // provider-scoped request budget.
+    const h = await harness();
+    h.server.configService.set("Router", { enableFallback: true });
+    h.server.configService.set("fallback", { default: ["workbuddy-ai,m"] });
+    vi.spyOn(getHealthStore(), "isAvailable").mockReturnValue(true);
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: any) => {
+      urls.push(String(url));
+      return String(url).includes("workbuddy.ai") ? success() : json({ code: 10085 }, 400);
+    }));
+    expect((await h.send()).statusCode).toBe(200);
+    expect(urls).toEqual([CN, AI]);
+  });
+  it("a CN terminal failure does not consume the international provider's refresh budget", async () => {
+    // Per-provider 401-once refresh budget: two sites keep separate budgets.
+    const h = await harness();
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: any) => {
+      seen.push(String(url));
+      return new Response(JSON.stringify({ error: { message: "unauthenticated" } }), { status: 401, headers: { "content-type": "application/json" } });
+    }));
+    expect((await h.send("workbuddy-ai")).statusCode).toBe(401);
+    expect((await h.send("workbuddy-ai")).statusCode).toBe(401);
+    // Fresh request: a CN-only budget would have suppressed nothing here; pin
+    // the two sites each get their own single retry via their own credentials.
+    expect(seen.filter(u => u.startsWith("https://www.workbuddy.ai")).length).toBeGreaterThanOrEqual(2);
+  });
+  it("an international terminal failure still allows the CN provider as a fallback entry", async () => {
+    const h = await harness();
+    h.server.configService.set("Router", { enableFallback: true });
+    h.server.configService.set("fallback", { default: ["workbuddy,m"] });
+    vi.spyOn(getHealthStore(), "isAvailable").mockReturnValue(true);
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: any) => {
+      urls.push(String(url));
+      return String(url).includes("workbuddy.ai") ? json({ code: 11140 }, 403) : success();
+    }));
+    expect((await h.send("workbuddy-ai")).statusCode).toBe(200);
+    expect(urls).toEqual([AI, CN]);
+  });
   it("rotation finishes before switching to a different configured fallback provider", async () => {
     const h = await harness();
     h.server.configService.set("Router", { enableFallback: true });
@@ -316,6 +359,41 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     const f = stubSequence(success);
     expect((await h.send()).statusCode).toBe(200);
     expect(f.headers.map(headers => headers.get("x-user-id"))).toEqual(["b"]);
+  });
+  it.each([
+    ["short window honored", 5.5 * 60_000, (elapsed: number) => elapsed > 4 * 60_000 && elapsed < 10 * 60_000],
+    ["window longer than the default is respected", 20 * 60_000, (elapsed: number) => elapsed > 15 * 60_000],
+  ])("SSE 6004 books the upstream reset window, not a flat 15 minutes (%s)", async (_name, windowMs, within) => {
+    const h = await harness();
+    const reset = new Date(Date.now() + windowMs);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const stamp = `${reset.getFullYear()}-${pad(reset.getMonth() + 1)}-${pad(reset.getDate())} ${pad(reset.getHours())}:${pad(reset.getMinutes())}`;
+    stubSequence(() => sse([event({ code: 6004, msg: `您的使用量已超出频率限制，将在 ${stamp} 重置` })]), () => sse([event({ code: 6004, msg: "频率限制" })]));
+    const before = Date.now();
+    expect((await h.send()).statusCode).toBe(400);
+    const until = (await h.store.loadData())!.sites.workbuddy!.accounts.find((a: any) => a.uid === "b")!.modelCooldowns!.m.until;
+    const elapsed = until - before;
+    expect(within(elapsed), `booked ${Math.round(elapsed / 1000)}s, expected ~${Math.round(windowMs / 1000)}s`).toBe(true);
+  });
+  it("SSE 6004 without a parseable reset still books the 15 minute default", async () => {
+    const h = await harness();
+    stubSequence(() => sse([event({ code: 6004, msg: "rate limited" })]), () => sse([event({ code: 6004, msg: "频率限制" })]));
+    const before = Date.now();
+    expect((await h.send()).statusCode).toBe(400);
+    const until = (await h.store.loadData())!.sites.workbuddy!.accounts.find((a: any) => a.uid === "b")!.modelCooldowns!.m.until;
+    expect(until - before).toBeGreaterThanOrEqual(899_000);
+  });
+  it("HTTP 6004 with a reset window keeps booking the exact window (unchanged path)", async () => {
+    const h = await harness();
+    const reset = new Date(Date.now() + 5.5 * 60_000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const stamp = `${reset.getFullYear()}-${pad(reset.getMonth() + 1)}-${pad(reset.getDate())} ${pad(reset.getHours())}:${pad(reset.getMinutes())}`;
+    stubSequence(() => json({ code: 6004, msg: `频率限制，将在 ${stamp} 重置` }, 429), () => success());
+    const before = Date.now();
+    expect((await h.send()).statusCode).toBe(200);
+    const cooldown = (await h.store.loadData())!.sites.workbuddy!.accounts.find((a: any) => a.uid === "b")!.modelCooldowns!.m;
+    const elapsed = cooldown.until - before;
+    expect(elapsed > 4 * 60_000 && elapsed < 10 * 60_000).toBe(true);
   });
   it("pre-content SSE error split across chunks rotates after role-only preamble", async () => {
     const h = await harness();

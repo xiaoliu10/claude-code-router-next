@@ -634,6 +634,7 @@
     "unavailable_title": "{{name}} 已安装但不可用",
     "disabled_hint": "该插件在 CCR 配置中被禁用。请启用它（例如执行 `ccr plugin enable {{name}}`）并重新加载本页面，即可在此管理其供应商。",
     "reinstall_hint": "请重新安装插件包（`ccr plugin add <包名>`）或重启 CCR，然后重新加载本页面。",
-    "card_failed_title": "{{name}} 的管理卡片加载失败"
+    "card_failed_title": "{{name}} 的管理卡片加载失败",
+    "managed_notice": "该供应商由其插件卡片管理。通用编辑/删除无法修改其名称、地址、凭据或转换器；请在此处使用“断开”移除，Router 不变。"
   }
 }

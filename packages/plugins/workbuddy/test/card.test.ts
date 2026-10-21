@@ -16,6 +16,7 @@ class Element {
   tabIndex = -1;
   style = { cssText: "" };
   dataset: Record<string, string> = {};
+  style = { cssText: "" };
   onclick?: () => void;
   constructor(tag: string) { this.tag = tag; }
   append(...nodes: Element[]) { this.children.push(...nodes); }
@@ -43,6 +44,27 @@ const siteStatus = (extra: Record<string, any> = {}) => ({
 });
 const status = { sites: { workbuddy: siteStatus(), "workbuddy-ai": siteStatus({ providerName: "workbuddy-ai", status: "not_connected", accounts: [], models: [] }) } };
 
+function harnessFocus(focusKey: string | null, scrolled: string[]) {
+  // Every element this mount creates carries the scroll/focus spies, so the
+  // one-shot demand is observable on the site section itself.
+  vi.stubGlobal("document", { createElement: (tag: string) => {
+    const el = new Element(tag) as any;
+    el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
+    el.focus = function () { scrolled.push(`focus:${this.dataset?.testid}`); };
+    return el;
+  } });
+  const host = new Element("div");
+  const callApi = vi.fn(async () => status);
+  let hostListener: (() => void) | null = null;
+  mount(host as any, {
+    callApi: callApi as any, locale: "en", locales: workbuddyLocales,
+    disabled: false, plugin: { name: "workbuddy", version: "1" }, log: console,
+    onBusy: vi.fn(), refreshConfig: vi.fn(async () => {}),
+    onHostChange: (listener: () => void) => { hostListener = listener; return () => { hostListener = null; }; },
+    focusKey,
+  } as any);
+  return { host, callApi, notify: () => hostListener?.() };
+}
 function harness(overrides: Record<string, any> = {}, disabled = false, heldLease = false) {
   vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag) });
   const host = new Element("div");
@@ -150,6 +172,51 @@ describe("self-contained WorkBuddy plugin card", () => {
     h.host.click(en.account_remove_confirm); await tick();
     expect(h.callApi.mock.calls.some(([path, init]) => path === "/account/remove" && init.body === JSON.stringify({ site: "workbuddy", uid }))).toBe(true);
   });
+  it("a matching focusKey scrolls to and focuses that site's section, exactly once", async () => {
+    const scrolled: string[] = [];
+    vi.stubGlobal("document", { createElement: (tag: string) => {
+      const el = new Element(tag) as any;
+      el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
+      el.focus = function () { scrolled.push(`focus:${this.dataset?.testid}`); };
+      return el;
+    } });
+    try {
+      const cn = harnessFocus("workbuddy", scrolled);
+      for (let i = 0; i < 4; ++i) await tick();
+      // Deferred to the render microtask: the matching site section (only) was
+      // scrolled into view and focused.
+      expect(scrolled).toEqual(["workbuddy-card-workbuddy", "focus:workbuddy-card-workbuddy"]);
+      expect(cn.host.card("workbuddy").tabIndex).toBe(-1);
+      // Re-renders (host change) never re-trigger the one-shot focus.
+      cn.notify();
+      for (let i = 0; i < 6; ++i) await tick();
+      expect(scrolled).toEqual(["workbuddy-card-workbuddy", "focus:workbuddy-card-workbuddy"]);
+
+      const ai = harnessFocus("workbuddy-ai", scrolled);
+      await tick();
+      expect(scrolled).toEqual(["workbuddy-card-workbuddy", "focus:workbuddy-card-workbuddy",
+        "workbuddy-card-workbuddy-ai", "focus:workbuddy-card-workbuddy-ai"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("an unknown focusKey is ignored entirely (no section scrolled)", async () => {
+    const scrolled: string[] = [];
+    vi.stubGlobal("document", { createElement: (tag: string) => {
+      const el = new Element(tag) as any;
+      el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
+      return el;
+    } });
+    try {
+      harnessFocus("gemini-oauth", scrolled);
+      await tick();
+      expect(scrolled).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("hidden models restore singly or all with exact site bodies, never Router adoption", async () => {
     const h = harness({ "/status": { sites: { workbuddy: siteStatus({ hiddenModels: ["hidden"] }) } } });
     await tick();

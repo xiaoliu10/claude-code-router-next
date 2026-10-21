@@ -39,6 +39,12 @@ export interface PluginCardMountProps {
    */
   onHostChange?: (listener: () => void) => () => void;
   log: Pick<Console, "info" | "warn" | "error">;
+  /**
+   * One-shot deep-link focus key (the managed provider's name, or null). Cards
+   * scroll to and focus the matching section, then treat it as consumed; a
+   * card that does not own the key ignores it.
+   */
+  focusKey?: string | null;
 }
 
 export interface PluginCardModule {
@@ -129,7 +135,7 @@ export interface PluginCardAreaController {
    * as a visible issue. Mounting is sequential; a disposed generation never
    * touches the DOM again.
    */
-  sync(entries: PluginInfo[] | null, locale: string, host: HTMLElement): Promise<void>;
+  sync(entries: PluginInfo[] | null, locale: string, host: HTMLElement, focusKey?: string | null): Promise<void>;
   /** Unmount cards, revoke Blob URLs, drop subscriptions and reset busy state. */
   dispose(): void;
   /** Fan a host state change (e.g. the Save gate) out to mounted cards, in place. */
@@ -196,7 +202,7 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
     }
   };
 
-  const mountOne = async (host: HTMLElement, plugin: PluginInfo, cardUrl: string, locale: string) => {
+  const mountOne = async (host: HTMLElement, plugin: PluginInfo, cardUrl: string, locale: string, focusKey?: string | null) => {
     const gen = generation;
     // Host lane: authenticated fetch (admin key header) instead of a bare
     // import(cardUrl), which cannot authenticate on a non-loopback UI.
@@ -245,6 +251,7 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
         };
       },
       log: bridge.log,
+      focusKey: focusKey ?? null,
     };
     try {
       await card.mount(el, props);
@@ -276,7 +283,7 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
   };
 
   return {
-    async sync(entries, locale, host) {
+    async sync(entries, locale, host, focusKey) {
       disposeCards();
       const gen = generation;
       if (entries === null) {
@@ -302,7 +309,7 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
       for (const { plugin, cardUrl } of usable) {
         if (gen !== generation) return;
         try {
-          await mountOne(host, plugin, cardUrl, locale);
+          await mountOne(host, plugin, cardUrl, locale, focusKey);
         } catch (error) {
           // A broken card must not take the settings page down — and must not
           // stay invisible either: it becomes a rendered recovery notice.

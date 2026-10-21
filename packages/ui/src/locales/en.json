@@ -634,6 +634,7 @@
     "unavailable_title": "{{name}} is installed but unavailable",
     "disabled_hint": "This plugin is disabled in the CCR configuration. Enable it (for example with `ccr plugin enable {{name}}`) and reload this page to manage its provider here.",
     "reinstall_hint": "Reinstall the plugin package (`ccr plugin add <package>`) or restart CCR, then reload this page.",
-    "card_failed_title": "The management card for {{name}} failed to load"
+    "card_failed_title": "The management card for {{name}} failed to load",
+    "managed_notice": "This provider is managed by its plugin card. Generic edit/delete cannot change its name, URL, credentials or transformer; use Disconnect here to remove it. Router is unchanged."
   }
 }

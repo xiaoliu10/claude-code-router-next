@@ -126,8 +126,19 @@ function cleanUpConfigModels(config: any, deletedModels: string[], providerName?
 }
 
 // The host knows only generic managed signals, never a plugin's site names.
+// The CCR self-referential preset ("ccr", ccr_managed) is a local loopback
+// endpoint carrying the user's real admin key — it is edited/deleted like any
+// ordinary provider, never captured by the plugin-card management guard.
+// Mirrors shared isCcrSelfProvider: the CCR self-referential preset
+// ("ccr", ccr_managed) is a local loopback endpoint carrying the user's real
+// admin key — it is edited/deleted like any ordinary provider, never captured
+// by the plugin-card management guard.
+const isCcrSelfProvider = (provider: ProviderType | null | undefined): boolean =>
+  Boolean(provider && provider.name === "ccr" && provider.ccr_managed === true);
+
 const isManagedProvider = (provider: ProviderType | null | undefined) =>
-  provider?.ccr_managed === true || provider?.api_key?.startsWith("ccr-managed-") === true;
+  !isCcrSelfProvider(provider) &&
+  (provider?.ccr_managed === true || provider?.api_key?.startsWith("ccr-managed-") === true);
 
 export function Providers() {
   const { t } = useTranslation();
@@ -135,7 +146,13 @@ export function Providers() {
   const [isSaving, setIsSaving] = useState(false);
   const navigate = useNavigate();
   // Plugin-owned managed entries are edited/disconnected on their own cards.
-  const showManagedProviderManagement = () => navigate('/settings?tab=providers');
+  // The managed provider's NAME is the only host-known identity; the settings
+  // area forwards it as a generic focus key so the owning card can scroll to
+  // and focus its section (a card that does not own the name ignores it).
+  const showManagedProviderManagement = (providerName?: string) =>
+    navigate('/settings?tab=providers', {
+      state: { managedProviderNotice: true, managedProviderFocus: providerName ?? null },
+    });
   // Contract D7: the Gemini subscription provider is managed on its Settings
   // card; the generic dialog never edits it.
   const showGeminiOauthManagement = () => {
@@ -361,7 +378,7 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[index]);
     const provider = config.Providers[actualIndex];
-    if (isManagedProvider(provider)) { showManagedProviderManagement(); return; }
+    if (isManagedProvider(provider)) { showManagedProviderManagement(provider.name); return; }
     if (isManagedGeminiOauth(provider)) { showGeminiOauthManagement(); return; }
     if (isSaving) return;
     setEditingProviderIndex(actualIndex);
@@ -382,7 +399,7 @@ export function Providers() {
     // identity, key, URL, model set or transformer, even if config refreshed.
     if (isManagedProvider(editingProviderData) ||
         (editingProviderIndex !== null && isManagedProvider(config.Providers[editingProviderIndex]))) {
-      showManagedProviderManagement();
+      showManagedProviderManagement(editingProviderData.name);
       return;
     }
     if (isManagedGeminiOauth(editingProviderData) ||
@@ -497,7 +514,7 @@ export function Providers() {
   const handleSetDeletingProviderIndex = (filteredIndex: number) => {
     if (isSaving) return;
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
-    if (isManagedProvider(config.Providers[actualIndex])) { showManagedProviderManagement(); return; }
+    if (isManagedProvider(config.Providers[actualIndex])) { showManagedProviderManagement(config.Providers[actualIndex].name); return; }
     // Contract D7: the Gemini subscription row is removed on its own card, so
     // delete navigates there instead of opening the generic confirmation.
     if (isManagedGeminiOauth(config.Providers[actualIndex])) { showGeminiOauthManagement(); return; }
@@ -509,7 +526,7 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     const deletedProvider = config.Providers[actualIndex];
-    if (isManagedProvider(deletedProvider)) { showManagedProviderManagement(); return; }
+    if (isManagedProvider(deletedProvider)) { showManagedProviderManagement(deletedProvider.name); return; }
     setDeletingProviderIndex(null);
     if (isSaving) return;
     if (isManagedGeminiOauth(deletedProvider)) {

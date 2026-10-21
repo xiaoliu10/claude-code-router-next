@@ -25,6 +25,8 @@
     "vitest": "^4.1.9"
   },
   "files": [
-    "dist"
+    "dist/**/*.js",
+    "dist/*.json",
+    "dist/*.md"
   ]
 }

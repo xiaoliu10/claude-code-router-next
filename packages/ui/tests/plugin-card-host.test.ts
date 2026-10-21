@@ -452,3 +452,23 @@ test("plugin API sends authenticated exact bodies and carries only sanitized loc
     controller.abort(); assert.equal(sent?.signal?.aborted, true);
   } finally { globalThis.fetch = original; }
 });
+
+test("focusKey is a one-shot mount prop: delivered to the owning sync, never re-triggered", async () => {
+  const fx = deterministicBridge();
+  const ok = fakeCard();
+  const cardUrl = "/plugins/workbuddy/card.js";
+  fx.sources.set(cardUrl, JSON.stringify({ staged: cardUrl }));
+  fx.modules.set(`blob:${ORIGIN}${cardUrl}`, ok.mod);
+  const controller = createPluginCardAreaController(fx.bridge);
+  const host = new El("div");
+  await controller.sync([entry({ name: "workbuddy", cardUrl })], "en", host, "workbuddy");
+  assert.equal(ok.mounts[0].props.focusKey, "workbuddy");
+
+  // A later re-render (locale/gate change) re-syncs WITHOUT the focus key.
+  await controller.sync([entry({ name: "workbuddy", cardUrl })], "zh", host);
+  assert.equal(ok.mounts[1].props.focusKey, null);
+
+  // No key at all stays null (ordinary remount path).
+  await controller.sync([entry({ name: "workbuddy", cardUrl })], "en", host, null);
+  assert.equal(ok.mounts[2].props.focusKey, null);
+});

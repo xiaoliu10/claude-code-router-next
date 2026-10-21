@@ -56,6 +56,9 @@ it("npm tarball + real createCcrServer: rotation/admin/card, then disabled and r
   const contents = packed[0].files.map((f: { path: string }) => f.path);
   for (const file of ["dist/plugin.js", "dist/plugin.json", "dist/card.js", "dist/package.json", "dist/THIRD_PARTY_NOTICES.md"]) expect(contents).toContain(file);
   expect(contents.some((p: string) => /(?:core\/src|src\/|node_modules\/)/.test(p))).toBe(false);
+  // P1: source maps (full sourcesContent, including host UI sources) never
+  // ship in the published artifact; they stay local debug aids only.
+  expect(contents.some((p: string) => p.endsWith(".map"))).toBe(false);
   const installed = join(temp, "installed"); mkdirSync(installed);
   // Offline npm installation proves this is a self-contained package, not a
   // workspace-link fixture. No lifecycle scripts or registry access required.

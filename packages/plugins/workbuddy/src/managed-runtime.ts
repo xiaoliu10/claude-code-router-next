@@ -85,6 +85,25 @@ function exceedsWorkBuddyEdgeReads(body: any): boolean {
 const MAX_ROTATION_ATTEMPTS = 8;
 
 /**
+ * The SSE prefix inspector throws the PROTOCOL classification directly
+ * (outside the runtime classifier bridge), so it carries `cooldownSeconds`
+ * rather than the seam's `cooldownMs`. Normalize at the throw site so the
+ * wrapper's cooldown mapper sees the upstream "resets at …" window exactly
+ * like the HTTP/hidden-JSON path; class codes stay untouched.
+ */
+function normalizeSseProtocolError(error: any): any {
+  if (error?.workbuddy === true && !error.pluginClassified) {
+    withManagedMarkers(error);
+    error.nonRetryable = WORKBUDDY_TERMINAL_CODES.has(error.code);
+    const seconds = Number(error.cooldownSeconds);
+    if (Number.isFinite(seconds) && seconds > 0 && !Number.isFinite(Number(error.cooldownMs))) {
+      error.cooldownMs = seconds * 1000;
+    }
+  }
+  return error;
+}
+
+/**
  * Inspect only the pre-content SSE prefix. No bytes have reached the client at
  * this point: a classified error may safely rotate accounts. After any useful
  * content/tool/reasoning delta (or the bounded inspection budget) we return a
@@ -118,7 +137,7 @@ async function inspectWorkBuddySse(response: Response): Promise<Response> {
         if (data === "[DONE]") { committed = true; break; }
         let value: any;
         try { value = JSON.parse(data); } catch { committed = true; break; }
-        if (workBuddyEnvelopeIsError(value)) throw classifyWorkBuddyError(response.status, value);
+        if (workBuddyEnvelopeIsError(value)) throw normalizeSseProtocolError(classifyWorkBuddyError(response.status, value));
         committed = value?.choices?.some((choice: any) => {
           const delta = choice.delta ?? choice.message;
           return delta && Object.entries(delta).some(([key, v]) => key !== "role" && v != null && v !== "" && (!Array.isArray(v) || v.length > 0));
@@ -370,11 +389,9 @@ export function createWorkBuddyManagedRuntime(options: WorkBuddyRuntimeOptions):
           return await inspectWorkBuddySse(response);
         } catch (error: any) {
           // SSE inspection throws the protocol surface directly (outside the
-          // core classifier); attach the SAME generic terminal semantics.
-          if (error?.workbuddy === true && !error.pluginClassified) {
-            withManagedMarkers(error);
-            error.nonRetryable = WORKBUDDY_TERMINAL_CODES.has(error.code);
-          }
+          // core classifier); attach the SAME generic terminal semantics and
+          // cooldown surface as the classifier bridge (see normalize above).
+          normalizeSseProtocolError(error);
           await probeEdgeReset(error, credential, requestBody);
           const cooldown = workBuddyFailoverCooldownFromInfo(error, model);
           if (!cooldown) {
@@ -415,10 +432,7 @@ export function createWorkBuddyManagedRuntime(options: WorkBuddyRuntimeOptions):
               const response = await attempt();
               return await inspectWorkBuddySse(response);
             } catch (retryError: any) {
-              if (retryError?.workbuddy === true && !retryError.pluginClassified) {
-                withManagedMarkers(retryError);
-                retryError.nonRetryable = WORKBUDDY_TERMINAL_CODES.has(retryError.code);
-              }
+              normalizeSseProtocolError(retryError);
               await probeEdgeReset(retryError, credential, requestBody);
               // Same cooldown bookkeeping as an in-loop attempt, so this
               // account cannot escape its cooldown for one later request.

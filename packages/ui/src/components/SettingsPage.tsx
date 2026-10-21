@@ -455,8 +455,11 @@ export function SettingsPage() {
 
             <TabsContent value="providers" className="space-y-4">
               {location.state?.geminiOauthManagedNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("geminiOauth.managed_notice")}</p>}
-              {/* Managed providers are contributed by installed plugin cards. */}
-              <PluginCardArea disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} />
+              {/* Managed providers are contributed by installed plugin cards. A
+                  row's managed navigation lands here with a generic notice and
+                  a one-shot focus key the owning card consumes. */}
+              {location.state?.managedProviderNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("pluginCards.managed_notice")}</p>}
+              <PluginCardArea disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} focusKey={(location.state as { managedProviderFocus?: string | null } | null)?.managedProviderFocus ?? null} />
             </TabsContent>
 
             {/* General Tab */}

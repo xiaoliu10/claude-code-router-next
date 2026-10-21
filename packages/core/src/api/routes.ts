@@ -401,7 +401,7 @@ async function handleTransformerEndpoint(
     // budget through rememberPluginFailure — the generic seam semantics that
     // replaced the per-provider inline checks); generic transient errors
     // (5xx/empty stream/network) keep one retry.
-    const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error);
+    const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error, provider);
     if (!terminalPluginFailure && !(req as any).__retryAttempted) {
       (req as any).__retryAttempted = true;
       try {
@@ -728,7 +728,10 @@ async function handleFallback(
       }
 
       const fallbackRuntime = fastify.pluginRegistry.getManagedRuntimeFor(configuredFallback.provider);
-      if (fallbackRuntime && pluginAttemptBudget(req, fallbackRuntime).terminalError) continue;
+      // Provider-scoped: one runtime may own several independent managed
+      // providers (e.g. per-site subscriptions); a terminal failure of one
+      // site's provider must never skip another site's fallback entry.
+      if (fallbackRuntime && pluginAttemptBudget(req, fallbackRuntime, { name: fbProviderName }).terminalError) continue;
       let fallbackError: any;
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
@@ -843,7 +846,7 @@ async function handleFallback(
           fallbackError = error;
           // A classified nonRetryable plugin failure never restarts its
           // account-pool attempt budget on a fallback retry.
-          if (rememberPluginFailure(req, fallbackRuntime, error)) break;
+          if (rememberPluginFailure(req, fallbackRuntime, error, { name: fbProviderName })) break;
           if (attempt === 1) {
             req.log.warn(`Fallback model ${fbProviderName},${fbModel} failed, retrying once: ${error.message}`);
             continue;

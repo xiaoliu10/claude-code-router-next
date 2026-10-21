@@ -85,6 +85,14 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   let toast: string | null = null;
   let release: (() => void) | null = null;
   let unsubscribeHost: (() => void) | null = null;
+  // One-shot deep-link focus: a host navigation carrying this plugin's managed
+  // provider name ("workbuddy" / "workbuddy-ai") scrolls to and focuses that
+  // site's section. Consumed on first render; unknown keys are ignored (and
+  // remain unconsumed — other cards own them).
+  let focusSite: WorkBuddyKind | null = (SITES as string[]).includes(String(props.focusKey ?? ""))
+    ? (props.focusKey as WorkBuddyKind)
+    : null;
+  if (focusSite) props.focusKey = null;
 
   const post = <T,>(path: string, body: any = {}, signal?: AbortSignal, timeoutMs = 30_000) =>
     props.callApi<T>(path, { method: "POST", body: JSON.stringify(body), signal, timeoutMs });
@@ -304,6 +312,12 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const card = node("div");
     (card as HTMLElement).dataset.testid = `workbuddy-card-${site}`;
     card.setAttribute("role", "group");
+    if (site === focusSite) {
+      // One-shot: consume the demand at first delivery so the post-status
+      // re-render (same synchronous mount) never scrolls again.
+      focusSite = null;
+      queueMicrotask(() => { card.scrollIntoView?.({ block: "start" }); (card as HTMLElement).focus?.(); });
+    }
     card.setAttribute("aria-busy", String(busy));
     card.style.cssText = "border:1px solid #8886;border-radius:12px;padding:20px;margin-bottom:16px;font-size:14px";
     card.tabIndex = -1;
