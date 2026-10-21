@@ -18,6 +18,20 @@ export interface Provider {
   quota_token?: string;
   // Optional SEC_TOKEN used to query Aliyun MaaS Token Plan quota usage.
   quota_sec_token?: string;
+  // Set by CCR for built-in subscription providers it manages (e.g. WorkBuddy).
+  // A managed provider's api_base_url / api_key / transformer are fixed by CCR and
+  // must not be edited through the generic provider dialog.
+  ccr_managed?: boolean;
+  // Which built-in subscription backend a managed provider belongs to:
+  // "workbuddy" (copilot.tencent.com) today; reserved for future sites.
+  workbuddy_kind?: string;
+  // Google-subscription (Antigravity OAuth) managed provider: CCR fixes its
+  // api_base_url / api_key marker / transformer, so the generic provider
+  // dialog must never edit it (same rule as ccr_managed).
+  gemini_oauth_managed?: boolean;
+  // Which OAuth backend a managed Google provider belongs to. v1 is
+  // antigravity only; the field exists so the UI never guesses.
+  gemini_oauth_kind?: GeminiOauthKind;
   // Thinking level injected when the client sends no thinking config:
   // "low" | "medium" | "high", a custom token budget (number), a free-form
   // provider effort string (e.g. "minimal"), or unset/empty to follow the
@@ -246,6 +260,248 @@ export interface ProviderHealthResponse {
   /** Optional for backwards compatibility with older servers. */
   probes?: ProviderProbeTelemetry[];
   timestamp: string;
+}
+
+export type WorkBuddyStatus =
+  | "not_connected"
+  | "connected"
+  | "expired"
+  | "sealed"
+  | "source_missing"
+  | "source_changed"
+  | "error";
+
+// Which fixed-origin WorkBuddy site a saved login belongs to. Since the §16
+// multi-account pool each site is independently connected and owns its own
+// managed provider: "workbuddy" (CN) and "workbuddy-ai" (international).
+export type WorkBuddyKind = "workbuddy" | "workbuddy-ai";
+
+export type WorkBuddyRenewalMode = "desktop" | "browser";
+
+// One account of a site's pool (§16). Only summary fields cross the API:
+// no token material of any kind.
+export interface WorkBuddyAccountSummary {
+  uid: string;
+  displayName: string | null;
+  source: "desktop" | "browser";
+  active: boolean;
+  coolingUntil?: number | null;
+  restrictedUntil?: number | null;
+  expiresAt?: number | null;
+}
+
+// Per-site status entry of GET /api/workbuddy/status → sites[site] (§16).
+export interface WorkBuddySiteStatus {
+  status: WorkBuddyStatus;
+  providerName: string;
+  accounts: WorkBuddyAccountSummary[];
+  activeUid: string | null;
+  models: string[];
+  hiddenModels: string[];
+  modelCount: number;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  // Display-only extras. Optional so the UI also renders against a server
+  // that returns exactly the §16 fields.
+  site?: string;
+  source?: "desktop" | "browser";
+  renewalMode?: WorkBuddyRenewalMode;
+  imagesUnsupportedModels?: string[];
+}
+
+export interface WorkBuddyStatusResponse {
+  // §16 source of truth: one independent entry per site.
+  sites: Partial<Record<WorkBuddyKind, WorkBuddySiteStatus>>;
+  // Legacy flat mirror of the only connected site. Kept one version for
+  // backwards compatibility; the UI reads it only when `sites` is absent.
+  status?: WorkBuddyStatus;
+  kind?: WorkBuddyKind;
+  providerName?: string;
+  site?: string;
+  models?: string[];
+  modelCount?: number;
+  uid?: string | null;
+  displayName?: string | null;
+  domain?: string | null;
+  expiresAt?: number | null;
+  importedAt?: string | null;
+  lastSyncAt?: string | null;
+  lastError?: string | null;
+  imagesUnsupportedModels?: string[];
+  renewalMode?: WorkBuddyRenewalMode;
+  source?: "desktop" | "browser";
+}
+
+export interface WorkBuddyUsage {
+  plan: string;
+  used: number;
+  limit: number;
+  unit: "credits";
+}
+
+export interface WorkBuddyUsageResponse {
+  usage: WorkBuddyUsage | null;
+}
+
+// §16: usage is an explicit POST {site, uid?}; uid defaults to the site's
+// active account server-side. Still invoked only on click, never polled.
+export interface WorkBuddyUsageRequest {
+  site: WorkBuddyKind;
+  uid?: string;
+}
+
+// §16 hide response: Router path labels are display-only, never model refs.
+// Optional reconciliation metadata permits a one-version older-server fallback.
+export interface WorkBuddyModelHideResponse {
+  ok: boolean;
+  clearedRefs?: string[];
+  removedModelRefs?: string[];
+  // Actual persisted Router.default after hide; null means no default remains.
+  defaultFallback?: string | null;
+}
+
+// Restoring never rewrites Router references (§16).
+export interface WorkBuddyModelRestoreResponse {
+  ok: boolean;
+}
+
+export type WorkBuddyFailureReason =
+  | "sealed"
+  | "source_missing"
+  | "source_invalid"
+  | "models_fetch_failed"
+  | "workbuddy_name_conflict"
+  | "login_state_rejected"
+  | "login_account_failed"
+  | "login_persist_failed";
+
+export interface WorkBuddyLoginStartResponse {
+  ok: true;
+  site: WorkBuddyKind;
+  loginId: string;
+  url: string;
+  expiresAt: number;
+}
+
+export type WorkBuddyLoginPollResponse =
+  | { status: "pending" | "none" | "expired" }
+  | { status: "failed"; reason: WorkBuddyFailureReason }
+  | (WorkBuddyMutationResponse & { status: "connected"; success: true; models: string[]; accountChange?: "added" | "updated"; accountCount?: number });
+
+export interface WorkBuddyImportRequest {
+  site: WorkBuddyKind;
+}
+
+export interface WorkBuddyAccountSwitchRequest {
+  site: WorkBuddyKind;
+  uid: string;
+}
+
+export interface WorkBuddyAccountRemoveRequest {
+  site: WorkBuddyKind;
+  uid: string;
+}
+
+export interface WorkBuddyModelHideRequest {
+  site: WorkBuddyKind;
+  model: string;
+}
+
+export interface WorkBuddyModelRestoreRequest {
+  site: WorkBuddyKind;
+  model?: string;
+}
+
+export interface WorkBuddyMutationResponse {
+  // §16 management routes return an additive `ok` alongside the legacy fields.
+  ok?: boolean;
+  success: boolean;
+  status?: WorkBuddyStatus;
+  models?: string[];
+  modelCount?: number;
+  displayName?: string | null;
+  message?: string | null;
+  modelsUnchanged?: boolean;
+  reason?: WorkBuddyFailureReason;
+  removedProvider?: boolean;
+  deletedCredential?: boolean;
+  error?: string;
+  /** §16 outcome metadata when a login/import committed an account upsert: a new pool row was added, or an existing uid was replaced in place. */
+  accountChange?: "added" | "updated";
+  /** Committed pool size for the site after that upsert. */
+  accountCount?: number;
+}
+
+// ===== Gemini subscription (Antigravity OAuth) provider =====
+
+// v1 supports the Antigravity installed-app OAuth only.
+export type GeminiOauthKind = "antigravity";
+
+/** Why the account cannot serve requests; codes are stable and localised. */
+export type GeminiOauthErrorCode =
+  | "gemini_oauth_identity_blocked"
+  | "gemini_oauth_validation_required"
+  | "gemini_oauth_quota_exceeded"
+  | "gemini_oauth_reauth_required"
+  | "gemini_oauth_upstream_error"
+  | "gemini_oauth_not_connected"
+  | "gemini_oauth_login_busy"
+  | "gemini_oauth_name_conflict"
+  | "gemini_oauth_login_state_rejected"
+  | "gemini_oauth_login_account_failed"
+  | "gemini_oauth_login_persist_failed"
+  | "gemini_oauth_models_fetch_failed"
+  | "gemini_oauth_config_write_failed"
+  | "request_failed";
+
+export interface GeminiOauthError {
+  code: GeminiOauthErrorCode;
+  // Server-side safe text only; token material never crosses this boundary.
+  message?: string | null;
+  // Present for VALIDATION_REQUIRED: the official appeal/verification link.
+  validationUrl?: string | null;
+}
+
+/** GET /api/gemini-oauth/status — never carries token material. */
+export interface GeminiOauthStatusResponse {
+  configured: boolean;
+  connected: boolean;
+  kind: GeminiOauthKind;
+  email?: string | null;
+  project?: string | null;
+  tier?: string | null;
+  modelsCount?: number;
+  lastError?: GeminiOauthError | null;
+  // Epoch ms until which the account is parked after an upstream signal.
+  cooldownUntil?: number | null;
+}
+
+/** POST /api/gemini-oauth/login/start */
+export interface GeminiOauthLoginStartResponse {
+  loginId: string;
+  url: string;
+  expiresAt: number;
+}
+
+/** POST /api/gemini-oauth/login/poll */
+export type GeminiOauthLoginPollResponse =
+  | { status: "pending" }
+  | { status: "success"; email?: string | null }
+  | { status: "failed"; error?: GeminiOauthErrorCode | null };
+
+/** POST /api/gemini-oauth/sync — a failure keeps the previous model list. */
+export interface GeminiOauthSyncResponse {
+  ok: boolean;
+  modelsCount?: number;
+  clearedRefs?: string[];
+  error?: GeminiOauthErrorCode | string | null;
+}
+
+/** POST /api/gemini-oauth/disconnect — Router paths are display labels only. */
+export interface GeminiOauthDisconnectResponse {
+  ok: boolean;
+  removedModelRefs?: string[];
+  defaultFallback?: string | null;
 }
 
 export interface ManualProbeResponse {

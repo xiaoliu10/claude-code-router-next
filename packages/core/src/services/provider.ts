@@ -101,6 +101,16 @@ export class ProviderService {
           name: providerConfig.name,
           baseUrl: providerConfig.api_base_url,
           apiKey: providerConfig.api_key,
+          // Managed built-in providers (e.g. WorkBuddy) carry their flag so the
+          // data plane can lock their upstream URL and headers.
+          workbuddyManaged: (providerConfig as any).workbuddyManaged === true ||
+            ((providerConfig as any).ccr_managed === true && providerConfig.name === "workbuddy"),
+          // Managed Gemini OAuth (Antigravity) provider carries its flag the same
+          // way, so the data plane can lock its fixed upstream URL and headers.
+          geminiOauthManaged: (providerConfig as any).geminiOauthManaged === true ||
+            ((providerConfig as any).gemini_oauth_managed === true && providerConfig.name === "gemini-oauth"),
+          geminiOauthKind: (providerConfig as any).gemini_oauth_kind === "antigravity" ||
+            (providerConfig as any).geminiOauthKind === "antigravity" ? "antigravity" : undefined,
           models: providerConfig.models || [],
           quotaToken: (providerConfig as any).quota_token,
           quotaSecToken: (providerConfig as any).quota_sec_token,

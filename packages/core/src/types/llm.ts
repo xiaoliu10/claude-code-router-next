@@ -232,6 +232,14 @@ export interface LLMProvider {
   wakeupEnabled?: boolean;
   wakeupTime?: string;
   wakeupModel?: string;
+  /** Set for CCR-managed built-in providers (e.g. WorkBuddy) so the data plane
+   *  can lock their fixed upstream URL and inject their own auth headers. */
+  workbuddyManaged?: boolean;
+  /** Set for the CCR-managed Gemini OAuth (Antigravity) provider so the data
+   *  plane can lock its fixed upstream URL and inject OAuth-derived headers. */
+  geminiOauthManaged?: boolean;
+  /** Managed Gemini OAuth account kind. v1: antigravity only. */
+  geminiOauthKind?: "antigravity";
 }
 
 export type RegisterProviderRequest = LLMProvider;
@@ -276,4 +284,7 @@ export interface ConfigProvider {
   wakeup_enabled?: boolean;
   wakeup_time?: string;
   wakeup_model?: string;
+  /** CCR-managed Gemini OAuth (Antigravity) provider flags (snake_case on disk). */
+  gemini_oauth_managed?: boolean;
+  gemini_oauth_kind?: "antigravity";
 }

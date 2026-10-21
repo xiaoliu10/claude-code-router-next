@@ -1,10 +1,47 @@
-import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse } from '@/types';
+import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyAccountRemoveRequest, WorkBuddyAccountSwitchRequest, WorkBuddyLoginStartResponse, WorkBuddyLoginPollResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyModelHideRequest, WorkBuddyModelHideResponse, WorkBuddyModelRestoreRequest, WorkBuddyModelRestoreResponse, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageRequest, WorkBuddyUsageResponse } from '@/types';
+import type { GeminiOauthDisconnectResponse, GeminiOauthLoginPollResponse, GeminiOauthLoginStartResponse, GeminiOauthStatusResponse, GeminiOauthSyncResponse } from '@/types';
+import { WORKBUDDY_POLL_TIMEOUT } from '../utils/workbuddy-login.ts';
+
+// The Gemini subscription provider has its own frozen code list (contract
+// §1.6); unknown server text is never surfaced to the browser.
+const GEMINI_OAUTH_ERROR_CODES = new Set(['gemini_oauth_identity_blocked', 'gemini_oauth_validation_required',
+  'gemini_oauth_quota_exceeded', 'gemini_oauth_reauth_required', 'gemini_oauth_upstream_error',
+  'gemini_oauth_not_connected', 'gemini_oauth_login_busy', 'gemini_oauth_name_conflict',
+  'gemini_oauth_login_state_rejected', 'gemini_oauth_login_account_failed', 'gemini_oauth_login_persist_failed',
+  'gemini_oauth_models_fetch_failed', 'gemini_oauth_config_write_failed']);
+
+/** Codes the Gemini OAuth routes may report, keyed by route family. */
+const GEMINI_OAUTH_ROUTE_CODES: Record<string, string[]> = {
+  status: ['gemini_oauth_not_connected'],
+  login: ['gemini_oauth_login_busy', 'gemini_oauth_login_state_rejected', 'gemini_oauth_login_account_failed',
+    'gemini_oauth_login_persist_failed', 'gemini_oauth_name_conflict', 'gemini_oauth_reauth_required'],
+  sync: ['gemini_oauth_not_connected', 'gemini_oauth_reauth_required', 'gemini_oauth_models_fetch_failed',
+    'gemini_oauth_quota_exceeded', 'gemini_oauth_config_write_failed', 'gemini_oauth_upstream_error'],
+  disconnect: ['gemini_oauth_config_write_failed'],
+};
+
+function geminiOauthRouteFamily(endpoint: string): string {
+  if (endpoint.startsWith('/gemini-oauth/login/')) return 'login';
+  if (endpoint.startsWith('/gemini-oauth/sync')) return 'sync';
+  if (endpoint.startsWith('/gemini-oauth/disconnect')) return 'disconnect';
+  return 'status';
+}
 
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
   private baseUrl: string;
   private apiKey: string;
   private tempApiKey: string | null;
+  private configWrites = 0;
+  private workBuddyManagementBusy = false;
+
+  // Shared with top-level Save: a stale full-config write must not race a
+  // managed import/disconnect, including the subsequent config reconciliation.
+  acquireWorkBuddyManagement(): (() => void) | null {
+    if (this.workBuddyManagementBusy || this.configWrites > 0) return null;
+    this.workBuddyManagementBusy = true;
+    return () => { this.workBuddyManagementBusy = false; };
+  }
 
   constructor(baseUrl: string = '/api', apiKey: string = '') {
     this.baseUrl = baseUrl;
@@ -60,6 +97,9 @@ class ApiClient {
   // milliseconds so a hung server can't leave the caller pending forever.
   private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
+    const isWorkBuddy = endpoint.startsWith('/workbuddy/');
+    const isGeminiOauth = endpoint.startsWith('/gemini-oauth/');
+    const isManagedSubscription = isWorkBuddy || isGeminiOauth;
     const { timeoutMs, ...rest } = options;
 
     const config: RequestInit = {
@@ -86,7 +126,37 @@ class ApiClient {
         // We'll dispatch a custom event that the app can listen to
         window.dispatchEvent(new CustomEvent('unauthorized'));
         // Return a promise that never resolves to prevent further execution
+        if (isGeminiOauth) throw Object.assign(new Error('Gemini OAuth request failed'), { reason: 'request_failed' });
+        if (isWorkBuddy) throw Object.assign(new Error('workbuddy_unauthorized'), { reason: 'workbuddy_unauthorized' });
         return new Promise(() => {}) as Promise<T>;
+      }
+
+      if (!response.ok && isGeminiOauth) {
+        let code = 'request_failed';
+        try {
+          const data = await response.json();
+          const candidate = data.reason || data.error;
+          if (typeof candidate === 'string' && GEMINI_OAUTH_ERROR_CODES.has(candidate)
+            && GEMINI_OAUTH_ROUTE_CODES[geminiOauthRouteFamily(endpoint)].includes(candidate)) code = candidate;
+        } catch { /* use the safe default */ }
+        throw Object.assign(new Error('Gemini OAuth request failed'), { reason: code });
+      }
+
+      if (!response.ok && isWorkBuddy) {
+        // Retain only known codes. Raw server/upstream messages must never enter
+        // the browser's error object, console, toast or component state.
+        const allowed = ['sealed', 'source_missing', 'source_invalid', 'models_fetch_failed',
+          'workbuddy_name_conflict', 'workbuddy_not_connected',
+          'workbuddy_unauthorized', 'login_state_rejected', 'login_account_failed', 'login_persist_failed',
+          'workbuddy_account_not_found', 'workbuddy_model_invalid',
+          'workbuddy_config_write_failed', 'workbuddy_login_busy'];
+        let code = 'request_failed';
+        try {
+          const data = await response.json();
+          const candidate = data.reason || data.error;
+          if (allowed.includes(candidate)) code = candidate;
+        } catch { /* use the safe default */ }
+        throw Object.assign(new Error('WorkBuddy request failed'), { reason: code });
       }
 
       if (!response.ok) {
@@ -111,6 +181,19 @@ class ApiClient {
       return text ? JSON.parse(text) : ({} as T);
 
     } catch (error) {
+      if (isManagedSubscription) {
+        // Network / JSON exceptions can include unsafe text too.
+        // A local request timeout is NOT a server verdict: tag it so the
+        // sequential login helper can retry within its deadline. The thrown
+        // value stays fully sanitized either way — the original DOMException
+        // text never leaves this boundary.
+        const reason = error instanceof DOMException && error.name === 'TimeoutError'
+          ? (isWorkBuddy ? WORKBUDDY_POLL_TIMEOUT : 'request_failed')
+          : error && typeof error === 'object' && 'reason' in error && typeof error.reason === 'string'
+            && (!isGeminiOauth || GEMINI_OAUTH_ERROR_CODES.has(error.reason) || error.reason === 'request_failed')
+            ? error.reason : 'request_failed';
+        throw Object.assign(new Error(isGeminiOauth ? 'Gemini OAuth request failed' : 'WorkBuddy request failed'), { reason });
+      }
       console.error('API request error:', error);
       throw error;
     }
@@ -165,7 +248,13 @@ class ApiClient {
 
   // Update entire configuration
   async updateConfig(config: Config): Promise<{ success: boolean; message?: string }> {
-    return this.post<{ success: boolean; message?: string }>('/config', config);
+    if (this.workBuddyManagementBusy) return { success: false };
+    this.configWrites += 1;
+    try {
+      return await this.post<{ success: boolean; message?: string }>('/config', config);
+    } finally {
+      this.configWrites -= 1;
+    }
   }
 
   // Restart service
@@ -385,6 +474,133 @@ class ApiClient {
       '/providers/quota',
       ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
     );
+  }
+
+  // ========== WorkBuddy built-in provider API methods ==========
+
+  // Management reads are local (no upstream call): the status endpoint only
+  // reports the saved provider + credential file summary. It must never read
+  // the WorkBuddy desktop login file — only an explicit import does that once.
+  getWorkBuddyStatus(): Promise<WorkBuddyStatusResponse> {
+    return this.get<WorkBuddyStatusResponse>(
+      '/workbuddy/status',
+      ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
+    );
+  }
+
+  // Explicit user action: read the fixed local login file of the explicitly
+  // selected site once (the selector makes the international site work even
+  // when both desktop files exist), register the managed provider and run
+  // model discovery. Never auto-invoked. Later near-expiry inference may do
+  // one bounded same-site/same-account desktop re-read in memory. CCR never
+  // stores a credential-refresh secret or calls a credential-refresh API.
+  // Generous timeout: this performs an upstream config fetch.
+  importWorkBuddy(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
+    const body: WorkBuddyImportRequest = { site };
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/import', body, 60_000);
+  }
+
+  startWorkBuddyLogin(site: WorkBuddyKind): Promise<WorkBuddyLoginStartResponse> {
+    return this.post('/workbuddy/login/start', { site }, 30_000);
+  }
+
+  pollWorkBuddyLogin(site: WorkBuddyKind, loginId: string, signal: AbortSignal): Promise<WorkBuddyLoginPollResponse> {
+    return this.apiFetch('/workbuddy/login/poll', {
+      method: 'POST', body: JSON.stringify({ site, loginId }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+    });
+  }
+
+  cancelWorkBuddyLogin(site: WorkBuddyKind, loginId: string): Promise<{ success: boolean }> {
+    return this.post('/workbuddy/login/cancel', { site, loginId }, 30_000);
+  }
+
+  // §16 per-site pool management. Every body carries the site; CN and the
+  // international site are fully independent pools and never conflict.
+  syncWorkBuddyModels(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/sync', { site }, 60_000);
+  }
+
+  // Disconnects the WHOLE site (its provider + account pool). Router
+  // references are preserved server-side (§14 semantics).
+  disconnectWorkBuddy(site: WorkBuddyKind): Promise<WorkBuddyMutationResponse> {
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/disconnect', { site }, 30_000);
+  }
+
+  switchWorkBuddyAccount(site: WorkBuddyKind, uid: string): Promise<WorkBuddyMutationResponse> {
+    const body: WorkBuddyAccountSwitchRequest = { site, uid };
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/account/switch', body, 30_000);
+  }
+
+  // Removing the last account disconnects the site server-side (§16).
+  removeWorkBuddyAccount(site: WorkBuddyKind, uid: string): Promise<WorkBuddyMutationResponse> {
+    const body: WorkBuddyAccountRemoveRequest = { site, uid };
+    return this.post<WorkBuddyMutationResponse>('/workbuddy/account/remove', body, 30_000);
+  }
+
+  // Explicit user action only: read subscription credits once for the site
+  // (uid defaults to the active account server-side). Never polled
+  // automatically. Failures are non-critical and quietly hide the display in
+  // the component — no raw quota errors are surfaced.
+  getWorkBuddyUsage(site: WorkBuddyKind, uid?: string): Promise<WorkBuddyUsageResponse> {
+    const body: WorkBuddyUsageRequest = uid ? { site, uid } : { site };
+    return this.post<WorkBuddyUsageResponse>(
+      '/workbuddy/usage',
+      body,
+      ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
+    );
+  }
+
+  // §16: hiding a model removes it from the managed provider, keeps it hidden
+  // across sync/re-login, and lets the server clear Router references that
+  // point at it. The cleared references come back for a UI toast.
+  hideWorkBuddyModel(site: WorkBuddyKind, model: string): Promise<WorkBuddyModelHideResponse> {
+    const body: WorkBuddyModelHideRequest = { site, model };
+    return this.post<WorkBuddyModelHideResponse>('/workbuddy/models/hide', body, 30_000);
+  }
+
+  // Restoring never rewrites Router references (§16); model omitted = all.
+  restoreWorkBuddyModel(site: WorkBuddyKind, model?: string): Promise<WorkBuddyModelRestoreResponse> {
+    const body: WorkBuddyModelRestoreRequest = model ? { site, model } : { site };
+    return this.post<WorkBuddyModelRestoreResponse>('/workbuddy/models/restore', body, 30_000);
+  }
+
+  // ========== Gemini subscription (Antigravity OAuth) provider API methods ==========
+
+  // Local status only: no polling, no upstream call, no token field of any kind.
+  getGeminiOauthStatus(): Promise<GeminiOauthStatusResponse> {
+    return this.get<GeminiOauthStatusResponse>(
+      '/gemini-oauth/status',
+      ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
+    );
+  }
+
+  // Opens one loopback callback server with a 10 minute TTL. Called ONLY after
+  // the user confirmed the risk dialog — never on mount, never automatically.
+  startGeminiOauthLogin(): Promise<GeminiOauthLoginStartResponse> {
+    return this.post<GeminiOauthLoginStartResponse>('/gemini-oauth/login/start', {}, 30_000);
+  }
+
+  pollGeminiOauthLogin(loginId: string, signal: AbortSignal): Promise<GeminiOauthLoginPollResponse> {
+    return this.apiFetch('/gemini-oauth/login/poll', {
+      method: 'POST', body: JSON.stringify({ loginId }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+    });
+  }
+
+  cancelGeminiOauthLogin(loginId: string): Promise<{ ok?: boolean; success?: boolean }> {
+    return this.post('/gemini-oauth/login/cancel', { loginId }, 30_000);
+  }
+
+  // Re-reads the available model list; a failure keeps the previous models.
+  syncGeminiOauthModels(): Promise<GeminiOauthSyncResponse> {
+    return this.post<GeminiOauthSyncResponse>('/gemini-oauth/sync', {}, 60_000);
+  }
+
+  // Deletes the managed provider and the private credential file. Router
+  // references are preserved and may stop working; CCR says so in the UI.
+  disconnectGeminiOauth(): Promise<GeminiOauthDisconnectResponse> {
+    return this.post<GeminiOauthDisconnectResponse>('/gemini-oauth/disconnect', {}, 30_000);
   }
 
   async probeProvider(providerName: string): Promise<ManualProbeResponse> {

@@ -3,9 +3,15 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
-// Isolate the SQLite database inside a throwaway HOME before the module
-// resolves DATA_DIR (computed from homedir() at import time).
+// Isolate the SQLite database inside a throwaway dir before the module resolves
+// DATA_DIR (computed at import time). CCR_CONFIG_DIR must be overridden too:
+// vitest.config.ts sets it for every worker and HOME_DIR prefers it over HOME,
+// so overriding HOME alone left this suite reading/writing the SHARED test DB —
+// any data-plane test scheduled before it (which appends usage rows through the
+// request pipeline) then changed these aggregate counts, making the suite
+// order-dependent/flaky.
 const tempHome = mkdtempSync(join(tmpdir(), "ccr-usage-summary-"));
+process.env.CCR_CONFIG_DIR = tempHome;
 process.env.HOME = tempHome;
 process.env.USERPROFILE = tempHome;
 

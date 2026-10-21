@@ -37,9 +37,14 @@ export function sendUnifiedRequest(
     headers: headers,
     body: JSON.stringify(request),
     signal: combinedSignal,
+    // Managed WorkBuddy requests set redirect:"error" so the fixed HTTPS origin
+    // can never be bounced to another host.
+    ...(config.redirect ? { redirect: config.redirect } : {}),
   };
 
-  if (config.httpsProxy) {
+  if (config.dispatcher) {
+    (fetchOptions as any).dispatcher = config.dispatcher;
+  } else if (config.httpsProxy) {
     (fetchOptions as any).dispatcher = getProxyDispatcher(config.httpsProxy);
   }
   logger?.debug(
