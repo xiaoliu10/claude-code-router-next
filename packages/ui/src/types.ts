@@ -18,6 +18,13 @@ export interface Provider {
   quota_token?: string;
   // Optional SEC_TOKEN used to query Aliyun MaaS Token Plan quota usage.
   quota_sec_token?: string;
+  // Set by CCR for built-in subscription providers it manages (e.g. WorkBuddy).
+  // A managed provider's api_base_url / api_key / transformer are fixed by CCR and
+  // must not be edited through the generic provider dialog.
+  ccr_managed?: boolean;
+  // Which built-in subscription backend a managed provider belongs to:
+  // "workbuddy" (copilot.tencent.com) today; reserved for future sites.
+  workbuddy_kind?: string;
   // Thinking level injected when the client sends no thinking config:
   // "low" | "medium" | "high", a custom token budget (number), a free-form
   // provider effort string (e.g. "minimal"), or unset/empty to follow the
@@ -246,6 +253,176 @@ export interface ProviderHealthResponse {
   /** Optional for backwards compatibility with older servers. */
   probes?: ProviderProbeTelemetry[];
   timestamp: string;
+}
+
+export type WorkBuddyStatus =
+  | "not_connected"
+  | "connected"
+  | "expired"
+  | "sealed"
+  | "source_missing"
+  | "source_changed"
+  | "error";
+
+// Which fixed-origin WorkBuddy site a saved login belongs to. Since the §16
+// multi-account pool each site is independently connected and owns its own
+// managed provider: "workbuddy" (CN) and "workbuddy-ai" (international).
+export type WorkBuddyKind = "workbuddy" | "workbuddy-ai";
+
+export type WorkBuddyRenewalMode = "desktop" | "browser";
+
+// One account of a site's pool (§16). Only summary fields cross the API:
+// no token material of any kind.
+export interface WorkBuddyAccountSummary {
+  uid: string;
+  displayName: string | null;
+  source: "desktop" | "browser";
+  active: boolean;
+  coolingUntil?: number | null;
+  restrictedUntil?: number | null;
+  expiresAt?: number | null;
+}
+
+// Per-site status entry of GET /api/workbuddy/status → sites[site] (§16).
+export interface WorkBuddySiteStatus {
+  status: WorkBuddyStatus;
+  providerName: string;
+  accounts: WorkBuddyAccountSummary[];
+  activeUid: string | null;
+  models: string[];
+  hiddenModels: string[];
+  modelCount: number;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  // Display-only extras. Optional so the UI also renders against a server
+  // that returns exactly the §16 fields.
+  site?: string;
+  source?: "desktop" | "browser";
+  renewalMode?: WorkBuddyRenewalMode;
+  imagesUnsupportedModels?: string[];
+}
+
+export interface WorkBuddyStatusResponse {
+  // §16 source of truth: one independent entry per site.
+  sites: Partial<Record<WorkBuddyKind, WorkBuddySiteStatus>>;
+  // Legacy flat mirror of the only connected site. Kept one version for
+  // backwards compatibility; the UI reads it only when `sites` is absent.
+  status?: WorkBuddyStatus;
+  kind?: WorkBuddyKind;
+  providerName?: string;
+  site?: string;
+  models?: string[];
+  modelCount?: number;
+  uid?: string | null;
+  displayName?: string | null;
+  domain?: string | null;
+  expiresAt?: number | null;
+  importedAt?: string | null;
+  lastSyncAt?: string | null;
+  lastError?: string | null;
+  imagesUnsupportedModels?: string[];
+  renewalMode?: WorkBuddyRenewalMode;
+  source?: "desktop" | "browser";
+}
+
+export interface WorkBuddyUsage {
+  plan: string;
+  used: number;
+  limit: number;
+  unit: "credits";
+}
+
+export interface WorkBuddyUsageResponse {
+  usage: WorkBuddyUsage | null;
+}
+
+// §16: usage is an explicit POST {site, uid?}; uid defaults to the site's
+// active account server-side. Still invoked only on click, never polled.
+export interface WorkBuddyUsageRequest {
+  site: WorkBuddyKind;
+  uid?: string;
+}
+
+// §16 hide response: Router path labels are display-only, never model refs.
+// Optional reconciliation metadata permits a one-version older-server fallback.
+export interface WorkBuddyModelHideResponse {
+  ok: boolean;
+  clearedRefs?: string[];
+  removedModelRefs?: string[];
+  // Actual persisted Router.default after hide; null means no default remains.
+  defaultFallback?: string | null;
+}
+
+// Restoring never rewrites Router references (§16).
+export interface WorkBuddyModelRestoreResponse {
+  ok: boolean;
+}
+
+export type WorkBuddyFailureReason =
+  | "sealed"
+  | "source_missing"
+  | "source_invalid"
+  | "models_fetch_failed"
+  | "workbuddy_name_conflict"
+  | "login_state_rejected"
+  | "login_account_failed"
+  | "login_persist_failed";
+
+export interface WorkBuddyLoginStartResponse {
+  ok: true;
+  site: WorkBuddyKind;
+  loginId: string;
+  url: string;
+  expiresAt: number;
+}
+
+export type WorkBuddyLoginPollResponse =
+  | { status: "pending" | "none" | "expired" }
+  | { status: "failed"; reason: WorkBuddyFailureReason }
+  | (WorkBuddyMutationResponse & { status: "connected"; success: true; models: string[]; accountChange?: "added" | "updated"; accountCount?: number });
+
+export interface WorkBuddyImportRequest {
+  site: WorkBuddyKind;
+}
+
+export interface WorkBuddyAccountSwitchRequest {
+  site: WorkBuddyKind;
+  uid: string;
+}
+
+export interface WorkBuddyAccountRemoveRequest {
+  site: WorkBuddyKind;
+  uid: string;
+}
+
+export interface WorkBuddyModelHideRequest {
+  site: WorkBuddyKind;
+  model: string;
+}
+
+export interface WorkBuddyModelRestoreRequest {
+  site: WorkBuddyKind;
+  model?: string;
+}
+
+export interface WorkBuddyMutationResponse {
+  // §16 management routes return an additive `ok` alongside the legacy fields.
+  ok?: boolean;
+  success: boolean;
+  status?: WorkBuddyStatus;
+  models?: string[];
+  modelCount?: number;
+  displayName?: string | null;
+  message?: string | null;
+  modelsUnchanged?: boolean;
+  reason?: WorkBuddyFailureReason;
+  removedProvider?: boolean;
+  deletedCredential?: boolean;
+  error?: string;
+  /** §16 outcome metadata when a login/import committed an account upsert: a new pool row was added, or an existing uid was replaced in place. */
+  accountChange?: "added" | "updated";
+  /** Committed pool size for the site after that upsert. */
+  accountCount?: number;
 }
 
 export interface ManualProbeResponse {

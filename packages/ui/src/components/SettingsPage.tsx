@@ -10,7 +10,9 @@ import { MultiCombobox } from "@/components/ui/multi-combobox";
 import { useConfig } from "./ConfigProvider";
 import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
+import { WorkBuddyProvider } from "./WorkBuddyProvider";
 import { ProjectsPage } from "./ProjectsPage";
+import { isWorkBuddyKind } from "@/utils/workbuddy";
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { LogViewer } from '@/components/LogViewer';
 import type { ClientApplyResponse, ClientId, ClientStatus, StatusLineConfig, FallbackConfig } from "@/types";
@@ -39,6 +41,7 @@ export function SettingsPage() {
   const [isStatusLineConfigOpen, setIsStatusLineConfigOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [workBuddyBusy, setWorkBuddyBusy] = useState(false);
   const [isRestarting, setIsRestarting] = useState(false);
   const [isLogViewerOpen, setIsLogViewerOpen] = useState(false);
   const [isNewVersionAvailable, setIsNewVersionAvailable] = useState(false);
@@ -50,7 +53,7 @@ export function SettingsPage() {
   const [isApplyingClients, setIsApplyingClients] = useState(false);
   const [restoringClientId, setRestoringClientId] = useState<ClientId | null>(null);
   const tabFromUrl = new URLSearchParams(location.search).get("tab");
-  const initialTab = ["general", "clients", "router", "projects", "usage", "tools"].includes(tabFromUrl || "")
+  const initialTab = ["general", "providers", "clients", "router", "projects", "usage", "tools"].includes(tabFromUrl || "")
     ? tabFromUrl || "general"
     : "general";
 
@@ -339,6 +342,7 @@ export function SettingsPage() {
   // request is sent. The server will reject the save with HTTP 400 regardless,
   // so the dialog is purely a UX affordance to avoid a round-trip.
   const runSaveWithProxyCheck = (action: "save" | "saveAndRestart") => {
+    if (workBuddyBusy || isSaving || isRestarting) return;
     const errors = findInvalidProxyUrls((config || {}) as Record<string, unknown>);
     if (errors.length > 0) {
       setProxyValidationErrors(errors);
@@ -369,6 +373,7 @@ export function SettingsPage() {
   };
 
   const saveConfig = async () => {
+    if (workBuddyBusy) return;
     setIsSaving(true);
     try {
       const response = await api.updateConfig(config);
@@ -385,6 +390,7 @@ export function SettingsPage() {
   };
 
   const saveAndRestart = async () => {
+    if (workBuddyBusy) return;
     setIsRestarting(true);
     try {
       const response = await api.updateConfig(config);
@@ -422,11 +428,11 @@ export function SettingsPage() {
           <h1 className="text-2xl font-bold tracking-tight text-foreground">{t('toplevel.title')}</h1>
         </div>
         <div className="flex items-center gap-3">
-          <Button variant="outline" onClick={() => runSaveWithProxyCheck("save")} disabled={isSaving || isRestarting} className="rounded-xl border-white/10 bg-white/5 hover:bg-white/10 h-10 px-6">
+          <Button variant="outline" onClick={() => runSaveWithProxyCheck("save")} disabled={isSaving || isRestarting || workBuddyBusy} className="rounded-xl border-white/10 bg-white/5 hover:bg-white/10 h-10 px-6">
             <Save className="mr-2 h-4 w-4" />
             {t('app.save')}
           </Button>
-          <Button onClick={() => runSaveWithProxyCheck("saveAndRestart")} disabled={isSaving || isRestarting} className="rounded-xl h-10 px-6 shadow-lg shadow-primary/20">
+          <Button onClick={() => runSaveWithProxyCheck("saveAndRestart")} disabled={isSaving || isRestarting || workBuddyBusy} className="rounded-xl h-10 px-6 shadow-lg shadow-primary/20">
             <RefreshCw className="mr-2 h-4 w-4" />
             {t('app.save_and_restart')}
           </Button>
@@ -435,15 +441,22 @@ export function SettingsPage() {
 
       <main className="h-[calc(100vh-4rem)] overflow-auto p-6">
         <div className="w-full">
-          <Tabs defaultValue={initialTab} className="w-full">
+          <Tabs value={initialTab} onValueChange={tab => navigate(`/settings?tab=${tab}`, { replace: true })} className="w-full">
             <TabsList className="w-full justify-start mb-4">
               <TabsTrigger value="general">{t("settings.tabs.general")}</TabsTrigger>
+              <TabsTrigger value="providers">{t("settings.tabs.providers")}</TabsTrigger>
               <TabsTrigger value="clients">{t("settings.tabs.clients")}</TabsTrigger>
               <TabsTrigger value="router">{t("settings.tabs.router")}</TabsTrigger>
               <TabsTrigger value="projects">{t("settings.tabs.projects")}</TabsTrigger>
               <TabsTrigger value="usage">{t("settings.tabs.usage")}</TabsTrigger>
               <TabsTrigger value="tools">{t("settings.tabs.tools")}</TabsTrigger>
             </TabsList>
+
+            <TabsContent value="providers" className="space-y-4">
+              {location.state?.workBuddyManagedNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("workbuddy.managed_notice")}</p>}
+              {/* §16: the dashboard's managed edit/delete lands on that site's card. */}
+              <WorkBuddyProvider disabled={isSaving || isRestarting} onBusyChange={setWorkBuddyBusy} focusSite={isWorkBuddyKind(location.state?.workBuddySite) ? location.state.workBuddySite : null} />
+            </TabsContent>
 
             {/* General Tab */}
             <TabsContent value="general" className="space-y-4">

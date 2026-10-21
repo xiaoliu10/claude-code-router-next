@@ -7,6 +7,7 @@ import {
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
+import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl, workBuddySiteFromProvider, workBuddyFailoverCooldown, workBuddyPoolExhaustedError, workBuddyEnvelopeIsError } from "../services/workbuddy";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -32,7 +33,7 @@ import {
   readBodyForSSE,
 } from "../transformer/response-body";
 import { router, findProviderModel, ProjectRoutingError } from "@/utils/router";
-import { resolveProviderProxyUrl } from "@/services/proxy";
+import { resolveProviderProxyUrl, getDirectDispatcher } from "@/services/proxy";
 
 // Matches the CCR model-family aliases that CCR injects into managed clients
 // (e.g. "ccr-opus", "ccr-sonnet[1m]"). Codex sends one of these as a bare model
@@ -296,15 +297,20 @@ async function handleTransformerEndpoint(
       normalizeResponsesBody(body);
     }
 
+    // One shared transformer context per request. Provider transformers stash
+    // request-phase state on it (e.g. the WorkBuddy tool-name map and the
+    // client's original stream flag) that the response-phase transformers of
+    // the SAME request must see; building a fresh object per phase silently
+    // drops that state.
+    const transformerContext: any = { req, isCodexOnMessagesEndpoint };
+
     // Process request transformer chain
     const { requestBody, config, bypass } = await processRequestTransformers(
       body,
       provider,
       transformer,
       req.headers,
-      {
-        req,
-      }
+      transformerContext
     );
 
     // Hoist system messages to the front of the messages array and dedupe exact
@@ -344,9 +350,7 @@ async function handleTransformerEndpoint(
       fastify,
       bypass,
       transformer,
-      {
-        req,
-      }
+      transformerContext
     );
 
     // Capture rate limit headers from upstream response
@@ -363,10 +367,7 @@ async function handleTransformerEndpoint(
       provider,
       transformer,
       bypass,
-      {
-        req,
-        isCodexOnMessagesEndpoint,
-      }
+      transformerContext
     );
 
     finalResponse = await validateStreamingResponse(body, finalResponse, provider.name || providerName);
@@ -390,7 +391,9 @@ async function handleTransformerEndpoint(
     // Double-check: retry the same model once before falling back.
     // Transient provider errors (network jitter, momentary overload, empty SSE)
     // often resolve on a second attempt, avoiding unnecessary model switches.
-    if (!(req as any).__retryAttempted) {
+    // WorkBuddy pool/terminal errors already exhausted their bounded account
+    // budget; generic transient errors (5xx/empty stream/network) keep one retry.
+    if (!(req as any).__retryAttempted && error?.code !== "workbuddy_reauth" && !isTerminalWorkBuddyError(error)) {
       (req as any).__retryAttempted = true;
       try {
         return await handleTransformerEndpoint(req, reply, fastify, transformer);
@@ -553,10 +556,20 @@ async function handleFallback(
     (error?.message && isRateLimitError(error.message));
 
   if (originalProvider && originalModel) {
-    // Use markRateLimited for rate-limit errors instead of recordFailure
-    // so the model is immediately isolated (bypassing the 3-failure threshold)
-    // and auto-recovers after a cooldown period.
-    if (isRateLimit) {
+    // WorkBuddy upstream errors carry their own classification and cooldown:
+    // a 6004 rate limit is per provider+model (not the whole account), and a
+    // 11140 account restriction is terminal for hours so it must not be retried
+    // on every request.
+    if (error?.workbuddy && (error.code === "rate_limit" || error.code === "insufficient_quota")) {
+      healthStore.markRateLimited(originalProvider, originalModel, error.cooldownSeconds ?? 900, error.message);
+      req.log.warn(`WorkBuddy model ${originalProvider},${originalModel} cooled down for ${error.cooldownSeconds ?? 900}s (${error.code})`);
+    } else if (error?.workbuddy && error.code === "workbuddy_account_restricted") {
+      healthStore.forceOpen(originalProvider, originalModel, error.message);
+      req.log.warn(`WorkBuddy account restricted; ${originalProvider},${originalModel} parked for ${error.cooldownSeconds ?? 7200}s`);
+    } else if (isRateLimit) {
+      // Use markRateLimited for rate-limit errors instead of recordFailure
+      // so the model is immediately isolated (bypassing the 3-failure threshold)
+      // and auto-recovers after a cooldown period.
       healthStore.markRateLimited(originalProvider, originalModel, 120, error?.message);
       req.log.warn(`Primary model ${originalProvider},${originalModel} rate-limited, will try fallbacks`);
     } else {
@@ -662,6 +675,11 @@ async function handleFallback(
     return null;
   }
 
+  // Reauthentication failures are account-wide and terminal: probing fallback models
+  // cannot renew the WorkBuddy sign-in and would multiply a rejected large request.
+  const terminalWorkBuddyReauth = error?.workbuddy === true && error?.nonRetryable === true && error.code === "workbuddy_reauth";
+  if (terminalWorkBuddyReauth) return null;
+
   const totalFallbacks = fallbackStages.reduce((total, stage) => total + stage.models.length, 0);
   req.log.warn(`Request failed for ${scenarioType}, trying ${totalFallbacks} fallback models across ${fallbackStages.length} fallback stage(s)`);
 
@@ -729,13 +747,21 @@ async function handleFallback(
 
           const provider = configuredFallback.provider;
 
+          // One shared transformer context per fallback attempt (same reason
+          // as the primary path): request-phase state must reach the
+          // response-phase transformers of the same attempt.
+          const fbContext: any = {
+            req: newReq,
+            isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
+          };
+
           // Process request transformer chain
           const { requestBody, config, bypass } = await processRequestTransformers(
             newBody,
             provider,
             transformer,
             req.headers,
-            { req: newReq }
+            fbContext
           );
 
           // Send request to LLM provider
@@ -746,7 +772,7 @@ async function handleFallback(
             fastify,
             bypass,
             transformer,
-            { req: newReq }
+            fbContext
           );
 
           // Capture rate limit headers from upstream response
@@ -764,10 +790,7 @@ async function handleFallback(
             provider,
             transformer,
             bypass,
-            {
-              req: newReq,
-              isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
-            }
+            fbContext
           );
           finalResponse = await validateStreamingResponse(newBody, finalResponse, fbProviderName);
 
@@ -817,6 +840,8 @@ async function handleFallback(
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
           fallbackError = error;
+          // Never restart a terminal WorkBuddy account-pool attempt budget.
+          if (error?.code === "workbuddy_reauth" || isTerminalWorkBuddyError(error)) break;
           if (attempt === 1) {
             req.log.warn(`Fallback model ${fbProviderName},${fbModel} failed, retrying once: ${error.message}`);
             continue;
@@ -1055,7 +1080,171 @@ function isCodexClient(req: any): boolean {
  * Send request to LLM provider
  * Handle authentication, build request config, send request and handle errors
  */
+/**
+ * WorkBuddy's front door resets the connection once a refused sign-in's request body passes
+ * EDGE_READS bytes (measured on both builds, magpie P:L1152-1160). Above that size a bare
+ * ECONNRESET says nothing about the cause, so the send failure is probed instead of guessed.
+ */
+const WORKBUDDY_EDGE_READS = 2 * 1024 * 1024;
+function exceedsWorkBuddyEdgeReads(body: any): boolean {
+  try { return Buffer.byteLength(JSON.stringify(body ?? {})) > WORKBUDDY_EDGE_READS; }
+  catch { return false; }
+}
+
+/** Pool/terminal errors must not reset the per-request account budget. */
+function isTerminalWorkBuddyError(error: any): boolean {
+  return error?.workbuddy === true && error?.nonRetryable === true && (error?.workbuddyPoolAttempted === true || [
+    "workbuddy_reauth", "workbuddy_protocol_error", "workbuddy_model_hidden",
+    "workbuddy_not_connected", "rate_limit", "insufficient_quota", "workbuddy_account_restricted",
+  ].includes(error.code));
+}
+
+/**
+ * Inspect only the pre-content SSE prefix. No bytes have reached the client at
+ * this point: a classified error may safely rotate accounts. After any useful
+ * content/tool/reasoning delta (or the bounded inspection budget) we return a
+ * byte-identical replay stream and NEVER inspect/replay a later error.
+ */
+async function inspectWorkBuddySse(response: Response): Promise<Response> {
+  if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) return response;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  const decoder = new TextDecoder();
+  let pending = "", bytes = 0, done = false, committed = false;
+  try {
+    while (!done && !committed && bytes < 256 * 1024) {
+      const next = await reader.read();
+      done = next.done;
+      if (next.value) {
+        chunks.push(next.value);
+        bytes += next.value.byteLength;
+        pending += decoder.decode(next.value, { stream: true });
+      }
+      // SSE permits an unterminated final event; inspect it on EOF as well.
+      if (done) pending += decoder.decode() + "\n\n";
+      const events = pending.split(/\r\n\r\n|\n\n|\r\r/);
+      pending = events.pop() ?? "";
+      for (const event of events) {
+        const data = event.split(/\r\n|\r|\n/).filter(line => line.startsWith("data:"))
+          .map(line => line.slice(5).trimStart()).join("\n");
+        if (!data) continue;
+        if (data === "[DONE]") { committed = true; break; }
+        let value: any;
+        try { value = JSON.parse(data); } catch { committed = true; break; }
+              if (workBuddyEnvelopeIsError(value)) throw classifyWorkBuddyError(response.status, value);
+        committed = value?.choices?.some((choice: any) => {
+          const delta = choice.delta ?? choice.message;
+          return delta && Object.entries(delta).some(([key, v]) => key !== "role" && v != null && v !== "" && (!Array.isArray(v) || v.length > 0));
+        }) || false;
+        if (committed) break;
+      }
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+  let index = 0;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (index < chunks.length) { controller.enqueue(chunks[index++]); return; }
+      if (done) { controller.close(); reader.releaseLock(); return; }
+      try {
+        const next = await reader.read();
+        if (next.done) { done = true; controller.close(); reader.releaseLock(); }
+        else controller.enqueue(next.value);
+      } catch (error) { controller.error(error); }
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+}
+
+/** §16: one request/model, sticky selection, each uid at most once. */
 async function sendRequestToProvider(
+  requestBody: any, config: any, provider: any, fastify: FastifyInstance,
+  bypass: boolean, transformer: any, context: any
+): Promise<Response> {
+  if (!isWorkBuddyRuntime(provider)) return sendProviderAttempt(requestBody, config, provider, fastify, bypass, transformer, context);
+  const service = getWorkBuddyAuthService();
+  if (!service) throw new Error("WorkBuddy 认证服务未初始化");
+  const site = workBuddySiteFromProvider(provider);
+  const model = requestBody?.model;
+  if (await service.isModelHidden(site, model)) {
+    throw Object.assign(new Error("WorkBuddy 模型已隐藏，请在管理页恢复后重试"), {
+      code: "workbuddy_model_hidden", statusCode: 422, workbuddy: true, nonRetryable: true,
+    });
+  }
+  const poolSize = await service.poolAccountCount(site);
+  // One request may retry (generic same-model retry, fallback's {...req} spread);
+  // the ROTATION budget must survive those, so it lives on the request object.
+  // A transient (non-rotatable) failure may still retry the SAME account once
+  // via the outer retry — that is not an account rotation and stays within the
+  // contract's per-request upstream-attempt bound (retry is one-shot).
+  const state: any = ((context?.req as any).__workbuddyState ??= { attempted: new Map(), transient: new Set() });
+  const attempted = state.attempted.get(site) ?? new Set<string>();
+  state.attempted.set(site, attempted);
+  let lastError: any;
+  while (attempted.size < poolSize) {
+    const credential = await service.currentCredential(site, model, [...attempted]);
+    if (!credential || attempted.has(credential.uid)) break;
+    attempted.add(credential.uid);
+    try {
+      const response = await sendProviderAttempt(requestBody, { ...config, headers: { ...config.headers }, workbuddyCredential: credential }, provider, fastify, bypass, transformer, context);
+      return await inspectWorkBuddySse(response);
+    } catch (error: any) {
+      const cooldown = workBuddyFailoverCooldown(error, model);
+      if (!cooldown) {
+        // A transient failure after a prior rotation must not restart the pool
+        // through the outer generic retry and exceed this request's budget.
+        if (lastError) {
+          const terminal = error?.workbuddy ? error : classifyWorkBuddyError(502, {});
+          terminal.workbuddyPoolAttempted = true;
+          throw terminal;
+        }
+        // Transient: the outer same-model retry may re-attempt this account.
+        state.transient.add(site);
+        throw error;
+      }
+      state.transient.delete(site);
+      lastError = error;
+      // Persist even for the last account: future requests must not hammer it.
+      try { await service.markAccountCooldown(site, credential.uid, cooldown); }
+      catch { throw error; } // preserve sanitized upstream error, never a raw filesystem error
+      // Classifications only: no uid, body, token, or thrown store diagnostic.
+      fastify.log.info({ code: error.code }, "WorkBuddy account cooldown recorded");
+    }
+  }
+  if (lastError) { state.transient.delete(site); throw lastError; }
+  if (attempted.size >= poolSize && poolSize > 0) {
+    // Budget exhausted by earlier attempts of this same request. A pending
+    // transient failure gets exactly one same-account retry (not a rotation);
+    // anything else is the §16 terminal pool-exhausted error.
+    if (state.transient.has(site)) {
+      state.transient.delete(site);
+      const credential = await service.currentCredential(site, model);
+      if (credential) {
+        try {
+          const response = await sendProviderAttempt(requestBody, { ...config, headers: { ...config.headers }, workbuddyCredential: credential }, provider, fastify, bypass, transformer, context);
+          return await inspectWorkBuddySse(response);
+        } catch (retryError: any) {
+          // Same cooldown bookkeeping as an in-loop attempt, so this account
+          // cannot escape its cooldown for one later request.
+          const cooldown = workBuddyFailoverCooldown(retryError, model);
+          if (cooldown) {
+            try { await service.markAccountCooldown(site, credential.uid, cooldown); }
+            catch { throw retryError; }
+          }
+          throw retryError;
+        }
+      }
+    }
+    throw workBuddyPoolExhaustedError(await service.poolCooldownRemainingMs(site, model));
+  }
+  if (poolSize) throw workBuddyPoolExhaustedError(await service.poolCooldownRemainingMs(site, model));
+  throw Object.assign(new Error("WorkBuddy 未导入登录态，请先在管理页导入"), { workbuddy: true, nonRetryable: true, statusCode: 409, code: "workbuddy_not_connected" });
+}
+
+async function sendProviderAttempt(
   requestBody: any,
   config: any,
   provider: any,
@@ -1064,6 +1253,29 @@ async function sendRequestToProvider(
   transformer: any,
   context: any
 ) {
+  // Managed WorkBuddy providers must always talk to the fixed HTTPS upstream.
+  // The transformer auth() hook returns a config.url, but the URL is computed
+  // above before the hook runs, so a config-supplied base_url could otherwise
+  // win. Re-lock the URL for the managed provider immediately before the send.
+  const workbuddyManaged = isWorkBuddyRuntime(provider);
+  if (workbuddyManaged) {
+    const service = getWorkBuddyAuthService();
+    const credential = config.workbuddyCredential ?? await service?.currentCredential(workBuddySiteFromProvider(provider), requestBody?.model);
+    if (!credential) throw new Error("WorkBuddy 未导入登录态，请先在管理页导入");
+    config.workbuddyCredential = credential;
+    const authTransformer = (provider.transformer?.use ?? []).find((item: any) => item?.name === "workbuddy" && typeof item.auth === "function");
+    if (authTransformer && !bypass) {
+      const auth = await authTransformer.auth(requestBody, provider, { ...context, config });
+      config.headers = { ...config.headers, ...auth.config?.headers };
+    }
+    const fixed = new URL(workBuddyChatUrl(workBuddySite(credential.kind)));
+    if (fixed.protocol !== "https:") throw new Error("WorkBuddy 上游地址不合法");
+    config.url = fixed.toString();
+    // Never follow a redirect away from the fixed origin.
+    config.redirect = "error";
+    // Fixed WorkBuddy origins must ignore configured CCR/proxy environment routing.
+    config.dispatcher = getDirectDispatcher();
+  }
   const url = config.url || new URL(provider.baseUrl);
 
   // Apply timeout from config
@@ -1076,7 +1288,7 @@ async function sendRequestToProvider(
 
   // Handle authentication in passthrough mode
   if (bypass && typeof transformer.auth === "function") {
-    const auth = await transformer.auth(requestBody, provider);
+    const auth = await transformer.auth(requestBody, provider, workbuddyManaged ? { ...context, config } : context);
     if (auth.body) {
       requestBody = auth.body;
       let headers = config.headers || {};
@@ -1105,6 +1317,13 @@ async function sendRequestToProvider(
     ...(config?.headers || {}),
   };
 
+  if (workbuddyManaged) {
+    // A single credential snapshot supplies BOTH destination and auth, never config URL/key.
+    for (const key of Object.keys(requestHeaders)) {
+      if (["authorization", "x-api-key", "host", "x-user-id", "x-domain", "x-enterprise-id", "x-tenant-id"].includes(key.toLowerCase())) delete requestHeaders[key];
+    }
+    Object.assign(requestHeaders, credentialHeaders(config.workbuddyCredential));
+  }
   stampUpstreamSessionId(requestHeaders, context?.req);
 
   for (const key in requestHeaders) {
@@ -1119,7 +1338,7 @@ async function sendRequestToProvider(
   }
 
   // Debug: log outgoing request to provider
-  if (isDebugLogEnabled(fastify.configService)) {
+  if (!workbuddyManaged && isDebugLogEnabled(fastify.configService)) {
     logProviderRequest(fastify.log, context.req.id, {
       url: String(url),
       headers: requestHeaders,
@@ -1127,21 +1346,50 @@ async function sendRequestToProvider(
     });
   }
 
-  const response = await sendUnifiedRequest(
-    url,
-    requestBody,
-    {
-      ...config,
-      headers: JSON.parse(JSON.stringify(requestHeaders)),
-      httpsProxy: resolveProviderProxyUrl(fastify.configService, provider),
-    },
-    context,
-    fastify.log
-  );
+  let response: Response;
+  try {
+    response = await sendUnifiedRequest(
+      url,
+      requestBody,
+      {
+        ...config,
+        headers: JSON.parse(JSON.stringify(requestHeaders)),
+        httpsProxy: workbuddyManaged ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
+      },
+      context,
+      workbuddyManaged ? undefined : fastify.log
+    );
+  } catch (sendError: any) {
+    // WorkBuddy's front door (APISIX) reads only the first EDGE_READS bytes of a request
+    // whose sign-in it refuses, then resets the connection: a big Claude Code request on a
+    // stale token fails as a bare ECONNRESET with no diagnostic (contract §14.3b). Probe the
+    // billing API once with a tiny request to tell "sign-in expired" from a real network
+    // fault; the original request is never re-sent.
+    if (workbuddyManaged && exceedsWorkBuddyEdgeReads(requestBody)) {
+      const reauth = sendError?.workbuddy !== true && !["AbortError", "TimeoutError"].includes(sendError?.name)
+        ? await getWorkBuddyAuthService()?.diagnoseReset(config.workbuddyCredential) : null;
+      if (reauth) throw reauth;
+    }
+    throw sendError;
+  }
 
   // Handle request errors
   if (!response.ok) {
     const errorText = await response.text();
+    // WorkBuddy managed providers: classify and redact the upstream body here,
+    // BEFORE any log or client-facing error is built. A raw WorkBuddy envelope
+    // must never reach the log stream, and a WorkBuddy access token must never
+    // be recoverable from an error message.
+    if (isWorkBuddyRuntime(provider)) {
+      const wbError = classifyWorkBuddyError(response.status, errorText);
+      fastify.log.error(
+        `[provider_response_error] WorkBuddy provider(${provider.name},${requestBody.model}: ${response.status}) code=${(wbError as any).upstreamCode ?? "n/a"} kind=${wbError.code}`
+      );
+      (wbError as any).isRateLimit = wbError.code === "rate_limit";
+      (wbError as any).workbuddy = true;
+      (wbError as any).cooldownSeconds = (wbError as any).cooldownSeconds;
+      throw wbError;
+    }
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
     );
@@ -1187,6 +1435,7 @@ async function sendRequestToProvider(
         }
         const bodyJson = JSON.parse(bodyText);
         // Check if the response contains an error object
+        if (workbuddyManaged && (Number(bodyJson?.code) > 0 || Number(bodyJson?.data?.code) > 0)) throw classifyWorkBuddyError(response.status, bodyJson);
         if (bodyJson && typeof bodyJson === 'object' && bodyJson.error) {
           // If error is null or explicitly empty, it might not be a real error
           const hasRealError =
@@ -1194,6 +1443,15 @@ async function sendRequestToProvider(
             (typeof bodyJson.error === 'object' && Object.keys(bodyJson.error).length > 0);
 
           if (hasRealError) {
+            if (isWorkBuddyRuntime(provider)) {
+              const wbError = classifyWorkBuddyError(response.status, bodyText);
+              fastify.log.error(
+                `[provider_response_error] WorkBuddy hidden error from provider(${provider.name},${requestBody.model}: ${response.status}) code=${(wbError as any).upstreamCode ?? "n/a"} kind=${wbError.code}`
+              );
+              (wbError as any).isRateLimit = wbError.code === "rate_limit";
+              (wbError as any).workbuddy = true;
+              throw wbError;
+            }
             fastify.log.error(
               `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
             );
@@ -1215,6 +1473,7 @@ async function sendRequestToProvider(
         // invalid response. Throw to trigger fallback instead of forwarding
         // the empty response to the client, which would cause a different error.
         if (e instanceof SyntaxError) {
+          if (workbuddyManaged) throw classifyWorkBuddyError(response.status, {});
           fastify.log.warn(
             `[provider_response_error] Empty or malformed JSON response from provider(${provider.name},${requestBody.model}: 200): "${bodyText}"`
           );
@@ -1234,7 +1493,7 @@ async function sendRequestToProvider(
   }
 
   // Debug: log non-stream response from provider
-  if (!requestBody.stream && isDebugLogEnabled(fastify.configService)) {
+  if (!workbuddyManaged && !requestBody.stream && isDebugLogEnabled(fastify.configService)) {
     const cloned = response.clone();
     const bodyText = await cloned.text();
     logProviderResponse(fastify.log, context.req.id, {
