@@ -767,7 +767,8 @@
       "gemini_oauth_models_fetch_failed": "Model discovery failed or returned nothing. The previous model list is preserved.",
       "gemini_oauth_config_write_failed": "The change was rolled back because the configuration could not be saved. Check the CCR server config and retry.",
       "request_failed": "The Gemini subscription request failed. No success was confirmed; retry explicitly.",
-      "config_busy": "A configuration save or another managed-provider action is in progress. Wait for it to finish and retry."
+      "config_busy": "A configuration save or another managed-provider action is in progress. Wait for it to finish and retry.",
+      "reconciliation_failed": "The action succeeded on the server, but the settings draft could not be refreshed. Reopen the settings page to see the saved changes."
     }
   }
 }

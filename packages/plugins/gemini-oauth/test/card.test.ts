@@ -34,7 +34,7 @@ class Element {
 const tick = async () => { for (let i = 0; i < 15; ++i) await Promise.resolve(); };
 const cleanups: Array<() => void> = [];
 afterEach(() => { cleanups.splice(0).forEach(f => f()); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
-function harness(overrides: Record<string, (init?: any) => any> = {}) {
+function harness(overrides: Record<string, (init?: any) => any> = {}, disabled = false) {
   vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag) });
   const open = vi.fn(); vi.stubGlobal("window", { open });
   const host = new Element("div");
@@ -47,12 +47,34 @@ function harness(overrides: Record<string, (init?: any) => any> = {}) {
     if (path === "/sync") return { ok: true, modelsCount: 3, clearedRefs: ["default"] };
     return { ok: true };
   });
-  const release = vi.fn(), onBusy = vi.fn(), refreshConfig = vi.fn(async (_merge: (current: any, server: any) => any) => {});
-  mount(host as any, { callApi: callApi as any, locale: "en", locales: geminiOauthLocales,
-    disabled: false, plugin: { name: "gemini-oauth", version: "1" }, log: console,
-    acquireManagement: () => release, onBusy, refreshConfig });
+  // Mirrors ApiClient.acquireWorkBuddyManagement: null while a managed action
+  // or config write holds the shared lease; the release is a spy.
+  let lock = false;
+  const release = vi.fn(() => { lock = false; });
+  const refreshFail = overrides.refreshFail === true;
+  const refreshConfig = vi.fn(async (_merge: (current: any, server: any) => any) => {
+    if (refreshFail) throw new Error("Configuration refresh failed");
+  });
+  let hostListener: (() => void) | null = null;
+  let unsubscribed = 0;
+  const props = {
+    callApi: callApi as any, locale: "en", locales: geminiOauthLocales,
+    disabled, plugin: { name: "gemini-oauth", version: "1" }, log: console,
+    acquireManagement: () => (lock ? null : (lock = true, release)), onBusy: vi.fn(), refreshConfig,
+    onHostChange: (listener: () => void) => {
+      hostListener = listener;
+      return () => { if (hostListener === listener) hostListener = null; unsubscribed += 1; };
+    },
+  };
+  mount(host as any, props);
   cleanups.push(() => unmount(host as any));
-  return { host, callApi, open, release, onBusy, refreshConfig };
+  return {
+    host, callApi, open, release, onBusy: props.onBusy, refreshConfig, props,
+    get lock() { return lock; },
+    get unsubscribed() { return unsubscribed; },
+    notify() { hostListener?.(); },
+    statusReads() { return callApi.mock.calls.filter(([path]) => path === "/status").length; },
+  };
 }
 const en = geminiOauthLocales.en.geminiOauth as any;
 describe("self-contained Gemini plugin card", () => {
@@ -73,6 +95,43 @@ describe("self-contained Gemini plugin card", () => {
     expect(h.refreshConfig).toHaveBeenCalledTimes(1);
     expect(h.release).toHaveBeenCalledTimes(1);
     expect(h.onBusy.mock.calls.map(([busy]) => busy)).toEqual([true, false]);
+  });
+
+  it("host disabled transitions re-render the mounted card in place: no remount, no cancel, no release", async () => {
+    const h = harness(); await tick();
+    expect(h.statusReads()).toBe(1);
+    expect(h.host.button(en.sync).disabled).toBe(false);
+    // Open the consent dialog: its survival across a disabled flip proves the
+    // same card instance re-rendered (a remount would reset to the loading view).
+    h.host.click(en.reconnect);
+    expect(h.host.text()).toContain(en.risk);
+    h.props.disabled = true; h.notify();
+    expect(h.host.button(en.sync).disabled).toBe(true);
+    expect(h.host.button(en.reconnect).disabled).toBe(true);
+    expect(h.host.text()).toContain(en.other_edit);
+    expect(h.host.text()).toContain(en.risk);
+    // In-place update only: no extra status read, no lease movement, no unmount.
+    expect(h.statusReads()).toBe(1);
+    expect(h.release).toHaveBeenCalledTimes(0);
+    expect(h.unsubscribed).toBe(0);
+    h.props.disabled = false; h.notify();
+    expect(h.host.button(en.sync).disabled).toBe(false);
+    expect(h.host.button(en.reconnect).disabled).toBe(false);
+    expect(h.host.text()).toContain(en.risk);
+    expect(h.statusReads()).toBe(1);
+    unmount(h.host as any);
+    expect(h.unsubscribed).toBe(1);
+  });
+
+  it("disabled-on-mount cards enable in place when the host gate lifts, still without a remount", async () => {
+    const h = harness({}, true); await tick();
+    expect(h.statusReads()).toBe(1);
+    expect(h.host.button(en.sync).disabled).toBe(true);
+    h.props.disabled = false; h.notify();
+    expect(h.host.button(en.sync).disabled).toBe(false);
+    expect(h.statusReads()).toBe(1); // the transition triggers no extra status read
+    expect(h.release).toHaveBeenCalledTimes(0);
+    unmount(h.host as any);
   });
   it("sync reconciles drafts and only reports server count/refs; disconnect is double-confirmed", async () => {
     const h = harness(); await tick();
@@ -109,5 +168,79 @@ describe("self-contained Gemini plugin card", () => {
     expect(h.host.text()).toContain(en.errors.request_failed);
     expect(h.host.text()).not.toContain("ya29.");
     expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("unmount during a deferred sync keeps the management lease; a config save stays blocked until reconciliation settles", async () => {
+    let resolveSync!: (value: any) => void;
+    const pending = new Promise(done => { resolveSync = done; });
+    const h = harness({ "/sync": () => pending }); await tick();
+    h.host.click(en.sync); await tick();
+    expect(h.lock).toBe(true);
+    // Settings navigation / locale change disposes the card mid-flight.
+    unmount(h.host as any);
+    expect(h.host.children).toEqual([]);
+    expect(h.onBusy.mock.calls.map(([busy]) => busy)).toEqual([true]); // visual busy stays with the host
+    // An attempted full-config save after unmount must still be excluded…
+    expect(h.props.acquireManagement()).toBeNull();
+    // …until the deferred mutation and its reconciliation finish.
+    resolveSync({ ok: true, modelsCount: 2 }); await tick();
+    expect(h.release).toHaveBeenCalledTimes(1);
+    expect(h.refreshConfig).toHaveBeenCalledTimes(1);
+    expect(h.statusReads()).toBe(2); // initial + post-commit reread, even after unmount
+    expect(h.props.acquireManagement()).not.toBeNull(); // saves allowed again
+  });
+
+  it("unmount during a deferred disconnect keeps the lease until the action settles", async () => {
+    let resolveDisconnect!: (value: any) => void;
+    const pending = new Promise(done => { resolveDisconnect = done; });
+    const h = harness({ "/disconnect": () => pending }); await tick();
+    h.host.click(en.disconnect); await tick();
+    h.host.click(en.disconnect); await tick(); // dialog confirm
+    expect(h.lock).toBe(true);
+    unmount(h.host as any);
+    expect(h.props.acquireManagement()).toBeNull();
+    resolveDisconnect({ ok: true, removedModelRefs: ["default"] }); await tick();
+    expect(h.release).toHaveBeenCalledTimes(1);
+    expect(h.refreshConfig).toHaveBeenCalledTimes(1);
+    expect(h.statusReads()).toBe(2);
+    expect(h.props.acquireManagement()).not.toBeNull();
+  });
+
+  it("a committed sync settles status even when draft reconciliation fails; the failure is reported separately", async () => {
+    const h = harness({ refreshFail: true, "/sync": () => ({ ok: true, modelsCount: 2 }) }); await tick();
+    h.host.click(en.sync); await tick();
+    expect(h.refreshConfig).toHaveBeenCalledTimes(1);
+    expect(h.statusReads()).toBe(2); // committed reread must not be skipped
+    expect(h.host.text()).toContain("Registered 2 Gemini models. Router unchanged.");
+    expect(h.host.text()).toContain(en.errors.reconciliation_failed);
+    expect(h.host.text()).not.toContain(en.errors.request_failed);
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("a committed disconnect settles status even when draft reconciliation fails", async () => {
+    const h = harness({ refreshFail: true }); await tick();
+    h.host.click(en.disconnect); await tick();
+    h.host.click(en.disconnect); await tick();
+    expect(h.refreshConfig).toHaveBeenCalledTimes(1);
+    expect(h.statusReads()).toBe(2);
+    expect(h.host.text()).toContain(en.disconnected);
+    expect(h.host.text()).toContain(en.errors.reconciliation_failed);
+    expect(h.host.text()).not.toContain(en.errors.request_failed);
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("a successful action clears the reconciliation warning on the next attempt", async () => {
+    let failRefresh = true;
+    const h = harness({ refreshFail: true });
+    // Flip the refresh outcome between actions.
+    h.refreshConfig.mockImplementation(async () => { if (failRefresh) throw new Error("Configuration refresh failed"); });
+    await tick();
+    h.host.click(en.disconnect); await tick();
+    h.host.click(en.disconnect); await tick();
+    expect(h.host.text()).toContain(en.errors.reconciliation_failed);
+    failRefresh = false;
+    h.host.click(en.sync); await tick();
+    expect(h.host.text()).not.toContain(en.errors.reconciliation_failed);
+    expect(h.host.text()).toContain("Registered 3 Gemini models and cleared default from Router.");
   });
 });

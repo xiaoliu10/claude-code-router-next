@@ -767,7 +767,8 @@
       "gemini_oauth_models_fetch_failed": "模型获取失败或为空，已保留原有模型列表。",
       "gemini_oauth_config_write_failed": "配置无法保存，改动已回滚，请检查 CCR 服务端配置后重试。",
       "request_failed": "Gemini 订阅账号操作失败，未确认成功；请手动重试。",
-      "config_busy": "配置保存或另一个受管供应商操作正在进行中，请等待其结束再重试。"
+      "config_busy": "配置保存或另一个受管供应商操作正在进行中，请等待其结束再重试。",
+      "reconciliation_failed": "操作已在服务端成功，但设置草稿刷新失败。请重新打开设置页面以查看已保存的更改。"
     }
   }
 }

@@ -21,6 +21,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   let session: ReturnType<typeof createGeminiOauthLogin> | null = null;
   let consentGranted = false;
   let release: (() => void) | null = null;
+  let reconcileFailed = false;
+  let unsubscribeHost: (() => void) | null = null;
   const locale = props.locale.startsWith("zh") ? "zh" : "en";
   const bundle = props.locales[locale]?.geminiOauth ?? geminiOauthLocales[locale].geminiOauth;
   const t = (key: string, vars: Record<string, unknown> = {}): string => {
@@ -51,11 +53,20 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     if (alive) { status = next; loadFailed = false; }
   };
   const settle = async (message: string) => {
-    // Preserve unrelated providers, Router and local drafts exactly as the old
-    // card did. The server remains authoritative for managed entry mutations.
-    await props.refreshConfig?.((current, server) => mergeGeminiOauthProvider(current, server));
+    // Draft reconciliation is advisory: the managed mutation already committed
+    // server-side, so a failed refresh must neither block the status reread nor
+    // flip the confirmed success into a generic retry error. The reconciliation
+    // failure is surfaced separately instead (baseline parity).
+    let reconciliationFailed = false;
+    try {
+      // Preserve unrelated providers, Router and local drafts exactly as the old
+      // card did. The server remains authoritative for managed entry mutations.
+      await props.refreshConfig?.((current, server) => mergeGeminiOauthProvider(current, server));
+    } catch {
+      reconciliationFailed = true;
+    }
     await readStatus();
-    if (alive) { toast = message; confirmDisconnect = false; }
+    if (alive) { toast = message; reconcileFailed = reconciliationFailed; confirmDisconnect = false; }
   };
   const endBusy = () => {
     release?.(); release = null;
@@ -67,7 +78,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       release = props.acquireManagement();
       if (!release) { errorKey = "config_busy"; render(); return; }
     }
-    busy = true; props.onBusy?.(true); errorKey = null; toast = null;
+    busy = true; props.onBusy?.(true); errorKey = null; toast = null; reconcileFailed = false;
     render();
     try {
       if (kind === "login") {
@@ -89,14 +100,15 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         await settle(email ? t("login_success", { email }) : t("login_success_unknown"));
       } else if (kind === "sync") {
         const result = await post<any>("/sync");
-        if (!alive) return;
+        // A mutation that commits after the card was disposed still reconciles
+        // and re-reads status: only the visual settlement is skipped when
+        // !alive. The lease is released by the finally below, after all of it.
         if (result?.ok !== true) { errorKey = geminiOauthErrorKey(result?.error ?? "gemini_oauth_models_fetch_failed"); await readStatus(); return; }
         const count = result.modelsCount ?? 0;
         await settle(result.clearedRefs?.length
           ? t("synced_cleared", { count, refs: result.clearedRefs.join(", ") }) : t("synced", { count }));
       } else {
         const result = await post<any>("/disconnect");
-        if (!alive) return;
         if (result?.ok !== true) { errorKey = geminiOauthErrorKey(result); return; }
         await settle(t("disconnected"));
       }
@@ -139,6 +151,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     for (const code of [geminiOauthStatusErrorKey(status), errorKey]) {
       if (code) { const alert = node("p", t(`errors.${code}`) || t("errors.request_failed")); alert.setAttribute("role", "alert"); el.append(alert); }
     }
+    if (reconcileFailed) { const note = node("p", t("errors.reconciliation_failed")); note.setAttribute("role", "alert"); el.append(note); }
     const validation = safeValidationUrl(status?.lastError?.validationUrl);
     if (validation) { const link = node("a", validation); link.href = validation; link.target = "_blank"; link.rel = "noopener noreferrer"; el.append(link); }
     const disabled = busy || loading || props.disabled;
@@ -171,10 +184,19 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     }
   };
   mounted.set(el, () => {
-    alive = false; consentGranted = false;
+    alive = false; consentGranted = false; consentOpen = false; confirmDisconnect = false;
+    unsubscribeHost?.(); unsubscribeHost = null;
     void session?.cancel().catch(() => {});
-    endBusy(); el.replaceChildren();
+    // Visual disposal only. The shared management lease deliberately stays held
+    // while a deferred sync/disconnect/login (and its config reconciliation)
+    // finishes: run()'s finally releases it. Releasing here let a full-config
+    // save race the still-pending managed mutation after navigation/unmount.
+    busy = false;
+    el.replaceChildren();
   });
+  // Host state changes (e.g. the page Save gate) re-render the card in place —
+  // never via a remount, which would cancel in-flight actions.
+  unsubscribeHost = props.onHostChange?.(() => { if (alive) render(); }) ?? null;
   render();
   // Only local status on mount. Never start login, sync models or poll here.
   void readStatus().catch(() => { if (alive) { loadFailed = true; errorKey = "request_failed"; } })
