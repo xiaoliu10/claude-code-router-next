@@ -1376,18 +1376,19 @@ async function sendProviderAttempt(
   }
 
   let response: Response;
+  const dispatchUpstream = () => sendUnifiedRequest(
+    url,
+    requestBody,
+    {
+      ...config,
+      headers: JSON.parse(JSON.stringify(requestHeaders)),
+      httpsProxy: workbuddyManaged || geminiOauthManaged ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
+    },
+    context,
+    workbuddyManaged || geminiOauthManaged ? undefined : fastify.log
+  );
   try {
-    response = await sendUnifiedRequest(
-      url,
-      requestBody,
-      {
-        ...config,
-        headers: JSON.parse(JSON.stringify(requestHeaders)),
-        httpsProxy: workbuddyManaged ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
-      },
-      context,
-      workbuddyManaged ? undefined : fastify.log
-    );
+    response = await dispatchUpstream();
   } catch (sendError: any) {
     // WorkBuddy's front door (APISIX) reads only the first EDGE_READS bytes of a request
     // whose sign-in it refuses, then resets the connection: a big Claude Code request on a
@@ -1400,6 +1401,22 @@ async function sendProviderAttempt(
       if (reauth) throw reauth;
     }
     throw sendError;
+  }
+
+  // Managed Gemini OAuth: an expired access token surfaces as 401. Refresh once
+  // and re-send exactly once — nothing has been committed to the client yet.
+  // Only the forced-refresh resend is allowed; a second 401 is terminal so the
+  // outer generic retry cannot produce a third upstream call.
+  if (!response.ok && geminiOauthManaged && response.status === 401 && !(context.req as any)?.__geminiOauth401Retried) {
+    (context.req as any).__geminiOauth401Retried = true;
+    try {
+      await geminiOauthService!.forceTokenRefresh?.();
+      requestHeaders.Authorization = `Bearer ${await geminiOauthService!.getAccessToken()}`;
+      response = await dispatchUpstream();
+    } catch {
+      // Refresh failed: fall through to classification of the original 401.
+    }
+    if (response.status === 401) (context.req as any).__retryAttempted = true;
   }
 
   // Handle request errors
