@@ -12,6 +12,7 @@ import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
 import { WorkBuddyProvider } from "./WorkBuddyProvider";
 import { GeminiOauthProvider } from "./GeminiOauthProvider";
+import { PluginCardArea } from "./PluginCardArea";
 import { ProjectsPage } from "./ProjectsPage";
 import { isWorkBuddyKind } from "@/utils/workbuddy";
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
@@ -462,6 +463,7 @@ export function SettingsPage() {
               {/* §16: the dashboard's managed edit/delete lands on that site's card. */}
               <WorkBuddyProvider disabled={isSaving || isRestarting} onBusyChange={setWorkBuddyBusy} focusSite={isWorkBuddyKind(location.state?.workBuddySite) ? location.state.workBuddySite : null} />
               <GeminiOauthProvider disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} />
+              <PluginCardArea disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} />
             </TabsContent>
 
             {/* General Tab */}

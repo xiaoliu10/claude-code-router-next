@@ -437,6 +437,16 @@ export interface WorkBuddyMutationResponse {
 // v1 supports the Antigravity installed-app OAuth only.
 export type GeminiOauthKind = "antigravity";
 
+/** Installed provider-plugin manifest entry (GET /api/plugins). */
+export interface PluginInfo {
+  name: string;
+  version: string | null;
+  enabled: boolean;
+  cardUrl?: string;
+  locales?: Record<string, Record<string, unknown>>;
+  error?: string;
+}
+
 /** Why the account cannot serve requests; codes are stable and localised. */
 export type GeminiOauthErrorCode =
   | "gemini_oauth_identity_blocked"

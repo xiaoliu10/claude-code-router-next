@@ -1,5 +1,6 @@
 import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyAccountRemoveRequest, WorkBuddyAccountSwitchRequest, WorkBuddyLoginStartResponse, WorkBuddyLoginPollResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyModelHideRequest, WorkBuddyModelHideResponse, WorkBuddyModelRestoreRequest, WorkBuddyModelRestoreResponse, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageRequest, WorkBuddyUsageResponse } from '@/types';
-import type { GeminiOauthDisconnectResponse, GeminiOauthLoginPollResponse, GeminiOauthLoginStartResponse, GeminiOauthStatusResponse, GeminiOauthSyncResponse } from '@/types';
+import type { GeminiOauthDisconnectResponse, GeminiOauthLoginPollResponse, GeminiOauthLoginStartResponse, GeminiOauthStatusResponse, GeminiOauthSyncResponse, PluginInfo } from '@/types';
+import { sanitizePluginErrorCode } from '../utils/plugin-card.ts';
 import { WORKBUDDY_POLL_TIMEOUT } from '../utils/workbuddy-login.ts';
 
 // The Gemini subscription provider has its own frozen code list (contract
@@ -95,12 +96,14 @@ class ApiClient {
   // Generic fetch wrapper with base URL and authentication.
   // An optional `timeoutMs` on `options` aborts the request after that many
   // milliseconds so a hung server can't leave the caller pending forever.
-  private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
+  private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number; plugin?: string } = {}): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
     const isWorkBuddy = endpoint.startsWith('/workbuddy/');
     const isGeminiOauth = endpoint.startsWith('/gemini-oauth/');
-    const isManagedSubscription = isWorkBuddy || isGeminiOauth;
-    const { timeoutMs, ...rest } = options;
+    const pluginName = (options as any).plugin as string | undefined;
+    const isPluginApi = typeof pluginName === 'string' && pluginName.length > 0;
+    const isManagedSubscription = isWorkBuddy || isGeminiOauth || isPluginApi;
+    const { timeoutMs, plugin: _plugin, ...rest } = options;
 
     const config: RequestInit = {
       ...rest,
@@ -129,6 +132,19 @@ class ApiClient {
         if (isGeminiOauth) throw Object.assign(new Error('Gemini OAuth request failed'), { reason: 'request_failed' });
         if (isWorkBuddy) throw Object.assign(new Error('workbuddy_unauthorized'), { reason: 'workbuddy_unauthorized' });
         return new Promise(() => {}) as Promise<T>;
+      }
+
+      if (!response.ok && isPluginApi) {
+        // Plugin cards own their error codes; the host passes through only a
+        // well-formed code token (never the raw message) so an upstream string
+        // can't reach the DOM through this boundary.
+        let code = 'request_failed';
+        try {
+          const data = await response.json();
+          const candidate = sanitizePluginErrorCode(data.reason ?? data.error);
+          if (candidate) code = candidate;
+        } catch { /* use the safe default */ }
+        throw Object.assign(new Error(`Plugin ${pluginName} request failed`), { reason: code, plugin: pluginName });
       }
 
       if (!response.ok && isGeminiOauth) {
@@ -194,9 +210,36 @@ class ApiClient {
             ? error.reason : 'request_failed';
         throw Object.assign(new Error(isGeminiOauth ? 'Gemini OAuth request failed' : 'WorkBuddy request failed'), { reason });
       }
+      if (isPluginApi) {
+        const reason = error instanceof DOMException && error.name === 'TimeoutError'
+          ? 'request_failed'
+          : error && typeof error === 'object' && 'reason' in error && typeof error.reason === 'string'
+            ? error.reason : 'request_failed';
+        throw Object.assign(new Error(`Plugin ${pluginName} request failed`), { reason, plugin: pluginName });
+      }
       console.error('API request error:', error);
       throw error;
     }
+  }
+
+  /**
+   * Fetch the installed provider-plugin manifest from /api/plugins.
+   */
+  getPlugins(): Promise<{ plugins: PluginInfo[] }> {
+    return this.get<{ plugins: PluginInfo[] }>('/plugins', ApiClient.MANAGEMENT_READ_TIMEOUT_MS);
+  }
+
+  /**
+   * Authenticated, sanitized fetch for provider-plugin cards. Cards never call
+   * fetch() directly: the host supplies this bridge so API-key handling, the
+   * 401 trap and error sanitization stay in exactly one place.
+   */
+  callPluginApi<T = unknown>(plugin: string, path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
+    if (!/^[a-z0-9][a-z0-9-]*$/i.test(plugin)) {
+      return Promise.reject(Object.assign(new Error('Plugin request failed'), { reason: 'request_failed' }));
+    }
+    if (!path.startsWith('/')) path = `/${path}`;
+    return this.apiFetch<T>(`/${plugin}${path}`, { ...init, plugin } as any);
   }
 
   // GET request
