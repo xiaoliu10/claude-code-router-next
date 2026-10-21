@@ -11,6 +11,7 @@ import { useConfig } from "./ConfigProvider";
 import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
 import { WorkBuddyProvider } from "./WorkBuddyProvider";
+import { GeminiOauthProvider } from "./GeminiOauthProvider";
 import { ProjectsPage } from "./ProjectsPage";
 import { isWorkBuddyKind } from "@/utils/workbuddy";
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
@@ -42,6 +43,9 @@ export function SettingsPage() {
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [workBuddyBusy, setWorkBuddyBusy] = useState(false);
+  // Managed subscription cards share one "a management action is running" gate
+  // so a full Save cannot race an in-flight OAuth login or disconnect.
+  const [managedProviderBusy, setManagedProviderBusy] = useState(false);
   const [isRestarting, setIsRestarting] = useState(false);
   const [isLogViewerOpen, setIsLogViewerOpen] = useState(false);
   const [isNewVersionAvailable, setIsNewVersionAvailable] = useState(false);
@@ -428,11 +432,11 @@ export function SettingsPage() {
           <h1 className="text-2xl font-bold tracking-tight text-foreground">{t('toplevel.title')}</h1>
         </div>
         <div className="flex items-center gap-3">
-          <Button variant="outline" onClick={() => runSaveWithProxyCheck("save")} disabled={isSaving || isRestarting || workBuddyBusy} className="rounded-xl border-white/10 bg-white/5 hover:bg-white/10 h-10 px-6">
+          <Button variant="outline" onClick={() => runSaveWithProxyCheck("save")} disabled={isSaving || isRestarting || workBuddyBusy || managedProviderBusy} className="rounded-xl border-white/10 bg-white/5 hover:bg-white/10 h-10 px-6">
             <Save className="mr-2 h-4 w-4" />
             {t('app.save')}
           </Button>
-          <Button onClick={() => runSaveWithProxyCheck("saveAndRestart")} disabled={isSaving || isRestarting || workBuddyBusy} className="rounded-xl h-10 px-6 shadow-lg shadow-primary/20">
+          <Button onClick={() => runSaveWithProxyCheck("saveAndRestart")} disabled={isSaving || isRestarting || workBuddyBusy || managedProviderBusy} className="rounded-xl h-10 px-6 shadow-lg shadow-primary/20">
             <RefreshCw className="mr-2 h-4 w-4" />
             {t('app.save_and_restart')}
           </Button>
@@ -454,8 +458,10 @@ export function SettingsPage() {
 
             <TabsContent value="providers" className="space-y-4">
               {location.state?.workBuddyManagedNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("workbuddy.managed_notice")}</p>}
+              {location.state?.geminiOauthManagedNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("geminiOauth.managed_notice")}</p>}
               {/* §16: the dashboard's managed edit/delete lands on that site's card. */}
               <WorkBuddyProvider disabled={isSaving || isRestarting} onBusyChange={setWorkBuddyBusy} focusSite={isWorkBuddyKind(location.state?.workBuddySite) ? location.state.workBuddySite : null} />
+              <GeminiOauthProvider disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} />
             </TabsContent>
 
             {/* General Tab */}

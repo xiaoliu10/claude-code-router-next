@@ -8,6 +8,7 @@ import { useConfig } from "./ConfigProvider";
 import { ProviderList } from "./ProviderList";
 import { useNavigate } from "react-router-dom";
 import { isManagedWorkBuddy, workBuddyErrorKey, workBuddyKindOf } from "@/utils/workbuddy";
+import { geminiOauthErrorKey, isManagedGeminiOauth } from "@/utils/gemini-oauth";
 import type { WorkBuddyKind } from "@/types";
 import {
   Dialog,
@@ -134,6 +135,11 @@ export function Providers() {
   const showWorkBuddyManagement = (site: WorkBuddyKind | null) => {
     // §16: each site has its own card; land the user on the right one.
     navigate('/settings?tab=providers', { state: { workBuddyManagedNotice: true, workBuddySite: site ?? undefined } });
+  };
+  // Contract D7: the Gemini subscription provider is managed on its Settings
+  // card; the generic dialog never edits it.
+  const showGeminiOauthManagement = () => {
+    navigate('/settings?tab=providers', { state: { geminiOauthManagedNotice: true } });
   };
   const [editingProviderIndex, setEditingProviderIndex] = useState<number | null>(null);
   const [deletingProviderIndex, setDeletingProviderIndex] = useState<number | null>(null);
@@ -359,6 +365,7 @@ export function Providers() {
     const actualIndex = validProviders.indexOf(filteredProviders[index]);
     const provider = config.Providers[actualIndex];
     if (isManagedWorkBuddy(provider)) { showWorkBuddyManagement(workBuddyKindOf(provider)); return; }
+    if (isManagedGeminiOauth(provider)) { showGeminiOauthManagement(); return; }
     if (isSaving) return;
     setEditingProviderIndex(actualIndex);
     setEditingProviderData(JSON.parse(JSON.stringify(provider))); // 深拷贝
@@ -379,6 +386,11 @@ export function Providers() {
     if (isManagedWorkBuddy(editingProviderData) ||
         (editingProviderIndex !== null && isManagedWorkBuddy(config.Providers[editingProviderIndex]))) {
       showWorkBuddyManagement(workBuddyKindOf(editingProviderData) ?? workBuddyKindOf(editingProviderIndex !== null ? config.Providers[editingProviderIndex] : null));
+      return;
+    }
+    if (isManagedGeminiOauth(editingProviderData) ||
+        (editingProviderIndex !== null && isManagedGeminiOauth(config.Providers[editingProviderIndex]))) {
+      showGeminiOauthManagement();
       return;
     }
     
@@ -489,6 +501,9 @@ export function Providers() {
     if (isSaving) return;
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     const managedSite = workBuddyKindOf(config.Providers[actualIndex]);
+    // Contract D7: the Gemini subscription row is removed on its own card, so
+    // delete navigates there instead of opening the generic confirmation.
+    if (isManagedGeminiOauth(config.Providers[actualIndex])) { showGeminiOauthManagement(); return; }
     // A managed provider's row IS its site. Keep the confirmation step, but
     // carry the site so the confirmed action calls the site-specific
     // `POST /api/workbuddy/disconnect {site}` instead of a global reset.
@@ -505,6 +520,24 @@ export function Providers() {
     setDeletingProviderIndex(null);
     setDeletingManagedSite(null);
     if (isSaving) return;
+    if (isManagedGeminiOauth(deletedProvider)) {
+      // Defense in depth for a config that changed under the dialog: explicit
+      // disconnect of the subscription provider, never an omission save.
+      setIsSaving(true);
+      try {
+        const response = await api.disconnectGeminiOauth();
+        setToast({
+          message: response?.ok === true ? t('geminiOauth.disconnected') : t(`geminiOauth.errors.${geminiOauthErrorKey(response)}`),
+          type: response?.ok === true ? 'success' : 'error',
+        });
+      } catch (e) {
+        setToast({ message: t(`geminiOauth.errors.${geminiOauthErrorKey(e)}`), type: 'error' });
+      } finally {
+        await refreshConfig();
+        setIsSaving(false);
+      }
+      return;
+    }
     if (managedSite) {
       // Explicit disconnect for this site only: the backend keeps Router
       // references and never touches the other site's pool.

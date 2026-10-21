@@ -554,7 +554,9 @@ test("settings owns management; dashboard only navigates managed edit/delete", (
   assert.match(settings, /TabsContent value="providers"/);
   assert.match(settings, /<WorkBuddyProvider disabled=\{isSaving \|\| isRestarting\}/);
   assert.match(settings, /focusSite=\{isWorkBuddyKind\(location\.state\?\.workBuddySite\)/);
-  assert.equal((settings.match(/disabled=\{isSaving \|\| isRestarting \|\| workBuddyBusy\}/g) || []).length, 2);
+  // Both Save buttons honour the WorkBuddy gate (the Gemini card adds its own
+  // busy flag to the same guard; gemini-oauth.test.ts asserts that pairing).
+  assert.equal((settings.match(/disabled=\{isSaving \|\| isRestarting \|\| workBuddyBusy[ \}]/g) || []).length, 2);
   assert.match(settings, /workbuddy.managed_notice/);
 });
 

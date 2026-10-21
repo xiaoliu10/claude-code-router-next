@@ -25,6 +25,13 @@ export interface Provider {
   // Which built-in subscription backend a managed provider belongs to:
   // "workbuddy" (copilot.tencent.com) today; reserved for future sites.
   workbuddy_kind?: string;
+  // Google-subscription (Antigravity OAuth) managed provider: CCR fixes its
+  // api_base_url / api_key marker / transformer, so the generic provider
+  // dialog must never edit it (same rule as ccr_managed).
+  gemini_oauth_managed?: boolean;
+  // Which OAuth backend a managed Google provider belongs to. v1 is
+  // antigravity only; the field exists so the UI never guesses.
+  gemini_oauth_kind?: GeminiOauthKind;
   // Thinking level injected when the client sends no thinking config:
   // "low" | "medium" | "high", a custom token budget (number), a free-form
   // provider effort string (e.g. "minimal"), or unset/empty to follow the
@@ -423,6 +430,78 @@ export interface WorkBuddyMutationResponse {
   accountChange?: "added" | "updated";
   /** Committed pool size for the site after that upsert. */
   accountCount?: number;
+}
+
+// ===== Gemini subscription (Antigravity OAuth) provider =====
+
+// v1 supports the Antigravity installed-app OAuth only.
+export type GeminiOauthKind = "antigravity";
+
+/** Why the account cannot serve requests; codes are stable and localised. */
+export type GeminiOauthErrorCode =
+  | "gemini_oauth_identity_blocked"
+  | "gemini_oauth_validation_required"
+  | "gemini_oauth_quota_exceeded"
+  | "gemini_oauth_reauth_required"
+  | "gemini_oauth_upstream_error"
+  | "gemini_oauth_not_connected"
+  | "gemini_oauth_login_busy"
+  | "gemini_oauth_name_conflict"
+  | "gemini_oauth_login_state_rejected"
+  | "gemini_oauth_login_account_failed"
+  | "gemini_oauth_login_persist_failed"
+  | "gemini_oauth_models_fetch_failed"
+  | "gemini_oauth_config_write_failed"
+  | "request_failed";
+
+export interface GeminiOauthError {
+  code: GeminiOauthErrorCode;
+  // Server-side safe text only; token material never crosses this boundary.
+  message?: string | null;
+  // Present for VALIDATION_REQUIRED: the official appeal/verification link.
+  validationUrl?: string | null;
+}
+
+/** GET /api/gemini-oauth/status — never carries token material. */
+export interface GeminiOauthStatusResponse {
+  configured: boolean;
+  connected: boolean;
+  kind: GeminiOauthKind;
+  email?: string | null;
+  project?: string | null;
+  tier?: string | null;
+  modelsCount?: number;
+  lastError?: GeminiOauthError | null;
+  // Epoch ms until which the account is parked after an upstream signal.
+  cooldownUntil?: number | null;
+}
+
+/** POST /api/gemini-oauth/login/start */
+export interface GeminiOauthLoginStartResponse {
+  loginId: string;
+  url: string;
+  expiresAt: number;
+}
+
+/** POST /api/gemini-oauth/login/poll */
+export type GeminiOauthLoginPollResponse =
+  | { status: "pending" }
+  | { status: "success"; email?: string | null }
+  | { status: "failed"; error?: GeminiOauthErrorCode | null };
+
+/** POST /api/gemini-oauth/sync — a failure keeps the previous model list. */
+export interface GeminiOauthSyncResponse {
+  ok: boolean;
+  modelsCount?: number;
+  clearedRefs?: string[];
+  error?: GeminiOauthErrorCode | string | null;
+}
+
+/** POST /api/gemini-oauth/disconnect — Router paths are display labels only. */
+export interface GeminiOauthDisconnectResponse {
+  ok: boolean;
+  removedModelRefs?: string[];
+  defaultFallback?: string | null;
 }
 
 export interface ManualProbeResponse {
