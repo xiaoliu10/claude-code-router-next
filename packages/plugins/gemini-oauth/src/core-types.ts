@@ -50,65 +50,8 @@ export interface PluginTransformer {
   transformResponseOut?(response: Response, context?: PluginTransformerContext): Promise<Response>;
 }
 
-// ---------------------------------------------------------------------------
-// Structural mirrors of the provider-plugin API (packages/core/src/
-// provider-plugins/types.ts). The plugin compiles without reaching into the
-// core tree; these stay compatible by construction — the loader only calls
-// the activate() signature and reads the manifest.
-// ---------------------------------------------------------------------------
-
-/** A classified upstream error, shared shape across providers (contract §1.6). */
-export interface PluginClassifiedError {
-  code: string;
-  message: string;
-  httpStatus: number;
-  cooldownMs?: number;
-  validationUrl?: string;
-  retryable?: boolean;
-}
-
-/** Host capabilities handed to a plugin at activation (structural mirror). */
-export interface PluginHostCapabilities {
-  configDir: string;
-  readConfig(): Promise<any>;
-  writeConfig(next: any): Promise<void>;
-  readRawConfig?(): Promise<any>;
-  reloadRuntime(config?: any): Promise<void>;
-  getDirectDispatcher(): unknown;
-}
-
-/** Managed-subscription semantics contributed by this plugin (structural mirror). */
-export interface ManagedRuntime {
-  name: string;
-  isManaged(provider: any): boolean;
-  ensureUsable?(): Promise<void>;
-  lockUpstream?(config: any, provider: any): Promise<void>;
-  signRequest(input: {
-    headers: Record<string, string>;
-    requestBody: any;
-    provider: any;
-  }): Promise<Record<string, string>>;
-  classifyError?(status: number, body: unknown, systemText: string): PluginClassifiedError | null;
-  noteUpstreamError?(info: PluginClassifiedError): Promise<void>;
-  authRefresh?: {
-    forceRefresh(): Promise<void>;
-  };
-  suppressDebugLog?: boolean;
-}
-
-/** The activation context (structural mirror of core's PluginContext). */
-export interface PluginContext {
-  readonly manifest: { name: string; version: string; coreApi: string; description?: string };
-  readonly log: {
-    info(msg: string): void;
-    warn(msg: string): void;
-    error(msg: string): void;
-  };
-  readonly host: PluginHostCapabilities;
-  registerTransformer(cls: new () => any): void;
-  registerManagedRuntime(rt: ManagedRuntime): void;
-  registerAdminRoutes(fn: (app: any) => void): void;
-  registerConfigProtector(fn: (next: any, prev: any) => void): void;
-  registerUiCard(def: { cardPath: string }): void;
-  registerLocales(bundle: Record<string, Record<string, unknown>>): void;
-}
+// Consume the canonical core API types (erased by esbuild — no host runtime
+// modules enter the plugin bundle). Do not fork this public contract.
+export type {
+  PluginContext, PluginHostCapabilities, ManagedRuntime, PluginClassifiedError,
+} from "../../../core/src/provider-plugins/types";

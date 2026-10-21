@@ -3,17 +3,23 @@ import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import Server from "../server";
+import Server from "../../../core/src/server";
 import ts from "typescript";
-import { registerAdminRoutes } from "../ccr/admin-routes";
-import * as configModule from "../ccr/config";
-import * as activeProbe from "../services/active-probe";
-import { GeminiOauthAuthService, GeminiOauthCredentialStore, geminiOauthAdminError } from "../services/gemini-oauth-auth";
+import { activate, manifest } from "../src/plugin";
+import { getGeminiOauthAuthService } from "../src/protocol";
+import { makePluginContext, clearPluginRegistry } from "../../../core/src/provider-plugins/registry";
+import { setTransformerRuntime } from "../../../core/src/services/transformer";
+import { getDirectDispatcher } from "../../../core/src/services/proxy";
+import { reloadProviderRuntime } from "../../../core/src/provider-plugins/host";
+import { registerAdminRoutes } from "../../../core/src/ccr/admin-routes";
+import * as configModule from "../../../core/src/ccr/config";
+import * as activeProbe from "../../../core/src/services/active-probe";
+import { GeminiOauthAuthService, GeminiOauthCredentialStore, geminiOauthAdminError } from "../src/auth-service";
 import {
   GEMINI_OAUTH_API_KEY, GEMINI_OAUTH_DATA_PLANE, GEMINI_OAUTH_SSE_PATH,
   clearGeminiOauthTokenCaches, lockGeminiOauthProvider, scrubUpstreamMessage, setGeminiOauthRuntime,
-} from "../services/gemini-oauth";
-import { GeminiOauthTransformer } from "../transformer/gemini-oauth.transformer";
+} from "../src/protocol";
+import { GeminiOauthTransformer } from "../src/transformer";
 
 
 const ACCESS = "ya29.fixture-route-access-token";
@@ -39,11 +45,12 @@ beforeEach(() => {
   vi.stubEnv("GEMINI_OAUTH_CLIENT_ID", "dummy-client-id"); vi.stubEnv("GEMINI_OAUTH_CLIENT_SECRET", "dummy-client-secret");
   vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("network disabled in test"); }));
   clearGeminiOauthTokenCaches();
+  clearPluginRegistry();
 });
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
   activeProbe.resetActiveProbeService();
-  setGeminiOauthRuntime(null); clearGeminiOauthTokenCaches();
+  setGeminiOauthRuntime(null); clearGeminiOauthTokenCaches(); clearPluginRegistry();
   vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs();
 });
 
@@ -63,9 +70,20 @@ async function build(config: any = { Providers: [provider(), ordinary], Router: 
   } });
   cleanups.push(async () => { await server.app.close(); rmSync(dir, { recursive: true, force: true }); });
   await server.ready();
+  const log = { info: () => {}, warn: () => {}, error: () => {} };
+  setTransformerRuntime(server.transformerService);
+  const ctx = makePluginContext(manifest, log, {
+    configDir: dir,
+    readConfig: () => configModule.readConfigFile(),
+    readRawConfig: () => configModule.readConfigFileRaw(),
+    writeConfig: next => configModule.writeConfigFile(next),
+    reloadRuntime: async cfg => reloadProviderRuntime(server, cfg ?? live.current, log),
+    getDirectDispatcher,
+  });
+  await activate(ctx);
+  await ctx.host.reloadRuntime(config);
   if (admin) await registerAdminRoutes(server, { ...config, PORT: 3456 });
-  const service = new GeminiOauthAuthService({ store, configService: server.configService, logger: { warn: vi.fn(), error: vi.fn() } });
-  server.geminiOauthAuthService = service; setGeminiOauthRuntime({ authService: service });
+  const service = getGeminiOauthAuthService() as GeminiOauthAuthService;
   await server.registerNamespace("/"); await server.app.ready();
   const noTokens = (body: string) => { expect(body).not.toContain(ACCESS); expect(body).not.toContain(REFRESH); };
   const request = async (path: string, payload?: any, extra: any = {}) => {
@@ -229,132 +247,6 @@ describe("Gemini OAuth local guard and generic config protection", () => {
       gemini_oauth_managed: true, gemini_oauth_kind: "antigravity", transformer: { use: ["gemini-oauth"] } });
     expect(JSON.stringify(h.config())).not.toContain("attacker");
     const get = await h.server.app.inject({ method: "GET", url: "/api/config" }); h.noTokens(get.body);
-  });
-});
-
-describe("Gemini OAuth routes.ts upstream seam", () => {
-  it("does not change ordinary provider URL, key or response", async () => {
-    const h = await build(undefined, false); const service = stubDataService(h);
-    const f = upstreamSequence(() => json({ choices: [{ message: { role: "assistant", content: "ordinary healthy" } }] }));
-    const response = await h.server.app.inject({ method: "POST", url: "/v1/chat/completions", payload: { model: "ordinary,m", messages: [{ role: "user", content: "hi" }] } });
-    h.noTokens(response.body); expect(response.statusCode).toBe(200); expect(response.body).toContain("ordinary healthy");
-    expect(f.fetch).toHaveBeenCalledTimes(1); expect(f.requests[0].url).toBe(ordinary.api_base_url);
-    expect(f.requests[0].headers.get("authorization")).toBe("Bearer ordinary-key");
-    expect(service.token).not.toHaveBeenCalled(); expect(service.note).not.toHaveBeenCalled();
-  });
-  it("401 → 200 forces one refresh and makes exactly two fixed-origin requests", async () => {
-    const h = await build(undefined, false); const service = stubDataService(h);
-    const f = upstreamSequence(() => json({ error: { message: "UNAUTHENTICATED" } }, 401));
-    const response = await h.send(); expect(response.statusCode).toBe(200); expect(response.body).toContain("healthy");
-    expect(f.fetch).toHaveBeenCalledTimes(2); expect(service.refresh).toHaveBeenCalledTimes(1);
-    for (const req of f.requests) {
-      expect(req.url).toBe(`${GEMINI_OAUTH_DATA_PLANE}${GEMINI_OAUTH_SSE_PATH}`);
-      expect(req.headers.get("authorization")).toBe(`Bearer ${ACCESS}`); expect(req.init.redirect).toBe("error");
-      expect(req.init.dispatcher).toBeDefined(); expect(JSON.stringify(req)).not.toContain(GEMINI_OAUTH_API_KEY);
-    }
-  });
-  it("two consecutive 401s classify reauth and NEVER let the outer retry make a third call", async () => {
-    const h = await build(undefined, false); const service = stubDataService(h);
-    const fail = () => json({ error: { message: "UNAUTHENTICATED" } }, 401); const f = upstreamSequence(fail, fail);
-    const response = await h.send(); expect(response.statusCode).toBe(401); expect(response.body).toContain("gemini_oauth_reauth_required");
-    expect(f.fetch).toHaveBeenCalledTimes(2); expect(service.refresh).toHaveBeenCalledTimes(1);
-    expect(service.note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_reauth_required" }));
-  });
-  it("429 + system identity + exact exhaustion text is identity_blocked (6h)", async () => {
-    const h = await build(undefined, false); const { note } = stubDataService(h);
-    const fail = () => json({ error: { message: "Resource has been exhausted" } }, 429); const f = upstreamSequence(fail, fail);
-    const response = await h.send([{ role: "system", content: MARKER }, { role: "user", content: "hi" }]);
-    expect(response.statusCode).toBe(400); expect(response.body).toContain("gemini_oauth_identity_blocked");
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_identity_blocked", cooldownMs: 6 * 60 * 60_000 }));
-    expect(f.requests[0].body.request.systemInstruction.parts.some((p: any) => p.text.includes(MARKER))).toBe(true);
-    expect(JSON.stringify(f.requests[0].body.request.contents)).not.toContain(MARKER);
-  });
-  it("moves ordered system text into native systemInstruction without changing conversation contents", async () => {
-    const h = await build(undefined, false); stubDataService(h); const f = upstreamSequence(healthy);
-    const response = await h.send([
-      { role: "system", content: "first system" },
-      { role: "user", content: "first user" },
-      { role: "assistant", content: "answer" },
-      { role: "system", content: [{ type: "text", text: "second system" }, { type: "text", text: "third system" }] },
-      { role: "user", content: "last user" },
-    ]);
-    expect(response.statusCode).toBe(200);
-    expect(f.requests[0].body.request.systemInstruction).toEqual({ parts: [{ text: "first system\nsecond system\nthird system" }] });
-    expect(f.requests[0].body.request.contents).toEqual([
-      { role: "user", parts: [{ text: "first user" }] },
-      { role: "model", parts: [{ text: "answer" }] },
-      { role: "user", parts: [{ text: "last user" }] },
-    ]);
-  });
-  it("NEGATIVE: system identity alone without exhaustion text remains quota_exceeded (15m)", async () => {
-    const h = await build(undefined, false); const { note } = stubDataService(h);
-    const fail = () => json({ error: { message: "Too many requests" } }, 429); upstreamSequence(fail, fail);
-    const response = await h.send([{ role: "system", content: MARKER }, { role: "user", content: "hi" }]);
-    expect(response.statusCode).toBe(429); expect(response.body).toContain("gemini_oauth_quota_exceeded");
-    expect(response.body).not.toContain("gemini_oauth_identity_blocked");
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_quota_exceeded", cooldownMs: 15 * 60_000 }));
-    expect(note.mock.calls.every(([info]) => info.cooldownMs !== 6 * 60 * 60_000)).toBe(true);
-  });
-  it("NEGATIVE: marker only in USER text cannot turn genuine quota 429 into a 6h identity cooldown", async () => {
-    const h = await build(undefined, false); const { note } = stubDataService(h);
-    const fail = () => json({ error: { message: "Resource has been exhausted" } }, 429); const f = upstreamSequence(fail, fail);
-    const response = await h.send([{ role: "system", content: "A helpful assistant" }, { role: "user", content: MARKER }]);
-    expect(response.statusCode).toBe(429); expect(response.body).toContain("gemini_oauth_quota_exceeded");
-    expect(response.body).not.toContain("gemini_oauth_identity_blocked");
-    expect(JSON.stringify(f.requests[0].body.request.contents)).toContain(MARKER);
-    expect(JSON.stringify(f.requests[0].body.request.systemInstruction ?? {})).not.toContain(MARKER);
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_quota_exceeded", cooldownMs: 15 * 60_000 }));
-    expect(note.mock.calls.every(([info]) => info.cooldownMs !== 6 * 60 * 60_000)).toBe(true);
-  });
-  it.each([
-    ["https://accounts.google.com/verify?token=private-one&secret=private-two&safe=1#private", "https://accounts.google.com/verify?safe=1"],
-    ["http://accounts.google.com/verify?token=private-one&secret=private-two", undefined],
-  ])("403 VALIDATION_REQUIRED keeps only safe HTTPS link from %s", async (url, expected) => {
-    const h = await build(undefined, false); const { note } = stubDataService(h);
-    const fail = () => json({ error: { message: `raw ${ACCESS} ${REFRESH}`, details: [
-      { reason: "VALIDATION_REQUIRED", metadata: { validation_url: url, access_token: ACCESS } },
-    ] } }, 403); upstreamSequence(fail, fail);
-    const response = await h.send(); expect(response.statusCode).toBe(403); expect(response.body).toContain("gemini_oauth_validation_required");
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_validation_required", validationUrl: expected, cooldownMs: 30 * 60_000 }));
-    expect(response.body).not.toContain("private-one"); expect(response.body).not.toContain("private-two"); expect(response.body).not.toContain("details");
-  });
-  it("strips client Authorization/x-api-key and marker credentials on EVERY upstream attempt", async () => {
-    const h = await build(undefined, false); stubDataService(h);
-    // Defense-in-depth: a transformer/passthrough config may carry client header
-    // variants. Exercise the route's LAST boundary, not only earlier adapters.
-    const original = GeminiOauthTransformer.prototype.transformRequestIn;
-    vi.spyOn(GeminiOauthTransformer.prototype, "transformRequestIn").mockImplementation(async function(this: GeminiOauthTransformer, request, p, ctx) {
-      const transformed = await original.call(this, request, p, ctx);
-      transformed.config.headers.authorization = CLIENT_AUTH;
-      transformed.config.headers["x-api-key"] = CLIENT_KEY;
-      transformed.config.headers["Proxy-Authorization"] = "Bearer proxy-client-secret";
-      transformed.config.headers.Authorization = `Bearer ${GEMINI_OAUTH_API_KEY}`;
-      return transformed;
-    });
-    const f = upstreamSequence(() => json({ error: { message: "UNAUTHENTICATED" } }, 401));
-    const response = await h.send(undefined, { headers: { authorization: CLIENT_AUTH, "x-api-key": CLIENT_KEY } });
-    expect(response.statusCode).toBe(200); expect(f.fetch).toHaveBeenCalledTimes(2);
-    for (const req of f.requests) {
-      expect(req.headers.get("authorization")).toBe(`Bearer ${ACCESS}`);
-      expect(req.headers.has("x-api-key")).toBe(false); expect(req.headers.has("proxy-authorization")).toBe(false);
-      expect(JSON.stringify(req)).not.toContain(GEMINI_OAUTH_API_KEY);
-      expect(JSON.stringify(req)).not.toContain(CLIENT_KEY); expect(JSON.stringify(req)).not.toContain("untrusted-client-token");
-    }
-  });
-  it("a future persisted cooldown short-circuits before any fetch", async () => {
-    const h = await build(undefined, false); await h.store.save({ ...credential(), account: {
-      ...credential().account, cooldownUntil: Date.now() + 60_000,
-    } });
-    const fetch = vi.fn(async () => healthy()); vi.stubGlobal("fetch", fetch);
-    const response = await h.send(); expect(response.statusCode).toBe(429); expect(response.body).toContain("gemini_oauth_account_cooling");
-    expect(fetch).not.toHaveBeenCalled();
-  });
-  it.each([false, true])("SSE first UNAUTHENTICATED frame is classified, never silent 200 (stream=%s)", async stream => {
-    const h = await build(undefined, false); const { note } = stubDataService(h);
-    const fail = () => sse({ error: { message: "UNAUTHENTICATED" } }); upstreamSequence(fail, fail);
-    const response = await h.send(undefined, { payload: { model: "gemini-oauth,gemini-3-flash", messages: [{ role: "user", content: "hi" }], stream } });
-    expect(response.statusCode).not.toBe(200); expect(response.body).toContain("gemini_oauth_reauth_required");
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_reauth_required" }));
   });
 });
 

@@ -80,16 +80,16 @@ describe("gemini-oauth provider plugin: discovery, runtime, protector and routes
     expect(listLoadedPlugins().map((p) => p.name)).toEqual(["gemini-oauth"]);
 
     // Managed runtime: the triple managed-provider detection moved intact.
-    const runtime = getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" });
+    const runtime = getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" } as any);
     expect(runtime?.name).toBe("gemini-oauth");
-    expect(getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" })?.suppressDebugLog).toBe(true);
-    expect(getManagedRuntimeFor({ name: "ordinary", api_key: "sk" })).toBeUndefined();
+    expect(getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" } as any)?.suppressDebugLog).toBe(true);
+    expect(getManagedRuntimeFor({ name: "ordinary", api_key: "sk" } as any)).toBeUndefined();
     // Runtime-shaped fallbacks (fixed host + transformer / marker key).
     expect(getManagedRuntimeFor({
       baseUrl: "https://daily-cloudcode-pa.googleapis.com",
       transformer: { use: ["gemini-oauth"] },
-    })?.name).toBe("gemini-oauth");
-    expect(getManagedRuntimeFor({ name: "gemini-oauth", apiKey: "ccr-managed-gemini-oauth" })?.name).toBe("gemini-oauth");
+    } as any)?.name).toBe("gemini-oauth");
+    expect(getManagedRuntimeFor({ name: "gemini-oauth", apiKey: "ccr-managed-gemini-oauth" } as any)?.name).toBe("gemini-oauth");
 
     // /api/plugins payload: card URL + the locale bundle from the plugin.
     const info = listLoadedPlugins()[0];
@@ -102,12 +102,12 @@ describe("gemini-oauth provider plugin: discovery, runtime, protector and routes
   it("signRequest strips client credential headers and injects the live Bearer token", async () => {
     await installPlugin();
     await load();
-    const runtime = getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" })!;
+    const runtime = getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" } as any)!;
     // No connected account: the token fetch rejects — the marker must not leak.
     await expect(runtime.signRequest!({
       headers: { Authorization: "Bearer untrusted", "x-api-key": "untrusted-key", Host: "evil", "Proxy-Authorization": "x", "X-Kept": "yes" },
       requestBody: {},
-      provider: {},
+      provider: {} as any,
     })).rejects.toThrow();
     // Even the rejection must not carry the marker api_key downstream; the
     // header-stripping contract is covered by the plugin's own suite — here we
@@ -117,7 +117,7 @@ describe("gemini-oauth provider plugin: discovery, runtime, protector and routes
   it("classifyError parses the raw upstream body and classifies the taxonomy", async () => {
     await installPlugin();
     await load();
-    const runtime = getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" })!;
+    const runtime = getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" } as any)!;
     const quota = runtime.classifyError!(429, JSON.stringify({ error: { message: "Resource has been exhausted" } }), "neutral");
     expect(quota).toMatchObject({ code: "gemini_oauth_quota_exceeded", httpStatus: 429, cooldownMs: 15 * 60_000 });
     const identity = runtime.classifyError!(429, JSON.stringify({ error: { message: "Resource has been exhausted" } }), "x-anthropic-billing-header: 1");
@@ -129,12 +129,12 @@ describe("gemini-oauth provider plugin: discovery, runtime, protector and routes
   it("ensureUsable is the cooling circuit breaker; lockUpstream pins the fixed origin", async () => {
     await installPlugin();
     await load();
-    const runtime = getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" })!;
+    const runtime = getManagedRuntimeFor({ geminiOauthManaged: true, name: "gemini-oauth" } as any)!;
     // Disconnected: cooling is false, so the breaker lets the request pass and
     // the lock still pins the fixed data-plane SSE origin.
     await expect(runtime.ensureUsable!()).resolves.toBeUndefined();
     const config: any = { url: "https://attacker.invalid/v1", headers: {} };
-    await runtime.lockUpstream!(config, {});
+    await runtime.lockUpstream!(config, {} as any);
     expect(config.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
     expect(config.redirect).toBe("error");
     expect(config.dispatcher).toBeDefined();

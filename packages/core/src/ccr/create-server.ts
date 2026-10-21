@@ -37,6 +37,7 @@ import { registerAdminRoutes } from "./admin-routes";
 import { setTransformerRuntime } from "../services/transformer";
 import { loadInstalledPlugins } from "../provider-plugins/loader";
 import { listLoadedPlugins } from "../provider-plugins/registry";
+import { reloadProviderRuntime } from "../provider-plugins/host";
 import { registerRequestPipeline, createCcrPreHandlerCallbacks } from "./request-pipeline";
 import { reconcileHealthStore } from "./health-reconcile";
 import { append as appendUsage } from "./usage-store";
@@ -173,7 +174,6 @@ export async function createCcrServer(options: CcrRunOptions = {}) {
     logger: loggerConfig,
   });
   await serverInstance.ready();
-  await registerAdminRoutes(serverInstance, config);
 
   // Provider plugins (docs/design/provider-plugins.md): the transformer
   // runtime pointer first (plugins may register transformer classes), then
@@ -182,6 +182,7 @@ export async function createCcrServer(options: CcrRunOptions = {}) {
   setTransformerRuntime((serverInstance as any).transformerService);
   const pluginLoad = await loadInstalledPlugins({
     configDir: HOME_DIR,
+    getServer: () => serverInstance,
     log: {
       info: (msg) => serverInstance.app?.log?.info?.(msg),
       warn: (msg) => serverInstance.app?.log?.warn?.(msg),
@@ -196,6 +197,11 @@ export async function createCcrServer(options: CcrRunOptions = {}) {
   if (listLoadedPlugins().length) {
     serverInstance.app?.log?.info?.(`provider plugins active: ${listLoadedPlugins().map((p) => `${p.name}@${p.version}`).join(", ")}`);
   }
+
+  // Plugins must activate BEFORE admin route registration; providers constructed
+  // before activation must then re-resolve plugin-contributed transformers.
+  if (pluginLoad.loaded.length) reloadProviderRuntime(serverInstance, config, serverInstance.app.log);
+  await registerAdminRoutes(serverInstance, config);
 
   // Set up usage recording callback for fallback failures in core
   serverInstance.recordUsage = (data: any) => {

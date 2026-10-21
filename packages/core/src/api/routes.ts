@@ -8,14 +8,6 @@ import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl, workBuddySiteFromProvider, workBuddyFailoverCooldown, workBuddyPoolExhaustedError, workBuddyEnvelopeIsError } from "../services/workbuddy";
-import {
-  GEMINI_OAUTH_DATA_PLANE,
-  GEMINI_OAUTH_SSE_PATH,
-  classifyGeminiOauthError,
-  geminiOauthError,
-  getGeminiOauthAuthService,
-  isGeminiOauthRuntime,
-} from "../services/gemini-oauth";
 import { getManagedRuntimeFor, pluginErrorFrom } from "../provider-plugins/registry";
 import {
   isDebugLogEnabled,
@@ -1297,31 +1289,10 @@ async function sendProviderAttempt(
     config.dispatcher = getDirectDispatcher();
   }
 
-  // Managed Gemini OAuth providers: the upstream is Code Assist, never a
-  // config-supplied base_url, and the access token is the only credential.
-  const geminiOauthManaged = isGeminiOauthRuntime(provider);
-  let geminiOauthService: ReturnType<typeof getGeminiOauthAuthService>;
-  if (geminiOauthManaged) {
-    geminiOauthService = getGeminiOauthAuthService();
-    if (!geminiOauthService) throw new Error("Gemini OAuth 服务未初始化");
-    // An account under cooldown (identity block, quota, verification) is a
-    // circuit breaker, not a display state: stop before touching the network.
-    if (await geminiOauthService.isAccountCooling?.()) {
-      throw geminiOauthError({
-        code: "gemini_oauth_account_cooling",
-        message: "Gemini OAuth 账号处于冷却期（配额/验证/风控拦截），请稍后再试或重新授权。",
-        httpStatus: 429,
-        retryable: false,
-      });
-    }
-    config.url = new URL(GEMINI_OAUTH_SSE_PATH, GEMINI_OAUTH_DATA_PLANE).toString();
-    // Never follow a redirect away from the fixed origin.
-    config.redirect = "error";
-    config.dispatcher = getDirectDispatcher();
-  }
-
-  // Generic provider-plugin runtime (docs/design/provider-plugins.md): the same
-  // managed-subscription semantics as above, contributed by an installed plugin.
+  // Generic provider-plugin runtime (docs/design/provider-plugins.md): the
+  // managed-subscription semantics (fixed upstream lock, cooling breaker, live
+  // token injection, error taxonomy, 401-once-refresh) are contributed by the
+  // provider's plugin — gemini-oauth included. The core only knows this seam.
   const pluginRuntime = getManagedRuntimeFor(provider);
   if (pluginRuntime) {
     // Circuit breaker before any network touch — including token refresh.
@@ -1376,14 +1347,6 @@ async function sendProviderAttempt(
     }
     Object.assign(requestHeaders, credentialHeaders(config.workbuddyCredential));
   }
-  if (geminiOauthManaged) {
-    // The marker api_key must never reach Google, and a client-supplied
-    // Authorization (bypass mode) must not survive either.
-    for (const key of Object.keys(requestHeaders)) {
-      if (["authorization", "x-api-key", "host", "proxy-authorization"].includes(key.toLowerCase())) delete requestHeaders[key];
-    }
-    requestHeaders.Authorization = `Bearer ${await geminiOauthService!.getAccessToken()}`;
-  }
   if (pluginRuntime) {
     // Body is final here: body-derived headers (Codex session-id) work.
     requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider });
@@ -1402,7 +1365,7 @@ async function sendProviderAttempt(
   }
 
   // Debug: log outgoing request to provider
-  if (!workbuddyManaged && !geminiOauthManaged && !pluginRuntime?.suppressDebugLog && isDebugLogEnabled(fastify.configService)) {
+  if (!workbuddyManaged && !pluginRuntime?.suppressDebugLog && isDebugLogEnabled(fastify.configService)) {
     logProviderRequest(fastify.log, context.req.id, {
       url: String(url),
       headers: requestHeaders,
@@ -1417,10 +1380,10 @@ async function sendProviderAttempt(
     {
       ...config,
       headers: JSON.parse(JSON.stringify(requestHeaders)),
-      httpsProxy: workbuddyManaged || geminiOauthManaged || pluginRuntime ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
+      httpsProxy: workbuddyManaged || pluginRuntime ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
     },
     context,
-    workbuddyManaged || geminiOauthManaged || pluginRuntime ? undefined : fastify.log
+    workbuddyManaged || pluginRuntime ? undefined : fastify.log
   );
   try {
     response = await dispatchUpstream();
@@ -1438,24 +1401,10 @@ async function sendProviderAttempt(
     throw sendError;
   }
 
-  // Managed Gemini OAuth: an expired access token surfaces as 401. Refresh once
-  // and re-send exactly once — nothing has been committed to the client yet.
-  // Only the forced-refresh resend is allowed; a second 401 is terminal so the
-  // outer generic retry cannot produce a third upstream call.
-  if (!response.ok && geminiOauthManaged && response.status === 401 && !(context.req as any)?.__geminiOauth401Retried) {
-    (context.req as any).__geminiOauth401Retried = true;
-    try {
-      await geminiOauthService!.forceTokenRefresh?.();
-      requestHeaders.Authorization = `Bearer ${await geminiOauthService!.getAccessToken()}`;
-      response = await dispatchUpstream();
-    } catch {
-      // Refresh failed: fall through to classification of the original 401.
-    }
-    if (response.status === 401) (context.req as any).__retryAttempted = true;
-  }
-
-  // Provider-plugin 401 handling: one forced refresh + one re-dispatch, same
-  // discipline as the gemini branch below. A second 401 is terminal.
+  // Provider-plugin 401 handling: one forced refresh + one re-dispatch —
+  // nothing has been committed to the client yet. Only the forced-refresh
+  // resend is allowed; a second 401 is terminal so the outer generic retry
+  // cannot produce a third upstream call.
   if (!response.ok && pluginRuntime?.authRefresh && response.status === 401 && !(context.req as any)?.__plugin401Retried) {
     (context.req as any).__plugin401Retried = true;
     try {
@@ -1496,24 +1445,6 @@ async function sendProviderAttempt(
       (wbError as any).workbuddy = true;
       (wbError as any).cooldownSeconds = (wbError as any).cooldownSeconds;
       throw wbError;
-    }
-    // Managed Gemini OAuth providers: classify HERE, before the generic branch
-    // logs the raw body or hands it to a client-facing error.
-    if (geminiOauthManaged) {
-      let parsedError: any;
-      try { parsedError = errorText ? JSON.parse(errorText) : undefined; } catch { parsedError = undefined; }
-      const info = classifyGeminiOauthError({
-        status: response.status,
-        body: parsedError ?? errorText,
-        systemText: geminiSystemText(requestBody),
-      });
-      await geminiOauthService?.noteUpstreamError?.(info);
-      fastify.log.error(
-        `[provider_response_error] Gemini OAuth provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
-      );
-      const geminiError: any = geminiOauthError(info);
-      geminiError.isRateLimit = info.code === "gemini_oauth_quota_exceeded";
-      throw geminiError;
     }
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
@@ -1577,15 +1508,18 @@ async function sendProviderAttempt(
               (wbError as any).workbuddy = true;
               throw wbError;
             }
-            if (geminiOauthManaged) {
-              const info = classifyGeminiOauthError({ status: response.status, body: bodyJson, systemText: geminiSystemText(requestBody) });
-              await geminiOauthService?.noteUpstreamError?.(info);
-              fastify.log.error(
-                `[provider_response_error] Gemini OAuth hidden error from provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
-              );
-              const geminiError: any = geminiOauthError(info);
-              geminiError.isRateLimit = info.code === "gemini_oauth_quota_exceeded";
-              throw geminiError;
+            // Installed plugin runtimes classify hidden HTTP-200 errors too:
+            // same taxonomy, same noteUpstreamError bookkeeping, thrown through
+            // the shared seam so fallback engages.
+            if (pluginRuntime?.classifyError) {
+              const info = pluginRuntime.classifyError(response.status, bodyText, geminiSystemText(requestBody));
+              if (info) {
+                await pluginRuntime.noteUpstreamError?.(info)?.catch(() => undefined);
+                fastify.log.error(
+                  `[provider_response_error] Plugin(${pluginRuntime.name}) hidden error from provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
+                );
+                throw pluginErrorFrom(pluginRuntime.name, info);
+              }
             }
             fastify.log.error(
               `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,

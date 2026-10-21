@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import type { LLMProvider } from "@/types/llm";
+import type { LLMProvider } from "../types/llm";
 
 /**
  * Provider plugin API (docs/design/provider-plugins.md).

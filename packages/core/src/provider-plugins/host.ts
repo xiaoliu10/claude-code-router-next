@@ -1,3 +1,7 @@
+import { ProviderService } from "../services/provider";
+import { reconcileHealthStore } from "../ccr/health-reconcile";
+import * as activeProbe from "../services/active-probe";
+import { resolveProviderProxyUrl } from "../services/proxy";
 
 
 /**
@@ -15,17 +19,10 @@ export function reloadProviderRuntime(server: any, config: any, log: { info(msg:
     if (server.transformerService) {
       // ProviderService re-resolves against the fresh config; require keeps the
       // plugin subsystem free of a static cycle with the provider service.
-      const { ProviderService } = require("../services/provider") as typeof import("../services/provider");
       server.providerService = new ProviderService(server.configService, server.transformerService, log);
     }
-    const { reconcileHealthStore } = require("../ccr/health-reconcile") as typeof import("../ccr/health-reconcile");
     reconcileHealthStore(config, log);
-    let activeProbe: typeof import("../services/active-probe") | undefined;
-    try {
-      activeProbe = require("../services/active-probe") as typeof import("../services/active-probe");
-      activeProbe.resetActiveProbeService();
-    } catch {}
-    if (!activeProbe) return;
+    activeProbe.resetActiveProbeService();
     const probeConfig = {
       enabled: server.configService.get("ACTIVE_PROBE_ENABLED") ?? true,
       quotaProbeIntervalMinutes: server.configService.get("QUOTA_PROBE_INTERVAL_MINUTES") ?? 10,
@@ -38,7 +35,6 @@ export function reloadProviderRuntime(server: any, config: any, log: { info(msg:
       () => server.providerService.getProviders(),
       probeConfig,
       (provider: any) => {
-        const { resolveProviderProxyUrl } = require("@/services/proxy") as typeof import("@/services/proxy");
         return resolveProviderProxyUrl(server.configService, provider);
       },
       log,
