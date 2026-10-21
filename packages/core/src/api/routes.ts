@@ -8,7 +8,9 @@ import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl, workBuddySiteFromProvider, workBuddyFailoverCooldown, workBuddyPoolExhaustedError, workBuddyEnvelopeIsError } from "../services/workbuddy";
-import { getManagedRuntimeFor, pluginErrorFrom } from "../provider-plugins/registry";
+import { getManagedRuntimeFor } from "../provider-plugins/registry";
+import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "./plugin-request-state";
+import { pluginResponseError } from "./plugin-response-error";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -184,6 +186,8 @@ async function handleTransformerEndpoint(
 ) {
   const body = req.body as any;
   ((req as any).ccrHookOrder ||= []).push("handler");
+  // Initialize on the original request before any fallback spreads it.
+  ensurePluginRequestState(req);
 
   // Normalize Responses API (Codex) format into a unified chat request BEFORE
   // provider resolution. This must happen first so that a CCR family alias can be
@@ -394,7 +398,8 @@ async function handleTransformerEndpoint(
     // often resolve on a second attempt, avoiding unnecessary model switches.
     // WorkBuddy pool/terminal errors already exhausted their bounded account
     // budget; generic transient errors (5xx/empty stream/network) keep one retry.
-    if (!(req as any).__retryAttempted && error?.code !== "workbuddy_reauth" && !isTerminalWorkBuddyError(error)) {
+    const terminalPluginFailure = rememberPluginFailure(req, getManagedRuntimeFor(provider), error);
+    if (!terminalPluginFailure && !(req as any).__retryAttempted && error?.code !== "workbuddy_reauth" && !isTerminalWorkBuddyError(error)) {
       (req as any).__retryAttempted = true;
       try {
         return await handleTransformerEndpoint(req, reply, fastify, transformer);
@@ -730,6 +735,8 @@ async function handleFallback(
         continue;
       }
 
+      const fallbackRuntime = getManagedRuntimeFor(configuredFallback.provider);
+      if (fallbackRuntime && pluginAttemptBudget(req, fallbackRuntime).terminalError) continue;
       let fallbackError: any;
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
@@ -841,6 +848,7 @@ async function handleFallback(
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
           fallbackError = error;
+          if (rememberPluginFailure(req, fallbackRuntime, error)) break;
           // Never restart a terminal WorkBuddy account-pool attempt budget.
           if (error?.code === "workbuddy_reauth" || isTerminalWorkBuddyError(error)) break;
           if (attempt === 1) {
@@ -893,6 +901,13 @@ async function processRequestTransformers(
   if (typeof provider.apiKey === "string" && provider.apiKey.startsWith("ccr-managed-") &&
       !isWorkBuddyRuntime(provider) && !getManagedRuntimeFor(provider)) {
     throw createApiError("Provider plugin missing or disabled; install and enable its provider plugin.", 503, "plugin_missing");
+  }
+  const runtime = getManagedRuntimeFor(provider);
+  if (runtime) {
+    const terminal = pluginAttemptBudget(context.req, runtime).terminalError;
+    if (terminal) throw terminal;
+    // Run before any transformer can refresh credentials or contact upstream.
+    await runtime.ensureUsable?.();
   }
   // Deep clone the request body to preserve original messages for caching
   // and to ensure thinking blocks are not lost when switching between models
@@ -1405,6 +1420,7 @@ async function sendProviderAttempt(
         ? await getWorkBuddyAuthService()?.diagnoseReset(config.workbuddyCredential) : null;
       if (reauth) throw reauth;
     }
+    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody));
     throw sendError;
   }
 
@@ -1412,8 +1428,10 @@ async function sendProviderAttempt(
   // nothing has been committed to the client yet. Only the forced-refresh
   // resend is allowed; a second 401 is terminal so the outer generic retry
   // cannot produce a third upstream call.
-  if (!response.ok && pluginRuntime?.authRefresh && response.status === 401 && !(context.req as any)?.__plugin401Retried) {
-    (context.req as any).__plugin401Retried = true;
+  if (!response.ok && pluginRuntime?.authRefresh && response.status === 401 && !pluginAttemptBudget(context.req, pluginRuntime).refreshUsed) {
+    // Runtime object identity is stable across provider aliases and models.
+    // The shared state survives primary/fallback request spreads.
+    pluginAttemptBudget(context.req, pluginRuntime).refreshUsed = true;
     try {
       await pluginRuntime.authRefresh.forceRefresh();
       requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider });
@@ -1426,22 +1444,21 @@ async function sendProviderAttempt(
 
   // Handle request errors
   if (!response.ok) {
-    const errorText = await response.text();
+    let errorText: string;
+    try { errorText = await response.text(); } catch (readError) {
+      if (pluginRuntime) throw await pluginResponseError(pluginRuntime, response.status, undefined, geminiSystemText(requestBody));
+      throw readError;
+    }
     // WorkBuddy managed providers: classify and redact the upstream body here,
     // BEFORE any log or client-facing error is built. A raw WorkBuddy envelope
     // must never reach the log stream, and a WorkBuddy access token must never
     // be recoverable from an error message.
     // Installed plugin runtimes classify first: the taxonomy belongs to the
     // plugin, the core only turns it into a thrown error.
-    if (pluginRuntime?.classifyError) {
-      const info = pluginRuntime.classifyError(response.status, errorText, geminiSystemText(requestBody));
-      if (info) {
-        await pluginRuntime.noteUpstreamError?.(info)?.catch(() => undefined);
-        fastify.log.error(
-          `[provider_response_error] Plugin(${pluginRuntime.name}) provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
-        );
-        throw pluginErrorFrom(pluginRuntime.name, info);
-      }
+    if (pluginRuntime) {
+      const error = await pluginResponseError(pluginRuntime, response.status, errorText, geminiSystemText(requestBody));
+      fastify.log.error(`[provider_response_error] Plugin(${pluginRuntime.name}) status=${response.status} code=${error.code}`);
+      throw error;
     }
     if (isWorkBuddyRuntime(provider)) {
       const wbError = classifyWorkBuddyError(response.status, errorText);
@@ -1479,9 +1496,9 @@ async function sendProviderAttempt(
     // content-type (e.g. text/event-stream for non-streaming requests), which
     // would bypass the JSON-only hidden error check and forward garbage to the client.
     if (!isStreamRequest || contentType.includes("application/json")) {
-      const cloned = response.clone();
       let bodyText = "";
       try {
+        const cloned = response.clone();
         bodyText = await cloned.text();
         if (!bodyText || bodyText.trim() === "") {
           throw new SyntaxError("Empty JSON body");
@@ -1518,15 +1535,8 @@ async function sendProviderAttempt(
             // Installed plugin runtimes classify hidden HTTP-200 errors too:
             // same taxonomy, same noteUpstreamError bookkeeping, thrown through
             // the shared seam so fallback engages.
-            if (pluginRuntime?.classifyError) {
-              const info = pluginRuntime.classifyError(response.status, bodyText, geminiSystemText(requestBody));
-              if (info) {
-                await pluginRuntime.noteUpstreamError?.(info)?.catch(() => undefined);
-                fastify.log.error(
-                  `[provider_response_error] Plugin(${pluginRuntime.name}) hidden error from provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
-                );
-                throw pluginErrorFrom(pluginRuntime.name, info);
-              }
+            if (pluginRuntime) {
+              throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody));
             }
             fastify.log.error(
               `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
@@ -1544,7 +1554,13 @@ async function sendProviderAttempt(
             throw error;
           }
         }
-      } catch (e) {
+      } catch (e: any) {
+        if (pluginRuntime) {
+          if (e?.pluginClassified === true) throw e;
+          // Includes malformed/empty JSON, HTML interception and body read
+          // errors. Nothing below may log or forward rawBody for a plugin.
+          throw await pluginResponseError(pluginRuntime, response.status, undefined, geminiSystemText(requestBody));
+        }
         // Empty or malformed JSON body on HTTP 200 — the provider returned an
         // invalid response. Throw to trigger fallback instead of forwarding
         // the empty response to the client, which would cause a different error.

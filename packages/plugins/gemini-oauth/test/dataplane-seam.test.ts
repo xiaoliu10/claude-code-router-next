@@ -268,9 +268,10 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     const response = await h.send();
     expect(response.statusCode).toBe(502); expect(response.body).toContain("gemini_oauth_upstream_error");
     expect(response.body).not.toContain(ACCESS);
-    expect(note).toHaveBeenCalledTimes(2);
+    // A classified terminal response is not re-sent to the same account.
+    expect(note).toHaveBeenCalledTimes(1);
     expect(note.mock.calls[0][0].code).toBe("gemini_oauth_upstream_error");
-    expect(f.fetch).toHaveBeenCalledTimes(2);
+    expect(f.fetch).toHaveBeenCalledTimes(1);
   });
 });
 
