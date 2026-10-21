@@ -16,12 +16,7 @@ export default defineConfig({
     env: {
       CCR_CONFIG_DIR: TEST_HOME,
     },
-    // The data-plane seam tests import the core Server directly from source.
-    server: {
-      fs: {
-        allow: [path.resolve(__dirname, "../..")],
-      },
-    },
+
   },
   resolve: {
     alias: {

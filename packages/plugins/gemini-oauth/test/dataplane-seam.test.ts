@@ -27,6 +27,7 @@ import * as configModule from "../../../core/src/ccr/config";
 import * as activeProbe from "../../../core/src/services/active-probe";
 import { setTransformerRuntime } from "../../../core/src/services/transformer";
 import { getDirectDispatcher } from "../../../core/src/services/proxy";
+import { getHealthStore } from "../../../core/src/services/provider-health";
 import { reloadProviderRuntime } from "../../../core/src/provider-plugins/host";
 import { makePluginContext, clearPluginRegistry } from "../../../core/src/provider-plugins/registry";
 import { manifest, activate } from "../src/plugin";
@@ -271,4 +272,21 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     expect(note.mock.calls[0][0].code).toBe("gemini_oauth_upstream_error");
     expect(f.fetch).toHaveBeenCalledTimes(2);
   });
+});
+
+it("the plugin runtime preserves configured ordinary-provider fallback", async () => {
+  const h = await build(); stubDataService(h);
+  h.server.configService.set("Router", { enableFallback: true });
+  h.server.configService.set("fallback", { default: ["ordinary,m"] });
+  vi.spyOn(getHealthStore(), "isAvailable").mockReturnValue(true);
+  const urls: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (url: any) => {
+    urls.push(String(url));
+    return String(url).includes("ordinary.invalid")
+      ? json({ choices: [{ message: { role: "assistant", content: "fallback healthy" } }] })
+      : json({ error: { message: "Resource has been exhausted" } }, 429);
+  }));
+  const response = await h.send();
+  expect(response.statusCode).toBe(200); expect(response.body).toContain("fallback healthy");
+  expect(urls.at(-1)).toBe(ordinary.api_base_url);
 });

@@ -151,6 +151,12 @@ async function probeProvider(
 ): Promise<ProbeResult> {
   const startedAt = performance.now();
   const elapsed = () => Math.max(0, Math.round(performance.now() - startedAt));
+  // Managed marker keys are identifiers, not credentials. Generic /models
+  // probing must never send them upstream (whether the plugin is installed or
+  // missing); subscription management/model sync owns its authenticated calls.
+  if (provider.apiKey?.startsWith("ccr-managed-")) {
+    return { success: false, error: "Managed provider requires its plugin's authenticated model sync", errorKind: "http", latencyMs: elapsed() };
+  }
   const modelsUrl = deriveModelsEndpoint(provider.baseUrl);
 
   if (!modelsUrl) {

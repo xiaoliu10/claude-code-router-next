@@ -24,7 +24,6 @@ import { GeminiOauthAuthService, GeminiOauthCredentialStore } from "./auth-servi
 import { registerGeminiOauthAdminRoutes } from "./admin-routes";
 import { geminiOauthLocales } from "./locales";
 import {
-  GEMINI_OAUTH_API_KEY,
   GEMINI_OAUTH_DATA_PLANE,
   GEMINI_OAUTH_SSE_PATH,
   classifyGeminiOauthError,
@@ -153,7 +152,7 @@ async function activate(ctx: PluginContext): Promise<void> {
   ctx.registerUiCard({ cardPath: "card.js" });
   ctx.registerLocales(geminiOauthLocales);
 
-  ctx.log.info(`gemini-oauth plugin active (marker key ${GEMINI_OAUTH_API_KEY} stays out of upstream traffic)`);
+  ctx.log.info("gemini-oauth plugin active");
 }
 
 const plugin = { manifest, activate };

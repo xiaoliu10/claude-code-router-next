@@ -3,8 +3,9 @@
  * frozen protocol code): the Gemini-native request builder and the Gemini SSE
  * → chat.completion response chain the shared transformer pipeline reuses.
  * The plugin bundle must be self-contained, so this pure protocol module
- * travels with the plugin; only type-only imports were dropped (esbuild
- * erases them). Keep in sync with the core original when the contract changes.
+ * travels with the plugin. Type-only imports are structural subsets; explicit
+ * any annotations repair pre-existing strict-mode diagnostics without changing
+ * protocol logic. Keep in sync with the core original when the contract changes.
  */
 
 import type { PluginUnifiedChatRequest, PluginUnifiedMessage } from "./core-types";

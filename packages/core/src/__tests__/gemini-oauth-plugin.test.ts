@@ -8,11 +8,17 @@
  * and the UI card/locale registration all work THROUGH the plugin — nothing
  * here imports the plugin's internals; only public registry/loader surfaces.
  */
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Fastify from "fastify";
+import Server from "../server";
+import * as configModule from "../ccr/config";
+import * as activeProbe from "../services/active-probe";
+import { reloadProviderRuntime } from "../provider-plugins/host";
+import { registerAdminRoutes } from "../ccr/admin-routes";
+import { execFileSync } from "node:child_process";
 import { build } from "esbuild";
 import { clearPluginRegistry, getManagedRuntimeFor, applyPluginConfigProtectors, listLoadedPlugins, registerAllPluginRoutes } from "../provider-plugins/registry";
 import { loadInstalledPlugins } from "../provider-plugins/loader";
@@ -36,6 +42,8 @@ beforeEach(() => {
 
 afterEach(() => {
   clearPluginRegistry();
+  activeProbe.resetActiveProbeService();
+  vi.restoreAllMocks(); vi.unstubAllGlobals();
   rmSync(configDir, { recursive: true, force: true });
   delete process.env.GEMINI_OAUTH_CLIENT_ID;
   delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
@@ -44,7 +52,8 @@ afterEach(() => {
 /** Build the plugin's prebuilt entry exactly like `scripts/build.ts` does and
  *  lay it out as an installed plugin under the temp config dir. */
 async function installPlugin(): Promise<void> {
-  await build({
+  const bundle = await build({
+    metafile: true,
     entryPoints: [join(PLUGIN_PKG, "src/plugin.ts")],
     bundle: true,
     platform: "node",
@@ -53,10 +62,14 @@ async function installPlugin(): Promise<void> {
     outfile: join(pluginDir, "plugin.js"),
     logLevel: "silent",
   });
+  expect(Object.keys(bundle.metafile!.inputs).some(file => /core\/src\//.test(file))).toBe(false);
+  await build({
+    entryPoints: [join(PLUGIN_PKG, "src/card-entry.ts")], bundle: true,
+    platform: "browser", target: "es2020", format: "esm", outfile: join(pluginDir, "card.js"), logLevel: "silent",
+  });
   writeFileSync(join(configDir, "plugins", "plugins.json"), JSON.stringify([{ name: "gemini-oauth", enabled: true }]));
   writeFileSync(join(pluginDir, "plugin.json"), JSON.stringify({ name: "gemini-oauth", version: "1.0.0", coreApi: "1" }));
   writeFileSync(join(pluginDir, "package.json"), JSON.stringify({ type: "module" }));
-  writeFileSync(join(pluginDir, "card.js"), "export default { mount() {} };");
 }
 
 const hostServer = {
@@ -205,4 +218,87 @@ describe("gemini-oauth provider plugin: discovery, runtime, protector and routes
       setTransformerRuntime(undefined as any);
     }
   });
+});
+
+// This test installs the independent tarball, activates through the real
+// loader, wires the root admin routes, re-resolves providers, and dispatches a
+// real transformer request. It catches ordering/bundle/state-fork bugs that a
+// fake plugin or a makePluginContext-only test cannot catch.
+it("installs an independent tarball and routes admin + inference without core Gemini imports", async () => {
+  await installPlugin();
+  // Independent distribution: no node_modules or workspace files are included.
+  execFileSync("tar", ["-czf", join(configDir, "plugin.tgz"), "-C", pluginDir, "."]);
+  rmSync(pluginDir, { recursive: true, force: true }); mkdirSync(pluginDir);
+  execFileSync("tar", ["-xzf", join(configDir, "plugin.tgz"), "-C", pluginDir]);
+  process.env.GEMINI_OAUTH_CLIENT_ID = "dummy-client-id";
+  process.env.GEMINI_OAUTH_CLIENT_SECRET = "dummy-client-secret";
+  const provider = { name: "gemini-oauth", api_key: "ccr-managed-gemini-oauth",
+    api_base_url: "https://daily-cloudcode-pa.googleapis.com", models: ["gemini-3-flash"],
+    transformer: { use: ["gemini-oauth"] } };
+  const config = { Providers: [provider], Router: {}, ACTIVE_PROBE_ENABLED: false };
+  vi.spyOn(configModule, "readConfigFileRaw").mockResolvedValue(config);
+  vi.spyOn(configModule, "readConfigFile").mockResolvedValue(config);
+  vi.spyOn(activeProbe, "startActiveProbe").mockReturnValue({ stop() {} } as any);
+  const app = new Server({ logger: false, useJsonFile: false, initialConfig: {
+    providers: [provider], ACTIVE_PROBE_ENABLED: false,
+  } });
+  await app.ready();
+  setTransformerRuntime(app.transformerService);
+  const calls: Array<{ url: string; init: any }> = [];
+  vi.stubGlobal("fetch", vi.fn(async (url: any, init: any) => {
+    calls.push({ url: String(url), init });
+    if (String(url).includes("/token")) return new Response(JSON.stringify({ access_token: "ya29.test-live" }));
+    return new Response('data: {"response":{"candidates":[{"content":{"parts":[{"text":"plugin healthy"}]},"finishReason":"STOP"}]}}\n\n',
+      { headers: { "content-type": "text/event-stream" } });
+  }));
+  writeFileSync(join(configDir, "gemini-oauth-credentials.json"), JSON.stringify({
+    version: 2, kind: "antigravity", account: { email: "fixture@example.invalid", refreshToken: "fixture-refresh",
+      projectId: "fixture-project", tier: "paid", importedAt: "2026-01-01T00:00:00Z", lastError: null, cooldownUntil: null },
+  }), { mode: 0o600 });
+  try {
+    const loaded = await loadInstalledPlugins({ configDir, log, getServer: () => app });
+    expect(loaded.failed).toEqual([]); expect(loaded.loaded).toEqual(["gemini-oauth"]);
+    reloadProviderRuntime(app, config, log);
+    await registerAdminRoutes(app, config);
+    await app.registerNamespace("/");
+    const status = await app.app.inject({ method: "GET", url: "http://localhost:3456/api/gemini-oauth/status" });
+    expect(status.statusCode).toBe(200); expect(status.json().connected).toBe(true);
+    const started = await app.app.inject({ method: "POST", url: "http://localhost:3456/api/gemini-oauth/login/start" });
+    expect(started.statusCode).toBe(200);
+    try {
+      for (const action of ["poll", "cancel"]) {
+        const invalid = await app.app.inject({ method: "POST", url: `http://localhost:3456/api/gemini-oauth/login/${action}`, payload: { loginId: "bad" } });
+        expect(invalid.statusCode).toBe(422);
+      }
+    } finally {
+      const cancel = await app.app.inject({ method: "POST", url: "http://localhost:3456/api/gemini-oauth/login/cancel", payload: { loginId: started.json().loginId } });
+      expect(cancel.json()).toEqual({ ok: true });
+    }
+    // Remaining mutation routes are real, but the local guard rejects a hostile
+    // origin before any credential/model mutation or upstream call.
+    for (const path of ["sync", "disconnect"]) {
+      const rejected = await app.app.inject({ method: "POST", url: `http://localhost:3456/api/gemini-oauth/${path}`, headers: { origin: "https://hostile.invalid" } });
+      expect(rejected.statusCode).toBe(403);
+    }
+    const response = await app.app.inject({ method: "POST", url: "/v1/chat/completions", payload: {
+      model: "gemini-oauth,gemini-3-flash", messages: [{ role: "user", content: "hello" }], stream: false,
+    } });
+    expect(response.statusCode).toBe(200); expect(response.body).toContain("plugin healthy");
+    expect(response.body).not.toContain("ya29."); expect(status.body).not.toContain("fixture-refresh");
+    expect(calls).toHaveLength(2);
+    expect(calls[1].url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
+    expect(new Headers(calls[1].init.headers).get("authorization")).toBe("Bearer ya29.test-live");
+    expect(calls[1].init.redirect).toBe("error");
+    clearPluginRegistry();
+    calls.length = 0;
+    const missing = await app.app.inject({ method: "POST", url: "/v1/chat/completions", payload: {
+      model: "gemini-oauth,gemini-3-flash", messages: [{ role: "user", content: "hello" }],
+    } });
+    expect(missing.statusCode).toBe(503); expect(missing.body).toContain("plugin_missing");
+    expect(calls).toHaveLength(0);
+    expect(existsSync(join(configDir, "gemini-oauth-credentials.json"))).toBe(true);
+    const probe = new activeProbe.ActiveProbeService(() => [app.providerService.getProvider("gemini-oauth")!], { enabled: false });
+    await probe.probeProviderManually("gemini-oauth");
+    expect(calls).toHaveLength(0);
+  } finally { await app.app.close(); }
 });

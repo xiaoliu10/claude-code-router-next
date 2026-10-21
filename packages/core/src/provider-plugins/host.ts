@@ -17,8 +17,7 @@ export function reloadProviderRuntime(server: any, config: any, log: { info(msg:
     const nextProviders = config?.Providers || config?.providers;
     if (Array.isArray(nextProviders)) server.configService.set("providers", nextProviders);
     if (server.transformerService) {
-      // ProviderService re-resolves against the fresh config; require keeps the
-      // plugin subsystem free of a static cycle with the provider service.
+      // Re-resolve provider transformer instances after plugin activation or save.
       server.providerService = new ProviderService(server.configService, server.transformerService, log);
     }
     reconcileHealthStore(config, log);

@@ -772,7 +772,7 @@ export class GeminiOauthAuthService {
         fetchImpl: (url, init) => this.directFetch(url, init),
       });
     } catch (error: any) {
-      this.log.warn?.(`[gemini-oauth] token exchange failed: ${error?.code ?? "upstream"}`);
+      this.log.warn?.(`[gemini-oauth] token exchange failed: ${GEMINI_OAUTH_LAST_ERROR_CODES.has(error?.code) ? error.code : "upstream"}`);
       return this.failLogin(job, "gemini_oauth_login_account_failed");
     }
     if (!isCurrent()) return this.failLogin(job, "gemini_oauth_login_state_rejected");
@@ -788,7 +788,7 @@ export class GeminiOauthAuthService {
     try {
       project = await discoverAntigravityProject(tokens.accessToken, (url, init) => this.directFetch(url, init));
     } catch (error: any) {
-      this.log.warn?.(`[gemini-oauth] project discovery failed: ${error?.code ?? "upstream"}`);
+      this.log.warn?.(`[gemini-oauth] project discovery failed: ${GEMINI_OAUTH_LAST_ERROR_CODES.has(error?.code) ? error.code : "upstream"}`);
       return this.failLogin(job, "gemini_oauth_login_account_failed");
     }
 
@@ -871,7 +871,7 @@ export class GeminiOauthAuthService {
         return { collapsed, rawIds: raw.map((m) => m.id) };
       }
     } catch (error: any) {
-      this.log.warn?.(`[gemini-oauth] model discovery failed, using static table: ${error?.code ?? "upstream"}`);
+      this.log.warn?.(`[gemini-oauth] model discovery failed, using static table: ${GEMINI_OAUTH_LAST_ERROR_CODES.has(error?.code) ? error.code : "upstream"}`);
     }
     return {
       collapsed: GEMINI_OAUTH_FALLBACK_MODELS.map((m) => ({ id: m.id, name: m.name, images: m.images, picker: 0 })),
@@ -931,7 +931,7 @@ export class GeminiOauthAuthService {
         await this.writeAccount({ ...account, lastError: null, cooldownUntil: null }, rawIds);
         await this.upsertManagedProvider(collapsedIds, { router: cleaned.clearedRefs.length ? cleaned.router : undefined });
       } catch {
-        try { await this.options.host.writeConfig(previousConfig); await this.reloadRuntime(previousConfig); } catch {}
+        try { await this.options.host.writeConfig(previousConfig); await this.options.host.reloadRuntime(previousConfig); } catch {}
         return { ok: false, modelsCount: currentModels.length, clearedRefs: [], error: "gemini_oauth_models_fetch_failed" } as GeminiOauthSyncResult;
       }
       return { ok: true, modelsCount: collapsedIds.length, clearedRefs: cleaned.clearedRefs };
@@ -975,13 +975,13 @@ export class GeminiOauthAuthService {
         try {
           await this.options.host.writeConfig(config);
         } catch {
-          try { await this.options.host.writeConfig(previousConfig); await this.reloadRuntime(previousConfig); } catch {}
+          try { await this.options.host.writeConfig(previousConfig); await this.options.host.reloadRuntime(previousConfig); } catch {}
           throw geminiOauthAdminError("gemini_oauth_config_write_failed", 500);
         }
         removedModelRefs.push(...cleaned.removedRefs);
         const persisted = await this.readConfig().catch(() => null);
         defaultFallback = typeof persisted?.Router?.default === "string" ? persisted.Router.default : null;
-        await this.reloadRuntime(config);
+        await this.options.host.reloadRuntime(config);
       }
       // Credential file last: a failed provider write leaves the account intact.
       await this.store.delete().catch(() => {});
@@ -1123,7 +1123,7 @@ export class GeminiOauthAuthService {
     } catch {
       try {
         await this.options.host.writeConfig(previousConfig);
-        await this.reloadRuntime(previousConfig);
+        await this.options.host.reloadRuntime(previousConfig);
       } catch {
         this.log.error?.("[gemini-oauth] previous configuration restoration failed");
       }
@@ -1134,11 +1134,7 @@ export class GeminiOauthAuthService {
       throw new Error("Gemini OAuth 配置写入被拒绝：Router 发生变化");
     }
     void routerBefore;
-    await this.reloadRuntime(config);
-  }
-
-  /** The canonical reload sequence is core-owned and arrives via the host. */
-  private async reloadRuntime(config: any): Promise<void> {
     await this.options.host.reloadRuntime(config);
   }
+
 }

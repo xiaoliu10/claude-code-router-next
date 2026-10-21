@@ -227,7 +227,8 @@ export class GeminiOauthTransformer implements PluginTransformer {
       const unwrapped = this.replayUnwrapped(pump, firstPayload, response);
       // Only the envelope peeling is new: the plain Gemini SSE stream goes
       // through the EXISTING Gemini conversion chain.
-      return geminiTransformResponseOut(unwrapped, this.name, this.logger);
+      // Managed credentials/errors must not reach protocol-level debug logging.
+      return geminiTransformResponseOut(unwrapped, this.name);
     }
     const unwrapped = this.replayUnwrapped(pump, firstPayload, response);
     return this.aggregateCompletion(unwrapped);

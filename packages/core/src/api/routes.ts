@@ -887,6 +887,13 @@ async function processRequestTransformers(
   headers: any,
   context: any
 ) {
+  // A managed marker is not a credential. Hard-cut external plugins must fail
+  // closed if absent/disabled; never send their marker to an upstream through
+  // the ordinary-provider path (configuration and credential files stay intact).
+  if (typeof provider.apiKey === "string" && provider.apiKey.startsWith("ccr-managed-") &&
+      !isWorkBuddyRuntime(provider) && !getManagedRuntimeFor(provider)) {
+    throw createApiError("Provider plugin missing or disabled; install and enable its provider plugin.", 503, "plugin_missing");
+  }
   // Deep clone the request body to preserve original messages for caching
   // and to ensure thinking blocks are not lost when switching between models
   let requestBody = JSON.parse(JSON.stringify(body));
@@ -1562,7 +1569,7 @@ async function sendProviderAttempt(
   }
 
   // Debug: log non-stream response from provider
-  if (!workbuddyManaged && !requestBody.stream && isDebugLogEnabled(fastify.configService)) {
+  if (!workbuddyManaged && !pluginRuntime?.suppressDebugLog && !requestBody.stream && isDebugLogEnabled(fastify.configService)) {
     const cloned = response.clone();
     const bodyText = await cloned.text();
     logProviderResponse(fastify.log, context.req.id, {
@@ -1713,7 +1720,7 @@ async function formatResponse(response: any, reply: FastifyReply, _body: any, fa
     reply.header("Connection", "keep-alive");
 
     // Debug: tee stream to log SSE chunks
-    if (fastify && isDebugLogEnabled(fastify.configService)) {
+    if (fastify && !getManagedRuntimeFor(fastify.providerService.getProvider(reply.request.provider || "") as any)?.suppressDebugLog && isDebugLogEnabled(fastify.configService)) {
       const [debugStream, clientStream] = response.body.tee();
       const options = getDebugLogOptions(fastify.configService);
       readStreamForDebug(debugStream, fastify.log, reply.request.id, options);
