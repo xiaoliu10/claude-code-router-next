@@ -87,8 +87,19 @@ export interface PluginHostCapabilities {
   configDir: string;
   readConfig(): Promise<any>;
   writeConfig(next: any): Promise<void>;
-  /** Re-resolve providers/transformers after a config write (server reload). */
-  reloadRuntime(): Promise<void>;
+  /**
+   * Read config WITHOUT env-var interpolation. Managed providers must do their
+   * read-modify-write against this: `readConfig` interpolates $VAR placeholders,
+   * so writing it back would bake env values into config.json. Optional for
+   * backward compatibility; hosts that predate it only offer `readConfig`.
+   */
+  readRawConfig?(): Promise<any>;
+  /**
+   * Re-resolve providers/transformers after a config write (server reload).
+   * The config argument is the JUST-WRITTEN config; passing it avoids a reread
+   * race between write and reload. Optional parameter for backward compat.
+   */
+  reloadRuntime(config?: any): Promise<void>;
   /** undici Agent that bypasses CCR/proxy env routing (for fixed subscription origins). */
   getDirectDispatcher(): unknown;
 }

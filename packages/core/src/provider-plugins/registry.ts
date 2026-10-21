@@ -8,6 +8,7 @@ import type {
   PluginManifest,
 } from "./types";
 import { PLUGIN_CORE_API } from "./types";
+import { registerTransformerFromPlugin } from "./transformer-hook";
 
 /**
  * Registry of everything activated plugins contribute. The core reads from
@@ -97,10 +98,9 @@ export function makePluginContext(
     host,
     registerTransformer(cls) {
       guard("registerTransformer", () => {
-        // Imported lazily to avoid a static cycle with the transformer registry.
-        const { registerTransformerFromPlugin } = require("./transformer-hook") as {
-          registerTransformerFromPlugin(cls: new () => any): void;
-        };
+        // Static import (no cycle: transformer-hook only pulls the transformer
+        // service). The previous lazy require() broke in ESM contexts — the
+        // first real plugin consumer surfaced it.
         registerTransformerFromPlugin(cls);
       });
     },

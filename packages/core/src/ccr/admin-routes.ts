@@ -2016,8 +2016,10 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
   });
 
   // Plugins that registered admin routes during activation hook in here —
-  // after all built-in routes, so /api/<name>/* cannot shadow them.
-  registerAllPluginRoutes(server);
+  // after all built-in routes, so /api/<name>/* cannot shadow them. The
+  // registrations run against the Fastify app (the Server wrapper has no
+  // route methods).
+  registerAllPluginRoutes(server.app ?? server);
 
   return server;
 }

@@ -5,7 +5,7 @@ import type { PluginManifest } from "./types";
 import { PLUGIN_CORE_API } from "./types";
 import { listLoadedPlugins, makePluginContext } from "./registry";
 import { reloadProviderRuntime } from "./host";
-import { readConfigFile, writeConfigFile } from "../ccr/config";
+import { readConfigFile, readConfigFileRaw, writeConfigFile } from "../ccr/config";
 import { getDirectDispatcher } from "@/services/proxy";
 
 /**
@@ -81,6 +81,9 @@ export async function loadInstalledPlugins(deps: {
   const host = {
     configDir,
     readConfig: () => readConfigFile(),
+    // Interpolation-free read: managed providers round-trip $VAR placeholders
+    // through read-modify-write, which readConfig() would bake in.
+    readRawConfig: () => readConfigFileRaw(),
     writeConfig: (next: any) => writeConfigFile(next),
     reloadRuntime: async (config?: any) =>
       reloadProviderRuntime(deps.getServer(), config ?? (await readConfigFile()), log),
