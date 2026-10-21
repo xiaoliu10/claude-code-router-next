@@ -9,6 +9,14 @@ import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import { classifyWorkBuddyError, credentialHeaders, getWorkBuddyAuthService, isWorkBuddyRuntime, workBuddySite, workBuddyChatUrl, workBuddySiteFromProvider, workBuddyFailoverCooldown, workBuddyPoolExhaustedError, workBuddyEnvelopeIsError } from "../services/workbuddy";
 import {
+  GEMINI_OAUTH_DATA_PLANE,
+  GEMINI_OAUTH_SSE_PATH,
+  classifyGeminiOauthError,
+  geminiOauthError,
+  getGeminiOauthAuthService,
+  isGeminiOauthRuntime,
+} from "../services/gemini-oauth";
+import {
   isDebugLogEnabled,
   getDebugLogOptions,
   logProviderRequest,
@@ -1276,6 +1284,19 @@ async function sendProviderAttempt(
     // Fixed WorkBuddy origins must ignore configured CCR/proxy environment routing.
     config.dispatcher = getDirectDispatcher();
   }
+
+  // Managed Gemini OAuth providers: the upstream is Code Assist, never a
+  // config-supplied base_url, and the access token is the only credential.
+  const geminiOauthManaged = isGeminiOauthRuntime(provider);
+  let geminiOauthService: ReturnType<typeof getGeminiOauthAuthService>;
+  if (geminiOauthManaged) {
+    geminiOauthService = getGeminiOauthAuthService();
+    if (!geminiOauthService) throw new Error("Gemini OAuth 服务未初始化");
+    config.url = new URL(GEMINI_OAUTH_SSE_PATH, GEMINI_OAUTH_DATA_PLANE).toString();
+    // Never follow a redirect away from the fixed origin.
+    config.redirect = "error";
+    config.dispatcher = getDirectDispatcher();
+  }
   const url = config.url || new URL(provider.baseUrl);
 
   // Apply timeout from config
@@ -1324,6 +1345,14 @@ async function sendProviderAttempt(
     }
     Object.assign(requestHeaders, credentialHeaders(config.workbuddyCredential));
   }
+  if (geminiOauthManaged) {
+    // The marker api_key must never reach Google, and a client-supplied
+    // Authorization (bypass mode) must not survive either.
+    for (const key of Object.keys(requestHeaders)) {
+      if (["authorization", "x-api-key", "host", "proxy-authorization"].includes(key.toLowerCase())) delete requestHeaders[key];
+    }
+    requestHeaders.Authorization = `Bearer ${await geminiOauthService!.getAccessToken()}`;
+  }
   stampUpstreamSessionId(requestHeaders, context?.req);
 
   for (const key in requestHeaders) {
@@ -1338,7 +1367,7 @@ async function sendProviderAttempt(
   }
 
   // Debug: log outgoing request to provider
-  if (!workbuddyManaged && isDebugLogEnabled(fastify.configService)) {
+  if (!workbuddyManaged && !geminiOauthManaged && isDebugLogEnabled(fastify.configService)) {
     logProviderRequest(fastify.log, context.req.id, {
       url: String(url),
       headers: requestHeaders,
@@ -1389,6 +1418,24 @@ async function sendProviderAttempt(
       (wbError as any).workbuddy = true;
       (wbError as any).cooldownSeconds = (wbError as any).cooldownSeconds;
       throw wbError;
+    }
+    // Managed Gemini OAuth providers: classify HERE, before the generic branch
+    // logs the raw body or hands it to a client-facing error.
+    if (geminiOauthManaged) {
+      let parsedError: any;
+      try { parsedError = errorText ? JSON.parse(errorText) : undefined; } catch { parsedError = undefined; }
+      const info = classifyGeminiOauthError({
+        status: response.status,
+        body: parsedError ?? errorText,
+        systemText: JSON.stringify(requestBody ?? {}),
+      });
+      await geminiOauthService?.noteUpstreamError(info).catch(() => undefined);
+      fastify.log.error(
+        `[provider_response_error] Gemini OAuth provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
+      );
+      const geminiError: any = geminiOauthError(info);
+      geminiError.isRateLimit = info.code === "gemini_oauth_quota_exceeded";
+      throw geminiError;
     }
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
@@ -1451,6 +1498,16 @@ async function sendProviderAttempt(
               (wbError as any).isRateLimit = wbError.code === "rate_limit";
               (wbError as any).workbuddy = true;
               throw wbError;
+            }
+            if (geminiOauthManaged) {
+              const info = classifyGeminiOauthError({ status: response.status, body: bodyJson, systemText: JSON.stringify(requestBody ?? {}) });
+              await geminiOauthService?.noteUpstreamError(info).catch(() => undefined);
+              fastify.log.error(
+                `[provider_response_error] Gemini OAuth hidden error from provider(${provider.name},${requestBody.model}: ${response.status}) code=${info.code}`
+              );
+              const geminiError: any = geminiOauthError(info);
+              geminiError.isRateLimit = info.code === "gemini_oauth_quota_exceeded";
+              throw geminiError;
             }
             fastify.log.error(
               `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
