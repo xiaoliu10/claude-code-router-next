@@ -109,6 +109,17 @@ export function antigravityUserAgent(): string {
 /** Injected transport so tests never touch the network. */
 export type GeminiOauthFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
+/** Every Google management-plane call is bounded and refuses redirects. */
+export const GEMINI_OAUTH_FETCH_TIMEOUT_MS = 30_000;
+
+function boundedInit(init: RequestInit = {}): RequestInit {
+  return {
+    ...init,
+    redirect: "error",
+    signal: init.signal ?? AbortSignal.timeout(GEMINI_OAUTH_FETCH_TIMEOUT_MS),
+  };
+}
+
 export function defaultGeminiOauthFetch(url: string, init?: RequestInit): Promise<Response> {
   // Fixed Google origins must ignore configured CCR/proxy environment routing.
   return fetch(url, { ...init, dispatcher: getDirectDispatcher() } as RequestInit);
@@ -366,7 +377,7 @@ export async function exchangeCodeForTokens(params: {
   fetchImpl?: GeminiOauthFetch;
 }): Promise<{ accessToken: string; refreshToken: string; expiresIn: number }> {
   const fetchImpl = params.fetchImpl ?? defaultGeminiOauthFetch;
-  const res = await fetchImpl(GOOGLE_TOKEN_URL, {
+  const res = await fetchImpl(GOOGLE_TOKEN_URL, boundedInit({
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -377,7 +388,7 @@ export async function exchangeCodeForTokens(params: {
       client_secret: antigravityClientSecret(),
       code_verifier: params.codeVerifier,
     }).toString(),
-  });
+  }));
   const json: any = await res.json().catch(() => ({}));
   if (!res.ok || !json?.access_token || !json?.refresh_token) {
     throw geminiOauthError({
@@ -410,7 +421,11 @@ export function clearGeminiOauthTokenCaches(): void {
 export async function refreshAccessToken(
   refreshToken: string,
   fetchImpl: GeminiOauthFetch = defaultGeminiOauthFetch,
-  now = Date.now()
+  now = Date.now(),
+  /** Called with the ROTATED refresh token BEFORE the cache identity switches,
+   *  so the caller can durably persist it first (contract §1: never assume the
+   *  refresh token never rotates). A thrown callback fails the whole refresh. */
+  onRotation?: (newRefreshToken: string) => Promise<void> | void
 ): Promise<string> {
   const cached = tokenCache.get(refreshToken);
   if (cached && cached.expiresAt - now > REFRESH_LEAD_MS) return cached.accessToken;
@@ -418,16 +433,29 @@ export async function refreshAccessToken(
   if (inflight) return inflight;
   const task = (async () => {
     try {
-      const res = await fetchImpl(GOOGLE_TOKEN_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          refresh_token: refreshToken,
-          client_id: antigravityClientId(),
-          client_secret: antigravityClientSecret(),
-        }).toString(),
-      });
+      let res: Response;
+      try {
+        res = await fetchImpl(GOOGLE_TOKEN_URL, boundedInit({
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: refreshToken,
+            client_id: antigravityClientId(),
+            client_secret: antigravityClientSecret(),
+          }).toString(),
+        }));
+      } catch (error: any) {
+        if (error?.code === "gemini_oauth_reauth_required") throw error;
+        // A bare network rejection is never surfaced raw (it may carry proxy
+        // URLs or system paths) — a sanitized transient instead.
+        throw geminiOauthError({
+          code: "gemini_oauth_transient",
+          message: "Gemini OAuth token refresh failed; retry later.",
+          httpStatus: 502,
+          retryable: true,
+        });
+      }
       const json: any = await res.json().catch(() => ({}));
       if (!res.ok || !json?.access_token) {
         // Refresh failed → the stored refresh token is no longer accepted:
@@ -439,7 +467,18 @@ export async function refreshAccessToken(
         });
       }
       const expiresIn = Number.isFinite(json.expires_in) ? Number(json.expires_in) : 3600;
-      tokenCache.set(refreshToken, { accessToken: String(json.access_token), expiresAt: now + expiresIn * 1000 });
+      const rotated = typeof json.refresh_token === "string" && json.refresh_token && json.refresh_token !== refreshToken
+        ? json.refresh_token
+        : undefined;
+      if (rotated) {
+        // Persist first, then switch the cache identity to the new token; the
+        // spent one's cache entry is dropped so it can never be served again.
+        await onRotation?.(rotated);
+        tokenCache.delete(refreshToken);
+        tokenCache.set(rotated, { accessToken: String(json.access_token), expiresAt: now + expiresIn * 1000 });
+      } else {
+        tokenCache.set(refreshToken, { accessToken: String(json.access_token), expiresAt: now + expiresIn * 1000 });
+      }
       return String(json.access_token);
     } finally {
       tokenInflight.delete(refreshToken);
@@ -449,14 +488,24 @@ export async function refreshAccessToken(
   return task;
 }
 
+/** Drop the cached access token for one refresh token so the next
+ *  refreshAccessToken call goes to the network (the routes seam's single
+ *  forced re-send after a 401). */
+export function invalidateGeminiOauthAccessToken(refreshToken: string | undefined): void {
+  if (typeof refreshToken === "string" && refreshToken) {
+    tokenCache.delete(refreshToken);
+    tokenInflight.delete(refreshToken);
+  }
+}
+
 /** userinfo: whose account an access token is (magpie googleWho). */
 export async function fetchUserEmail(
   accessToken: string,
   fetchImpl: GeminiOauthFetch = defaultGeminiOauthFetch
 ): Promise<string> {
-  const res = await fetchImpl(GOOGLE_USERINFO_URL, {
+  const res = await fetchImpl(GOOGLE_USERINFO_URL, boundedInit({
     headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  }));
   const json: any = await res.json().catch(() => ({}));
   if (!res.ok || typeof json?.email !== "string" || !json.email) {
     throw geminiOauthError({
@@ -501,7 +550,7 @@ async function callCodeAssist(params: {
   fetchImpl: GeminiOauthFetch;
   headers?: Record<string, string>;
 }): Promise<any> {
-  const res = await params.fetchImpl(`${params.base}/v1internal:${params.method}`, {
+  const res = await params.fetchImpl(`${params.base}/v1internal:${params.method}`, boundedInit({
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -510,7 +559,7 @@ async function callCodeAssist(params: {
       ...(params.headers ?? {}),
     },
     body: JSON.stringify(params.body),
-  });
+  }));
   const text = await res.text();
   let json: any;
   try { json = text ? JSON.parse(text) : {}; } catch { json = {}; }
@@ -774,14 +823,15 @@ export function collapseAntigravityModels(raw: GeminiOauthModelInfo[]): GeminiOa
 
 /**
  * POST {dataPlane}/v1internal:fetchAvailableModels — with the account's tier as
- * entitlement first, without it second (magpie modelInfo); failure falls back to
- * the static list.
+ * entitlement first, without it second (magpie modelInfo). Returns the RAW
+ * (unfolded) upstream list; failure throws (callers fall back to the static
+ * list). Antigravity's picker order first (newest first), then id order.
  */
-export async function fetchAvailableModels(
+async function fetchAvailableModelsInternal(
   accessToken: string,
   project: string,
   tier: string,
-  fetchImpl: GeminiOauthFetch = defaultGeminiOauthFetch
+  fetchImpl: GeminiOauthFetch
 ): Promise<GeminiOauthModelInfo[]> {
   const attempts: Array<Record<string, unknown>> = [];
   if (tier) attempts.push({ project, entitlement: { userTier: tier } });
@@ -834,9 +884,30 @@ export async function fetchAvailableModels(
     const pb = b.picker || Number.MAX_SAFE_INTEGER;
     return pa === pb ? a.id.localeCompare(b.id) : pa - pb;
   });
-  return collapseAntigravityModels(out);
+  return out;
 }
 
+/** The live list WITHOUT family folding — the raw upstream ids a request may
+ *  actually be addressed by (the credential service persists these so a
+ *  collapsed family id can still be mapped to a real variant on the wire). */
+export function fetchAvailableModelVariants(
+  accessToken: string,
+  project: string,
+  tier: string,
+  fetchImpl: GeminiOauthFetch = defaultGeminiOauthFetch
+): Promise<GeminiOauthModelInfo[]> {
+  return fetchAvailableModelsInternal(accessToken, project, tier, fetchImpl);
+}
+
+/** Same discovery, with magpie's effort-family collapse applied. */
+export async function fetchAvailableModels(
+  accessToken: string,
+  project: string,
+  tier: string,
+  fetchImpl: GeminiOauthFetch = defaultGeminiOauthFetch
+): Promise<GeminiOauthModelInfo[]> {
+  return collapseAntigravityModels(await fetchAvailableModelsInternal(accessToken, project, tier, fetchImpl));
+}
 // ---------------------------------------------------------------------------
 // Data-plane envelope (magpie codeAssistEnvelope + antigravitySession)
 // ---------------------------------------------------------------------------
@@ -1320,6 +1391,56 @@ export function normalizeChunkToolNames(chunk: any): any {
 }
 
 // ---------------------------------------------------------------------------
+// Wire-variant selection (magpie AntigravitySentID / byEffort / nearestEffort)
+// ---------------------------------------------------------------------------
+
+/** magpie Levels: the reasoning-level rank a nearest-effort pick walks. */
+const EFFORT_LEVEL_RANK = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** magpie nearestEffort: the level of `levels` nearest `want` (Levels order),
+ *  a tie going up; `want` itself when the levels hold it or are none. */
+function nearestEffort(want: string, levels: readonly string[]): string {
+  const at = EFFORT_LEVEL_RANK.indexOf(want);
+  if (!levels.length || at < 0 || levels.includes(want)) return want;
+  let best = want;
+  let dist = EFFORT_LEVEL_RANK.length;
+  for (const l of levels) {
+    const i = EFFORT_LEVEL_RANK.indexOf(l);
+    if (i < 0 || l === "none") continue;
+    const d = Math.abs(i - at);
+    if (d < dist || (d === dist && i > at)) {
+      best = l;
+      dist = d;
+    }
+  }
+  return best;
+}
+
+/**
+ * The id an Antigravity request for `requested` goes out under at `effort`
+ * (CCR ThinkLevel or ""/undefined): the family variant the effort picks, at
+ * the family's nearest level; with no effort asked, the family's default. A
+ * variant id with no effort asked goes as it is, and any id that is not a
+ * collapsed family goes as it is (magpie AntigravitySentID). `rawModels` are
+ * the account's UNFOLDED upstream entries (names included — Antigravity's
+ * variant names can disagree with the id words, e.g. "-extra-low" named
+ * "(Low)"); without a family match the request passes through.
+ */
+export function antigravityWireModel(rawModels: ReadonlyArray<{ id: string; name?: string }>, requested: string, effort?: string): string {
+  if (typeof requested !== "string" || !requested) return requested;
+  const reqFamily = antigravityEffortFamily(requested);
+  const fam = antigravityFamilies(rawModels.map((m) => ({ id: m.id, name: m.name, picker: 0 }))).find((f) => f.id === reqFamily);
+  if (!fam || fam.variants.length <= 1) return requested;
+  const byEffort = familyByEffort(fam);
+  const isVariant = splitAntigravityId(requested).effort !== "";
+  const want = typeof effort === "string" ? effort : "";
+  if (isVariant && !want) return requested; // a kept variant id, no effort asked
+  const levels = fam.efforts.filter((l) => l && EFFORT_LEVEL_RANK.includes(l));
+  const picked = want ? byEffort.get(nearestEffort(want, levels)) : byEffort.get("");
+  return picked || byEffort.get("") || requested;
+}
+
+// ---------------------------------------------------------------------------
 // Config-protection trio (contract §1.4; mirrors workbuddy's, lives HERE —
 // never inside workbuddy.ts)
 // ---------------------------------------------------------------------------
@@ -1401,6 +1522,13 @@ export interface GeminiOauthAuthServiceLike {
   getProject(): Promise<string>;
   /** Record a classified upstream error (cooldown/lastError) when possible. */
   noteUpstreamError?(info: GeminiOauthErrorInfo): Promise<void> | void;
+  /** Map a requested (possibly collapsed family) model id to the concrete
+   *  upstream variant id the effort picks. Absent → pass the id through. */
+  resolveWireModel?(requested: string, effort?: string): Promise<string>;
+  /** Drop the cached access token (the 401 seam's one forced re-send). */
+  forceTokenRefresh?(): Promise<void>;
+  /** True while the account is parked by a recorded cooldown. */
+  isAccountCooling?(): Promise<boolean>;
 }
 
 let geminiOauthRuntime: { authService?: GeminiOauthAuthServiceLike } | null = null;
