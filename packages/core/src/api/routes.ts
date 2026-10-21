@@ -900,7 +900,9 @@ async function processRequestTransformers(
   }
   const runtime = context.pluginRegistry.getManagedRuntimeFor(provider);
   if (runtime) {
-    const terminal = pluginAttemptBudget(context.req, runtime).terminalError;
+    // Keyed by (runtime, provider): a terminal on one managed subscription
+    // must not short-circuit a sibling provider served by the same runtime.
+    const terminal = pluginAttemptBudget(context.req, runtime, provider).terminalError;
     if (terminal) throw terminal;
     // Run before any transformer can refresh credentials or contact upstream.
     await runtime.ensureUsable?.();
@@ -1245,10 +1247,11 @@ async function sendProviderAttempt(
   // nothing has been committed to the client yet. Only the forced-refresh
   // resend is allowed; a second 401 is terminal so the outer generic retry
   // cannot produce a third upstream call.
-  if (!response.ok && pluginRuntime?.authRefresh && response.status === 401 && !pluginAttemptBudget(context.req, pluginRuntime).refreshUsed) {
-    // Runtime object identity is stable across provider aliases and models.
-    // The shared state survives primary/fallback request spreads.
-    pluginAttemptBudget(context.req, pluginRuntime).refreshUsed = true;
+  if (!response.ok && pluginRuntime?.authRefresh && response.status === 401 && !pluginAttemptBudget(context.req, pluginRuntime, provider).refreshUsed) {
+    // The one-refresh budget is per (runtime, provider): independent managed
+    // subscriptions served by one runtime refresh independently. The shared
+    // state survives primary/fallback request spreads.
+    pluginAttemptBudget(context.req, pluginRuntime, provider).refreshUsed = true;
     try {
       await pluginRuntime.authRefresh.forceRefresh();
       requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider });
