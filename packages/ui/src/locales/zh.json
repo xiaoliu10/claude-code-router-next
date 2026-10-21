@@ -770,5 +770,13 @@
       "config_busy": "配置保存或另一个受管供应商操作正在进行中，请等待其结束再重试。",
       "reconciliation_failed": "操作已在服务端成功，但设置草稿刷新失败。请重新打开设置页面以查看已保存的更改。"
     }
+  },
+  "pluginCards": {
+    "area_label": "供应商插件管理卡片",
+    "manifest_failed": "无法加载已安装的供应商插件列表。请确认 CCR 服务正在运行，然后重新加载本页面。",
+    "unavailable_title": "{{name}} 已安装但不可用",
+    "disabled_hint": "该插件在 CCR 配置中被禁用。请启用它（例如执行 `ccr plugin enable {{name}}`）并重新加载本页面，即可在此管理其供应商。",
+    "reinstall_hint": "请重新安装插件包（`ccr plugin add <包名>`）或重启 CCR，然后重新加载本页面。",
+    "card_failed_title": "{{name}} 的管理卡片加载失败"
   }
 }

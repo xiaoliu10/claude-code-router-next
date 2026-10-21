@@ -1,101 +1,118 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
-import { pluginLocaleOf, type PluginCardModule } from "../utils/plugin-card";
+import {
+  createPluginCardAreaController, pluginLocaleOf,
+  type PluginCardAreaController, type PluginCardHostIssue,
+} from "../utils/plugin-card";
 import { useConfig } from "./ConfigProvider";
 import type { PluginInfo } from "../types";
 
+type ManifestState =
+  | { status: "loading" }
+  | { status: "ok"; entries: PluginInfo[] }
+  | { status: "failed" };
+
 /**
  * Renders one mounted card per installed provider plugin (docs/design/provider-plugins.md).
- * Card chunks are self-contained ES modules served by the core at /plugins/<name>/card.js;
- * the host only bridges an authenticated API caller, the locale and the busy signal.
+ *
+ * Card chunks are self-contained ES modules served by the core at
+ * /plugins/<name>/card.js. They are loaded through the authenticated host
+ * lane (fetch with the admin API key → same-origin Blob URL → dynamic import;
+ * the Blob URL is revoked on cleanup) so remote authenticated UIs work without
+ * an API key in any URL and without loosening the server's auth middleware.
+ *
+ * Installed-but-unavailable entries (disabled or failed to load), manifest
+ * failures and broken card modules are rendered as visible recovery notices —
+ * a provider must never silently disappear from the settings page.
  */
 export function PluginCardArea({ disabled, onBusyChange }: { disabled: boolean; onBusyChange?: (busy: boolean) => void }) {
-  const { i18n } = useTranslation();
+  const { i18n, t } = useTranslation();
   const { refreshConfig } = useConfig();
   const currentProps = useRef({ disabled, refreshConfig, onBusyChange });
   currentProps.current = { disabled, refreshConfig, onBusyChange };
-  const [plugins, setPlugins] = useState<PluginInfo[]>([]);
-  const [failed, setFailed] = useState(false);
+  const [manifest, setManifest] = useState<ManifestState>({ status: "loading" });
+  const [issues, setIssues] = useState<PluginCardHostIssue[]>([]);
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const mountedRef = useRef<Array<{ el: HTMLElement; unmount?: (el: HTMLElement) => void }>>([]);
-  const busyCountRef = useRef(0);
+  const controllerRef = useRef<PluginCardAreaController | null>(null);
+  if (controllerRef.current === null) {
+    controllerRef.current = createPluginCardAreaController({
+      origin: (typeof location !== "undefined" && location && location.origin) || "",
+      getDisabled: () => currentProps.current.disabled,
+      callPluginApi: (plugin, path, init) => api.callPluginApi(plugin, path, init),
+      acquireManagement: () => api.acquireWorkBuddyManagement(),
+      refreshConfig: (merge) => currentProps.current.refreshConfig(merge),
+      onBusyChange: (busy) => currentProps.current.onBusyChange?.(busy),
+      log: console,
+      fetchCardSource: (cardUrl) => api.fetchPluginCardSource(cardUrl),
+      importModule: (url) => import(/* @vite-ignore */ url),
+      makeBlobUrl: (source) => URL.createObjectURL(new Blob([source], { type: "text/javascript" })),
+      revokeBlobUrl: (url) => URL.revokeObjectURL(url),
+    });
+  }
+  const controller = controllerRef.current;
   const locale = pluginLocaleOf(i18n.language);
 
   useEffect(() => {
     let cancelled = false;
     api.getPlugins()
-      .then((data) => { if (!cancelled) setPlugins((data.plugins ?? []).filter((p) => p.enabled && !p.error)); })
-      .catch(() => { if (!cancelled) setFailed(true); });
+      .then((data) => { if (!cancelled) setManifest({ status: "ok", entries: data.plugins ?? [] }); })
+      .catch(() => { if (!cancelled) setManifest({ status: "failed" }); });
     return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
     const host = hostRef.current;
-    if (!host || plugins.length === 0) return;
-    let cancelled = false;
+    if (!host) return;
+    if (manifest.status === "loading") {
+      controller.dispose();
+      return;
+    }
+    void controller.sync(manifest.status === "failed" ? null : manifest.entries, locale, host);
+    return () => { controller.dispose(); };
+  }, [controller, manifest, locale]);
 
-    const mountOne = async (plugin: PluginInfo) => {
-      if (!plugin.cardUrl) return;
-      const mod = (await import(/* @vite-ignore */ plugin.cardUrl)) as Partial<PluginCardModule> & {
-        default?: Partial<PluginCardModule>;
-      };
-      const card = (mod.mount ? mod : mod.default) as PluginCardModule | undefined;
-      if (!card?.mount) throw new Error("card exports no mount()");
-      const el = document.createElement("div");
-      el.className = "plugin-card-host";
-      el.dataset.plugin = plugin.name;
-      host.appendChild(el);
-      await card.mount(el, {
-        callApi: <T,>(path: string, init?: RequestInit & { timeoutMs?: number }) =>
-          api.callPluginApi<T>(plugin.name, path, init),
-        locale,
-        locales: plugin.locales ?? {},
-        plugin: { name: plugin.name, version: plugin.version },
-        get disabled() { return currentProps.current.disabled; },
-        acquireManagement: () => api.acquireWorkBuddyManagement(),
-        refreshConfig: merge => currentProps.current.refreshConfig(merge),
-        onBusy: (busy: boolean) => {
-          busyCountRef.current = Math.max(0, busyCountRef.current + (busy ? 1 : -1));
-          currentProps.current.onBusyChange?.(busyCountRef.current > 0);
-        },
-        log: console,
-      });
-      if (cancelled) {
-        card.unmount?.(el);
-        el.remove();
-        return;
-      }
-      mountedRef.current.push({ el, unmount: card.unmount });
-    };
+  // Host state changes (e.g. the page Save gate) reach mounted cards in place:
+  // no remount, so no in-flight card action is ever cancelled by them.
+  useEffect(() => {
+    controller.notifyHostChange();
+  }, [controller, disabled]);
 
-    void (async () => {
-      for (const plugin of plugins) {
-        if (cancelled) return;
-        try {
-          await mountOne(plugin);
-        } catch (error) {
-          // A broken card must not take the settings page down.
-          console.error(`[plugin:${plugin.name}] card failed to mount:`, error);
-          setFailed(true);
-        }
-      }
-    })();
+  useEffect(() => {
+    setIssues(controller.getIssues());
+    return controller.subscribeIssues(setIssues);
+  }, [controller]);
 
-    return () => {
-      cancelled = true;
-      for (const entry of mountedRef.current.splice(0)) {
-        try { entry.unmount?.(entry.el); } catch { /* plugin cleanup must not break the host */ }
-        entry.el.remove();
-      }
-      busyCountRef.current = 0;
-      currentProps.current.onBusyChange?.(false);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plugins, locale]);
-
-  if (plugins.length === 0) {
-    return failed ? null : null; // No installed plugins (or manifest unavailable): render nothing.
-  }
-  return <div ref={hostRef} className="plugin-card-area" />;
+  return (
+    <div className="plugin-card-area">
+      <div ref={hostRef} aria-label={t("pluginCards.area_label")} />
+      {issues.map((issue, index) => (
+        <div
+          key={`${issue.kind}:${issue.plugin ?? "manifest"}:${index}`}
+          role="note"
+          data-testid="plugin-card-issue"
+          className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm"
+        >
+          {issue.kind === "manifest_failed" && <p>{t("pluginCards.manifest_failed")}</p>}
+          {issue.kind === "unavailable" && (
+            <>
+              <p className="font-medium">{t("pluginCards.unavailable_title", { name: issue.plugin ?? "" })}</p>
+              {issue.detail ? <p className="mt-1 text-xs opacity-80">{issue.detail}</p> : null}
+              <p className="mt-1">
+                {issue.reason === "disabled"
+                  ? t("pluginCards.disabled_hint", { name: issue.plugin ?? "" })
+                  : t("pluginCards.reinstall_hint")}
+              </p>
+            </>
+          )}
+          {issue.kind === "card_failed" && (
+            <>
+              <p className="font-medium">{t("pluginCards.card_failed_title", { name: issue.plugin ?? "" })}</p>
+              <p className="mt-1">{t("pluginCards.reinstall_hint")}</p>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }

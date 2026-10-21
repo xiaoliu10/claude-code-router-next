@@ -34,17 +34,32 @@ test("pluginLocaleOf maps zh family to zh, everything else to en", () => {
   assert.equal(pluginLocaleOf(undefined), "en");
 });
 
-test("PluginCardArea fetches /api/plugins via the api client and mounts cards dynamically", () => {
+test("PluginCardArea loads cards via the authenticated host lane and renders failures", () => {
   const src = read("components/PluginCardArea.tsx");
   assert.match(src, /api\.getPlugins\(\)/);
-  // Dynamic import of the served chunk must stay out of the bundler's graph.
-  assert.match(src, /import\(\/\* @vite-ignore \*\/ plugin\.cardUrl\)/);
+  // Host lane: authenticated source fetch (admin key header) → same-origin
+  // Blob URL → dynamic import kept out of the bundler's graph → revoke on cleanup.
+  assert.match(src, /fetchCardSource:\s*\(cardUrl\)\s*=>\s*api\.fetchPluginCardSource\(cardUrl\)/);
+  assert.match(src, /importModule:\s*\(url\)\s*=>\s*import\(\/\* @vite-ignore \*\/ url\)/);
+  assert.match(src, /makeBlobUrl:\s*\(source\)\s*=>\s*URL\.createObjectURL/);
+  assert.match(src, /revokeBlobUrl:\s*\(url\)\s*=>\s*URL\.revokeObjectURL\(url\)/);
+  // A bare import of the manifest-declared URL can never authenticate remotely.
+  assert.doesNotMatch(src, /import\(\/\* @vite-ignore \*\/ plugin\.cardUrl\)/);
   // Cards get the host bridge, never raw fetch.
-  assert.match(src, /callApi:\s*<T,>\(path[\s\S]*?api\.callPluginApi<T>\(plugin\.name, path, init\)/);
-  assert.ok(!/fetch\(/.test(src.replace(/callApi[^;]*api\.callPluginApi/g, "")));
+  assert.match(src, /callPluginApi:\s*\(plugin,\s*path,\s*init\)\s*=>\s*api\.callPluginApi\(plugin,\s*path,\s*init\)/);
+  const bridged = src
+    .replace(/callPluginApi[^;]*api\.callPluginApi/g, "")
+    .replace(/fetchCardSource[^;]*api\.fetchPluginCardSource/g, "");
+  assert.ok(!/fetch\(/.test(bridged));
+  // Host state changes reach cards in place (no remount).
+  assert.match(src, /notifyHostChange\(\)/);
   // Unmount cleanup exists — plugin cleanup must not break the host.
-  assert.match(src, /unmount\?\.\(entry\.el\)/);
-  assert.match(src, /busyCountRef/);
+  assert.match(src, /controller\.dispose\(\)/);
+  // Missing/disabled/error plugins and broken cards render visible recovery notices.
+  assert.match(src, /data-testid="plugin-card-issue"/);
+  assert.match(src, /role="note"/);
+  assert.match(src, /t\("pluginCards\.manifest_failed"\)/);
+  assert.match(src, /t\("pluginCards\.reinstall_hint"\)/);
 });
 
 test("api.callPluginApi routes plugin paths with sanitization and format check", () => {
@@ -57,6 +72,17 @@ test("api.callPluginApi routes plugin paths with sanitization and format check",
   // Error boundary: code-token pass-through only, raw message never kept.
   assert.match(src, /sanitizePluginErrorCode\(data\.reason \?\? data\.error\)/);
   assert.match(src, /reason: code, plugin: pluginName/);
+});
+
+test("api.fetchPluginCardSource keeps the card lane authenticated and same-origin", () => {
+  const src = read("lib/api.ts");
+  assert.match(src, /async fetchPluginCardSource\(cardUrl: string\): Promise<string>/);
+  // Same-origin guard runs BEFORE any request carries credentials.
+  assert.match(src, /isSameOriginCardUrl\(cardUrl, origin\)/);
+  assert.match(src, /headers: this\.createHeaders\(''\)/);
+  assert.match(src, /credentials: 'same-origin'/);
+  // The card URL itself must never be turned into a keyed URL.
+  assert.doesNotMatch(src, new RegExp("cardUrl[^\\n]*apiKey"));
 });
 
 test("SettingsPage mounts the plugin card area after the built-in managed cards", () => {

@@ -770,5 +770,13 @@
       "config_busy": "A configuration save or another managed-provider action is in progress. Wait for it to finish and retry.",
       "reconciliation_failed": "The action succeeded on the server, but the settings draft could not be refreshed. Reopen the settings page to see the saved changes."
     }
+  },
+  "pluginCards": {
+    "area_label": "Provider plugin management cards",
+    "manifest_failed": "The installed provider plugin list could not be loaded. Check that the CCR server is running, then reload this page.",
+    "unavailable_title": "{{name}} is installed but unavailable",
+    "disabled_hint": "This plugin is disabled in the CCR configuration. Enable it (for example with `ccr plugin enable {{name}}`) and reload this page to manage its provider here.",
+    "reinstall_hint": "Reinstall the plugin package (`ccr plugin add <package>`) or restart CCR, then reload this page.",
+    "card_failed_title": "The management card for {{name}} failed to load"
   }
 }

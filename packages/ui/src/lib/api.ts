@@ -1,6 +1,6 @@
 import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse, WorkBuddyAccountRemoveRequest, WorkBuddyAccountSwitchRequest, WorkBuddyLoginStartResponse, WorkBuddyLoginPollResponse, WorkBuddyImportRequest, WorkBuddyKind, WorkBuddyModelHideRequest, WorkBuddyModelHideResponse, WorkBuddyModelRestoreRequest, WorkBuddyModelRestoreResponse, WorkBuddyMutationResponse, WorkBuddyStatusResponse, WorkBuddyUsageRequest, WorkBuddyUsageResponse } from '@/types';
 import type { GeminiOauthDisconnectResponse, GeminiOauthLoginPollResponse, GeminiOauthLoginStartResponse, GeminiOauthStatusResponse, GeminiOauthSyncResponse, PluginInfo } from '@/types';
-import { sanitizePluginErrorCode } from '../utils/plugin-card.ts';
+import { isSameOriginCardUrl, sanitizePluginErrorCode } from '../utils/plugin-card.ts';
 import { WORKBUDDY_POLL_TIMEOUT } from '../utils/workbuddy-login.ts';
 
 // API Client Class for handling requests with baseUrl and apikey authentication
@@ -202,6 +202,35 @@ class ApiClient {
     }
     if (!path.startsWith('/')) path = `/${path}`;
     return this.apiFetch<T>(`/${plugin}${path}`, { ...init, plugin } as any);
+  }
+
+  /**
+   * Host lane for authenticated card-module loading. A native
+   * `import(cardUrl)` cannot attach the admin API key, so on a non-loopback
+   * authenticated UI the /plugins/<name>/card.js request failed the global
+   * auth middleware (401) and the card silently vanished. The host fetches
+   * the declared card URL through this authenticated boundary instead and
+   * imports a same-origin Blob URL (see PluginCardArea): the JS endpoint
+   * stays fully authenticated, no API key ever appears in a URL and no
+   * server-side auth exemption is introduced. The Blob URL is revoked by the
+   * caller on cleanup.
+   */
+  async fetchPluginCardSource(cardUrl: string): Promise<string> {
+    const origin = (typeof location !== 'undefined' && location && location.origin) || '';
+    if (!isSameOriginCardUrl(cardUrl, origin)) {
+      // Never send admin credentials to a non same-origin target.
+      throw new Error('Refusing to load a plugin card from a non same-origin URL');
+    }
+    const response = await fetch(cardUrl, { headers: this.createHeaders(''), credentials: 'same-origin' });
+    if (response.status === 401) {
+      localStorage.removeItem('apiKey');
+      window.dispatchEvent(new CustomEvent('unauthorized'));
+      throw new Error('Plugin card request failed: unauthorized');
+    }
+    if (!response.ok) {
+      throw new Error(`Plugin card request failed: ${response.status} ${response.statusText}`);
+    }
+    return response.text();
   }
 
   // GET request
