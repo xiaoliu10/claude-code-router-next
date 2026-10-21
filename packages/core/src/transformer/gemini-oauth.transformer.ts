@@ -30,7 +30,7 @@ import { Transformer, TransformerContext } from "@/types/transformer";
 import {
   buildRequestBody,
   transformResponseOut as geminiTransformResponseOut,
-} from "@/utils/gemini.util";
+} from "../utils/gemini.util";
 import {
   GEMINI_OAUTH_DATA_PLANE,
   GEMINI_OAUTH_SSE_PATH,
