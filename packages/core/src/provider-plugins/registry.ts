@@ -183,7 +183,7 @@ export class PluginRegistry {
     const validator = Fastify({ logger: false });
     try {
       for (const register of registrations) {
-        const result = register(facade);
+        const result: unknown = register(facade);
         // Route shorthand returns the facade (which must not be probed as a
         // thenable); actual async callbacks must settle before publication.
         if (result !== facade) await result;
