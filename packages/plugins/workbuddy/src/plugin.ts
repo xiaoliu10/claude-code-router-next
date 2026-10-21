@@ -21,6 +21,7 @@ import { WorkBuddyAuthService, type WorkBuddyAuthServiceLike } from "./auth-serv
 import { createWorkBuddyManagedRuntime } from "./managed-runtime";
 import { WorkBuddyTransformer } from "./transformer";
 import { registerWorkBuddyAdminRoutes } from "./admin-routes";
+import { workbuddyLocales } from "./locales";
 import {
   protectWorkBuddyConfig,
   WorkBuddyCredentialStore,
@@ -77,6 +78,8 @@ async function activate(ctx: PluginContext): Promise<void> {
   }));
   ctx.registerAdminRoutes((app) => registerWorkBuddyAdminRoutes(app, { getService: () => service }));
   ctx.registerConfigProtector((next, prev) => protectWorkBuddyConfig(next, prev));
+  ctx.registerUiCard({ cardPath: "card.js" });
+  ctx.registerLocales(workbuddyLocales);
 
   ctx.log.info(`workbuddy plugin active (${WORKBUDDY_PROVIDER_NAME}, ${WORKBUDDY_AI_PROVIDER_NAME})`);
 }

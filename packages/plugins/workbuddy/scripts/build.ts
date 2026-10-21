@@ -13,7 +13,7 @@
  *                       (no package.json exists above it there).
  */
 import * as esbuild from "esbuild";
-import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,21 +37,17 @@ await esbuild.build({
   logLevel: "info",
 });
 
-// The card chunk lands with the UI milestone (contract §6 M3); the build stays
-// green before that by building the card entry only once it exists.
-if (existsSync(join(root, "src/card-entry.ts"))) {
-  await esbuild.build({
-    entryPoints: [join(root, "src/card-entry.ts")],
-    bundle: true,
-    sourcemap: true,
-    platform: "browser",
-    target: "es2020",
-    format: "esm",
-    outfile: join(dist, "card.js"),
-    legalComments: "none",
-    logLevel: "info",
-  });
-}
+await esbuild.build({
+  entryPoints: [join(root, "src/card-entry.ts")],
+  bundle: true,
+  sourcemap: true,
+  platform: "browser",
+  target: "es2020",
+  format: "esm",
+  outfile: join(dist, "card.js"),
+  legalComments: "none",
+  logLevel: "info",
+});
 
 copyFileSync(join(root, "plugin.json"), join(dist, "plugin.json"));
 writeFileSync(join(dist, "package.json"), JSON.stringify({ type: "module" }, null, 2) + "\n");
