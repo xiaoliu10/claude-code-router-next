@@ -24,6 +24,7 @@ import { OpenCodeTransformer } from "./opencode.transformer"
 import { DefaultThinkingTransformer } from "./defaultthinking.transformer"
 import { AmdTransformer } from "./amd.transformer"
 import { WorkBuddyTransformer } from "./workbuddy.transformer"
+import { GeminiOauthTransformer } from "./gemini-oauth.transformer"
 
 export default {
   AnthropicTransformer,
@@ -51,5 +52,6 @@ export default {
   OpenCodeTransformer,
   DefaultThinkingTransformer,
   AmdTransformer,
-  WorkBuddyTransformer
+  WorkBuddyTransformer,
+  GeminiOauthTransformer
 };
