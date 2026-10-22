@@ -97,17 +97,84 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   const post = <T,>(path: string, body: any = {}, signal?: AbortSignal, timeoutMs = 30_000) =>
     props.callApi<T>(path, { method: "POST", body: JSON.stringify(body), signal, timeoutMs });
 
+  // ---- visual layer ---------------------------------------------------------
+  // The card renders inside the host settings page, so the host's global
+  // stylesheet (Tailwind utilities + the custom .glass-card rule) is part of
+  // its runtime environment — same as document/props.callApi. Class names
+  // below mirror the pre-migration React card EXACTLY (host ui/button,
+  // ui/badge and ui/card class lists inlined; no host imports, no React).
+
+  const BUTTON_BASE = "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-xl text-sm font-semibold ring-offset-background transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 active:scale-95";
+  const BUTTON_PRIMARY = "bg-primary text-primary-foreground shadow-lg shadow-primary/20 hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/30";
+  const BUTTON_OUTLINE = "border border-input bg-input/50 backdrop-blur-md shadow-sm hover:bg-input/80 hover:border-primary/50 hover:shadow-md hover:text-accent-foreground";
+  const BUTTON_DESTRUCTIVE = "border border-destructive/50 text-destructive hover:bg-destructive hover:text-destructive-foreground";
+  const BADGE_BASE = "inline-flex items-center rounded-lg border px-2.5 py-0.5 text-[10px] font-bold transition-colors";
+  const BADGE_OUTLINE = "border-white/10 text-foreground bg-white/5";
+  const BADGE_SECONDARY = "border-white/5 bg-white/5 text-muted-foreground";
+  const TOGGLE = "rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors";
+
   const node = (tag: string, text?: string): HTMLElement => {
     const result = document.createElement(tag);
     if (text !== undefined) result.textContent = text; // Never innerHTML/upstream error text.
     return result;
   };
-  const button = (parent: HTMLElement, text: string, action: () => void, disabled = false, style = ""): HTMLButtonElement => {
-    const result = node("button", text) as HTMLButtonElement;
+  const styled = <K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] => {
+    const result = node(tag, text) as HTMLElementTagNameMap[K];
+    if (className) result.className = className;
+    return result;
+  };
+  /** Inline copy of the lucide svg markup (paths only; icons ship as code). */
+  const icon = (paths: string[], className: string): SVGSVGElement => {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    svg.setAttribute("width", "24");
+    svg.setAttribute("height", "24");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("class", className);
+    for (const d of paths) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", d);
+      svg.appendChild(path);
+    }
+    return svg;
+  };
+  const coinsIcon = (className: string): SVGSVGElement => {
+    const svg = icon(["M18.09 10.37A6 6 0 1 1 10.34 18", "M7 6h1v4", "m16.71 13.88.7.71-2.82 2.82"], className);
+    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    circle.setAttribute("cx", "8"); circle.setAttribute("cy", "8"); circle.setAttribute("r", "6");
+    svg.insertBefore(circle, svg.firstChild);
+    return svg;
+  };
+  const shieldCheckIcon = (className: string) => icon([
+    "M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z",
+    "m9 12 2 2 4-4",
+  ], className);
+  const refreshCwIcon = (className: string) => icon([
+    "M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8",
+    "M21 3v5h-5",
+    "M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16",
+    "M8 16H3v5",
+  ], className);
+  const xIcon = (className: string) => icon(["M18 6 6 18", "m6 6 12 12"], className);
+
+  const badge = (parent: HTMLElement, text: string, variant: "outline" | "secondary", extra = "", role?: string): HTMLElement => {
+    const result = styled("span", `${BADGE_BASE} ${variant === "outline" ? BADGE_OUTLINE : BADGE_SECONDARY} ${extra}`, text);
+    if (role) result.setAttribute("role", role);
+    parent.append(result);
+    return result;
+  };
+  const button = (parent: HTMLElement, text: string, action: () => void, disabled = false, variant: "primary" | "outline" | "destructive" = "outline", extra = "", iconNode?: SVGSVGElement): HTMLButtonElement => {
+    const result = styled("button", `${BUTTON_BASE} ${variant === "primary" ? BUTTON_PRIMARY : variant === "destructive" ? BUTTON_DESTRUCTIVE : BUTTON_OUTLINE} ${extra}`, text) as HTMLButtonElement;
     result.type = "button";
     result.disabled = disabled;
     result.onclick = action;
-    result.style.cssText = `padding:4px 10px;border:1px solid currentColor;border-radius:6px;margin:2px;font:inherit;cursor:pointer;font-size:11px;${style}`;
+    if (iconNode) result.prepend(iconNode);
     parent.append(result);
     return result;
   };
@@ -309,163 +376,209 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const disabled = busy || props.disabled;
     const pendingHide = (model: string) => action?.kind === "hide" && action.site === site && action.model === model;
 
-    const card = node("div");
-    (card as HTMLElement).dataset.testid = `workbuddy-card-${site}`;
+    const card = styled("div", "glass-card rounded-2xl overflow-hidden mb-4");
+    card.dataset.testid = `workbuddy-card-${site}`;
     card.setAttribute("role", "group");
     if (site === focusSite) {
       // One-shot: consume the demand at first delivery so the post-status
       // re-render (same synchronous mount) never scrolls again.
       focusSite = null;
-      queueMicrotask(() => { card.scrollIntoView?.({ block: "start" }); (card as HTMLElement).focus?.(); });
+      queueMicrotask(() => { card.scrollIntoView?.({ block: "start" }); card.focus?.(); });
     }
     card.setAttribute("aria-busy", String(busy));
-    card.style.cssText = "border:1px solid #8886;border-radius:12px;padding:20px;margin-bottom:16px;font-size:14px";
     card.tabIndex = -1;
 
-    const header = node("div");
-    header.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center";
-    const title = node("h2", `${t(`site.${site}`)} · ${t("builtin")}`);
-    title.style.cssText = "margin:0;font-size:16px";
-    header.append(title, node("span", t(`kind.${site}`)), node("span", t(`status.${state}`)));
-    card.append(header);
-    card.append(node("p", t("managed_provider", { name: siteStatus?.providerName || site })));
+    const layout = styled("div", "flex flex-col gap-4 p-5 sm:flex-row sm:items-start sm:justify-between");
+    const body = styled("div", "min-w-0 flex-1 space-y-3");
+
+    const header = styled("div", "flex flex-wrap items-center gap-2");
+    header.append(
+      shieldCheckIcon("h-5 w-5 shrink-0 text-primary"),
+      styled("p", "text-lg font-bold tracking-tight text-foreground", t(`site.${site}`)),
+    );
+    badge(header, t("builtin"), "outline");
+    if (siteStatus && siteStatus.status !== "not_connected") {
+      badge(header, t(`kind.${site}`), "outline", "border-primary/40 text-primary");
+    }
+    badge(header, t(`status.${state}`), "secondary", "", "status");
+    body.append(header);
+    body.append(styled("p", "max-w-md truncate text-xs font-medium text-muted-foreground/60",
+      t("managed_provider", { name: siteStatus?.providerName || site })));
 
     if (accounts.length > 0) {
+      const pool = styled("div", "space-y-2");
+      pool.setAttribute("aria-label", t("accounts_label", { count: accounts.length }));
       for (const account of accounts as WorkBuddyAccountSummary[]) {
         const cooling = workBuddyAccountCooling(account);
         const restricted = workBuddyAccountRestricted(account);
         const usageLine = usage[site]?.[account.uid];
-        const row = node("div");
-        row.style.cssText = "border:1px solid #8883;border-radius:8px;padding:8px;margin:6px 0";
-        const line = node("div");
-        line.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center";
-        line.append(
-          node("span", `${account.active ? "●" : "○"} ${maskWorkBuddyUid(account.uid)}`),
-          account.displayName ? node("span", account.displayName) : node("span"),
-          node("span", t(`source_badge.${account.source}`)),
-          account.active ? node("span", t("active_badge")) : node("span"),
-          cooling !== null ? node("span", t("cooling_until", { time: formatWorkBuddyClock(cooling, locale) })) : node("span"),
-          restricted !== null ? node("span", t("restricted_until", { time: formatWorkBuddyClock(restricted, locale) })) : node("span"),
-        );
-        row.append(line);
-        const actions = node("div");
-        button(actions, t("credits.action"), () => void run("usage", site, account.uid), disabled);
-        button(actions, t("set_active"), () => void run("switch", site, account.uid), disabled || account.active);
-        button(actions, t("remove"), () => { confirm = { kind: "remove", site, uid: account.uid }; render(); }, disabled, "color:#ef4444");
-        row.append(actions);
-        if (usageLine !== undefined && usageLine !== null) {
-          row.append(node("p", t("credits.line", { plan: usageLine.plan, used: usageLine.used, limit: usageLine.limit })));
-        } else if (usageLine === null) {
-          row.append(node("p", t("credits.action")));
+        const row = styled("div", "rounded-lg border border-white/5 bg-white/5 px-3 py-2");
+        const line = styled("div", "flex flex-wrap items-center gap-2");
+        const dot = styled("span", `h-2 w-2 shrink-0 rounded-full ${account.active ? "bg-green-500" : "bg-muted-foreground/30"}`);
+        dot.setAttribute("aria-hidden", "true");
+        line.append(dot);
+        line.append(styled("span", "sr-only", t(account.active ? "active_account" : "inactive_account")));
+        line.append(styled("span", "font-mono text-xs text-foreground", maskWorkBuddyUid(account.uid)));
+        if (account.displayName) {
+          line.append(styled("span", "max-w-[10rem] truncate text-xs text-muted-foreground", account.displayName));
         }
-        card.append(row);
+        badge(line, t(`source_badge.${account.source}`), "outline", "px-1.5 py-0 text-[10px]");
+        if (account.active) {
+          badge(line, t("active_badge"), "outline", "border-primary/40 px-1.5 py-0 text-[10px] text-primary");
+        }
+        if (cooling !== null) {
+          line.append(styled("span", "text-[11px] font-medium text-yellow-600", t("cooling_until", { time: formatWorkBuddyClock(cooling, locale) })));
+        }
+        if (restricted !== null) {
+          line.append(styled("span", "text-[11px] font-medium text-red-500", t("restricted_until", { time: formatWorkBuddyClock(restricted, locale) })));
+        }
+        row.append(line);
+        const accountActions = styled("div", "mt-2 flex flex-wrap items-center gap-2");
+        button(accountActions, t("credits.action"), () => void run("usage", site, account.uid), disabled, "outline", "h-7 px-2 text-[11px]",
+          coinsIcon(`mr-1 h-3 w-3 ${readingUsage ? "animate-pulse" : ""}`));
+        button(accountActions, t("set_active"), () => void run("switch", site, account.uid), disabled || account.active, "outline", "h-7 px-2 text-[11px]");
+        button(accountActions, t("remove"), () => { confirm = { kind: "remove", site, uid: account.uid }; render(); }, disabled, "outline", "h-7 px-2 text-[11px] text-red-500");
+        row.append(accountActions);
+        if (usageLine !== undefined && usageLine !== null) {
+          row.append(styled("p", "mt-1 text-[11px] text-muted-foreground", t("credits.line", { plan: usageLine.plan, used: usageLine.used, limit: usageLine.limit })));
+        } else if (usageLine === null) {
+          // A failed credit read is non-critical: hide the value behind the
+          // action label instead of rendering a raw quota error (baseline parity).
+          row.append(styled("p", "mt-1 text-[11px] text-muted-foreground", t("credits.action")));
+        }
+        pool.append(row);
       }
+      body.append(pool);
     }
 
     if (models.length > 0) {
-      const chips = node("div");
-      chips.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;padding-top:4px";
+      const chips = styled("div", "flex flex-wrap gap-2 pt-1");
       for (const model of models) {
-        const chip = node("span", model);
-        chip.style.cssText = "border:1px solid #8883;border-radius:6px;padding:1px 6px;font-size:10px;font-weight:700;display:inline-flex;gap:3px;align-items:center";
-        const hide = node("button", "×") as HTMLButtonElement;
+        const chip = styled("span", "inline-flex max-w-full items-center gap-1 break-all whitespace-normal rounded-lg border border-white/5 bg-white/5 px-2 py-0.5 text-[10px] font-bold text-muted-foreground", model);
+        const hide = styled("button", "rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-white/10 hover:text-foreground disabled:opacity-40") as HTMLButtonElement;
         hide.type = "button";
         hide.disabled = disabled;
         hide.setAttribute("aria-label", t("hide_model", { model }));
-        hide.style.cssText = "border:0;background:none;color:inherit;cursor:pointer;font-size:11px;padding:0 2px";
+        hide.setAttribute("aria-busy", String(pendingHide(model)));
+        hide.append(xIcon("h-3 w-3"));
         hide.onclick = () => void run("hide", site, model);
         chip.append(hide);
         chips.append(chip);
       }
-      card.append(chips);
+      body.append(chips);
     }
 
     if (hiddenModels.length > 0) {
-      const details = node("details");
-      details.append(node("summary", t("hidden_models", { count: hiddenModels.length })));
+      const details = styled("details", "max-w-md text-xs text-muted-foreground");
+      details.append(styled("summary", "cursor-pointer select-none font-medium", t("hidden_models", { count: hiddenModels.length })));
+      const list = styled("ul", "mt-2 space-y-1");
       for (const model of hiddenModels) {
-        const line = node("div");
-        line.append(node("span", model), button(line, t("restore"), () => void run("restore", site, model), disabled));
-        details.append(line);
+        const item = styled("li", "flex items-center justify-between gap-2");
+        item.append(styled("span", "break-all font-mono", model));
+        button(item, t("restore"), () => void run("restore", site, model), disabled, "outline", "h-6 shrink-0 px-2 text-[11px]");
+        list.append(item);
       }
-      button(details, t("restore_all"), () => void run("restore", site), disabled);
-      card.append(details);
+      details.append(list);
+      button(details, t("restore_all"), () => void run("restore", site), disabled, "outline", "mt-2 h-7 px-2 text-[11px]");
+      body.append(details);
     }
 
     if (imageUnsupported.length > 0) {
-      const note = node("p", t("images_unsupported", { models: imageUnsupported.join(", ") }));
+      const note = styled("p", "max-w-md rounded-lg border border-yellow-500/25 bg-yellow-500/10 px-3 py-2 text-[11px] font-medium text-yellow-600",
+        t("images_unsupported", { models: imageUnsupported.join(", ") }));
       note.setAttribute("role", "note");
-      card.append(note);
+      body.append(note);
     }
     if (!loading && siteStatus && !["connected", "not_connected"].includes(siteStatus.status)) {
-      card.append(node("p", t(`help.${siteStatus.status}`)));
+      body.append(styled("p", "text-xs text-yellow-600", t(`help.${siteStatus.status}`)));
     }
     if (visibleError) {
-      const alert = node("p", t(`errors.${visibleError}`) || t("errors.request_failed"));
+      const alert = styled("p", "max-w-md rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] font-medium text-red-500",
+        t(`errors.${visibleError}`) || t("errors.request_failed"));
       alert.setAttribute("role", "alert");
-      card.append(alert);
+      body.append(alert);
     }
     if (login && login.site === site) {
-      const box = node("div");
+      const box = styled("div", "max-w-md space-y-1.5 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs");
       box.setAttribute("role", "status");
-      box.append(node("p", t("login_pending")));
+      box.append(styled("p", "font-medium", t("login_pending")));
       if (!cancelling) {
-        const link = node("a", t("open_login", { site: t(`site.${login.site}`) })) as HTMLAnchorElement;
+        const link = styled("a", "block break-all text-primary underline", t("open_login", { site: t(`site.${login.site}`) })) as HTMLAnchorElement;
         link.href = login.url; link.target = "_blank"; link.rel = "noopener noreferrer";
         box.append(link);
       }
       button(box, cancelling ? t("working") : t("app.cancel"), () => {
         cancelling = true;
         void loginSession?.cancel().catch(() => { if (alive) { setSiteError(site, "request_failed"); render(); } });
-      }, cancelling);
-      card.append(box);
+      }, cancelling, "outline", "h-7 px-2 text-xs");
+      body.append(box);
     }
 
-    const about = node("details");
-    about.append(node("summary", t("about")));
+    const about = styled("details", "max-w-md text-xs text-muted-foreground");
+    about.append(styled("summary", "cursor-pointer select-none font-medium", t("about")));
+    const aboutBody = styled("div", "mt-2 space-y-1 leading-relaxed");
     for (const key of ["description", "server_host", "privacy_selected", "backup_warning", "browser_source", "routing_note", "hidden_note"]) {
-      about.append(node("p", key === "privacy_selected" ? t("privacy", { site: siteStatus?.site || t("privacy_selected") }) : t(key)));
+      aboutBody.append(styled("p", "", key === "privacy_selected" ? t("privacy", { site: siteStatus?.site || t("privacy_selected") }) : t(key)));
     }
     if (siteStatus && siteStatus.status !== "not_connected") {
-      about.append(node("p", t(siteStatus.source === "browser" ? "source_browser" : siteStatus.source === "desktop" ? "source_desktop" : "source_unknown")));
-      if (siteStatus.renewalMode === "desktop") about.append(node("p", t("renewal_desktop")));
-      if (siteStatus.renewalMode === "browser") about.append(node("p", t("renewal_browser")));
+      aboutBody.append(styled("p", "", t(siteStatus.source === "browser" ? "source_browser" : siteStatus.source === "desktop" ? "source_desktop" : "source_unknown")));
+      if (siteStatus.renewalMode === "desktop") aboutBody.append(styled("p", "", t("renewal_desktop")));
+      if (siteStatus.renewalMode === "browser") aboutBody.append(styled("p", "", t("renewal_browser")));
     }
-    card.append(about);
-    if (props.disabled) card.append(node("p", t("other_edit")));
+    about.append(aboutBody);
+    body.append(about);
+    if (props.disabled) body.append(styled("p", "text-xs text-muted-foreground", t("other_edit")));
 
-    const actions = node("div");
-    actions.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:8px";
+    // Right action column (baseline kept a site switcher there too).
+    const actions = styled("div", "flex shrink-0 flex-col gap-2 sm:w-[210px]");
+    for (const other of SITES) {
+      if (other === site) continue;
+      const toggle = styled("button", `${TOGGLE} bg-white/5 text-muted-foreground hover:bg-white/10 hover:text-foreground`, t(`site.${other}`)) as HTMLButtonElement;
+      toggle.type = "button";
+      toggle.setAttribute("aria-label", t(`site.${other}`));
+      toggle.onclick = () => {
+        const target = el.querySelector?.(`[data-testid="workbuddy-card-${other}"]`) as HTMLElement | null;
+        if (target) { target.scrollIntoView?.({ block: "start" }); target.focus?.(); }
+      };
+      actions.append(toggle);
+    }
     button(actions, action?.kind === "login" && action.site === site ? t("working") : connected ? t("add_account") : t("browser_login"),
-      () => void run("login", site), disabled);
-    button(actions, t("sync"), () => void run("sync", site), disabled || !connected);
-    button(actions, t("disconnect"), () => { confirm = { kind: "disconnect", site }; render(); }, disabled || !canDisconnect);
-    card.append(actions);
+      () => void run("login", site), disabled, "primary", "h-8 w-full text-xs");
+    button(actions, t("sync"), () => void run("sync", site), disabled || !connected, "outline", "h-8 w-full text-xs",
+      refreshCwIcon(`mr-1 h-3.5 w-3.5 ${action?.kind === "sync" && action.site === site ? "animate-spin" : ""}`));
+    button(actions, t("disconnect"), () => { confirm = { kind: "disconnect", site }; render(); }, disabled || !canDisconnect, "outline", "h-8 w-full text-xs");
+
+    layout.append(body, actions);
+    card.append(layout);
     return card;
   };
 
   const render = () => {
     if (!alive) return;
     el.replaceChildren();
-    el.style.cssText = "font-size:14px";
     el.dataset.testid = "workbuddy-card";
     el.setAttribute("aria-busy", String(loading || action !== null));
     for (const site of SITES) el.append(renderSiteCard(site));
-    if (toast) { const message = node("p", toast); message.setAttribute("role", "status"); el.append(message); }
+    if (toast) {
+      const message = styled("p", "flex max-w-md items-center gap-2 rounded-lg border border-green-500/25 bg-green-500/10 px-3 py-2 text-xs font-medium text-green-600", toast);
+      message.setAttribute("role", "status");
+      el.append(message);
+    }
     if (confirm) {
-      const panel = node("div");
+      const panel = styled("div", "glass-card mt-3 max-w-lg space-y-3 rounded-2xl p-5");
       panel.setAttribute("role", "dialog");
-      panel.style.cssText = "padding:16px;margin-top:12px;border:2px solid #b45309;border-radius:8px";
       panel.append(
-        node("h3", confirm.kind === "remove" ? t("account_remove_title") : t("disconnect_title")),
-        node("p", confirm.kind === "remove" ? t("account_remove_warning") : t("disconnect_warning")),
+        styled("h3", "text-sm font-semibold tracking-tight text-foreground", confirm.kind === "remove" ? t("account_remove_title") : t("disconnect_title")),
+        styled("p", "text-xs text-muted-foreground", confirm.kind === "remove" ? t("account_remove_warning") : t("disconnect_warning")),
       );
       const err = errors[confirm.site] ?? null;
-      if (err && action) { const alert = node("p", t(`errors.${err}`)); alert.setAttribute("role", "alert"); panel.append(alert); }
-      button(panel, t("app.cancel"), () => { if (!action) { confirm = null; render(); } }, !!action);
-      button(panel, action ? t("working") : confirm.kind === "remove" ? t("account_remove_confirm") : t("disconnect"),
+      if (err && action) { const alert = styled("p", "text-sm text-red-600", t(`errors.${err}`)); alert.setAttribute("role", "alert"); panel.append(alert); }
+      const footer = styled("div", "flex justify-end gap-2");
+      button(footer, t("app.cancel"), () => { if (!action) { confirm = null; render(); } }, !!action, "outline", "h-8 text-xs");
+      button(footer, action ? t("working") : confirm.kind === "remove" ? t("account_remove_confirm") : t("disconnect"),
         () => { if (confirm) void run(confirm.kind === "remove" ? "remove" : "disconnect", confirm.site, confirm.kind === "remove" ? confirm.uid : undefined); },
-        loading || action !== null || props.disabled);
+        loading || action !== null || props.disabled, "destructive", "h-8 text-xs");
+      panel.append(footer);
       el.append(panel);
     }
   };

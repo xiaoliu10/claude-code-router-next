@@ -126,9 +126,28 @@ test("managed row navigation carries a generic focus key and the area renders th
   assert.match(settings, /focusKey=\{\(location\.state as \{ managedProviderFocus\?: string \| null \} \| null\)\?\.managedProviderFocus \?\? null\}/);
   const area = read("components/PluginCardArea.tsx");
   assert.match(area, /focusKey\?: string \| null/);
-  // One-shot: consumed before the sync hands it to cards, never re-triggered.
-  assert.match(area, /pendingFocus\.current = null;/);
+  // F1: consumed per DISTINCT key through the focus gate — a locale switch or
+  // manifest re-sync observes the same persistent location.state without
+  // re-delivering the scroll/focus.
+  assert.match(area, /createPluginFocusGate\(\)/);
+  assert.match(area, /focusGate\.current\.offer\(focusKey\)/);
+  assert.match(area, /focusGate\.current\?\.take\(\)/);
   const contract = read("utils/plugin-card.ts");
   assert.match(contract, /focusKey\?: string \| null;/);
   assert.match(contract, /sync\(entries: PluginInfo\[\] \| null, locale: string, host: HTMLElement, focusKey\?: string \| null\)/);
+});
+
+test("the host stylesheet keeps the plugin-card utility contract generated", () => {
+  // Plugin cards render inside this page and style themselves with host
+  // utilities; Tailwind emits only scanned classes, so index.css safelists
+  // the ones no surviving host component references.
+  const css = read("index.css");
+  assert.match(css, /@source inline/);
+  for (const cls of [
+    "grid-cols-[auto_minmax(0,1fr)]", "max-w-[10rem]", "border-primary/30", "bg-primary/5",
+    "border-primary/40", "bg-muted-foreground/30", "border-green-500/25", "bg-green-500/10",
+    "gap-x-3", "gap-y-1", "whitespace-normal", "w-[210px]", "bg-white/20", "shadow-primary/30",
+  ]) {
+    assert.ok(css.includes(cls), `plugin-card safelist missing ${cls}`);
+  }
 });

@@ -13,7 +13,7 @@
  *                       (no package.json exists above it there).
  */
 import * as esbuild from "esbuild";
-import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,6 +21,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const dist = join(root, "dist");
 mkdirSync(dist, { recursive: true });
+
+/**
+ * F3: shipped bundles keep their local .map files as debug aids but never
+ * reference them — the tarball contract already excludes the maps, so a
+ * dangling sourceMappingURL comment in dist would only leak local paths and
+ * spam devtools with unresolvable map requests.
+ */
+const stripSourcemapComment = (file: string): void => {
+  const source = readFileSync(file, "utf8");
+  writeFileSync(file, source.replace(/\n?\/\/# sourceMappingURL=[^\n]*\n?$/, "\n"));
+};
 
 const nodeExternals = []; // fully self-contained: only node: builtins stay external
 
@@ -52,5 +63,8 @@ await esbuild.build({
 copyFileSync(join(root, "plugin.json"), join(dist, "plugin.json"));
 copyFileSync(join(root, "THIRD_PARTY_NOTICES.md"), join(dist, "THIRD_PARTY_NOTICES.md"));
 writeFileSync(join(dist, "package.json"), JSON.stringify({ type: "module" }, null, 2) + "\n");
+
+// F3: emit the shipped artifacts without the sourcemap reference comment.
+for (const artifact of ["plugin.js", "card.js"]) stripSourcemapComment(join(dist, artifact));
 
 console.log("workbuddy plugin built into dist/");

@@ -14,6 +14,15 @@ describe("shared build identity", () => {
     expect(build).toContain('outfile: join(dist, "card.js")');
   });
 
+  it("the build strips sourceMappingURL comments from both shipped bundles (F3)", () => {
+    const build = read("scripts/build.ts");
+    // Local .map files stay as debug aids; the reference line never ships.
+    expect(build).toContain("stripSourcemapComment");
+    expect(build).toContain("sourceMappingURL");
+    expect(build).toContain('"plugin.js"');
+    expect(build).toContain('"card.js"');
+  });
+
   it("ships self-contained bundles with no core implementation imports", async () => {
     const { build } = await import("esbuild");
     for (const [entry, platform] of [["plugin", "node"], ["card-entry", "browser"]] as const) {

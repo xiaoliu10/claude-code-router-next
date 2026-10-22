@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import {
-  createPluginCardAreaController, pluginLocaleOf,
-  type PluginCardAreaController, type PluginCardHostIssue,
+  createPluginCardAreaController, createPluginFocusGate, pluginLocaleOf,
+  type PluginCardAreaController, type PluginCardHostIssue, type PluginFocusGate,
 } from "../utils/plugin-card";
 import { useConfig } from "./ConfigProvider";
 import type { PluginInfo } from "../types";
@@ -31,11 +31,14 @@ export function PluginCardArea({ disabled, onBusyChange, focusKey }: { disabled:
   const { refreshConfig } = useConfig();
   const currentProps = useRef({ disabled, refreshConfig, onBusyChange });
   currentProps.current = { disabled, refreshConfig, onBusyChange };
-  // A deep-linked focus key is consumed exactly once by the owning card: the
-  // area clears it after handing it to a sync, so a later re-render (locale or
-  // gate change) never re-triggers the scroll/focus.
-  const pendingFocus = useRef<string | null>(focusKey ?? null);
-  if (focusKey != null) pendingFocus.current = focusKey;
+  // F1: a deep-linked focus key is delivered exactly once per DISTINCT key.
+  // location.state is persistent, so a locale switch or manifest re-sync
+  // observes the same key again — the gate keeps it consumed; a NEW navigation
+  // carrying a different key re-arms delivery (deep links also survive a hard
+  // reload, which remounts the area with a fresh gate).
+  const focusGate = useRef<PluginFocusGate | null>(null);
+  if (focusGate.current === null) focusGate.current = createPluginFocusGate();
+  focusGate.current.offer(focusKey);
   const [manifest, setManifest] = useState<ManifestState>({ status: "loading" });
   const [issues, setIssues] = useState<PluginCardHostIssue[]>([]);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -73,8 +76,7 @@ export function PluginCardArea({ disabled, onBusyChange, focusKey }: { disabled:
       controller.dispose();
       return;
     }
-    const focus = pendingFocus.current;
-    pendingFocus.current = null;
+    const focus = focusGate.current?.take() ?? null;
     void controller.sync(manifest.status === "failed" ? null : manifest.entries, locale, host, focus);
     return () => { controller.dispose(); };
   }, [controller, manifest, locale]);

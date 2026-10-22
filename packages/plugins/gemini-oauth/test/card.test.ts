@@ -15,13 +15,26 @@ class Element {
   target = "";
   rel = "";
   style = { cssText: "" };
+  className = "";
   dataset: Record<string, string> = {};
+  parent: Element | null = null;
+  attrs: Record<string, string> = {};
   onclick?: () => void;
   onchange?: () => void;
+  firstChild: Element | null = null;
   constructor(tag: string) { this.tag = tag; }
-  append(...nodes: Element[]) { this.children.push(...nodes); }
-  replaceChildren(...nodes: Element[]) { this.children = nodes; }
-  setAttribute() {}
+  append(...nodes: Element[]) { for (const n of nodes) { n.parent = this; this.children.push(n); } this.firstChild = this.children[0] ?? null; }
+  appendChild(child: Element) { this.append(child); return child; }
+  prepend(...nodes: Element[]) { for (const n of nodes.reverse()) { n.parent = this; this.children.unshift(n); } this.firstChild = this.children[0] ?? null; }
+  insertBefore(child: Element, before: Element | null) {
+    const at = before ? this.children.indexOf(before) : -1;
+    child.parent = this;
+    if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+    this.firstChild = this.children[0] ?? null;
+    return child;
+  }
+  replaceChildren(...nodes: Element[]) { this.children = nodes; for (const n of nodes) n.parent = this; this.firstChild = nodes[0] ?? null; }
+  setAttribute(name: string, value: string) { this.attrs[name] = value; }
   all(): Element[] { return [this, ...this.children.flatMap(n => n.all())]; }
   button(text: string) {
     const result = this.all().filter(n => n.tag === "button" && n.textContent === text).at(-1);
@@ -35,7 +48,7 @@ const tick = async () => { for (let i = 0; i < 15; ++i) await Promise.resolve();
 const cleanups: Array<() => void> = [];
 afterEach(() => { cleanups.splice(0).forEach(f => f()); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 function harness(overrides: Record<string, (init?: any) => any> = {}, disabled = false) {
-  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag) });
+  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any });
   const open = vi.fn(); vi.stubGlobal("window", { open });
   const host = new Element("div");
   const status = { configured: true, connected: true, kind: "antigravity", email: "user@example.test", project: "p", tier: "paid", modelsCount: 2 };
@@ -82,6 +95,18 @@ describe("self-contained Gemini plugin card", () => {
     const h = harness(); await tick();
     expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status"]);
     expect(h.host.text()).toContain(en.status.connected);
+    // Visual contract: the pre-migration look is expressed through host
+    // stylesheet classes (glass card, badges, primary/outline button
+    // hierarchy) — never inline cssText anymore.
+    const card = h.host.all().find(n => n.className?.includes("glass-card"))!;
+    expect(card, "glass card container").toBeTruthy();
+    const authorize = h.host.button(en.reconnect);
+    expect(authorize.className).toContain("bg-primary");
+    expect(authorize.style.cssText).toBe("");
+    expect(h.host.button(en.sync).className).toContain("border-input");
+    expect(h.host.all().filter(n => n.tag === "svg").length).toBeGreaterThanOrEqual(3); // KeyRound + Plug + RefreshCw
+    const statusBadge = h.host.all().find(n => n.textContent === en.status.connected && n.attrs?.role === "status")!;
+    expect(statusBadge.className).toContain("bg-white/5");
     h.host.click(en.reconnect);
     expect(h.host.text()).toContain(en.risk);
     expect(h.host.button(en.risk_continue).disabled).toBe(true);

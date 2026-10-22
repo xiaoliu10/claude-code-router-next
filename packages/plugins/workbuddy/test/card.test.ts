@@ -15,13 +15,30 @@ class Element {
   rel = "";
   tabIndex = -1;
   style = { cssText: "" };
+  className = "";
   dataset: Record<string, string> = {};
-  style = { cssText: "" };
+  parent: Element | null = null;
+  attrs: Record<string, string> = {};
   onclick?: () => void;
+  firstChild: Element | null = null;
   constructor(tag: string) { this.tag = tag; }
-  append(...nodes: Element[]) { this.children.push(...nodes); }
-  replaceChildren(...nodes: Element[]) { this.children = nodes; }
-  setAttribute() {}
+  append(...nodes: Element[]) { for (const n of nodes) { n.parent = this; this.children.push(n); } this.firstChild = this.children[0] ?? null; }
+  appendChild(child: Element) { this.append(child); return child; }
+  prepend(...nodes: Element[]) { for (const n of nodes.reverse()) { n.parent = this; this.children.unshift(n); } this.firstChild = this.children[0] ?? null; }
+  insertBefore(child: Element, before: Element | null) {
+    const at = before ? this.children.indexOf(before) : -1;
+    child.parent = this;
+    if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+    this.firstChild = this.children[0] ?? null;
+    return child;
+  }
+  querySelector(selector: string): Element | null {
+    const match = selector.match(/^\[data-testid="(.+)"\]$/);
+    if (!match) return null;
+    return this.all().find(n => n.dataset?.testid === match[1]) ?? null;
+  }
+  replaceChildren(...nodes: Element[]) { this.children = nodes; for (const n of nodes) n.parent = this; this.firstChild = nodes[0] ?? null; }
+  setAttribute(name: string, value: string) { this.attrs[name] = value; }
   all(): Element[] { return [this, ...this.children.flatMap(n => n.all())]; }
   button(text: string) {
     const result = this.all().filter(n => n.tag === "button" && n.textContent === text).at(-1);
@@ -52,7 +69,7 @@ function harnessFocus(focusKey: string | null, scrolled: string[]) {
     el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
     el.focus = function () { scrolled.push(`focus:${this.dataset?.testid}`); };
     return el;
-  } });
+  } , createElementNS: () => new Element("svg") as any });
   const host = new Element("div");
   const callApi = vi.fn(async () => status);
   let hostListener: (() => void) | null = null;
@@ -66,7 +83,7 @@ function harnessFocus(focusKey: string | null, scrolled: string[]) {
   return { host, callApi, notify: () => hostListener?.() };
 }
 function harness(overrides: Record<string, any> = {}, disabled = false, heldLease = false) {
-  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag) });
+  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any });
   const host = new Element("div");
   const callApi = vi.fn(async (path: string, init?: any) => {
     if (overrides[path]) {
@@ -123,6 +140,21 @@ describe("self-contained WorkBuddy plugin card", () => {
     expect(h.host.card("workbuddy").text()).toContain("uid\u202689");
     expect(h.host.button(en["credits"].action)).toBeTruthy();
     expect(h.host.text()).toContain(en.source_badge.browser);
+    // Visual contract: the pre-migration look is expressed through host
+    // stylesheet classes (glass card, badges, primary/outline button
+    // hierarchy) — never inline cssText anymore.
+    expect(h.host.card("workbuddy").className).toContain("glass-card");
+    expect(h.host.card("workbuddy").className).toContain("rounded-2xl");
+    const addAccount = h.host.card("workbuddy").button(en.add_account);
+    expect(addAccount.className).toContain("bg-primary");
+    expect(addAccount.style.cssText).toBe("");
+    const sync = h.host.card("workbuddy").button(en.sync);
+    expect(sync.className).toContain("border-input");
+    expect(h.host.card("workbuddy").all().filter(n => n.tag === "svg").length).toBeGreaterThanOrEqual(2); // ShieldCheck + RefreshCw icons
+    const builtinBadge = h.host.card("workbuddy").all().find(n => n.textContent === en.builtin)!;
+    expect(builtinBadge.className).toContain("border-white/10");
+    const statusBadge = h.host.card("workbuddy").all().find(n => n.textContent === en.status.connected && n.attrs?.role === "status")!;
+    expect(statusBadge.className).toContain("bg-white/5");
   });
 
   it("a failed status read renders a visible recovery note instead of an empty area", async () => {
@@ -147,7 +179,8 @@ describe("self-contained WorkBuddy plugin card", () => {
   it("model chips hide through the explicit endpoint and settle via the Router reconciliation merge", async () => {
     const h = harness({ "/models/hide": { ok: true, clearedRefs: ["default"], removedModelRefs: ["workbuddy,glm-5.3"], defaultFallback: "" } });
     await tick();
-    const hide = h.host.card("workbuddy").all().find(n => n.tag === "button" && n.textContent === "×");
+    const hide = h.host.card("workbuddy").all().find(n => n.tag === "button" && n.attrs?.["aria-label"] === en.hide_model.replace("{{model}}", "glm-5.3"));
+    expect(hide, "chip hide button").toBeTruthy();
     hide!.onclick!();
     await tick();
     expect(h.callApi.mock.calls.some(([path, init]) => path === "/models/hide" && JSON.parse(init.body).model === "glm-5.3")).toBe(true);
@@ -179,7 +212,7 @@ describe("self-contained WorkBuddy plugin card", () => {
       el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
       el.focus = function () { scrolled.push(`focus:${this.dataset?.testid}`); };
       return el;
-    } });
+    } , createElementNS: () => new Element("svg") as any });
     try {
       const cn = harnessFocus("workbuddy", scrolled);
       for (let i = 0; i < 4; ++i) await tick();
@@ -207,7 +240,7 @@ describe("self-contained WorkBuddy plugin card", () => {
       const el = new Element(tag) as any;
       el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
       return el;
-    } });
+    } , createElementNS: () => new Element("svg") as any });
     try {
       harnessFocus("gemini-oauth", scrolled);
       await tick();

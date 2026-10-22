@@ -69,6 +69,37 @@ export function pluginLocaleOf(language: string | undefined): "en" | "zh" {
 }
 
 /**
+ * One-shot deep-link focus gate (F1). The settings page's location.state is
+ * persistent, so the SAME focus key reaches the card area again on every
+ * re-render — a locale switch or manifest re-sync must not re-deliver the
+ * scroll/focus. Each distinct key is delivered exactly once; a NEW key (a
+ * fresh navigation) re-arms delivery, and a remount after a hard reload gets
+ * a fresh gate whose initial key still delivers.
+ */
+export interface PluginFocusGate {
+  /** Observe the incoming prop on every render; re-arms only for a NEW key. */
+  offer(focusKey: string | null | undefined): void;
+  /** Consume the armed key at sync time; null when nothing new is pending. */
+  take(): string | null;
+}
+
+export function createPluginFocusGate(): PluginFocusGate {
+  let lastDelivered: string | null = null;
+  let pending: string | null = null;
+  return {
+    offer(focusKey) {
+      if (focusKey != null && focusKey !== lastDelivered) pending = focusKey;
+    },
+    take() {
+      const deliver = pending;
+      pending = null;
+      if (deliver != null) lastDelivered = deliver;
+      return deliver;
+    },
+  };
+}
+
+/**
  * A manifest-declared card URL is only loadable when it resolves to exactly
  * the UI's own origin over http(s). This rejects absolute cross-origin URLs,
  * protocol-relative hosts, embedded credentials and blob:/data:/javascript:
