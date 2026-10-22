@@ -197,6 +197,28 @@ it("add preserves hand-written records that omit enabled", async () => {
   ]);
 });
 
+it("add refuses to silently rewrite a corrupted plugins.json", async () => {
+  const pluginsDir = join(configDir, "plugins");
+  mkdirSync(pluginsDir, { recursive: true });
+  const original = "{{{CORRUPTED";
+  writeFileSync(join(pluginsDir, "plugins.json"), original);
+  const payload = makePayload(join(scratch, "acme-payload"), { name: "acme" });
+
+  const code = await handlePluginCommand(["add", payload, "--yes"], { configDir });
+
+  expect(code).toBe(1);
+  expect(output()).toContain("not valid JSON");
+  // The unparseable file is left untouched for manual repair.
+  expect(readFileSync(join(pluginsDir, "plugins.json"), "utf8")).toBe(original);
+  expect(existsSync(join(pluginsDir, "acme"))).toBe(false);
+
+  // --force is the explicit escape hatch: replace the file (losing the
+  // unreadable content is then the user's informed choice).
+  const forced = await handlePluginCommand(["add", payload, "--yes", "--force"], { configDir });
+  expect(forced).toBe(0);
+  expect(records()).toEqual([{ name: "acme", enabled: true }]);
+});
+
 it("add rejects an existing install without --force and replaces with it", async () => {
   const payloadV1 = makePayload(join(scratch, "v1"), { name: "acme", version: "1.0.0" });
   const payloadV2 = makePayload(join(scratch, "v2"), { name: "acme", version: "2.0.0" });
@@ -213,6 +235,33 @@ it("add rejects an existing install without --force and replaces with it", async
   // No staging leftovers.
   const leftovers = readdirSync(join(configDir, "plugins")).filter((n) => n.includes("staging"));
   expect(leftovers).toEqual([]);
+});
+
+it("add cleans up its staging dir when the copy fails", async () => {
+  const payload = makePayload(join(scratch, "acme-payload"), { name: "acme" });
+  // Simulate a mid-copy failure without chmod games: point the add at a
+  // payload that disappears between validation and copy is impossible to
+  // orchestrate from here, so instead corrupt the source AFTER a first add
+  // succeeded — force-replace against a payload dir that becomes unreadable
+  // is flaky across environments; the deterministic equivalent is a payload
+  // whose plugin.js vanishes when handlePluginCommand re-reads the STAGED
+  // copy... which the staging cleanup covers by construction. So drive the
+  // failure through an unreadable source file (EACCES) with a root-skip.
+  if (process.getuid?.() === 0) return; // chmod 000 is ineffective for root
+  writeFileSync(join(payload, "secret.bin"), "x");
+  const mode = 0o000;
+  const target = join(payload, "secret.bin");
+  const { chmodSync } = await import("node:fs");
+  chmodSync(target, mode);
+  try {
+    const code = await handlePluginCommand(["add", payload, "--yes"], { configDir });
+    expect(code).toBe(1);
+    const leftovers = readdirSync(join(configDir, "plugins")).filter((n) => n.includes("staging"));
+    expect(leftovers).toEqual([]);
+    expect(existsSync(join(configDir, "plugins", "acme"))).toBe(false);
+  } finally {
+    chmodSync(target, 0o644);
+  }
 });
 
 it("add rejects bad coreApi", async () => {

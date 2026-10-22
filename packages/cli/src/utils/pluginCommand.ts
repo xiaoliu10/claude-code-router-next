@@ -249,19 +249,39 @@ function recordsFile(configDir: string): string {
   return join(configDir, "plugins", RECORDS_FILE);
 }
 
+interface ReadRecordsResult {
+  records: InstallRecord[];
+  /** The file existed but could not be parsed — a rewrite would be lossy. */
+  corrupted: boolean;
+}
+
 function readRecords(configDir: string): InstallRecord[] {
+  return readRecordsChecked(configDir).records;
+}
+
+function readRecordsChecked(configDir: string): ReadRecordsResult {
+  let raw: string;
   try {
-    const raw = JSON.parse(readFileSync(recordsFile(configDir), "utf8"));
-    if (!Array.isArray(raw)) return [];
+    raw = readFileSync(recordsFile(configDir), "utf8");
+  } catch {
+    // Missing file is the normal first-run state, not corruption.
+    return { records: [], corrupted: false };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return { records: [], corrupted: true };
     // Mirror the loader's tolerance: any {name: string} entry counts, with
     // enabled !== false treated as enabled — so hand-tolerated records are
     // never silently dropped when the file is rewritten.
-    return raw
-      .filter((e: any): e is { name: string; enabled?: unknown } =>
-        e && typeof e.name === "string")
-      .map((e) => ({ name: e.name, enabled: e.enabled !== false }));
+    return {
+      records: parsed
+        .filter((e: any): e is { name: string; enabled?: unknown } =>
+          e && typeof e.name === "string")
+        .map((e) => ({ name: e.name, enabled: e.enabled !== false })),
+      corrupted: false,
+    };
   } catch {
-    return [];
+    return { records: [], corrupted: true };
   }
 }
 
@@ -270,9 +290,30 @@ function writeRecords(configDir: string, records: InstallRecord[]): void {
 }
 
 /** Register or replace the record for name, preserving the order of all
- *  other records (the loader loads in plugins.json order). */
-function upsertRecord(configDir: string, name: string): void {
-  const records = readRecords(configDir);
+ *  other records (the loader loads in plugins.json order). Refuses to
+ *  overwrite an UNPARSEABLE plugins.json without force: a silent rewrite
+ *  would permanently drop records the loader would have tolerated after a
+ *  manual fix. */
+/** Refuse an unparseable plugins.json up front (before any filesystem work):
+ *  the later rewrite would silently and permanently drop records the loader
+ *  would have tolerated after a manual fix. --force is the escape hatch. */
+function upsertPreflight(configDir: string, force: boolean): void {
+  if (force) return;
+  const { corrupted } = readRecordsChecked(configDir);
+  if (corrupted) {
+    throw new PluginCommandError(
+      `${recordsFile(configDir)} is not valid JSON; refusing to overwrite it. Fix or remove the file (or pass --force to replace it with only the new record).`
+    );
+  }
+}
+
+function upsertRecord(configDir: string, name: string, force = false): void {
+  const { records, corrupted } = readRecordsChecked(configDir);
+  if (corrupted && !force) {
+    throw new PluginCommandError(
+      `${recordsFile(configDir)} is not valid JSON; refusing to overwrite it. Fix or remove the file (or pass --force to replace it with only the new record).`
+    );
+  }
   const record: InstallRecord = { name, enabled: true };
   const idx = records.findIndex((r) => r.name === name);
   if (idx >= 0) records[idx] = record;
@@ -426,20 +467,30 @@ function installStaged(payloadDir: string, manifest: PluginManifest, configDir: 
       `plugin "${manifest.name}" is already installed at ${target} (use --force to replace it)`
     );
   }
+  // Refuse a lossy record rewrite BEFORE staging/payload work: an unparseable
+  // plugins.json would otherwise be replaced by only the new record.
+  upsertPreflight(configDir, force);
 
   const stage = join(pluginsDir, `.${manifest.name}.staging-${process.pid}-${Date.now()}`);
   mkdirSync(stage, { recursive: true });
-  cpSync(payloadDir, stage, { recursive: true });
-  const stagedManifest = validatePluginManifest(readManifest(stage), manifest.name);
-  if (!existsSync(join(stage, ENTRY_FILE))) {
-    throw new PluginCommandError(`staged payload is missing its entry ${ENTRY_FILE}`);
+  try {
+    cpSync(payloadDir, stage, { recursive: true });
+    const stagedManifest = validatePluginManifest(readManifest(stage), manifest.name);
+    if (!existsSync(join(stage, ENTRY_FILE))) {
+      throw new PluginCommandError(`staged payload is missing its entry ${ENTRY_FILE}`);
+    }
+    if (lstatSyncSafe(target)) {
+      rmSync(target, { recursive: true, force: true });
+    }
+    renameSync(stage, target);
+    upsertRecord(configDir, manifest.name, force);
+  } catch (error) {
+    // Never orphan the staging dir on a failed copy/validate (disk full,
+    // EACCES, bad payload): it is invisible to loader and list, so it would
+    // otherwise leak silently in the user's plugins directory.
+    rmSync(stage, { recursive: true, force: true });
+    throw error;
   }
-  if (lstatSyncSafe(target)) {
-    rmSync(target, { recursive: true, force: true });
-  }
-  renameSync(stage, target);
-
-  upsertRecord(configDir, stagedManifest.name);
   return target;
 }
 
