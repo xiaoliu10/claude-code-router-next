@@ -165,6 +165,38 @@ it("add rejects a manifest whose declared card file is missing", async () => {
   expect(existsSync(join(configDir, "plugins", "acme"))).toBe(false);
 });
 
+it("add rejects a manifest that declares a traversing card path", async () => {
+  const payload = makePayload(join(scratch, "acme-payload"), { name: "acme" });
+  writeFileSync(
+    join(payload, "plugin.json"),
+    JSON.stringify({ name: "acme", version: "1.0.0", coreApi: "1", card: "../outside.js" })
+  );
+  writeFileSync(join(scratch, "outside.js"), "export {};\n");
+
+  const code = await handlePluginCommand(["add", payload, "--yes"], { configDir });
+
+  expect(code).toBe(1);
+  expect(output()).toContain("unsafe UI card path");
+  expect(existsSync(join(configDir, "plugins", "acme"))).toBe(false);
+});
+
+it("add preserves hand-written records that omit enabled", async () => {
+  const pluginsDir = join(configDir, "plugins");
+  mkdirSync(pluginsDir, { recursive: true });
+  writeFileSync(join(pluginsDir, "plugins.json"), JSON.stringify([{ name: "manual" }]));
+  const payload = makePayload(join(scratch, "acme-payload"), { name: "acme" });
+
+  const code = await handlePluginCommand(["add", payload, "--yes"], { configDir });
+
+  expect(code).toBe(0);
+  // The loader treats enabled !== false as enabled; the rewrite must keep the
+  // hand-written record (normalized), not silently drop it.
+  expect(records()).toEqual([
+    { name: "manual", enabled: true },
+    { name: "acme", enabled: true },
+  ]);
+});
+
 it("add rejects an existing install without --force and replaces with it", async () => {
   const payloadV1 = makePayload(join(scratch, "v1"), { name: "acme", version: "1.0.0" });
   const payloadV2 = makePayload(join(scratch, "v2"), { name: "acme", version: "2.0.0" });

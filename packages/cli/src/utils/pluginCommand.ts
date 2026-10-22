@@ -31,7 +31,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -222,12 +221,18 @@ function assertNoSymlinks(root: string): void {
 }
 
 /** card.js is optional; but if the manifest declares a UI card file it must
- *  exist in the payload. */
+ *  exist in the payload. The declared path must be a plain file name inside
+ *  the payload — the same shape the core loader serves (no traversal). */
 function validateCardPayload(payloadDir: string, raw: RawManifest): void {
   const declared = typeof raw.card === "string"
     ? raw.card
     : typeof raw.ui?.card === "string" ? raw.ui.card : undefined;
   if (typeof declared === "string" && declared.length > 0) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(declared)) {
+      throw new PluginCommandError(
+        `manifest declares an unsafe UI card path "${declared}" (must be a plain file inside the payload)`
+      );
+    }
     if (!existsSync(join(payloadDir, declared))) {
       throw new PluginCommandError(
         `manifest declares UI card "${declared}" but the file is missing from the payload`
@@ -248,10 +253,13 @@ function readRecords(configDir: string): InstallRecord[] {
   try {
     const raw = JSON.parse(readFileSync(recordsFile(configDir), "utf8"));
     if (!Array.isArray(raw)) return [];
-    return raw.filter(
-      (e: any): e is InstallRecord =>
-        e && typeof e.name === "string" && typeof e.enabled === "boolean"
-    );
+    // Mirror the loader's tolerance: any {name: string} entry counts, with
+    // enabled !== false treated as enabled — so hand-tolerated records are
+    // never silently dropped when the file is rewritten.
+    return raw
+      .filter((e: any): e is { name: string; enabled?: unknown } =>
+        e && typeof e.name === "string")
+      .map((e) => ({ name: e.name, enabled: e.enabled !== false }));
   } catch {
     return [];
   }
