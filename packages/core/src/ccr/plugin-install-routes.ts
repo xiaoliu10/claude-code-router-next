@@ -156,7 +156,9 @@ export interface PluginMarketRouteDeps {
    *  inject() without a socket). */
   configuredPort?: number;
   /** Test seams. */
-  registryUrl?: string;
+  /** npm registry used by the install lane (defaults to npm's own registry).
+   *  Also serves as the catalog base unless catalogRegistryBase is given. */
+  registry?: string;
   npmTimeoutMs?: number;
   /** Registry base for catalog search (tests stub this). */
   catalogRegistryBase?: string;
@@ -252,7 +254,7 @@ export function registerPluginMarketRoutes(
     }
     try {
       return await buildPluginCatalog(deps.configDir, {
-        registryBase: deps.catalogRegistryBase,
+        registryBase: deps.catalogRegistryBase ?? deps.registry,
         timeoutMs: deps.catalogTimeoutMs,
       });
     } catch (error: any) {
@@ -275,7 +277,7 @@ export function registerPluginMarketRoutes(
         spec: rawSpec as string,
         configDir: deps.configDir,
         force,
-        registry: deps.registryUrl,
+        registry: deps.registry,
         timeoutMs: deps.npmTimeoutMs,
       });
       app.log?.info?.(

@@ -89,6 +89,15 @@ export interface ManagedRuntime {
 - 启动加载：core 按 plugins.json 顺序 `await import(entry)`，失败只告警不炸主服务；`/api/plugins` 返回清单（含 UI 卡地址与 locale 包）。
 - **不捆绑插件**（§7 已确认）：供应商分别构建为可安装包，主包不静态导入、不以依赖或 bundled-plugins 目录夹带。缺包/禁用时报告 plugin missing，禁止携带 marker api_key 出网；保留 Router 与凭证，重新安装后可恢复。
 
+#### 2.2.1 插件市场（一键安装，2026-10 新增）
+
+- **目录来源**：npm registry 搜索 `keywords:ccr-provider-plugin` 与 `keywords:claude-code-router-plugin`（各 size=100），按包名合并去重；只有 package.json 声明 marker keyword 的包才会被展示（搜索接口索引的就是 package.json keywords，路由侧再做一次防御性过滤）。`GET /api/plugins/catalog` 返回 `{ok, plugins:[{name, description, version, installed, installedVersion}], warning?}`；registry 不可达时降级为空列表 + `warning:"registry_unavailable"`，绝不 500、不透传上游错误文本。目录请求有界（默认 30s）。
+- **安装路由**：`POST /api/plugins/install`，body `{name|spec, force?}`。请求名必须匹配 npm 包名白名单（路径/URL/@version 一律 400）；实际安装名只来自校验过的 plugin.json。复用 CLI 的共享安装核心（`@wengine-ai/claude-code-router-shared/plugin-install`）：`npm pack --prefer-offline --ignore-scripts`（30s 上限、一次性 HOME/userconfig/cache，绝不读取用户 ~/.npmrc 凭证）→ 压缩/解压 25MB 与 2000 文件上限 → manifest/入口/卡声明/符号链接校验 → plugins/ 下暂存原子换入 → upsert plugins.json。损坏的 plugins.json 返回 `409 plugins_json_corrupted`（永不静默重写；`{force:true}` 是显式逃生门）。状态码映射：invalid_spec 400、already_installed/plugins_json_corrupted 409、npm_pack_failed/timeout 502、内容问题 422、其他 500 install_failed；npm 内部输出永不进响应体。
+- **本地限定**：两个路由都走 workbuddy 管理路由同款本地 guard（socket 地址是唯一身份；loopback 的 Origin/Host 必须匹配本服务自身 authority，防 DNS rebinding/CSRF），叠加常规 CCR 鉴权管线；远程 bind 下等同拒绝。
+- **UI**：Settings → Providers 在已安装插件卡区之下渲染「可安装插件」区（`utils/plugin-market.ts` 无框架 controller + `PluginMarketArea.tsx`）。未安装的目录项列出 name/version/description + 一键安装按钮；安装中所有按钮禁用；错误只渲染稳定错误码的本地化文案（`sanitizeMarketErrorCode`，原始 npm 输出不进 DOM/日志）。安装成功显示「重启生效」提示，**重启按钮**走既有 `POST /api/restart` 流程（必须用户显式点击，绝不自动重启）。已安装/损坏/禁用条目的恢复提示保持不变。
+- **不热加载**：安装只落盘 + 登记，激活必须重启；`restartRequired` 恒为 true。
+- **私有 registry**：config.json 可设 `CCR_PLUGIN_NPM_REGISTRY`（http(s) URL）把安装源指向私有/离线仓库；该值不以任何形式携带凭证（npm 子进程使用一次性空 userconfig）。未设置时使用 npm 默认 registry。
+
 ### 2.3 UI 卡加载
 
 - core 增加静态端点 `GET /plugins/:name/*`（白名单校验后从插件目录读文件，拒绝路径穿越）。

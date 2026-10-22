@@ -1243,6 +1243,12 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
   registerPluginMarketRoutes(_app, {
     configDir: HOME_DIR,
     configuredPort: Number(config.PORT) || 3456,
+    // Optional install-registry override (private/air-gapped registries and
+    // hermetic evidence runs). Never carries credentials: the npm child runs
+    // with a throwaway userconfig, so this URL must be a plain http(s) URL.
+    registry: typeof config.CCR_PLUGIN_NPM_REGISTRY === "string" && /^https?:\/\//.test(config.CCR_PLUGIN_NPM_REGISTRY)
+      ? config.CCR_PLUGIN_NPM_REGISTRY
+      : undefined,
   });
 
   // Auth remains the normal CCR request pipeline. Only the explicitly declared,

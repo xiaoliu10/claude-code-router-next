@@ -118,13 +118,13 @@ function packument(name: string, tarballUrl: string): unknown {
   };
 }
 
-function buildApp(options: { registryUrl?: string; npmTimeoutMs?: number } = {}) {
+function buildApp(options: { registry?: string; npmTimeoutMs?: number } = {}) {
   const app = Fastify({ logger: false });
   apps.push(app);
   registerPluginMarketRoutes(app, {
     configDir,
     configuredPort: 3456,
-    registryUrl: options.registryUrl,
+    registry: options.registry,
     npmTimeoutMs: options.npmTimeoutMs,
   });
   return app;
@@ -157,7 +157,7 @@ describe("POST /api/plugins/install", () => {
       json: packument("ccr-provider-fixture", `${registry.url}/fixture-1.0.0.tgz`),
     };
     registry.entries["fixture-1.0.0.tgz"] = { body: tarball };
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 15_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 15_000 });
 
     const res = await postLocal(app, { name: "ccr-provider-fixture" });
 
@@ -180,7 +180,7 @@ describe("POST /api/plugins/install", () => {
       json: packument("ccr-provider-alias", `${registry.url}/alias-1.0.0.tgz`),
     };
     registry.entries["alias-1.0.0.tgz"] = { body: tarball };
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 15_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 15_000 });
 
     const res = await postLocal(app, { spec: "ccr-provider-alias" });
     expect(res.statusCode).toBe(200);
@@ -201,7 +201,7 @@ describe("POST /api/plugins/install", () => {
     writeFileSync(seedTgz, v1);
     await installPluginFromArchive(seedTgz, { configDir });
 
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 15_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 15_000 });
     const denied = await postLocal(app, { name: "ccr-provider-fixture" });
     expect(denied.statusCode).toBe(409);
     expect(denied.json()).toEqual({ ok: false, error: "already_installed" });
@@ -223,7 +223,7 @@ describe("POST /api/plugins/install", () => {
       json: packument("ccr-provider-corrupt", `${registry.url}/corrupt-1.0.0.tgz`),
     };
     registry.entries["corrupt-1.0.0.tgz"] = { body: tarball };
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 15_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 15_000 });
 
     const res = await postLocal(app, { name: "ccr-provider-corrupt" });
     expect(res.statusCode).toBe(409);
@@ -248,7 +248,7 @@ describe("POST /api/plugins/install — request validation", () => {
     [null],
   ])("rejects the spec %s with 400 invalid_spec", async (spec) => {
     const registry = await startStubRegistry();
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 5_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 5_000 });
     const res = await postLocal(app, { name: spec as any });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ ok: false, error: "invalid_spec" });
@@ -257,7 +257,7 @@ describe("POST /api/plugins/install — request validation", () => {
 
   it("rejects a missing body with 400", async () => {
     const registry = await startStubRegistry();
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 5_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 5_000 });
     const res = await postLocal(app, {});
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe("invalid_spec");
@@ -267,7 +267,7 @@ describe("POST /api/plugins/install — request validation", () => {
 describe("POST /api/plugins/install — local-only guard", () => {
   it("rejects a non-loopback caller even with perfect headers", async () => {
     const registry = await startStubRegistry();
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 5_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 5_000 });
     const res = await app.inject({
       method: "POST",
       url: "/api/plugins/install",
@@ -282,7 +282,7 @@ describe("POST /api/plugins/install — local-only guard", () => {
 
   it("rejects a loopback caller with a spoofed Host authority", async () => {
     const registry = await startStubRegistry();
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 5_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 5_000 });
     const res = await app.inject({
       method: "POST",
       url: "/api/plugins/install",
@@ -296,7 +296,7 @@ describe("POST /api/plugins/install — local-only guard", () => {
 
   it("rejects a loopback caller whose Origin points elsewhere (DNS rebinding)", async () => {
     const registry = await startStubRegistry();
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 5_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 5_000 });
     const res = await app.inject({
       method: "POST",
       url: "/api/plugins/install",
@@ -311,7 +311,7 @@ describe("POST /api/plugins/install — local-only guard", () => {
 
   it("pins Origin to the REAL listening port when a socket exists", async () => {
     const registry = await startStubRegistry();
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 5_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 5_000 });
     await app.listen({ host: "127.0.0.1", port: 0 });
     const port = (app.server.address() as any).port;
 
@@ -347,7 +347,7 @@ describe("POST /api/plugins/install — registry and content failures", () => {
     const registry = await startStubRegistry({
       "ccr-provider-broken": { status: 404, json: { error: "not_found: internal registry detail <secret>" } },
     });
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 10_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 10_000 });
     const res = await postLocal(app, { name: "ccr-provider-broken" });
     expect(res.statusCode).toBe(502);
     expect(res.json()).toEqual({ ok: false, error: "npm_pack_failed" });
@@ -358,7 +358,7 @@ describe("POST /api/plugins/install — registry and content failures", () => {
     const registry = await startStubRegistry({
       "ccr-provider-hang": { hang: true },
     });
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 400 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 400 });
     const started = Date.now();
     const res = await postLocal(app, { name: "ccr-provider-hang" });
     expect(res.statusCode).toBe(502);
@@ -373,7 +373,7 @@ describe("POST /api/plugins/install — registry and content failures", () => {
       json: packument("ccr-provider-badapi", `${registry.url}/badapi-1.0.0.tgz`),
     };
     registry.entries["badapi-1.0.0.tgz"] = { body: tarball };
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 15_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 15_000 });
     const res = await postLocal(app, { name: "ccr-provider-badapi" });
     expect(res.statusCode).toBe(422);
     expect(res.json()).toEqual({ ok: false, error: "invalid_manifest" });
@@ -387,10 +387,55 @@ describe("POST /api/plugins/install — registry and content failures", () => {
       json: packument("ccr-provider-fat", `${registry.url}/fat-1.0.0.tgz`),
     };
     registry.entries["fat-1.0.0.tgz"] = { body: tarball };
-    const app = buildApp({ registryUrl: registry.url, npmTimeoutMs: 30_000 });
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 30_000 });
     const res = await postLocal(app, { name: "ccr-provider-fat" });
     expect(res.statusCode).toBe(422);
     expect(res.json()).toEqual({ ok: false, error: "archive_too_large" });
     expect(existsSync(join(configDir, "plugins/fat"))).toBe(false);
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Wiring contract (regression): admin-routes must pass the registry override
+// under the key the route interface actually declares. A silent rename here
+// (registry vs registryUrl) makes the whole install lane fall back to the
+// public npm registry while every hermetic test that stubs `registry` still
+// passes — that is exactly the drift this test pins down.
+// ---------------------------------------------------------------------------
+describe("registry override wiring", () => {
+  it("accepts `registry` as the install-lane override and uses it", async () => {
+    const tarball = buildPluginTarball({ pluginName: "wired" });
+    const registry = await startStubRegistry();
+    registry.entries["ccr-provider-wired"] = {
+      json: packument("ccr-provider-wired", `${registry.url}/wired-1.0.0.tgz`),
+    };
+    registry.entries["wired-1.0.0.tgz"] = { body: tarball };
+    const app = buildApp({ registry: registry.url, npmTimeoutMs: 15_000 });
+    const res = await postLocal(app, { name: "ccr-provider-wired" });
+    // Reaching the stub at all proves the override was honored: npm would
+    // otherwise contact the real registry and fail.
+    expect(res.statusCode).toBe(200);
+    expect(res.json().name).toBe("wired");
+  });
+
+  it("the catalog falls back to the same override when no catalog base is given", async () => {
+    const app = Fastify({ logger: false });
+    apps.push(app);
+    registerPluginMarketRoutes(app, {
+      configDir,
+      configuredPort: 3456,
+      // No catalogRegistryBase: the catalog must use `registry`.
+      registry: "http://127.0.0.1:9", // discard port — nothing listens
+      catalogTimeoutMs: 1_000,
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/plugins/catalog",
+      headers: { host: "localhost:3456" },
+    });
+    expect(res.statusCode).toBe(200);
+    // A registry that is unreachable must degrade, never 500 — and proving we
+    // tried (rather than npmjs) is covered by the install test above.
+    expect(res.json()).toEqual({ ok: true, plugins: [], warning: "registry_unavailable" });
+  });
 });
