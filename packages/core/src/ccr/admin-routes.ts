@@ -16,6 +16,7 @@ import { getHealthStore } from "../services/provider-health";
 import { clearProviderHealth } from "./health-reconcile";
 import { reloadProviderRuntime } from "../provider-plugins/host";
 import { describeInstalledPlugins } from "../provider-plugins/loader";
+import { registerPluginMarketRoutes } from "./plugin-install-routes";
 import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
 import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
@@ -1231,6 +1232,17 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
   // Install manifest for the UI: loaded plugins, their cards and locale bundles.
   _app.get("/api/plugins", async () => {
     return { plugins: describeInstalledPlugins(HOME_DIR, server.pluginRegistry) };
+  });
+
+  // One-click install (marketplace) lives in plugin-install-routes.ts: the
+  // same validated install as the CLI's `ccr plugin add` (strict npm-name
+  // allowlist → npm pack --ignore-scripts, 30s bound, throwaway credential
+  // env → archive caps → payload validation → staged atomic swap → upsert
+  // plugins.json), behind a local-only guard. Nothing hot-loads: the caller
+  // restarts via the existing POST /api/restart flow.
+  registerPluginMarketRoutes(_app, {
+    configDir: HOME_DIR,
+    configuredPort: Number(config.PORT) || 3456,
   });
 
   // Auth remains the normal CCR request pipeline. Only the explicitly declared,

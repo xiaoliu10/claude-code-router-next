@@ -20,7 +20,7 @@
  * Credential files ($CCR_CONFIG_DIR/<name>-credentials.json etc.) live
  * OUTSIDE plugins/ and are never read, printed or removed here.
  */
-import { execFileSync } from "child_process";
+import { execFile, execFileSync } from "child_process";
 import {
   cpSync,
   createReadStream,
@@ -652,8 +652,12 @@ function isolatedNpmEnv(homeDir: string, cacheDir: string): NodeJS.ProcessEnv {
  *  and return the packed archive path. Never uses `npm install` on the
  *  target: a pack is a pure download of the published tarball with no install
  *  scripts. npm stderr/stdout beyond the JSON line is discarded so registry
- *  URLs and config hints can never surface to callers. */
-export function npmPackPlugin(spec: string, destDir: string, options: NpmPackOptions = {}): string {
+ *  URLs and config hints can never surface to callers.
+ *
+ *  ASYNC on purpose: the host route calls this from the Fastify event loop,
+ *  and a synchronous 30s npm wait would freeze the whole CCR service (and
+ *  deadlock anything trying to serve the npm child from the same process). */
+export async function npmPackPlugin(spec: string, destDir: string, options: NpmPackOptions = {}): Promise<string> {
   assertSafeNpmSpec(spec);
   mkdirSync(destDir, { recursive: true });
   const homeDir = options.homeDir ?? join(destDir, "npm-home");
@@ -672,12 +676,19 @@ export function npmPackPlugin(spec: string, destDir: string, options: NpmPackOpt
   args.push("--pack-destination", destDir, spec);
   let stdout: string;
   try {
-    stdout = execFileSync("npm", args, {
-      cwd: destDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: options.timeoutMs ?? PLUGIN_NPM_PACK_TIMEOUT_MS,
-      env: isolatedNpmEnv(homeDir, cacheDir),
+    stdout = await new Promise<string>((resolve, reject) => {
+      const child = execFile("npm", args, {
+        cwd: destDir,
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: options.timeoutMs ?? PLUGIN_NPM_PACK_TIMEOUT_MS,
+        env: isolatedNpmEnv(homeDir, cacheDir),
+      }, (error: any, standardOutput: any) => {
+        if (error) reject(error);
+        else resolve(String(standardOutput ?? ""));
+      });
+      // npm never reads stdin; a closed stdin also makes prompts impossible.
+      child.stdin?.end();
     });
   } catch (e: any) {
     // Never surface npm stderr: it can include registry URLs, config paths or
@@ -835,7 +846,7 @@ export async function installPluginFromNpm(options: InstallFromNpmOptions): Prom
   const temp = options.tempRoot ?? mkdtempSync(join(tmpdir(), "ccr-plugin-add-"));
   const ownsTemp = options.tempRoot === undefined;
   try {
-    const archive = npmPackPlugin(options.spec, join(temp, "pack"), {
+    const archive = await npmPackPlugin(options.spec, join(temp, "pack"), {
       registry: options.registry,
       cacheDir: options.cacheDir ?? join(temp, "npm-cache"),
       homeDir: options.homeDir ?? join(temp, "npm-home"),
