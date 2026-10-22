@@ -124,12 +124,12 @@ Options:
   --yes     Skip the confirmation prompt
 
 Examples:
-  ccr plugin add @wengine-ai/ccr-provider-workbuddy
+  ccr plugin add @your-scope/ccr-provider-your-plugin
   ccr plugin add /path/to/plugin-package          # package root with dist/
   ccr plugin add /path/to/ccr-provider-x-1.0.0.tgz
   ccr plugin list
-  ccr plugin disable workbuddy
-  ccr plugin remove workbuddy --yes
+  ccr plugin disable my-plugin
+  ccr plugin remove my-plugin --yes
 `;
 }
 
