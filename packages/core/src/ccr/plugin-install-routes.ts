@@ -18,11 +18,136 @@
  * credential material.
  */
 import type { FastifyInstance } from "fastify";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
+  NPM_SPEC_PATTERN,
   PluginInstallError,
   installPluginFromNpm,
+  readPluginRecords,
   type PluginInstallErrorCode,
 } from "@wengine-ai/claude-code-router-shared";
+
+/** npm search marker keywords: a package is only OFFERED when its
+ *  package.json declares one of these (the search endpoint indexes exactly
+ *  those package.json keywords). */
+export const PLUGIN_MARKER_KEYWORDS = [
+  "ccr-provider-plugin",
+  "claude-code-router-plugin",
+] as const;
+
+/** Default registry searched by GET /api/plugins/catalog. */
+export const PLUGIN_CATALOG_REGISTRY = "https://registry.npmjs.org";
+
+export interface CatalogEntry {
+  name: string;
+  description: string;
+  version: string;
+  installed: boolean;
+  installedVersion: string | null;
+}
+
+export interface CatalogResult {
+  ok: true;
+  plugins: CatalogEntry[];
+  /** Stable code when the registry could not be reached at all. */
+  warning?: "registry_unavailable";
+}
+
+interface NpmSearchObject {
+  package?: {
+    name?: unknown;
+    version?: unknown;
+    description?: unknown;
+    keywords?: unknown;
+  };
+}
+
+/** Query the npm search endpoint once and return the raw objects. Throws on
+ *  any failure; the route turns that into the stable warning. */
+async function searchNpm(
+  base: string,
+  keyword: string,
+  timeoutMs: number
+): Promise<NpmSearchObject[]> {
+  const url = `${base}/-/v1/search?text=${encodeURIComponent(`keywords:${keyword}`)}&size=100`;
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error(`registry_status_${response.status}`);
+  const body: any = await response.json();
+  return Array.isArray(body?.objects) ? body.objects : [];
+}
+
+/** Build the marketplace catalog: npm registry search by marker keyword,
+ *  merged/deduped by package name, annotated with installed state. A total
+ *  registry outage degrades to an empty list + warning — never a 500 and
+ *  never raw upstream error text. */
+export async function buildPluginCatalog(
+  configDir: string,
+  options: { registryBase?: string; timeoutMs?: number } = {}
+): Promise<CatalogResult> {
+  const base = (options.registryBase ?? PLUGIN_CATALOG_REGISTRY).replace(/\/$/, "");
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const searches = await Promise.allSettled(
+    PLUGIN_MARKER_KEYWORDS.map((keyword) => searchNpm(base, keyword, timeoutMs))
+  );
+  const byName = new Map<string, { name: string; description: string; version: string }>();
+  let anySettled = false;
+  for (const search of searches) {
+    if (search.status !== "fulfilled") continue;
+    anySettled = true;
+    for (const object of search.value) {
+      const pkg = object?.package;
+      const name = typeof pkg?.name === "string" ? pkg.name : "";
+      if (!name || !NPM_SPEC_PATTERN.test(name)) continue;
+      const keywords = Array.isArray(pkg?.keywords)
+        ? pkg.keywords.filter((k): k is string => typeof k === "string")
+        : [];
+      // Defense in depth: the search index should only return keyword
+      // matches, but never offer a package the marker keyword does not
+      // vouch for.
+      if (!keywords.some((k) => (PLUGIN_MARKER_KEYWORDS as readonly string[]).includes(k))) continue;
+      const version = typeof pkg?.version === "string" ? pkg.version : "";
+      if (!byName.has(name)) {
+        byName.set(name, {
+          name,
+          version,
+          description: typeof pkg?.description === "string" ? pkg.description : "",
+        });
+      }
+    }
+  }
+  if (!anySettled) {
+    return { ok: true, plugins: [], warning: "registry_unavailable" };
+  }
+
+  const records = readPluginRecords(configDir);
+  const recordByName = new Map(records.map((r) => [r.name, r]));
+  // Installed manifest version comes from the plugin payload, not npm.
+  const installedVersion = (name: string): string | null => {
+    try {
+      const raw = JSON.parse(
+        readFileSync(join(configDir, "plugins", name, "plugin.json"), "utf8")
+      );
+      return typeof raw?.version === "string" ? raw.version : null;
+    } catch {
+      return null;
+    }
+  };
+  const plugins: CatalogEntry[] = [...byName.values()]
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((entry) => {
+      const installed = recordByName.has(entry.name) || existsSync(join(configDir, "plugins", entry.name));
+      return {
+        ...entry,
+        installed,
+        installedVersion: installed ? installedVersion(entry.name) : null,
+      };
+    });
+  return { ok: true, plugins };
+}
 
 export interface PluginMarketRouteDeps {
   /** $CCR_CONFIG_DIR (the plugins/ root the loader reads). */
@@ -33,6 +158,10 @@ export interface PluginMarketRouteDeps {
   /** Test seams. */
   registryUrl?: string;
   npmTimeoutMs?: number;
+  /** Registry base for catalog search (tests stub this). */
+  catalogRegistryBase?: string;
+  /** Bounded catalog network wait (tests use small values). */
+  catalogTimeoutMs?: number;
 }
 
 /** HTTP status for a stable install error code. Only the contract-pinned
@@ -116,6 +245,23 @@ export function registerPluginMarketRoutes(
 
   const deny = (reply: any, status: number, code: string) =>
     reply.status(status).send({ ok: false, error: code });
+
+  app.get("/api/plugins/catalog", async (req: any, reply: any) => {
+    if (!assertLocalMarketplaceRequest(req, app, configuredPort)) {
+      return deny(reply, 403, "local_only");
+    }
+    try {
+      return await buildPluginCatalog(deps.configDir, {
+        registryBase: deps.catalogRegistryBase,
+        timeoutMs: deps.catalogTimeoutMs,
+      });
+    } catch (error: any) {
+      // buildPluginCatalog already tolerates registry failures; this is the
+      // belt-and-braces branch so no upstream detail can ever leak as a 500.
+      app.log?.warn?.(`plugin catalog failed: ${error?.code ?? error?.name ?? "error"}`);
+      return { ok: true, plugins: [], warning: "registry_unavailable" };
+    }
+  });
 
   app.post("/api/plugins/install", async (req: any, reply: any) => {
     if (!assertLocalMarketplaceRequest(req, app, configuredPort)) {
