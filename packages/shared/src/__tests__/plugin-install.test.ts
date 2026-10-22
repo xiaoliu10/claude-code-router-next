@@ -109,16 +109,20 @@ function ustar(entries: Array<{ name: string; data?: Buffer; link?: string; type
       n = n.slice(cut + 1);
     }
     pad(n, 100).copy(h, 0);
+    pad("0000644\0", 8).copy(h, 100); // mode
+    pad("0000000\0", 8).copy(h, 108); // uid
+    pad("0000000\0", 8).copy(h, 116); // gid
     pad((size & 0o7777777).toString(8).padStart(11, "0") + "\0", 12).copy(h, 124);
-    pad("0000000\0", 8).copy(h, 108); // mtime
-    pad("        ", 8).copy(h, 136); // checksum placeholder (spaces)
+    pad("00000000000\0", 12).copy(h, 136); // mtime
+    pad("        ", 8).copy(h, 148); // checksum placeholder (spaces)
     h.write(type, 156, 1, "ascii");
     pad(link, 100).copy(h, 157);
     pad("ustar\0", 6).copy(h, 257);
     pad("00", 2).copy(h, 263);
     pad(prefix, 155).copy(h, 345);
+    // Checksum covers the whole block with the checksum field read as spaces.
     let sum = 0;
-    for (const byte of h) sum += byte;
+    for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 0x20 : h[i];
     pad(sum.toString(8).padStart(6, "0") + "\0 ", 8).copy(h, 148);
     return h;
   };

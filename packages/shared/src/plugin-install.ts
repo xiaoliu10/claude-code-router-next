@@ -37,7 +37,7 @@ import {
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
-import { basename, join } from "path";
+import { basename, dirname, join, resolve, sep } from "path";
 import { createGunzip } from "zlib";
 
 /** Keep in sync with packages/core/src/provider-plugins/types.ts: the loader
@@ -358,6 +358,8 @@ interface RawArchiveMember {
   name: string;
   size: number;
   type: string;
+  /** Symlink/hardlink destination when the archive declares one. */
+  linkTarget?: string;
 }
 
 const BLOCK = 512;
@@ -376,6 +378,40 @@ function readOctal(buf: Buffer, offset: number, length: number): number {
   if (!s) return 0;
   const n = parseInt(s.trim(), 8);
   return Number.isFinite(n) ? n : 0;
+}
+
+/** The stored header checksum is the sum of the header's bytes with the
+ *  checksum field itself read as spaces. Real extractors use it to decide
+ *  whether a block is a header at all, so a validator that ignores it can
+ *  treat arbitrary payload bytes (non-zero padding left over from a PAX size
+ *  mismatch) as a member the extractor never sees. Rejecting a mismatch keeps
+ *  both sides aligned. */
+function assertValidHeaderChecksum(header: Buffer, name: string): void {
+  // A header whose checksum field is not octal digits is not a header at all:
+  // real extractors reject it too, so we must not silently parse it as one.
+  const checksumField = header.subarray(148, 156);
+  const digits = cString(checksumField, 0, 8).replace(/[ \0]/g, "");
+  if (!/^[0-7]+$/.test(digits)) {
+    throw new PluginInstallError(
+      `plugin archive has a corrupt tar header${name ? ` (near "${name}")` : ""}`,
+      "unsafe_archive_member"
+    );
+  }
+  const stored = parseInt(digits, 8);
+  if (stored === 0) return; // legacy archive with no checksum: nothing to compare
+  let unsigned = 0;
+  let signed = 0;
+  for (let i = 0; i < BLOCK; i++) {
+    const b = i >= 148 && i < 156 ? 0x20 : header[i];
+    unsigned += b;
+    signed += b > 127 ? b - 256 : b;
+  }
+  if (stored !== unsigned && stored !== signed) {
+    throw new PluginInstallError(
+      `plugin archive has a corrupt tar header${name ? ` (near "${name}")` : ""}`,
+      "unsafe_archive_member"
+    );
+  }
 }
 
 function cString(buf: Buffer, offset: number, length: number): string {
@@ -407,21 +443,64 @@ function parsePaxRecords(data: Buffer): Record<string, string> {
   return out;
 }
 
-/** Walk the 512-byte header blocks of a gzipped tar archive and list every
- *  member with its on-disk size and type flag. Supports ustar prefixes plus
- *  PAX ('x'/'g') and GNU ('L'/'K') long-name records emitted by bsdtar/GNU
- *  tar/npm. The uncompressed stream is bounded while it is read, so a gzip
- *  bomb trips the size cap instead of exhausting memory. A truncated tail
- *  (header without its full data, no terminator) is refused rather than
- *  silently under-counted. */
-async function listGzipTarMembers(archive: string): Promise<RawArchiveMember[]> {
-  const members: RawArchiveMember[] = [];
-  let carry = Buffer.alloc(0);
+/** PAX override fields that change how the FOLLOWING member must be parsed.
+ *  Real extractors (GNU tar, bsdtar) apply these; if the validator ignores
+ *  them the two sides walk two different archives. */
+interface PaxOverrides {
+  path?: string;
+  size?: number;
+  linkpath?: string;
+}
+
+function applyPaxOverrides(pax: Record<string, string>, target: PaxOverrides): void {
+  if (pax.path !== undefined) target.path = pax.path;
+  if (pax.linkpath !== undefined) target.linkpath = pax.linkpath;
+  if (pax.size !== undefined) {
+    if (!/^\d+$/.test(pax.size)) {
+      throw new PluginInstallError(
+        `plugin archive has a malformed PAX size record "${pax.size}"`,
+        "unsafe_archive_member"
+      );
+    }
+    const size = Number(pax.size);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new PluginInstallError(
+        `plugin archive has an out-of-range PAX size record "${pax.size}"`,
+        "unsafe_archive_member"
+      );
+    }
+    target.size = size;
+  }
+}
+
+/** Read and validate the whole archive in one pass, returning the resolved
+ *  member list. This is the ONLY place that knows how the archive is laid
+ *  out; extraction reuses these exact offsets, so the validated byte ranges
+ *  and the written byte ranges can never disagree.
+ *
+ *  Extension records ('x'/'g' PAX, 'L'/'K' GNU) are honoured the way a real
+ *  extractor honours them: 'x'/'L'/'K' apply to exactly the next member and
+ *  are then cleared, 'g' sets defaults for every following member. The
+ *  uncompressed stream is bounded while it is read, so a gzip bomb trips the
+ *  size cap instead of exhausting memory, and a truncated tail (a live header
+ *  whose data never arrived) is refused rather than silently under-counted. */
+interface ResolvedArchiveMember extends RawArchiveMember {
+  /** Byte offset of the member's data inside the uncompressed stream. */
+  dataOffset: number;
+}
+
+async function readArchiveMembers(archive: string): Promise<ResolvedArchiveMember[]> {
+  const members: ResolvedArchiveMember[] = [];
+  let carry: Buffer = Buffer.alloc(0);
   let uncompressedBytes = 0;
-  let globalPaxPath: string | null = null;
-  let pendingName: string | null = null;
+  // Offsets are absolute within the decompressed stream, while `carry` shifts.
+  let absoluteBase = 0;
+  const globalPax: PaxOverrides = {};
+  let pendingPax: PaxOverrides = {};
+  let pendingGnuName: string | null = null;
 
   let fileCount = 0;
+  let declaredBytes = 0;
   const consume = (buf: Buffer, allowPartialTail: boolean): { rest: Buffer; ended: boolean } => {
     let offset = 0;
     while (true) {
@@ -430,50 +509,94 @@ async function listGzipTarMembers(archive: string): Promise<RawArchiveMember[]> 
       // Two zero blocks terminate an archive; an all-zero header means no
       // more entries.
       if (header.every((b) => b === 0)) return { rest: Buffer.alloc(0), ended: true };
-      let name = cString(header, 0, 100);
-      const size = readOctal(header, 124, 12);
+
       const typeFlag = String.fromCharCode(header[156] ?? 0x30);
       const magic = cString(header, 257, 6);
-      const prefix = cString(header, 345, 155);
-      if (magic.startsWith("ustar") && prefix) name = `${prefix}/${name}`;
-      const dataBlocks = Math.ceil(size / BLOCK);
+      const prefix = magic.startsWith("ustar") ? cString(header, 345, 155) : "";
+      const rawName = cString(header, 0, 100);
+
+      // Decide whether this block really is a header before trusting any of
+      // its fields. A block that carries neither a tar magic nor a plausible
+      // name/size is payload padding, and the archive ends there - the same
+      // judgement a real extractor makes. Anything that DOES look like a
+      // header must then pass its checksum, so a smuggled block cannot pose
+      // as a member the extractor ignores (or vice versa).
+      const magicOk = magic.startsWith("ustar");
+      const nameOk = rawName.length > 0 && /^[ -~]+$/.test(rawName);
+      const sizeOk = /^[0-7]+$/.test(cString(header, 124, 12).replace(/[ \0]/g, "") || "0");
+      if (!magicOk && !(nameOk && sizeOk)) {
+        // Not a header. If the previous member already declared more data than
+        // we can see, this is a truncated payload rather than a clean end.
+        if (declaredBytes > absoluteBase + buf.length) {
+          throw new PluginInstallError(
+            "plugin archive is truncated (member data missing)",
+            "extract_failed"
+          );
+        }
+        return { rest: Buffer.alloc(0), ended: true };
+      }
+      assertValidHeaderChecksum(header, prefix ? `${prefix}/${rawName}` : rawName);
+      const octalSize = readOctal(header, 124, 12);
+
+      // 'g' defaults apply to every following member; a per-member 'x' record
+      // wins over them (POSIX: the extended header overrides the standard one).
+      const effectiveSize = pendingPax.size ?? octalSize;
+      // Cap the declared payload before trusting the layout: a single member
+      // that declares more than the whole budget is a bomb regardless of what
+      // the following blocks look like.
+      declaredBytes += effectiveSize;
+      if (declaredBytes > PLUGIN_ARCHIVE_MAX_BYTES) {
+        throw new PluginInstallError(
+          `plugin payload exceeds ${PLUGIN_ARCHIVE_MAX_BYTES} bytes uncompressed`,
+          "archive_too_large"
+        );
+      }
+      const dataBlocks = Math.ceil(effectiveSize / BLOCK);
       const need = BLOCK + dataBlocks * BLOCK;
       if (buf.length - offset < need) {
         if (!allowPartialTail) {
-          // The stream ended with a live header whose data never arrived.
           throw new PluginInstallError(
-            `plugin archive is truncated (member "${name}" data missing)`,
+            `plugin archive is truncated (member data missing)`,
             "extract_failed"
           );
         }
         if (offset === 0) break;
-        // Earlier entries were already emitted from this same buffer; keep the
-        // unprocessed tail only when it starts at the incomplete header.
+        // Keep the unprocessed tail (it starts at this incomplete header).
         break;
       }
-      const dataStart = offset + BLOCK;
-      const data = buf.subarray(dataStart, dataStart + size);
-      offset = dataStart + dataBlocks * BLOCK;
 
+      const headerStart = absoluteBase + offset;
+      const data = buf.subarray(offset + BLOCK, offset + BLOCK + effectiveSize);
+      offset += need;
+
+      // Extension records carry metadata only; they are never materialised.
       if (typeFlag === "x" || typeFlag === "g") {
-        const pax = parsePaxRecords(data);
-        if (typeFlag === "g") globalPaxPath = pax.path ?? globalPaxPath;
-        else if (pax.path) pendingName = pax.path;
+        applyPaxOverrides(parsePaxRecords(data), typeFlag === "g" ? globalPax : pendingPax);
         continue;
       }
       if (typeFlag === "L") {
-        pendingName = cString(data, 0, data.length);
+        pendingGnuName = cString(data, 0, data.length);
         continue;
       }
       if (typeFlag === "K") continue;
 
-      if (pendingName) {
-        name = pendingName;
-        pendingName = null;
-      } else if (!name && globalPaxPath) {
-        name = globalPaxPath;
-      }
-      members.push({ name: name.replace(/\/$/, ""), size, type: typeFlag });
+      // Long-name extensions (GNU 'L', PAX 'x' path) override the ustar name.
+      let name =
+        pendingGnuName ??
+        pendingPax.path ??
+        globalPax.path ??
+        (prefix ? `${prefix}/${rawName}` : rawName);
+      const linkTarget = pendingPax.linkpath ?? globalPax.linkpath;
+      pendingGnuName = null;
+      pendingPax = {};
+
+      members.push({
+        name: name.replace(/\/$/, ""),
+        size: effectiveSize,
+        type: typeFlag,
+        linkTarget,
+        dataOffset: headerStart + BLOCK,
+      });
       if (typeFlag === "0" || typeFlag === "\0" || typeFlag === "7") fileCount += 1;
       if (fileCount > PLUGIN_ARCHIVE_MAX_FILES) {
         throw new PluginInstallError(
@@ -482,7 +605,7 @@ async function listGzipTarMembers(archive: string): Promise<RawArchiveMember[]> 
         );
       }
     }
-    return { rest: buf.subarray(offset), ended: false };
+    return { rest: buf.subarray(offset) as Buffer, ended: false };
   };
 
   const stream = createReadStream(archive).pipe(createGunzip());
@@ -496,9 +619,11 @@ async function listGzipTarMembers(archive: string): Promise<RawArchiveMember[]> 
           "archive_too_large"
         );
       }
-      carry = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+      carry = carry.length ? Buffer.concat([carry, chunk]) : Buffer.from(chunk);
+      const before = carry.length;
       const r = consume(carry, true);
-      carry = r.rest;
+      absoluteBase += before - r.rest.length;
+      carry = r.rest as Buffer;
       if (r.ended) return members;
     }
   } catch (e) {
@@ -540,7 +665,12 @@ export async function assertArchiveWithinCaps(archive: string): Promise<void> {
       "archive_too_large"
     );
   }
-  const members = await listGzipTarMembers(archive);
+  assertMembersWithinCaps(await readArchiveMembers(archive));
+}
+
+/** Caps + member safety for an already-resolved archive. Shared by the
+ *  validate-only entry point and the extractor so both judge the same list. */
+function assertMembersWithinCaps(members: ResolvedArchiveMember[]): void {
   let total = 0;
   let files = 0;
   for (const member of members) {
@@ -551,7 +681,7 @@ export async function assertArchiveWithinCaps(archive: string): Promise<void> {
         "unsafe_archive_member"
       );
     }
-    if ("346".includes(member.type)) {
+    if ("346".includes(member.type) || member.type === "S" || member.type === "V") {
       throw new PluginInstallError(
         `refusing to extract special archive member "${member.name}"`,
         "unsafe_archive_member"
@@ -576,21 +706,85 @@ export async function assertArchiveWithinCaps(archive: string): Promise<void> {
   }
 }
 
-/** Extract a plugin tarball with the system tar (pure extract, no scripts).
+/** Extract a plugin tarball.
+ *
+ *  The archive is re-parsed with the same parser used for validation and the
+ *  validated byte ranges are written directly, instead of shelling out to the
+ *  system tar. That removes the class of bug where the validator and the
+ *  extractor disagree about the archive layout (a PAX `size` record, an
+ *  unusual extension header, a different tar implementation) and a member the
+ *  validator never saw gets written anyway.
+ *
  *  Returns the extracted package root ("package" for npm artifacts). */
 export async function extractPluginArchive(archive: string, destDir: string): Promise<string> {
   mkdirSync(destDir, { recursive: true });
+  const members = await readArchiveMembers(archive);
+  // Re-check on the very list we are about to write: never trust an earlier
+  // validation pass to describe this archive.
+  assertMembersWithinCaps(members);
+
+  const root = resolve(destDir);
+  const ensureInside = (target: string): string => {
+    const full = resolve(target);
+    if (full !== root && !full.startsWith(root + sep)) {
+      throw new PluginInstallError(
+        `refusing to extract "${target}" outside the target directory`,
+        "unsafe_archive_member"
+      );
+    }
+    return full;
+  };
+
+  const stream = createReadStream(archive).pipe(createGunzip());
+  const chunks: Uint8Array[] = [];
   try {
-    execFileSync("tar", ["-xzf", archive, "-C", destDir], {
-      stdio: "pipe",
-      timeout: 60_000,
-    });
-  } catch (e: any) {
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      chunks.push(chunk);
+      if (chunks.reduce((n, c) => n + c.length, 0) > PLUGIN_ARCHIVE_MAX_BYTES) {
+        stream.destroy();
+        throw new PluginInstallError(
+          `plugin payload exceeds ${PLUGIN_ARCHIVE_MAX_BYTES} bytes uncompressed`,
+          "archive_too_large"
+        );
+      }
+    }
+  } catch (e) {
+    if (e instanceof PluginInstallError) throw e;
     throw new PluginInstallError(
-      `failed to extract ${basename(archive)}: ${e.message}`,
+      `failed to extract ${basename(archive)}: ${(e as Error)?.message ?? e}`,
       "extract_failed"
     );
   }
+  const raw = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+
+  for (const member of members) {
+    const full = ensureInside(join(destDir, member.name));
+    if (member.type === "5") {
+      mkdirSync(full, { recursive: true });
+      continue;
+    }
+    if (member.type !== "0" && member.type !== "\0" && member.type !== "7") {
+      // Links/specials were already rejected; anything else is metadata we
+      // deliberately do not materialise.
+      continue;
+    }
+    if (!member.name) {
+      throw new PluginInstallError(
+        "refusing to extract archive member with an empty name",
+        "unsafe_archive_member"
+      );
+    }
+    const end = member.dataOffset + member.size;
+    if (end > raw.length) {
+      throw new PluginInstallError(
+        `plugin archive is truncated (member "${member.name}" data missing)`,
+        "extract_failed"
+      );
+    }
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, raw.subarray(member.dataOffset, end), { mode: 0o644 });
+  }
+
   // Post-extract safety: refuse any symlinked member so nothing in the
   // extracted tree can point outside the extraction root.
   assertNoSymlinks(destDir);
