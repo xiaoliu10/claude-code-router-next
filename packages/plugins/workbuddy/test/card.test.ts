@@ -51,7 +51,14 @@ class Element {
 }
 const tick = async () => { for (let i = 0; i < 15; ++i) await Promise.resolve(); };
 const cleanups: Array<() => void> = [];
-afterEach(() => { cleanups.splice(0).forEach(f => f()); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => {
+  cleanups.splice(0).forEach(f => f());
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  // Node ships a real (session-persisting) sessionStorage; the card caches
+  // quota there, so each test starts from a fresh tab equivalent.
+  (globalThis as any).sessionStorage?.clear?.();
+});
 
 const siteStatus = (extra: Record<string, any> = {}) => ({
   status: "connected", providerName: "workbuddy", activeUid: "u-1",
@@ -132,6 +139,9 @@ describe("self-contained WorkBuddy plugin card", () => {
     await tick();
     expect(h.statusReads()).toBe(1);
     expect(h.callApi.mock.calls.every(([path]) => path !== "/sync" && !String(path).startsWith("/login"))).toBe(true);
+    // Quota auto-reads once for connected accounts after the status lands.
+    const usageCalls = h.callApi.mock.calls.filter(([path]) => path === "/usage");
+    expect(usageCalls).toEqual([["/usage", { method: "POST", body: JSON.stringify({ site: "workbuddy", uid: "uid-123456789" }), timeoutMs: 30_000 }]]);
     expect(h.host.card("workbuddy")).toBeTruthy();
     expect(h.host.card("workbuddy-ai")).toBeTruthy();
     expect(h.host.text()).toContain(CN);
@@ -272,6 +282,41 @@ describe("self-contained WorkBuddy plugin card", () => {
     failing.host.card("workbuddy").click(en["credits"].action);
     await tick();
     expect(failing.host.text()).not.toContain("quota");
+  });
+
+  it("auto-reads quota once per mount without touching the busy mutex; failures stay silent", async () => {
+    const failing = harness({ "/usage": new Error("quota") });
+    await tick();
+    // Failed auto-reads leave the line hidden (no fabricated failure text)
+    // and never acquire the shared management mutex or the busy signal.
+    expect(failing.callApi.mock.calls.filter(([path]) => path === "/usage").length).toBe(1);
+    expect(failing.host.text()).not.toContain("quota");
+    expect(failing.onBusy).not.toHaveBeenCalled();
+    expect(failing.lock).toBe(false);
+  });
+
+  it("a fresh session cache seeds quota and skips the auto-read; the button still refreshes", async () => {
+    const store = {
+      savedAt: Date.now(),
+      entries: { workbuddy: { "uid-123456789": { value: { plan: "Pro", used: 3, limit: 100, unit: "credits" }, at: Date.now() } } },
+    };
+    vi.stubGlobal("sessionStorage", {
+      getItem: (k: string) => (k === "wb-usage-cache-v1" ? JSON.stringify(store) : null),
+      setItem: () => {},
+    });
+    try {
+      const h = harness({ "/usage": { usage: { plan: "Max", used: 9, limit: 90, unit: "credits" } } });
+      await tick();
+      // Cache hit: no /usage call on mount, cached numbers rendered.
+      expect(h.callApi.mock.calls.filter(([path]) => path === "/usage").length).toBe(0);
+      expect(h.host.text()).toContain(en["credits"].line.replace("{{plan}}", "Pro").replace("{{used}}", "3").replace("{{limit}}", "100"));
+      // Explicit click still refreshes through the API.
+      h.host.card("workbuddy").click(en["credits"].action);
+      await tick();
+      expect(h.host.text()).toContain(en["credits"].line.replace("{{plan}}", "Max").replace("{{used}}", "9").replace("{{limit}}", "90"));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("browser authorization runs the sequential login helper and shows the pending link; cancel invalidates the job", async () => {

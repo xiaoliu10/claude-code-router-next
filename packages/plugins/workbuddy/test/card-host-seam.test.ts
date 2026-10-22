@@ -144,7 +144,7 @@ const cardEntry = () => ({
   cardUrl: "/plugins/workbuddy/card.js", locales: workbuddyLocales,
 });
 
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); (globalThis as any).sessionStorage?.clear?.(); });
 
 describe("real host controller × real WorkBuddy card seam", () => {
   it("mounts the card through the bridge; disabled transitions update the DOM in place without remount or release", async () => {
@@ -154,7 +154,7 @@ describe("real host controller × real WorkBuddy card seam", () => {
     expect(seam.fetches).toEqual(["/plugins/workbuddy/card.js"]);
     expect(seam.host.children).toHaveLength(1);
     const cardEl = seam.host.children[0];
-    expect(seam.calls).toEqual(["/status"]);
+    expect(seam.calls).toEqual(["/status", "/usage"]); // auto quota read for the connected CN account
     expect(cardEl.card("workbuddy").button(en.sync).disabled).toBe(false);
 
     seam.disabled.value = true;
@@ -162,7 +162,7 @@ describe("real host controller × real WorkBuddy card seam", () => {
     expect(cardEl.card("workbuddy").button(en.sync).disabled).toBe(true);
     expect(cardEl.card("workbuddy").button(en.disconnect).disabled).toBe(true);
     expect(cardEl.text()).toContain(en.other_edit);
-    expect(seam.calls).toEqual(["/status"]); // no remount status read, nothing cancelled
+    expect(seam.calls).toEqual(["/status", "/usage"]); // no remount, no remount status read, nothing cancelled
     expect(seam.releases).toBe(0);
     expect(seam.imports).toBe(1);
 
@@ -250,9 +250,10 @@ describe("real host controller × real WorkBuddy card seam", () => {
     await seam.controller.sync([cardEntry()], "en", seam.host);
     await tick();
     expect(seam.imports).toBe(1);
-    // The card issued its initial status read through the bridge with the
-    // plugin name attached (see callPluginApi in seamHarness).
-    expect(seam.calls).toEqual(["/status"]);
+    // The card issued its initial status read plus the auto quota read for the
+    // connected CN account, both through the bridge with the plugin name
+    // attached (see callPluginApi in seamHarness).
+    expect(seam.calls).toEqual(["/status", "/usage"]);
     expect(seam.blobs.length).toBe(1);
     seam.controller.dispose();
     expect(seam.revoked).toEqual(seam.blobs);

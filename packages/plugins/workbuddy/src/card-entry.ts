@@ -49,6 +49,34 @@ const FALLBACKS: Record<string, { en: string; zh: string }> = {
 
 const mounted = new WeakMap<HTMLElement, () => void>();
 
+// ---- session quota cache ---------------------------------------------------
+// Per-tab (sessionStorage) cache of the last quota read per account, with a
+// TTL. The card remounts on every page visit; the cache is what makes the
+// auto-read "once" instead of "once per render" and keeps tab switches free.
+// sessionStorage may be absent (tests, exotic embeds): the cache then simply
+// stays empty and every mount auto-reads — same as a first visit.
+const USAGE_CACHE_KEY = "wb-usage-cache-v1";
+const USAGE_CACHE_TTL_MS = 10 * 60_000;
+interface CachedUsage { value: WorkBuddyUsage | null; at: number }
+interface UsageCacheShape { savedAt: number; entries: Partial<Record<WorkBuddyKind, Record<string, CachedUsage>>> }
+
+function readUsageStore(): UsageCacheShape {
+  try {
+    const raw = (globalThis as any).sessionStorage?.getItem(USAGE_CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.entries && typeof parsed.entries === "object") {
+        return parsed as UsageCacheShape;
+      }
+    }
+  } catch { /* unavailable or corrupt */ }
+  return { savedAt: 0, entries: {} };
+}
+
+function writeUsageStore(store: UsageCacheShape): void {
+  try { (globalThis as any).sessionStorage?.setItem(USAGE_CACHE_KEY, JSON.stringify(store)); } catch { /* unavailable */ }
+}
+
 export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   unmount(el);
   const locale = props.locale.startsWith("zh") ? "zh" : "en";
@@ -82,6 +110,17 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   let cancelling = false;
   let loginSession: ReturnType<typeof createWorkBuddyLogin> | null = null;
   const usage: Partial<Record<WorkBuddyKind, Record<string, WorkBuddyUsage | null>>> = {};
+  const usageStore = readUsageStore();
+  const freshUsage = (site: WorkBuddyKind, uid: string): WorkBuddyUsage | null | undefined => {
+    const hit = usageStore.entries[site]?.[uid];
+    if (!hit || Date.now() - hit.at > USAGE_CACHE_TTL_MS) return undefined;
+    return hit.value;
+  };
+  const rememberUsage = (site: WorkBuddyKind, uid: string, value: WorkBuddyUsage | null): void => {
+    usageStore.savedAt = Date.now();
+    usageStore.entries[site] = { ...(usageStore.entries[site] || {}), [uid]: { value, at: usageStore.savedAt } };
+    writeUsageStore(usageStore);
+  };
   let toast: string | null = null;
   let release: (() => void) | null = null;
   let unsubscribeHost: (() => void) | null = null;
@@ -223,7 +262,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     try {
       const payload = await post<any>("/usage", { site, uid });
       if (alive && generation === id) {
-        usage[site] = { ...(usage[site] || {}), [uid]: parseWorkBuddyUsage(payload) };
+        const parsed = parseWorkBuddyUsage(payload);
+        usage[site] = { ...(usage[site] || {}), [uid]: parsed };
+        rememberUsage(site, uid, parsed);
       }
     } catch {
       if (alive && generation === id) {
@@ -234,6 +275,35 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       props.onBusy?.(false);
       if (alive && generation === id && action?.kind === "usage") { action = null; render(); }
       else if (alive) render();
+    }
+  };
+
+  // ---- credits auto-read ---------------------------------------------------
+  // The page remounts this card on every visit and quota is the first thing
+  // people look for, so a fresh mount reads every connected account once
+  // without a click. Values live in a session-scoped cache with a TTL: tab
+  // switches stay free and the upstream API is not hammered. The per-account
+  // button stays as the explicit refresh. Failures are not cached — the next
+  // mount (or a manual click) retries.
+  let autoUsageStopped = false;
+  const autoReadUsage = async (): Promise<void> => {
+    if (!alive || props.disabled || loading) return;
+    for (const site of SITES as WorkBuddyKind[]) {
+      const siteStatus = workBuddySiteStatus(status, site);
+      if (siteStatus?.status !== "connected") continue;
+      for (const account of siteStatus.accounts) {
+        // A user action (mutation or explicit read) takes precedence; stop
+        // scheduling new reads, the in-flight one is read-only and harmless.
+        if (!alive || autoUsageStopped || props.disabled || locked || loading) return;
+        if (usage[site]?.[account.uid] !== undefined) continue;
+        const payload = await post<any>("/usage", { site, uid: account.uid }).catch(() => undefined);
+        if (!alive) return;
+        if (payload === undefined) continue;
+        const parsed = parseWorkBuddyUsage(payload);
+        usage[site] = { ...(usage[site] || {}), [account.uid]: parsed };
+        rememberUsage(site, account.uid, parsed);
+        render();
+      }
     }
   };
 
@@ -585,6 +655,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
 
   mounted.set(el, () => {
     alive = false;
+    autoUsageStopped = true;
     confirm = null;
     unsubscribeHost?.(); unsubscribeHost = null;
     void loginSession?.cancel().catch(() => {});
@@ -601,7 +672,19 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   render();
   // Only local status on mount. Never start a login, sync models or poll here.
   readStatus().then(value => {
-    if (alive) { status = value; loadFailed = false; }
+    if (alive) {
+      status = value; loadFailed = false;
+      // Seed recently-read quota values so the card shows them immediately;
+      // the auto-read below only fills what the cache cannot provide.
+      for (const site of SITES as WorkBuddyKind[]) {
+        const siteStatus = workBuddySiteStatus(status, site);
+        if (siteStatus?.status !== "connected") continue;
+        for (const account of siteStatus.accounts) {
+          const cached = freshUsage(site, account.uid);
+          if (cached !== undefined) usage[site] = { ...(usage[site] || {}), [account.uid]: cached };
+        }
+      }
+    }
   }).catch(() => {
     if (alive) {
       loadFailed = true;
@@ -609,7 +692,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       errors["workbuddy-ai"] = "request_failed";
     }
   }).finally(() => {
-    if (alive) { loading = false; render(); }
+    if (alive) { loading = false; render(); void autoReadUsage(); }
   });
 }
 
