@@ -636,5 +636,20 @@
     "reinstall_hint": "请重新安装插件包（`ccr plugin add <包名>`）或重启 CCR，然后重新加载本页面。",
     "card_failed_title": "{{name}} 的管理卡片加载失败",
     "managed_notice": "该供应商由其插件卡片管理。通用编辑/删除无法修改其名称、地址、凭据或转换器；请在此处使用“断开”移除，Router 不变。"
+  },
+  "pluginMarket": {
+    "title": "可安装插件",
+    "subtitle": "来自 npm、声明 ccr-provider-plugin 关键字的供应商插件。安装仅下载包文件（绝不执行任何脚本），重启后生效。",
+    "loading": "正在搜索 npm 仓库…",
+    "empty": "未找到可安装的供应商插件。",
+    "empty_all_installed": "发现的供应商插件均已安装（{{count}} 个）。",
+    "registry_warning": "无法连接 npm 仓库，请检查网络连接后重试。",
+    "install": "安装",
+    "installing": "安装中…",
+    "restart_notice": "{{name}} 已安装，重启 CCR 后生效。",
+    "restart_now": "立即重启",
+    "dismiss": "知道了",
+    "retry": "重试",
+    "error_generic": "安装失败（{{code}}）。请稍后重试，或在终端使用 `ccr plugin add` 安装。"
   }
 }

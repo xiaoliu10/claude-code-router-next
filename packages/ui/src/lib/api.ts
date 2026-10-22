@@ -161,6 +161,25 @@ class ApiClient {
   }
 
   /**
+   * Marketplace catalog: installable provider plugins from the npm registry
+   * (marker keyword), merged/deduped and annotated with installed state.
+   * A registry outage resolves with an empty list + warning — never throws
+   * raw upstream errors into the UI.
+   */
+  getPluginCatalog(): Promise<{ ok: true; plugins: import('@/types').PluginMarketCatalogEntry[]; warning?: string }> {
+    return this.get('/plugins/catalog', ApiClient.MANAGEMENT_READ_TIMEOUT_MS);
+  }
+
+  /**
+   * One-click install via the local-only POST /api/plugins/install. Same
+   * validated install as the CLI; the response's restartRequired is always
+   * true — activation requires the existing restart flow.
+   */
+  installPlugin(name: string, force = false): Promise<{ ok: true; name: string; version: string; restartRequired: boolean }> {
+    return this.post('/plugins/install', { name, force }, 60_000);
+  }
+
+  /**
    * Authenticated, sanitized fetch for provider-plugin cards. Cards never call
    * fetch() directly: the host supplies this bridge so API-key handling, the
    * 401 trap and error sanitization stay in exactly one place.

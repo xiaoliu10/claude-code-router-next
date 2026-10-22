@@ -274,6 +274,15 @@ export interface PluginInfo {
   error?: string;
 }
 
+/** Installable catalog entry (GET /api/plugins/catalog). */
+export interface PluginMarketCatalogEntry {
+  name: string;
+  description: string;
+  version: string;
+  installed: boolean;
+  installedVersion: string | null;
+}
+
 /** Why the account cannot serve requests; codes are stable and localised. */
 export type GeminiOauthErrorCode =
   | "gemini_oauth_identity_blocked"

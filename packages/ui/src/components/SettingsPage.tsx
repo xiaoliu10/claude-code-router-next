@@ -11,6 +11,7 @@ import { useConfig } from "./ConfigProvider";
 import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
 import { PluginCardArea } from "./PluginCardArea";
+import { PluginMarketArea } from "./PluginMarketArea";
 import { ProjectsPage } from "./ProjectsPage";
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { LogViewer } from '@/components/LogViewer';
@@ -460,6 +461,10 @@ export function SettingsPage() {
                   a one-shot focus key the owning card consumes. */}
               {location.state?.managedProviderNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("pluginCards.managed_notice")}</p>}
               <PluginCardArea disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} focusKey={(location.state as { managedProviderFocus?: string | null } | null)?.managedProviderFocus ?? null} />
+              {/* Marketplace: installable provider plugins from npm with the
+                  marker keyword. Install is local-only + one click; activation
+                  needs the explicit restart flow. */}
+              <PluginMarketArea disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} />
             </TabsContent>
 
             {/* General Tab */}

@@ -636,5 +636,20 @@
     "reinstall_hint": "Reinstall the plugin package (`ccr plugin add <package>`) or restart CCR, then reload this page.",
     "card_failed_title": "The management card for {{name}} failed to load",
     "managed_notice": "This provider is managed by its plugin card. Generic edit/delete cannot change its name, URL, credentials or transformer; use Disconnect here to remove it. Router is unchanged."
+  },
+  "pluginMarket": {
+    "title": "Available plugins",
+    "subtitle": "Provider plugins published to npm with the ccr-provider-plugin keyword. Installing downloads the package (no scripts are ever run) and needs a restart to activate.",
+    "loading": "Searching the npm registry…",
+    "empty": "No installable provider plugins found.",
+    "empty_all_installed": "All discovered provider plugins are already installed ({{count}}).",
+    "registry_warning": "The npm registry could not be reached. Check your network connection and retry.",
+    "install": "Install",
+    "installing": "Installing…",
+    "restart_notice": "{{name}} was installed. Restart CCR to activate it.",
+    "restart_now": "Restart now",
+    "dismiss": "Dismiss",
+    "retry": "Retry",
+    "error_generic": "Installation failed ({{code}}). Check the code, then retry — or install from a terminal with `ccr plugin add`."
   }
 }
