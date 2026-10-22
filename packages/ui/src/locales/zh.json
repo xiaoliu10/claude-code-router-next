@@ -650,6 +650,7 @@
     "restart_now": "立即重启",
     "dismiss": "知道了",
     "retry": "重试",
-    "error_generic": "安装失败（{{code}}）。请稍后重试，或在终端使用 `ccr plugin add` 安装。"
+    "error_generic": "安装失败（{{code}}）。请稍后重试，或在终端使用 `ccr plugin add` 安装。",
+    "error_local_only": "安装只能在运行 CCR 的本机（localhost）上进行。请在本机的管理界面操作，或在终端执行 `ccr plugin add`。"
   }
 }

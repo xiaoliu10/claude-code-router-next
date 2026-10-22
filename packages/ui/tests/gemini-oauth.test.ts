@@ -427,7 +427,9 @@ test("EN/ZH geminiOauth locale parity", () => {
 
 test("Settings uses PluginCardArea only and the chunk receives the shared mutex/draft bridge", () => {
   assert.doesNotMatch(settingsPage, /<GeminiOauthProvider/);
-  assert.match(settingsPage, /<PluginCardArea disabled=\{isSaving \|\| isRestarting\} onBusyChange=\{setManagedProviderBusy\} focusKey=/);
+  // Each lane reports into its own slot of the shared busy gate: a lane that
+  // finishes must not unlock the page while the other is still working.
+  assert.match(settingsPage, /<PluginCardArea disabled=\{isSaving \|\| isRestarting\} onBusyChange=\{busyLanes\.cards\} focusKey=/);
   assert.equal((settingsPage.match(/\|\| managedProviderBusy\}/g) || []).length, 2);
   assert.match(card, /props\.acquireManagement\(\)/);
   assert.match(card, /props\.refreshConfig/);

@@ -650,6 +650,7 @@
     "restart_now": "Restart now",
     "dismiss": "Dismiss",
     "retry": "Retry",
-    "error_generic": "Installation failed ({{code}}). Check the code, then retry — or install from a terminal with `ccr plugin add`."
+    "error_generic": "Installation failed ({{code}}). Check the code, then retry — or install from a terminal with `ccr plugin add`.",
+    "error_local_only": "Installation is only available from this machine (localhost). Open the CCR admin UI on the host machine, or install from a terminal with `ccr plugin add`."
   }
 }

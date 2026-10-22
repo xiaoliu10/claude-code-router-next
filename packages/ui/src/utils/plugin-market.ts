@@ -55,6 +55,7 @@ export type PluginMarketErrorCode =
   | "invalid_manifest"
   | "already_installed"
   | "plugins_json_corrupted"
+  | "local_only"
   | "install_failed"
   | "request_failed";
 
@@ -68,7 +69,7 @@ export function sanitizeMarketErrorCode(value: unknown): PluginMarketErrorCode {
     "invalid_spec", "npm_pack_failed", "npm_pack_timeout", "archive_too_large",
     "archive_too_many_files", "unsafe_archive_member", "extract_failed",
     "invalid_manifest", "already_installed", "plugins_json_corrupted",
-    "install_failed", "request_failed",
+    "local_only", "install_failed", "request_failed",
   ];
   if (typeof value === "string" && (known as string[]).includes(value)) {
     return value as PluginMarketErrorCode;
@@ -217,7 +218,11 @@ export function renderPluginMarketState(
       errorLine.className = "basis-full text-xs text-red-400";
       errorLine.dataset.testid = "plugin-market-error";
       errorLine.setAttribute("role", "note");
-      errorLine.textContent = t("pluginMarket.error_generic", { code: state.error.code });
+      // Some codes have a dedicated, accurate explanation; the rest fall back
+      // to the generic "check the code" copy.
+      errorLine.textContent = state.error.code === "local_only"
+        ? t("pluginMarket.error_local_only")
+        : t("pluginMarket.error_generic", { code: state.error.code });
       row.appendChild(errorLine);
     }
 

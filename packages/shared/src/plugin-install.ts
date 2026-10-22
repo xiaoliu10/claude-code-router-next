@@ -590,6 +590,12 @@ async function readArchiveMembers(archive: string): Promise<ResolvedArchiveMembe
       pendingGnuName = null;
       pendingPax = {};
 
+      if (!name.replace(/\/$/, "")) {
+        throw new PluginInstallError(
+          "refusing archive member with an empty name",
+          "unsafe_archive_member"
+        );
+      }
       members.push({
         name: name.replace(/\/$/, ""),
         size: effectiveSize,
@@ -876,6 +882,9 @@ export async function npmPackPlugin(spec: string, destDir: string, options: NpmP
         encoding: "utf8",
         maxBuffer: 16 * 1024 * 1024,
         timeout: options.timeoutMs ?? PLUGIN_NPM_PACK_TIMEOUT_MS,
+        // SIGTERM alone leaves a wedged npm (and any helper it spawned) alive;
+        // escalate so the request is genuinely bounded.
+        killSignal: "SIGKILL",
         env: isolatedNpmEnv(homeDir, cacheDir),
       }, (error: any, standardOutput: any) => {
         if (error) reject(error);
@@ -1000,6 +1009,15 @@ export async function installPluginFromArchive(
   archive: string,
   options: InstallFromArchiveOptions
 ): Promise<{ target: string; manifest: PluginManifest }> {
+  // Extract outside the lock (it can be slow), then take the lock for the
+  // read-modify-write of plugins.json plus the staged directory swap.
+  return withInstallLock(options.configDir, () => installPluginFromArchiveUnlocked(archive, options));
+}
+
+async function installPluginFromArchiveUnlocked(
+  archive: string,
+  options: InstallFromArchiveOptions
+): Promise<{ target: string; manifest: PluginManifest }> {
   const temp = options.tempRoot ?? mkdtempSync(join(tmpdir(), "ccr-plugin-add-"));
   const ownsTemp = options.tempRoot === undefined;
   try {
@@ -1032,6 +1050,33 @@ export interface InstallFromNpmOptions extends InstallFromArchiveOptions {
 /** Host/CLI lane: npm pack (offline-first, scripts disabled, bounded,
  *  credential-isolated) → cap/validate → staged atomic swap → upsert
  *  plugins.json. */
+/** Serialise installs per config directory.
+ *
+ *  Every install is a read-modify-write over plugins.json plus a staged
+ *  directory rename, so two overlapping requests can otherwise lose a record
+ *  or have one request's cleanup delete the other's freshly staged payload.
+ *  The marketplace UI makes overlapping installs easy (double click, retry
+ *  while a 30s npm fetch is still running), so this is an in-process lock
+ *  rather than a best-effort guard. */
+const installLocks = new Map<string, Promise<void>>();
+
+async function withInstallLock<T>(configDir: string, run: () => Promise<T>): Promise<T> {
+  const key = resolve(configDir);
+  const previous = installLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const tail = previous.then(() => gate);
+  installLocks.set(key, tail);
+  await previous;
+  try {
+    return await run();
+  } finally {
+    release();
+    // Drop the entry once we are the last waiter so the map cannot grow.
+    if (installLocks.get(key) === tail) installLocks.delete(key);
+  }
+}
+
 export async function installPluginFromNpm(options: InstallFromNpmOptions): Promise<{
   target: string;
   manifest: PluginManifest;

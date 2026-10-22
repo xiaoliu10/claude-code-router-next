@@ -33,6 +33,20 @@ import type { ModelFamilyConfig } from "@/types";
 
 const FALLBACK_SCENARIOS = ["default", "think", "longContext", "extendedContext", "webSearch", "image"] as const;
 
+/** Both plugin lanes publish a busy flag into one page-level gate. Each lane
+ *  reports only its own state, so the combined flag must be "any lane busy"
+ *  rather than "last writer wins". */
+function useBusyLanes(setBusy: (busy: boolean) => void) {
+  const lanes = useRef({ cards: false, market: false });
+  const publish = useCallback(() => {
+    setBusy(lanes.current.cards || lanes.current.market);
+  }, [setBusy]);
+  return useMemo(() => ({
+    cards: (busy: boolean) => { lanes.current.cards = busy; publish(); },
+    market: (busy: boolean) => { lanes.current.market = busy; publish(); },
+  }), [publish]);
+}
+
 export function SettingsPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
@@ -44,6 +58,7 @@ export function SettingsPage() {
   // Managed subscription cards share one "a management action is running" gate
   // so a full Save cannot race an in-flight OAuth login or disconnect.
   const [managedProviderBusy, setManagedProviderBusy] = useState(false);
+  const busyLanes = useBusyLanes(setManagedProviderBusy);
   const [isRestarting, setIsRestarting] = useState(false);
   const [isLogViewerOpen, setIsLogViewerOpen] = useState(false);
   const [isNewVersionAvailable, setIsNewVersionAvailable] = useState(false);
@@ -460,11 +475,11 @@ export function SettingsPage() {
                   row's managed navigation lands here with a generic notice and
                   a one-shot focus key the owning card consumes. */}
               {location.state?.managedProviderNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("pluginCards.managed_notice")}</p>}
-              <PluginCardArea disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} focusKey={(location.state as { managedProviderFocus?: string | null } | null)?.managedProviderFocus ?? null} />
+              <PluginCardArea disabled={isSaving || isRestarting} onBusyChange={busyLanes.cards} focusKey={(location.state as { managedProviderFocus?: string | null } | null)?.managedProviderFocus ?? null} />
               {/* Marketplace: installable provider plugins from npm with the
                   marker keyword. Install is local-only + one click; activation
                   needs the explicit restart flow. */}
-              <PluginMarketArea disabled={isSaving || isRestarting} onBusyChange={setManagedProviderBusy} />
+              <PluginMarketArea disabled={isSaving || isRestarting} onBusyChange={busyLanes.market} />
             </TabsContent>
 
             {/* General Tab */}

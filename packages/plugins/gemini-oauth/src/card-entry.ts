@@ -213,7 +213,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const footer = styled("div", "flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2");
     const close = styled("button", "absolute right-4 top-4 rounded-sm opacity-70 transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2") as HTMLButtonElement;
     close.type = "button";
-    close.setAttribute("aria-label", "Close");
+    close.setAttribute("aria-label", locale === "zh" ? "关闭" : "Close");
     close.append(icon(["M18 6 6 18", "m6 6 12 12"], "h-4 w-4"));
     close.onclick = onClose;
     panel.append(header, body, footer, close);

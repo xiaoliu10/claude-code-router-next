@@ -16,6 +16,23 @@ import {
  * shows a "restart to activate" notice whose Restart button calls the
  * existing POST /api/restart flow only on an explicit user click.
  */
+/** Poll until the restarted service answers again, so the reload never lands
+ *  on a closed port. Mirrors the update flow in App.tsx. */
+async function waitForServiceBack(): Promise<void> {
+  const intervalMs = 1500;
+  const maxAttempts = 20;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    try {
+      await api.checkForUpdates();
+      return;
+    } catch {
+      // still restarting
+    }
+  }
+  // Give up waiting but still reload; the caller surfaces nothing further.
+}
+
 export function PluginMarketArea({ disabled, onBusyChange }: { disabled: boolean; onBusyChange?: (busy: boolean) => void }) {
   const { t } = useTranslation();
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -53,11 +70,8 @@ export function PluginMarketArea({ disabled, onBusyChange }: { disabled: boolean
         // Explicit user click only — never automatic.
         setIsRestarting(true);
         api.restartService()
-          .then(() => {
-            // Give the service a moment to come back, then reload the page so
-            // the newly installed plugin's card appears.
-            window.setTimeout(() => window.location.reload(), 2000);
-          })
+          .then(waitForServiceBack)
+          .then(() => window.location.reload())
           .catch(() => {
             setIsRestarting(false);
           });
