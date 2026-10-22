@@ -59,6 +59,12 @@ it("npm tarball + real createCcrServer: rotation/admin/card, then disabled and r
   // P1: source maps (full sourcesContent, including host UI sources) never
   // ship in the published artifact; they stay local debug aids only.
   expect(contents.some((p: string) => p.endsWith(".map"))).toBe(false);
+  // F3: the shipped bundles never reference their (unshipped) source maps,
+  // while the local .map debug aids still exist next to the build output.
+  for (const artifact of ["dist/plugin.js", "dist/card.js"]) {
+    expect(readFileSync(join(pkg, artifact), "utf8")).not.toContain("sourceMappingURL");
+    expect(existsSync(join(pkg, `${artifact}.map`))).toBe(true);
+  }
   const installed = join(temp, "installed"); mkdirSync(installed);
   // Offline npm installation proves this is a self-contained package, not a
   // workspace-link fixture. No lifecycle scripts or registry access required.

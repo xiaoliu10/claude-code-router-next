@@ -68,7 +68,9 @@ test("risk consent is frozen verbatim in both locales and carries the permanent 
 });
 
 test("the plugin card risk gate is acknowledged before login, and never starts on mount", () => {
-  assert.match(card, /dialog\(t\("risk_title"\), t\("risk"\)\)/);
+  assert.match(card, /dialog\(t\("risk_title"\)/);
+  // The risk text renders as a hard red alert inside the consent dialog.
+  assert.match(card, /errorAlert\(t\("risk"\)/);
   assert.match(card, /if \(consentAck\) void run\("login"\)/);
   assert.match(card, /disabled \|\| !consentAck/);
   assert.equal((card.match(/run\("login"\)/g) || []).length, 1);
@@ -282,7 +284,7 @@ test("the cooldown line outranks a stale error and the card offers no token surf
 test("disconnect requires a second confirmation and calls the dedicated plugin route", () => {
   assert.match(card, /confirmDisconnect = true/);
   assert.match(card, /if \(confirmDisconnect\)/);
-  assert.match(card, /dialog\(t\("disconnect_title"\), t\("disconnect_warning"\)\)/);
+  assert.match(card, /dialog\(t\("disconnect_title"\), t\("disconnect_warning"\)/);
   assert.equal((card.match(/run\("disconnect"\)/g) || []).length, 1);
   assert.match(card, /post<any>\("\/disconnect"\)/);
   assert.match(providers, /isManagedGeminiOauth\(config\.Providers\[actualIndex\]\)\) \{ showGeminiOauthManagement\(\); return; \}/);

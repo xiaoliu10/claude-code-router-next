@@ -9,7 +9,7 @@ process.env.TMPDIR = "/tmp/ccr-plugin-card-tests-home/card-host/tmp";
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
-  createPluginCardAreaController, isSameOriginCardUrl, pluginLocaleOf,
+  createPluginCardAreaController, createPluginFocusGate, isSameOriginCardUrl, pluginLocaleOf,
   type PluginCardAreaBridge, type PluginCardModule,
 } from "../src/utils/plugin-card.ts";
 
@@ -471,4 +471,29 @@ test("focusKey is a one-shot mount prop: delivered to the owning sync, never re-
   // No key at all stays null (ordinary remount path).
   await controller.sync([entry({ name: "workbuddy", cardUrl })], "en", host, null);
   assert.equal(ok.mounts[2].props.focusKey, null);
+});
+
+// F1 regression: location.state is persistent, so PluginCardArea sees the same
+// focus key again on every re-render. The gate (createPluginFocusGate, consumed
+// by PluginCardArea at each sync) must deliver each distinct key exactly once.
+test("focus gate: initial sync delivers once, a locale-change re-sync does not re-deliver, a NEW key delivers again", () => {
+  const gate = createPluginFocusGate();
+  // Initial navigation (or hard reload): the key from location.state delivers.
+  gate.offer("workbuddy");
+  assert.equal(gate.take(), "workbuddy");
+  // A locale-change re-sync observes the same persistent location.state key…
+  gate.offer("workbuddy");
+  assert.equal(gate.take(), null); // …but must not re-deliver it.
+  gate.offer(null);
+  assert.equal(gate.take(), null);
+  // A NEW navigation carrying a different key re-arms delivery.
+  gate.offer("workbuddy-ai");
+  assert.equal(gate.take(), "workbuddy-ai");
+  // Another locale switch with that same key stays consumed.
+  gate.offer("workbuddy-ai");
+  assert.equal(gate.take(), null);
+  // Hard reload remounts the area with a fresh gate: the deep link delivers.
+  const reloaded = createPluginFocusGate();
+  reloaded.offer("workbuddy-ai");
+  assert.equal(reloaded.take(), "workbuddy-ai");
 });

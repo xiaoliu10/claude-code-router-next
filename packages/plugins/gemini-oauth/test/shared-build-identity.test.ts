@@ -20,6 +20,15 @@ describe("shared build identity", () => {
     expect(build).toContain('outfile: join(dist, "card.js")');
   });
 
+  it("the build strips sourceMappingURL comments from both shipped bundles (F3)", () => {
+    const build = read("scripts/build.ts");
+    // Local .map files stay as debug aids; the reference line never ships.
+    expect(build).toContain("stripSourcemapComment");
+    expect(build).toContain("sourceMappingURL");
+    expect(build).toContain('"plugin.js"');
+    expect(build).toContain('"card.js"');
+  });
+
   it("card-entry consumes the shared UI contract and helpers — no vendored card copy", () => {
     const card = read("src/card-entry.ts");
     expect(card).toContain('from "../../../ui/src/utils/plugin-card"');
