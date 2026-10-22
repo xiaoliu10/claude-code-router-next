@@ -13,10 +13,16 @@
  * plugins/plugins.json — the same source of truth the core loader reads
  * (packages/core/src/provider-plugins/loader.ts).
  *
- * Import-graph rule: this module must only use node builtins and the shared
- * package. It must not import core/server code (the CLI's bundle already
- * carries the runtime through src/cli.ts; the plugin command itself stays
- * independent so tests do not drag the server in).
+ * The validated install core (manifest/record validation, archive caps,
+ * staged atomic swap) lives in the shared package
+ * (`@wengine-ai/claude-code-router-shared/plugin-install`) and is reused
+ * verbatim by the host admin API (POST /api/plugins/install). This file only
+ * adds CLI concerns: argument parsing, confirmation prompts, the human-facing
+ * npm-pack error lane and the live-service list view.
+ *
+ * Import-graph rule: this module must not import core/server code (the CLI's
+ * bundle already carries the runtime through src/cli.ts; the plugin command
+ * itself stays independent so tests do not drag the server in).
  *
  * Credential files ($CCR_CONFIG_DIR/<name>-credentials.json etc.) live
  * OUTSIDE plugins/ and are never read, printed or removed here.
@@ -24,25 +30,41 @@
 
 import { execFileSync } from "child_process";
 import {
-  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
-  renameSync,
   rmSync,
   statSync,
   unlinkSync,
-  writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
-import { basename, join } from "path";
+import { join } from "path";
 import readline from "readline";
 import { Readable, Writable } from "stream";
 import JSON5 from "json5";
-import { HOME_DIR } from "@wengine-ai/claude-code-router-shared";
+import {
+  HOME_DIR,
+  PLUGIN_ENTRY_FILE as ENTRY_FILE,
+  PLUGIN_MANIFEST_FILE as MANIFEST_FILE,
+  PLUGIN_NAME_PATTERN,
+  assertArchiveWithinCaps,
+  extractPluginArchive,
+  readPluginRecords,
+  readPluginRecordsChecked,
+  removePluginRecord,
+  resolvePluginPayloadDir,
+  stagePluginInstall,
+  validatePayload,
+  validatePluginManifest,
+  writePluginRecords,
+  type PluginInstallRecord as InstallRecord,
+} from "@wengine-ai/claude-code-router-shared";
+
+// Re-exported for the unit tests (historical public surface of this module).
+export { validatePluginManifest };
 
 // ANSI color codes (same style as installCommand.ts)
 const RESET = "\x1B[0m";
@@ -53,36 +75,8 @@ const BOLDYELLOW = "\x1B[1m\x1B[33m";
 const BOLDCYAN = "\x1B[1m\x1B[36m";
 const DIM = "\x1B[2m";
 
-/** Keep in sync with packages/core/src/provider-plugins/types.ts: the loader
- *  refuses plugins whose coreApi major differs from this. */
-const PLUGIN_CORE_API = "1";
-
-const MANIFEST_FILE = "plugin.json";
-const ENTRY_FILE = "plugin.js";
+const NAME_PATTERN = PLUGIN_NAME_PATTERN;
 const RECORDS_FILE = "plugins.json";
-const NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/i;
-
-export interface PluginManifest {
-  name: string;
-  version: string;
-  coreApi: string;
-  description?: string;
-}
-
-interface InstallRecord {
-  name: string;
-  enabled: boolean;
-}
-
-/** Manifest fields as they appear on disk, before validation. */
-interface RawManifest {
-  name?: unknown;
-  version?: unknown;
-  coreApi?: unknown;
-  description?: unknown;
-  card?: unknown;
-  ui?: { card?: unknown };
-}
 
 interface PluginCommandDeps {
   /** Override the config dir (tests). Defaults to the shared HOME_DIR rule:
@@ -128,205 +122,23 @@ Examples:
   ccr plugin add /path/to/ccr-provider-x-1.0.0.tgz
   ccr plugin list
   ccr plugin disable my-plugin
-  ccr plugin remove my-plugin --yes
 `;
 }
 
 // ---------------------------------------------------------------------------
-// Manifest / payload validation
-// ---------------------------------------------------------------------------
-
-/** Validate a manifest read from disk; when installName is given the manifest
- *  name must equal it (the loader makes the same check against the install
- *  directory name). Returns the normalized manifest. */
-export function validatePluginManifest(raw: RawManifest, installName?: string): PluginManifest {
-  const m = raw;
-  if (typeof m.name !== "string" || m.name.length === 0) {
-    throw new PluginCommandError(`${MANIFEST_FILE} has no "name"`);
-  }
-  if (!NAME_PATTERN.test(m.name)) {
-    throw new PluginCommandError(
-      `invalid plugin name "${m.name}" (must match ${NAME_PATTERN.toString()})`
-    );
-  }
-  if (typeof m.version !== "string" || m.version.length === 0) {
-    throw new PluginCommandError(`${MANIFEST_FILE} for "${m.name}" has no "version"`);
-  }
-  const coreApi = String(m.coreApi ?? PLUGIN_CORE_API);
-  if (coreApi.split(".")[0] !== PLUGIN_CORE_API) {
-    throw new PluginCommandError(
-      `plugin "${m.name}" declares coreApi ${coreApi}, incompatible with this CCR (core ${PLUGIN_CORE_API})`
-    );
-  }
-  if (installName !== undefined && m.name !== installName) {
-    throw new PluginCommandError(
-      `manifest name "${m.name}" does not match install directory name "${installName}"`
-    );
-  }
-  return {
-    name: m.name,
-    version: m.version,
-    coreApi,
-    description: typeof m.description === "string" ? m.description : undefined,
-  };
-}
-
-/** Read and parse a payload manifest, returning the raw field record. */
-function readManifest(payloadDir: string): RawManifest {
-  let raw: string;
-  try {
-    raw = readFileSync(join(payloadDir, MANIFEST_FILE), "utf8");
-  } catch {
-    throw new PluginCommandError(`${MANIFEST_FILE} not found in ${payloadDir}`);
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (e: any) {
-    throw new PluginCommandError(`${MANIFEST_FILE} is not valid JSON: ${e.message}`);
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new PluginCommandError(`${MANIFEST_FILE} is not a JSON object`);
-  }
-  return parsed as RawManifest;
-}
-
-/** The installable payload is either the directory itself (installed layout)
- *  or its built dist/ (package root layout). */
-function resolvePayloadDir(dir: string): string | null {
-  for (const candidate of [dir, join(dir, "dist")]) {
-    if (existsSync(join(candidate, MANIFEST_FILE)) && existsSync(join(candidate, ENTRY_FILE))) {
-      return candidate;
-    }
-  }
-  return null;
-}
-
-/** Refuse to install payloads that carry symlinks: the loader only ever
- *  accepts real directories/files under plugins/<name>/, so a symlinked
- *  payload could never load and might point outside the install root. */
-function assertNoSymlinks(root: string): void {
-  const stack: string[] = [root];
-  while (stack.length > 0) {
-    const dir = stack.pop() as string;
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.isSymbolicLink()) {
-        throw new PluginCommandError(
-          `refusing to install: payload contains a symlink "${join(dir, entry.name)}"`
-        );
-      }
-      if (entry.isDirectory()) stack.push(join(dir, entry.name));
-    }
-  }
-}
-
-/** card.js is optional; but if the manifest declares a UI card file it must
- *  exist in the payload. The declared path must be a plain file name inside
- *  the payload — the same shape the core loader serves (no traversal). */
-function validateCardPayload(payloadDir: string, raw: RawManifest): void {
-  const declared = typeof raw.card === "string"
-    ? raw.card
-    : typeof raw.ui?.card === "string" ? raw.ui.card : undefined;
-  if (typeof declared === "string" && declared.length > 0) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(declared)) {
-      throw new PluginCommandError(
-        `manifest declares an unsafe UI card path "${declared}" (must be a plain file inside the payload)`
-      );
-    }
-    if (!existsSync(join(payloadDir, declared))) {
-      throw new PluginCommandError(
-        `manifest declares UI card "${declared}" but the file is missing from the payload`
-      );
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// plugins.json records (same file the core loader reads)
+// plugins.json records (delegated to the shared install core)
 // ---------------------------------------------------------------------------
 
 function recordsFile(configDir: string): string {
   return join(configDir, "plugins", RECORDS_FILE);
 }
 
-interface ReadRecordsResult {
-  records: InstallRecord[];
-  /** The file existed but could not be parsed — a rewrite would be lossy. */
-  corrupted: boolean;
-}
-
 function readRecords(configDir: string): InstallRecord[] {
-  return readRecordsChecked(configDir).records;
-}
-
-function readRecordsChecked(configDir: string): ReadRecordsResult {
-  let raw: string;
-  try {
-    raw = readFileSync(recordsFile(configDir), "utf8");
-  } catch {
-    // Missing file is the normal first-run state, not corruption.
-    return { records: [], corrupted: false };
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return { records: [], corrupted: true };
-    // Mirror the loader's tolerance: any {name: string} entry counts, with
-    // enabled !== false treated as enabled — so hand-tolerated records are
-    // never silently dropped when the file is rewritten.
-    return {
-      records: parsed
-        .filter((e: any): e is { name: string; enabled?: unknown } =>
-          e && typeof e.name === "string")
-        .map((e) => ({ name: e.name, enabled: e.enabled !== false })),
-      corrupted: false,
-    };
-  } catch {
-    return { records: [], corrupted: true };
-  }
+  return readPluginRecords(configDir);
 }
 
 function writeRecords(configDir: string, records: InstallRecord[]): void {
-  writeFileSync(recordsFile(configDir), JSON.stringify(records, null, 2) + "\n");
-}
-
-/** Register or replace the record for name, preserving the order of all
- *  other records (the loader loads in plugins.json order). Refuses to
- *  overwrite an UNPARSEABLE plugins.json without force: a silent rewrite
- *  would permanently drop records the loader would have tolerated after a
- *  manual fix. */
-/** Refuse an unparseable plugins.json up front (before any filesystem work):
- *  the later rewrite would silently and permanently drop records the loader
- *  would have tolerated after a manual fix. --force is the escape hatch. */
-function upsertPreflight(configDir: string, force: boolean): void {
-  if (force) return;
-  const { corrupted } = readRecordsChecked(configDir);
-  if (corrupted) {
-    throw new PluginCommandError(
-      `${recordsFile(configDir)} is not valid JSON; refusing to overwrite it. Fix or remove the file (or pass --force to replace it with only the new record).`
-    );
-  }
-}
-
-function upsertRecord(configDir: string, name: string, force = false): void {
-  const { records, corrupted } = readRecordsChecked(configDir);
-  if (corrupted && !force) {
-    throw new PluginCommandError(
-      `${recordsFile(configDir)} is not valid JSON; refusing to overwrite it. Fix or remove the file (or pass --force to replace it with only the new record).`
-    );
-  }
-  const record: InstallRecord = { name, enabled: true };
-  const idx = records.findIndex((r) => r.name === name);
-  if (idx >= 0) records[idx] = record;
-  else records.push(record);
-  writeRecords(configDir, records);
-}
-
-function removeRecord(configDir: string, name: string): boolean {
-  const records = readRecords(configDir);
-  const next = records.filter((r) => r.name !== name);
-  if (next.length === records.length) return false;
-  writeRecords(configDir, next);
-  return true;
+  writePluginRecords(configDir, records);
 }
 
 // ---------------------------------------------------------------------------
@@ -337,26 +149,13 @@ function looksLikeTgz(source: string): boolean {
   return source.endsWith(".tgz") || source.endsWith(".tar.gz");
 }
 
-/** Extract a plugin tarball with the system tar (pure extract, no scripts).
- *  Returns the extracted package root ("package" for npm artifacts). */
-function extractTgz(archive: string, destDir: string): string {
-  mkdirSync(destDir, { recursive: true });
-  try {
-    execFileSync("tar", ["-xzf", archive, "-C", destDir], { stdio: "pipe", timeout: 60_000 });
-  } catch (e: any) {
-    throw new PluginCommandError(`failed to extract ${basename(archive)}: ${e.message}`);
-  }
-  // Post-extract safety: tar itself refuses absolute paths and ".." traversal
-  // on extraction; additionally refuse any symlinked member so nothing in the
-  // extracted tree can point outside the extraction root.
-  assertNoSymlinks(destDir);
-  const packageRoot = join(destDir, "package");
-  if (existsSync(packageRoot) && statSync(packageRoot).isDirectory()) return packageRoot;
-  return destDir;
-}
-
-/** Download an npm spec with npm pack (offline-first) WITHOUT running any
- *  lifecycle scripts, and return the packed archive path. */
+/**
+ * Human-facing npm pack lane (CLI only). It shares the command shape with the
+ * host lane in the shared core — `npm pack`, offline-first, lifecycle scripts
+ * disabled — but keeps the operator-oriented stderr tail and the longer
+ * interactive timeout. The host route uses the stricter shared lane (30s
+ * bound, no stderr leakage, throwaway credentials env).
+ */
 function npmPack(spec: string, destDir: string): string {
   mkdirSync(destDir, { recursive: true });
   let stdout: string;
@@ -414,14 +213,14 @@ async function confirmPrompt(question: string, deps: ResolvedDeps): Promise<bool
 /** Resolve the user-supplied source into an installable payload directory.
  *  The returned payload may live inside temp (tgz/npm paths) — callers must
  *  not clean temp before the payload has been copied. */
-function resolveSourcePayload(source: string, temp: string): { payloadDir: string; originDescription: string } {
+async function resolveSourcePayload(source: string, temp: string): Promise<{ payloadDir: string; originDescription: string }> {
   if (source.startsWith("-")) {
     throw new PluginCommandError(`invalid plugin source "${source}"`);
   }
   if (existsSync(source)) {
     const st = statSync(source);
     if (st.isDirectory()) {
-      const resolved = resolvePayloadDir(source);
+      const resolved = resolvePluginPayloadDir(source);
       if (!resolved) {
         throw new PluginCommandError(
           `"${source}" is not a plugin payload or plugin package: expected ${MANIFEST_FILE} + ${ENTRY_FILE} in the directory or in its dist/`
@@ -442,56 +241,16 @@ function resolveSourcePayload(source: string, temp: string): { payloadDir: strin
   return tgzPayload(archive, temp, source);
 }
 
-/** Extract an npm-style tarball and locate its payload. */
-function tgzPayload(archive: string, temp: string, originDescription: string): { payloadDir: string; originDescription: string } {
-  const payloadDir = resolvePayloadDir(extractTgz(archive, join(temp, "extract")));
+/** Enforce the shared archive caps, extract an npm-style tarball and locate
+ *  its payload. Pure extract (system tar), no scripts. */
+async function tgzPayload(archive: string, temp: string, originDescription: string): Promise<{ payloadDir: string; originDescription: string }> {
+  await assertArchiveWithinCaps(archive);
+  const packageRoot = await extractPluginArchive(archive, join(temp, "extract"));
+  const payloadDir = resolvePluginPayloadDir(packageRoot);
   if (!payloadDir) {
     throw new PluginCommandError(`no ${MANIFEST_FILE} + ${ENTRY_FILE} found in ${archive}`);
   }
   return { payloadDir, originDescription };
-}
-
-/** Stage the payload under plugins/, validate the staged copy, then swap it
- *  into place (refusing an existing install unless force). rename() inside
- *  the same directory is atomic; the pre-swap removal window is minimized.
- *  Returns the install target path. */
-function installStaged(payloadDir: string, manifest: PluginManifest, configDir: string, force: boolean): string {
-  const pluginsDir = join(configDir, "plugins");
-  mkdirSync(pluginsDir, { recursive: true });
-  if (lstatSync(pluginsDir).isSymbolicLink() || !lstatSync(pluginsDir).isDirectory()) {
-    throw new PluginCommandError(`plugins directory is not a real directory: ${pluginsDir}`);
-  }
-  const target = join(pluginsDir, manifest.name);
-  if (existsSync(target) && !force) {
-    throw new PluginCommandError(
-      `plugin "${manifest.name}" is already installed at ${target} (use --force to replace it)`
-    );
-  }
-  // Refuse a lossy record rewrite BEFORE staging/payload work: an unparseable
-  // plugins.json would otherwise be replaced by only the new record.
-  upsertPreflight(configDir, force);
-
-  const stage = join(pluginsDir, `.${manifest.name}.staging-${process.pid}-${Date.now()}`);
-  mkdirSync(stage, { recursive: true });
-  try {
-    cpSync(payloadDir, stage, { recursive: true });
-    const stagedManifest = validatePluginManifest(readManifest(stage), manifest.name);
-    if (!existsSync(join(stage, ENTRY_FILE))) {
-      throw new PluginCommandError(`staged payload is missing its entry ${ENTRY_FILE}`);
-    }
-    if (lstatSyncSafe(target)) {
-      rmSync(target, { recursive: true, force: true });
-    }
-    renameSync(stage, target);
-    upsertRecord(configDir, manifest.name, force);
-  } catch (error) {
-    // Never orphan the staging dir on a failed copy/validate (disk full,
-    // EACCES, bad payload): it is invisible to loader and list, so it would
-    // otherwise leak silently in the user's plugins directory.
-    rmSync(stage, { recursive: true, force: true });
-    throw error;
-  }
-  return target;
 }
 
 async function pluginAdd(
@@ -516,15 +275,9 @@ async function pluginAdd(
 
   const temp = mkdtempSync(join(tmpdir(), "ccr-plugin-add-"));
   try {
-    const { payloadDir, originDescription } = resolveSourcePayload(source, temp);
+    const { payloadDir, originDescription } = await resolveSourcePayload(source, temp);
 
-    const rawManifest = readManifest(payloadDir);
-    const manifest = validatePluginManifest(rawManifest);
-    if (!existsSync(join(payloadDir, ENTRY_FILE))) {
-      throw new PluginCommandError(`plugin entry ${ENTRY_FILE} is missing from the payload`);
-    }
-    validateCardPayload(payloadDir, rawManifest);
-    assertNoSymlinks(payloadDir);
+    const { manifest } = validatePayload(payloadDir);
 
     console.log(`\n${BOLDCYAN}About to install and enable${RESET} ${BOLDGREEN}${manifest.name}@${manifest.version}${RESET}`);
     console.log(`${DIM}Its code will run with your user permissions. Source: ${originDescription}${RESET}`);
@@ -536,7 +289,7 @@ async function pluginAdd(
       }
     }
 
-    const target = installStaged(payloadDir, manifest, configDir, force);
+    const target = stagePluginInstall(payloadDir, manifest, configDir, force);
 
     console.log(`\n${BOLDGREEN}✓ Installed ${manifest.name}@${manifest.version}${RESET}`);
     console.log(`${DIM}Location: ${target}${RESET}`);
@@ -544,15 +297,6 @@ async function pluginAdd(
     return 0;
   } finally {
     rmSync(temp, { recursive: true, force: true });
-  }
-}
-
-function lstatSyncSafe(p: string): boolean {
-  try {
-    lstatSync(p);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -706,9 +450,16 @@ async function pluginRemove(args: string[], deps: ResolvedDeps): Promise<number>
   }
 
   const pluginDir = join(configDir, "plugins", name);
-  const dirExists = lstatSyncSafe(pluginDir);
+  const dirExistsSafe = (() => {
+    try {
+      lstatSync(pluginDir);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
   const recordExists = readRecords(configDir).some((r) => r.name === name);
-  if (!dirExists && !recordExists) {
+  if (!dirExistsSafe && !recordExists) {
     console.error(`\n${BOLDYELLOW}Error:${RESET} plugin "${name}" is not installed\n`);
     return 1;
   }
@@ -723,14 +474,14 @@ async function pluginRemove(args: string[], deps: ResolvedDeps): Promise<number>
     }
   }
 
-  if (dirExists) {
+  if (dirExistsSafe) {
     // Never follow symlinks out of plugins/: unlink a symlinked entry, remove
     // real directories recursively. Credential files live outside plugins/
     // and are never touched here.
     if (lstatSync(pluginDir).isSymbolicLink()) unlinkSync(pluginDir);
     else rmSync(pluginDir, { recursive: true, force: true });
   }
-  removeRecord(configDir, name);
+  removePluginRecord(configDir, name);
 
   console.log(`\n${BOLDGREEN}✓ Removed ${name}${RESET}`);
   console.log(`${DIM}Restart CCR (ccr restart) to apply. Credential files were left untouched.${RESET}\n`);
@@ -754,11 +505,19 @@ async function pluginSetEnabled(
     console.error(`\n${BOLDYELLOW}Error:${RESET} invalid plugin name "${name}"\n`);
     return 1;
   }
-  const records = readRecords(configDir);
+  const { records, corrupted } = readPluginRecordsChecked(configDir);
   const record = records.find((r) => r.name === name);
   if (!record) {
     console.error(
       `\n${BOLDYELLOW}Error:${RESET} plugin "${name}" is not registered — install it first with ${GREEN}ccr plugin add${RESET}\n`
+    );
+    return 1;
+  }
+  if (corrupted) {
+    // Defensive: readPluginRecordsChecked normalizes parseable arrays; an
+    // unparseable file must not be silently rewritten by enable/disable.
+    console.error(
+      `\n${BOLDYELLOW}Error:${RESET} ${recordsFile(configDir)} is not valid JSON; refusing to overwrite it.\n`
     );
     return 1;
   }
@@ -783,13 +542,12 @@ export async function handlePluginCommand(
   args: string[],
   deps?: PluginCommandDeps
 ): Promise<number> {
-  const configDir = deps?.configDir ?? HOME_DIR;
-  const [subcommand, ...rest] = args;
   const resolved: ResolvedDeps = {
     configDir: deps?.configDir ?? HOME_DIR,
     input: deps?.input ?? process.stdin,
     output: deps?.output ?? process.stdout,
   };
+  const [subcommand, ...rest] = args;
   try {
     switch (subcommand) {
       case "add":
@@ -812,6 +570,8 @@ export async function handlePluginCommand(
         return 1;
     }
   } catch (error: any) {
+    // PluginInstallError from the shared core carries the same human-facing
+    // wording this command always printed; render any error's message.
     const message = error instanceof PluginCommandError
       ? error.message
       : (error?.message ?? String(error));
