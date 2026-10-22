@@ -23,12 +23,27 @@ class El {
   removed = false;
   type = "";
   style = { cssText: "" };
+  attrs: Record<string, string> = {};
   onclick?: () => void;
+  firstChild: El | null = null;
   constructor(tag: string) { this.tag = tag; }
-  append(...nodes: El[]) { for (const n of nodes) { n.parent = this; this.children.push(n); } }
-  appendChild(child: El): El { child.parent = this; this.children.push(child); return child; }
-  replaceChildren(...nodes: El[]) { this.children = [...nodes]; for (const n of nodes) n.parent = this; }
-  setAttribute() {}
+  append(...nodes: El[]) { for (const n of nodes) { n.parent = this; this.children.push(n); } this.firstChild = this.children[0] ?? null; }
+  appendChild(child: El): El { this.append(child); return child; }
+  prepend(...nodes: El[]) { for (const n of nodes.reverse()) { n.parent = this; this.children.unshift(n); } this.firstChild = this.children[0] ?? null; }
+  insertBefore(child: El, before: El | null) {
+    const at = before ? this.children.indexOf(before) : -1;
+    child.parent = this;
+    if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+    this.firstChild = this.children[0] ?? null;
+    return child;
+  }
+  querySelector(selector: string): El | null {
+    const match = selector.match(/^\[data-testid="(.+)"\]$/);
+    if (!match) return null;
+    return this.all().find(n => n.dataset?.testid === match[1]) ?? null;
+  }
+  replaceChildren(...nodes: El[]) { this.children = [...nodes]; for (const n of nodes) n.parent = this; this.firstChild = nodes[0] ?? null; }
+  setAttribute(name: string, value: string) { this.attrs[name] = value; }
   remove() {
     if (this.parent) {
       const at = this.parent.children.indexOf(this);
@@ -65,7 +80,7 @@ function deferred<T = any>() {
 }
 
 function seamHarness() {
-  vi.stubGlobal("document", { createElement: (tag: string) => new El(tag) });
+  vi.stubGlobal("document", { createElement: (tag: string) => new El(tag), createElementNS: () => new El("svg") as any });
   const host = new El("div");
   const site = {
     status: "connected", providerName: "workbuddy", activeUid: "uid-123456789",
