@@ -41,6 +41,7 @@ import {
 import { tmpdir } from "os";
 import { basename, join } from "path";
 import readline from "readline";
+import { Readable, Writable } from "stream";
 import JSON5 from "json5";
 import { HOME_DIR } from "@wengine-ai/claude-code-router-shared";
 
@@ -88,6 +89,16 @@ interface PluginCommandDeps {
   /** Override the config dir (tests). Defaults to the shared HOME_DIR rule:
    *  process.env.CCR_CONFIG_DIR || ~/.claude-code-router. */
   configDir?: string;
+  /** stdin for confirmation prompts (tests); defaults to process.stdin. */
+  input?: Readable;
+  /** stdout sink for prompts (tests); defaults to process.stdout. */
+  output?: Writable;
+}
+
+interface ResolvedDeps {
+  configDir: string;
+  input: Readable;
+  output: Writable;
 }
 
 class PluginCommandError extends Error {}
@@ -335,21 +346,100 @@ function npmPack(spec: string, destDir: string): string {
 // Subcommands
 // ---------------------------------------------------------------------------
 
-async function confirmPrompt(question: string): Promise<boolean> {
+async function confirmPrompt(question: string, deps: ResolvedDeps): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    // Callback form: an EOF without an answer yields "" → declined.
-    rl.question(question, (answer: string) => {
+    const rl = readline.createInterface({ input: deps.input, output: deps.output });
+    let settled = false;
+    const done = (answer: string | null): void => {
+      if (settled) return;
+      settled = true;
       rl.close();
-      resolve(/^\s*(y|yes)\s*$/i.test(answer));
-    });
+      resolve(answer !== null && /^\s*(y|yes)\s*$/i.test(answer));
+    };
+    // A closed stdin without an answer (EOF) declines instead of hanging.
+    rl.on("close", () => done(null));
+    rl.question(question, (answer: string) => done(answer));
   });
+}
+
+/** Resolve the user-supplied source into an installable payload directory.
+ *  The returned payload may live inside temp (tgz/npm paths) — callers must
+ *  not clean temp before the payload has been copied. */
+function resolveSourcePayload(source: string, temp: string): { payloadDir: string; originDescription: string } {
+  if (source.startsWith("-")) {
+    throw new PluginCommandError(`invalid plugin source "${source}"`);
+  }
+  if (existsSync(source)) {
+    const st = statSync(source);
+    if (st.isDirectory()) {
+      const resolved = resolvePayloadDir(source);
+      if (!resolved) {
+        throw new PluginCommandError(
+          `"${source}" is not a plugin payload or plugin package: expected ${MANIFEST_FILE} + ${ENTRY_FILE} in the directory or in its dist/`
+        );
+      }
+      return { payloadDir: resolved, originDescription: resolved === source ? source : join(source, "dist") };
+    }
+    if (st.isFile() && looksLikeTgz(source)) {
+      return tgzPayload(source, temp, source);
+    }
+    throw new PluginCommandError(`unsupported plugin source file "${source}" (expected a directory or a .tgz)`);
+  }
+  if (looksLikeTgz(source)) {
+    throw new PluginCommandError(`tarball not found: ${source}`);
+  }
+  console.log(`${BOLDCYAN}Resolving npm package:${RESET} ${source} (offline-first, scripts disabled)`);
+  const archive = npmPack(source, join(temp, "pack"));
+  return tgzPayload(archive, temp, source);
+}
+
+/** Extract an npm-style tarball and locate its payload. */
+function tgzPayload(archive: string, temp: string, originDescription: string): { payloadDir: string; originDescription: string } {
+  const payloadDir = resolvePayloadDir(extractTgz(archive, join(temp, "extract")));
+  if (!payloadDir) {
+    throw new PluginCommandError(`no ${MANIFEST_FILE} + ${ENTRY_FILE} found in ${archive}`);
+  }
+  return { payloadDir, originDescription };
+}
+
+/** Stage the payload under plugins/, validate the staged copy, then swap it
+ *  into place (refusing an existing install unless force). rename() inside
+ *  the same directory is atomic; the pre-swap removal window is minimized.
+ *  Returns the install target path. */
+function installStaged(payloadDir: string, manifest: PluginManifest, configDir: string, force: boolean): string {
+  const pluginsDir = join(configDir, "plugins");
+  mkdirSync(pluginsDir, { recursive: true });
+  if (lstatSync(pluginsDir).isSymbolicLink() || !lstatSync(pluginsDir).isDirectory()) {
+    throw new PluginCommandError(`plugins directory is not a real directory: ${pluginsDir}`);
+  }
+  const target = join(pluginsDir, manifest.name);
+  if (existsSync(target) && !force) {
+    throw new PluginCommandError(
+      `plugin "${manifest.name}" is already installed at ${target} (use --force to replace it)`
+    );
+  }
+
+  const stage = join(pluginsDir, `.${manifest.name}.staging-${process.pid}-${Date.now()}`);
+  mkdirSync(stage, { recursive: true });
+  cpSync(payloadDir, stage, { recursive: true });
+  const stagedManifest = validatePluginManifest(readManifest(stage), manifest.name);
+  if (!existsSync(join(stage, ENTRY_FILE))) {
+    throw new PluginCommandError(`staged payload is missing its entry ${ENTRY_FILE}`);
+  }
+  if (lstatSyncSafe(target)) {
+    rmSync(target, { recursive: true, force: true });
+  }
+  renameSync(stage, target);
+
+  upsertRecord(configDir, stagedManifest.name);
+  return target;
 }
 
 async function pluginAdd(
   args: string[],
-  configDir: string
+  deps: ResolvedDeps
 ): Promise<number> {
+  const { configDir } = deps;
   const force = args.includes("--force");
   const assumeYes = args.includes("--yes");
   const positional = args.filter((a) => !a.startsWith("--"));
@@ -366,41 +456,8 @@ async function pluginAdd(
   }
 
   const temp = mkdtempSync(join(tmpdir(), "ccr-plugin-add-"));
-  let payloadDir: string;
-  let originDescription: string;
   try {
-    if (source.startsWith("-")) {
-      throw new PluginCommandError(`invalid plugin source "${source}"`);
-    }
-    if (existsSync(source)) {
-      const st = statSync(source);
-      if (st.isDirectory()) {
-        const resolved = resolvePayloadDir(source);
-        if (!resolved) {
-          throw new PluginCommandError(
-            `"${source}" is not a plugin payload or plugin package: expected ${MANIFEST_FILE} + ${ENTRY_FILE} in the directory or in its dist/`
-          );
-        }
-        payloadDir = resolved;
-        originDescription = resolved === source ? source : join(source, "dist");
-      } else if (st.isFile() && looksLikeTgz(source)) {
-        const fromTgz = resolvePayloadDir(extractTgz(source, join(temp, "extract")));
-        if (!fromTgz) throw new PluginCommandError(`no ${MANIFEST_FILE} + ${ENTRY_FILE} found in ${source}`);
-        payloadDir = fromTgz;
-        originDescription = source;
-      } else {
-        throw new PluginCommandError(`unsupported plugin source file "${source}" (expected a directory or a .tgz)`);
-      }
-    } else if (looksLikeTgz(source)) {
-      throw new PluginCommandError(`tarball not found: ${source}`);
-    } else {
-      console.log(`${BOLDCYAN}Resolving npm package:${RESET} ${source} (offline-first, scripts disabled)`);
-      const archive = npmPack(source, join(temp, "pack"));
-      const fromPack = resolvePayloadDir(extractTgz(archive, join(temp, "extract")));
-      if (!fromPack) throw new PluginCommandError(`no ${MANIFEST_FILE} + ${ENTRY_FILE} found in ${source}`);
-      payloadDir = fromPack;
-      originDescription = source;
-    }
+    const { payloadDir, originDescription } = resolveSourcePayload(source, temp);
 
     const rawManifest = readManifest(payloadDir);
     const manifest = validatePluginManifest(rawManifest);
@@ -413,42 +470,16 @@ async function pluginAdd(
     console.log(`\n${BOLDCYAN}About to install and enable${RESET} ${BOLDGREEN}${manifest.name}@${manifest.version}${RESET}`);
     console.log(`${DIM}Its code will run with your user permissions. Source: ${originDescription}${RESET}`);
     if (!assumeYes) {
-      const ok = await confirmPrompt("Install this plugin? [y/N] ");
+      const ok = await confirmPrompt("Install this plugin? [y/N] ", deps);
       if (!ok) {
         console.log(`${DIM}Installation aborted.${RESET}`);
         return 0;
       }
     }
 
-    const pluginsDir = join(configDir, "plugins");
-    mkdirSync(pluginsDir, { recursive: true });
-    if (lstatSync(pluginsDir).isSymbolicLink() || !lstatSync(pluginsDir).isDirectory()) {
-      throw new PluginCommandError(`plugins directory is not a real directory: ${pluginsDir}`);
-    }
-    const target = join(pluginsDir, manifest.name);
-    if (existsSync(target) && !force) {
-      throw new PluginCommandError(
-        `plugin "${manifest.name}" is already installed at ${target} (use --force to replace it)`
-      );
-    }
+    const target = installStaged(payloadDir, manifest, configDir, force);
 
-    // Stage → validate the staged copy → swap. rename() inside the same
-    // directory is atomic; the pre-swap removal window is minimized.
-    const stage = join(pluginsDir, `.${manifest.name}.staging-${process.pid}-${Date.now()}`);
-    mkdirSync(stage, { recursive: true });
-    cpSync(payloadDir, stage, { recursive: true });
-    const stagedManifest = validatePluginManifest(readManifest(stage), manifest.name);
-    if (!existsSync(join(stage, ENTRY_FILE))) {
-      throw new PluginCommandError(`staged payload is missing its entry ${ENTRY_FILE}`);
-    }
-    if (existsSync(target) || lstatSyncSafe(target)) {
-      rmSync(target, { recursive: true, force: true });
-    }
-    renameSync(stage, target);
-
-    upsertRecord(configDir, stagedManifest.name);
-
-    console.log(`\n${BOLDGREEN}✓ Installed ${stagedManifest.name}@${stagedManifest.version}${RESET}`);
+    console.log(`\n${BOLDGREEN}✓ Installed ${manifest.name}@${manifest.version}${RESET}`);
     console.log(`${DIM}Location: ${target}${RESET}`);
     console.log(`\n${GREEN}Next step:${RESET} restart CCR (ccr restart) to load the plugin.\n`);
     return 0;
@@ -600,7 +631,8 @@ async function pluginList(args: string[], configDir: string): Promise<number> {
   return 0;
 }
 
-async function pluginRemove(args: string[], configDir: string): Promise<number> {
+async function pluginRemove(args: string[], deps: ResolvedDeps): Promise<number> {
+  const { configDir } = deps;
   const assumeYes = args.includes("--yes");
   const positional = args.filter((a) => !a.startsWith("--"));
   const name = positional[0];
@@ -625,7 +657,7 @@ async function pluginRemove(args: string[], configDir: string): Promise<number> 
   if (!assumeYes) {
     console.log(`\n${BOLDCYAN}About to remove${RESET} ${BOLDYELLOW}${name}${RESET}`);
     console.log(`${DIM}Its providers stop working until reinstalled; credential files outside plugins/ are kept.${RESET}`);
-    const ok = await confirmPrompt("Remove this plugin? [y/N] ");
+    const ok = await confirmPrompt("Remove this plugin? [y/N] ", deps);
     if (!ok) {
       console.log(`${DIM}Removal aborted.${RESET}`);
       return 0;
@@ -694,18 +726,23 @@ export async function handlePluginCommand(
 ): Promise<number> {
   const configDir = deps?.configDir ?? HOME_DIR;
   const [subcommand, ...rest] = args;
+  const resolved: ResolvedDeps = {
+    configDir: deps?.configDir ?? HOME_DIR,
+    input: deps?.input ?? process.stdin,
+    output: deps?.output ?? process.stdout,
+  };
   try {
     switch (subcommand) {
       case "add":
-        return await pluginAdd(rest, configDir);
+        return await pluginAdd(rest, resolved);
       case "list":
-        return await pluginList(rest, configDir);
+        return await pluginList(rest, resolved.configDir);
       case "remove":
-        return await pluginRemove(rest, configDir);
+        return await pluginRemove(rest, resolved);
       case "enable":
-        return await pluginSetEnabled(rest, configDir, true);
+        return await pluginSetEnabled(rest, resolved.configDir, true);
       case "disable":
-        return await pluginSetEnabled(rest, configDir, false);
+        return await pluginSetEnabled(rest, resolved.configDir, false);
       default:
         if (subcommand === undefined) {
           console.error(`\n${BOLDYELLOW}Error:${RESET} a subcommand is required\n`);
