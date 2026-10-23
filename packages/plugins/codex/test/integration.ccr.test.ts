@@ -110,7 +110,6 @@ function fakeUpstream(opts: { refreshStatus?: number; accessSecs?: number } = {}
   return { impl, calls };
 }
 
-const b64 = (s: string) => Buffer.from(s).toString("base64");
 /** Scenario upstream: default OAuth/models/wham handling + a custom
  *  data-plane responder. Never delegates back into the mock (no recursion). */
 function scenarioUpstream(dataHandler: (u: string, init: any, calls: Array<{ url: string; init: any }>) => Promise<Response> | Response) {
@@ -150,6 +149,7 @@ let configDir = "";
 let tarballPath = "";
 const unstubbedFetch = globalThis.fetch;
 const cleanupDirs: string[] = [];
+const sandboxEnv = { HOME: process.env.HOME, CCR_CONFIG_DIR: process.env.CCR_CONFIG_DIR };
 
 beforeEach(() => {
   clearPluginRegistry();
@@ -176,8 +176,10 @@ afterEach(async () => {
   getHealthStore().clear();
   for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   rmSync(tarballPath, { force: true });
-  delete process.env.CCR_CONFIG_DIR;
-  delete process.env.HOME;
+  if (sandboxEnv.CCR_CONFIG_DIR === undefined) delete process.env.CCR_CONFIG_DIR;
+  else process.env.CCR_CONFIG_DIR = sandboxEnv.CCR_CONFIG_DIR;
+  if (sandboxEnv.HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = sandboxEnv.HOME;
 });
 
 /** Install through the PRODUCTION installer (extract+validate+stage) from the
@@ -772,7 +774,8 @@ describe("codex plugin integration — fake browser login through the real admin
       expect(managed.models).toEqual(["gpt-5.1-codex", "gpt-5.1"]);
       const userCodex = afterList.find((p: any) => p.name === "codex");
       expect(userCodex.api_key).toBe("sk-user-owns-this");
-      expect(rawAfter.Router).toEqual(before.Router);
+      expect(JSON.stringify(userCodex)).toBe(JSON.stringify((before.Providers ?? before.providers).find((p: any) => p.name === "codex")));
+      expect(JSON.stringify(rawAfter.Router)).toBe(JSON.stringify(before.Router));
       const unrelated = afterList.find((p: any) => p.name === "unrelated");
       expect(JSON.stringify(unrelated)).toBe(JSON.stringify((before.Providers ?? before.providers).find((p: any) => p.name === "unrelated")));
 
