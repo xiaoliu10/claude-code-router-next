@@ -362,6 +362,11 @@ describe("codex plugin integration — install, purity and fail-closed", () => {
       (key) => key === "WAKEUP_ENABLED" ? true : undefined);
     for (let cycle = 0; cycle < 3; cycle++) await (probe as any).runHealthProbe();
     await (probe as any).runQuotaProbe();
+    await (probe as any).runScheduledWakeup();
+    getHealthStore().markRateLimited(provider.name, "m", 3600, "fixture quota");
+    const beforeRecovery = structuredClone(getHealthStore().getAllStates());
+    await (probe as any).runRateLimitProbe();
+    expect(getHealthStore().getAllStates()).toEqual(beforeRecovery);
     expect(fetch).not.toHaveBeenCalled();
     expect(probe.getProbeTelemetry()).toEqual([]);
     expect(await probe.probeProviderManually("codex-subscription")).toMatchObject({ skipped: true, status: "skipped" });
