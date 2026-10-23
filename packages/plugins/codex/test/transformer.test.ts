@@ -126,19 +126,30 @@ describe("CodexTransformer — terminal stream errors", () => {
       { type: "response.created", response: { id: "r" } },
       { type: "error", error: { type: "usage_limit_reached", message: "limit", resets_in_seconds: 120 } },
     ]);
+    // The THROWN error is the CLASSIFIED plugin error: canonical whitelisted
+    // code, semantic status, nonRetryable/pluginClassified and no rawBody —
+    // so the core surfaces a safe codex_* error instead of forwarding the raw
+    // upstream envelope.
     await expect(readAll(await t.transformResponseOut(sseResponse(text), {} as any))).rejects.toMatchObject({
-      code: "usage_limit_reached",
+      code: "codex_usage_limit",
+      statusCode: 429,
+      nonRetryable: true,
+      pluginClassified: true,
     });
-    // The failure is reported on the noteUpstreamError channel (ruling B).
+    // The failure is reported on the noteUpstreamError channel with the SAME
+    // canonical code (ruling B: quota classification cools the account).
     expect(service.errors.at(-1)).toMatchObject({ code: "codex_usage_limit" });
     expect(service.errors.at(-1)!.cooldownMs).toBe(120_000);
   });
 
-  it("throws on response.failed even without an error body", async () => {
+  it("throws a classified error on response.failed even without an error body", async () => {
     const t = new CodexTransformer({ service: stubService() });
     const text = sse([{ type: "response.failed", response: { id: "r" } }]);
     await expect(readAll(await t.transformResponseOut(sseResponse(text), {} as any))).rejects.toMatchObject({
-      code: "response_failed",
+      code: "codex_overloaded",
+      statusCode: 502,
+      nonRetryable: false,
+      pluginClassified: true,
     });
   });
 

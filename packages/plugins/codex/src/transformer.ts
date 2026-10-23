@@ -30,7 +30,7 @@
  */
 import { codexFinalizeBody, codexSessionKey } from "./finalize-body";
 import type { CodexRateLimitWindow, CodexRateLimits } from "./protocol-quota";
-import { classifyCodexError } from "./protocol";
+import { classifyCodexError, codexError } from "./protocol";
 import type { CodexServiceLike } from "./protocol";
 import type { PluginClassifiedError, PluginTransformer, PluginTransformerContext, PluginUnifiedChatRequest } from "./core-types";
 
@@ -151,6 +151,38 @@ export function codexTerminalError(event: any): Record<string, any> | undefined 
  * core's generic retry/fallback and the runtime's classifier engage. The
  * thrown object is already redacted (no token material is ever in it).
  */
+/**
+ * Build the THROWN error for an in-stream terminal event. Unlike
+ * `codexStreamError` (the raw provenance helper), this is classified through
+ * the SAME canonical classifier as HTTP failures: a canonical whitelisted
+ * code, the semantic httpStatus (429 quota / 502 other terminal),
+ * `nonRetryable`, `pluginClassified` and NO rawBody — so the core's
+ * rememberPluginFailure/error-handler surface a safe codex_* error instead of
+ * forwarding the raw upstream envelope, and the service whitelist cools the
+ * account. `upstreamStatus` preserves the real wire status (normally 200 for
+ * an SSE terminal).
+ */
+export function codexClassifiedStreamError(event: any, upstreamStatus = 200): Error & Record<string, any> {
+  const probe = codexStreamError(event, upstreamStatus);
+  const effectiveStatus =
+    probe.statusCode >= 400 ? probe.statusCode : probe.isRateLimit ? 429 : 502;
+  const classified: PluginClassifiedError =
+    classifyCodexError(effectiveStatus, event) ??
+    { code: "codex_upstream_error", message: "Codex upstream stream failed.", httpStatus: 502, retryable: true };
+  const error = codexError({
+    code: classified.code as any,
+    message: classified.message,
+    httpStatus: classified.httpStatus,
+    ...(classified.cooldownMs !== undefined ? { cooldownMs: classified.cooldownMs } : {}),
+    retryable: classified.retryable === true,
+  });
+  return Object.assign(error, {
+    pluginClassified: true as const,
+    upstreamStatus,
+    isRateLimit: classified.httpStatus === 429,
+  });
+}
+
 export function codexStreamError(event: any, status = 200): Error & Record<string, any> {
   const error = codexTerminalError(event) ?? {};
   const code = typeof error.code === "string" ? error.code : typeof error.type === "string" ? error.type : "codex_stream_error";
@@ -275,7 +307,7 @@ export class CodexTransformer implements PluginTransformer {
     let finished = false;
     let rateLimitsSeen = false;
 
-    const handleEvent = (data: string): boolean => {
+    const handleEvent = async (data: string): Promise<boolean> => {
       // true => commit (stop inspecting)
       if (data === "[DONE]") return true;
       let event: any;
@@ -316,7 +348,7 @@ export class CodexTransformer implements PluginTransformer {
               httpStatus: 502,
               retryable: true,
             } satisfies PluginClassifiedError);
-          void this.service.noteUpstreamError?.({
+          await this.service.noteUpstreamError?.({
             code: classified.code,
             message: classified.message,
             httpStatus: classified.httpStatus,
@@ -324,7 +356,7 @@ export class CodexTransformer implements PluginTransformer {
             ...(classified.retryable !== undefined ? { retryable: classified.retryable } : {}),
           });
         } catch { /* bookkeeping never masks the error */ }
-        throw error;
+        throw codexClassifiedStreamError(event, response.status);
       }
       // Content-bearing events commit the stream: after this point a failure is
       // the client's problem, not a retry decision.
@@ -381,7 +413,7 @@ export class CodexTransformer implements PluginTransformer {
                   .map((line) => line.slice(5).trimStart())
                   .join("\n");
                 if (!data) continue;
-                if (handleEvent(data)) { committed = true; break; }
+                if (await handleEvent(data)) { committed = true; break; }
               }
               // The parsed events came from the raw chunk(s) already queued in
               // `chunks`; drop the decoded copy so nothing is emitted twice.
