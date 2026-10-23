@@ -164,12 +164,6 @@ export function codexStreamError(event: any, status = 200): Error & Record<strin
   });
 }
 
-/** Minimal, redaction-safe usage observation handed to the service. */
-export interface CodexUsageObservation {
-  rateLimits: CodexRateLimits;
-  source: "headers" | "sse";
-}
-
 export class CodexTransformer implements PluginTransformer {
   static TransformerName = "codex";
   name = "codex";
