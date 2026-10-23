@@ -43,6 +43,10 @@ export const CODEX_STRIPPED_HEADERS = [
   "session-id",
   "thread-id",
   "conversation-id",
+  // Account identity is CONDITIONALLY injected (only when an account id is
+  // known); strip a client value even on a call that does not re-inject it,
+  // or it would ride through to the upstream verbatim.
+  "chatgpt-account-id",
 ] as const;
 
 const STRIPPED = new Set<string>(CODEX_STRIPPED_HEADERS);
@@ -122,7 +126,7 @@ export function createCodexManagedRuntime(options: CodexRuntimeOptions): Managed
     // Called AFTER the body is final: session headers derive from it.
     signRequest: async ({ headers, requestBody }) => {
       const accessToken = await service.getAccessToken();
-      const accountId = await service.getAccountId().catch(() => undefined);
+      const accountId = await Promise.resolve().then(() => service.getAccountId()).catch(() => undefined);
       const injected = codexAccountHeaders({ accessToken, accountId, requestBody });
       const injectedNames = new Set(Object.keys(injected).map((k) => k.toLowerCase()));
       const next: Record<string, string> = {};

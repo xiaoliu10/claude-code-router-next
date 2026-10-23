@@ -168,7 +168,7 @@ export function codexClassifiedStreamError(event: any, upstreamStatus = 200): Er
   const effectiveStatus =
     probe.statusCode >= 400 ? probe.statusCode : probe.isRateLimit ? 429 : 502;
   const classified: PluginClassifiedError =
-    classifyCodexError(effectiveStatus, terminal ? { error: terminal } : event) ??
+    classifyCodexError(effectiveStatus, terminal ? { ...event, error: terminal } : event) ??
     { code: "codex_upstream_error", message: "Codex upstream stream failed.", httpStatus: 502, retryable: true };
   const error = codexError({
     code: classified.code as any,
@@ -342,10 +342,12 @@ export class CodexTransformer implements PluginTransformer {
             error.statusCode >= 400 ? error.statusCode : (error as any).isRateLimit ? 429 : 502;
           // Classify the UNWRAPPED terminal error: for response.failed the
           // failure object lives at event.response.error, which the classifier
-          // (reading .error off the body) would otherwise never see. Wrapping
-          // keeps the top-level error shape identical to the HTTP path.
+          // (reading .error off the body) would otherwise never see. MERGE over
+          // the event rather than replacing it: a top-level error event may
+          // carry resets_at/resets_in_seconds as event-level siblings, and the
+          // classifier's body-level fallback must keep seeing those.
           const classified =
-            classifyCodexError(effectiveStatus, terminal ? { error: terminal } : event) ??
+            classifyCodexError(effectiveStatus, terminal ? { ...event, error: terminal } : event) ??
             ({
               code: "codex_upstream_error",
               message: "Codex upstream stream failed.",

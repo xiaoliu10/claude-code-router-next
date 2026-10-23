@@ -166,6 +166,19 @@ describe("CodexTransformer — terminal stream errors", () => {
     expect(service.errors.at(-1)).toMatchObject({ code: "codex_usage_limit", cooldownMs: 300_000 });
   });
 
+  it("still cools when the reset window is an event-level sibling of error", async () => {
+    const service = stubService();
+    const t = new CodexTransformer({ service });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "error", error: { type: "usage_limit_reached", message: "limit" }, resets_in_seconds: 180 },
+    ]);
+    await expect(readAll(await t.transformResponseOut(sseResponse(text), {} as any))).rejects.toMatchObject({
+      code: "codex_usage_limit", statusCode: 429,
+    });
+    expect(service.errors.at(-1)?.cooldownMs).toBeGreaterThanOrEqual(180_000);
+  });
+
   it("passes response.incomplete and response.completed as normal completions", async () => {
     const t = new CodexTransformer({ service: stubService() });
     const text = sse([{ type: "response.incomplete", response: { id: "r", status: "incomplete" } }]);

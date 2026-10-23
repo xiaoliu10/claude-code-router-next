@@ -135,6 +135,23 @@ describe("createCodexManagedRuntime — signRequest header hygiene", () => {
     expect(JSON.stringify(next)).not.toContain("spoof");
   });
 
+  it("drops a client chatgpt-account-id even when no account id is (re)injected this call", async () => {
+    // getAccountId absent/throwing means the header is not injected; it must
+    // still be stripped, never forwarded verbatim (defense-in-depth).
+    for (const over of [
+      { getAccountId: async () => undefined as any },
+      { getAccountId: (() => { throw new Error("account read failed"); }) as any },
+    ]) {
+      const rt = build(stubService(over));
+      const next = await rt.signRequest!({
+        headers: { "ChatGPT-Account-ID": "SPOOF-ACCT" },
+        requestBody: {}, provider: {} as any,
+      });
+      expect(JSON.stringify(next)).not.toContain("SPOOF-ACCT");
+      expect(Object.keys(next).map((k) => k.toLowerCase())).not.toContain("chatgpt-account-id");
+    }
+  });
+
   it("never forwards the marker api_key", async () => {
     const rt = build(stubService());
     const next = await rt.signRequest!({ headers: { Authorization: `Bearer ${CODEX_MARKER_API_KEY}` }, requestBody: {}, provider: {} as any });
