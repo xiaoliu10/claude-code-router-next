@@ -13,7 +13,8 @@
   "keywords": [
     "claude-code-router",
     "workbuddy",
-    "provider-plugin"
+    "provider-plugin",
+    "ccr-provider-plugin"
   ],
   "license": "MIT",
   "devDependencies": {

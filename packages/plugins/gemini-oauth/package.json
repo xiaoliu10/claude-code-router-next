@@ -13,7 +13,8 @@
     "claude-code-router",
     "gemini",
     "antigravity",
-    "provider-plugin"
+    "provider-plugin",
+    "ccr-provider-plugin"
   ],
   "license": "MIT",
   "devDependencies": {
