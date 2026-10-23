@@ -145,6 +145,30 @@ it("add from a pre-seeded npm-layout tgz (package/dist payload) via tar", async 
   expect(records()).toEqual([{ name: "tgzplug", enabled: true }]);
 });
 
+it("add from an npm spec records the npm source on the plugin record", async () => {
+  const pkgRoot = join(scratch, "npm-src");
+  makePayload(pkgRoot, { name: "npmplug", layout: "dist" });
+  mkdirSync(join(pkgRoot, "package"), { recursive: true });
+  execFileSync("mv", [join(pkgRoot, "dist"), join(pkgRoot, "package", "dist")]);
+  writeFileSync(join(pkgRoot, "package", "package.json"), JSON.stringify({ name: "@wengine-ai/ccr-provider-npmplug", version: "1.0.0" }));
+  const archive = join(scratch, "wengine-ai-ccr-provider-npmplug-1.0.0.tgz");
+  execFileSync("tar", ["-czf", archive, "-C", pkgRoot, "package"]);
+
+  // The npm executor is stubbed (a pre-packed tarball plays the registry);
+  // the lane under test is the real one: npmSpec → record `source`, which the
+  // dashboard catalog uses to hide installed entries.
+  const seen: string[] = [];
+  const code = await handlePluginCommand(["add", "@wengine-ai/ccr-provider-npmplug", "--yes"], {
+    configDir,
+    npmPackImpl: (spec, destDir) => { seen.push(spec); mkdirSync(destDir, { recursive: true }); return archive; },
+  });
+
+  expect(code).toBe(0);
+  expect(seen).toEqual(["@wengine-ai/ccr-provider-npmplug"]);
+  expect(existsSync(join(configDir, "plugins", "npmplug", "plugin.js"))).toBe(true);
+  expect(records()).toEqual([{ name: "npmplug", enabled: true, source: "@wengine-ai/ccr-provider-npmplug" }]);
+});
+
 // ---------------------------------------------------------------------------
 // add — rejections
 // ---------------------------------------------------------------------------

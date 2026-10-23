@@ -169,7 +169,9 @@ describe("POST /api/plugins/install", () => {
       restartRequired: true,
     });
     expect(existsSync(join(configDir, "plugins", "fixture", "plugin.js"))).toBe(true);
-    expect(records()).toEqual([{ name: "fixture", enabled: true }]);
+    // The npm lane records the package name the plugin came from so the
+    // catalog can map npm entries back to installed plugins.
+    expect(records()).toEqual([{ name: "fixture", enabled: true, source: "ccr-provider-fixture" }]);
     expect(readdirSync(join(configDir, "plugins")).filter((n) => n.includes("staging"))).toEqual([]);
   });
 

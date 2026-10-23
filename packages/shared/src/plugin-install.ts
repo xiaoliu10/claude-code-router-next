@@ -76,6 +76,9 @@ export interface PluginManifest {
 export interface PluginInstallRecord {
   name: string;
   enabled: boolean;
+  /** npm package name this plugin was installed from (npm lane only); the
+   *  catalog uses it to map npm catalog entries back to installed plugins. */
+  source?: string;
 }
 
 /** Manifest fields as they appear on disk, before validation. */
@@ -293,9 +296,13 @@ export function readPluginRecordsChecked(configDir: string): ReadRecordsResult {
     // never silently dropped when the file is rewritten.
     return {
       records: parsed
-        .filter((e: any): e is { name: string; enabled?: unknown } =>
+        .filter((e: any): e is { name: string; enabled?: unknown; source?: unknown } =>
           e && typeof e.name === "string")
-        .map((e) => ({ name: e.name, enabled: e.enabled !== false })),
+        .map((e) => ({
+          name: e.name,
+          enabled: e.enabled !== false,
+          ...(typeof e.source === "string" && e.source ? { source: e.source } : {}),
+        })),
       corrupted: false,
     };
   } catch {
@@ -330,12 +337,18 @@ export function assertRecordsWritable(configDir: string, force: boolean): void {
 /** Register or replace the record for name, preserving the order of all
  *  other records (the loader loads in plugins.json order). Refuses to
  *  overwrite an UNPARSEABLE plugins.json without force. A disabled record is
- *  re-enabled by reinstalling. */
-export function upsertPluginRecord(configDir: string, name: string, force = false): void {
+ *  re-enabled by reinstalling. `source` records the npm package name for
+ *  npm-lane installs (the catalog matches entries by it); when omitted, a
+ *  previously recorded source is preserved. */
+export function upsertPluginRecord(configDir: string, name: string, force = false, source?: string): void {
   const { records, corrupted } = readPluginRecordsChecked(configDir);
   if (corrupted && !force) throw corruptedRecordsError(configDir);
-  const record: PluginInstallRecord = { name, enabled: true };
   const idx = records.findIndex((r) => r.name === name);
+  const record: PluginInstallRecord = { name, enabled: true };
+  const sourceValue = typeof source === "string" && source
+    ? source
+    : idx >= 0 ? records[idx].source : undefined;
+  if (sourceValue) record.source = sourceValue;
   if (idx >= 0) records[idx] = record;
   else records.push(record);
   writePluginRecords(configDir, records);
@@ -935,7 +948,8 @@ export function stagePluginInstall(
   payloadDir: string,
   manifest: PluginManifest,
   configDir: string,
-  force: boolean
+  force: boolean,
+  source?: string
 ): string {
   const pluginsDir = join(configDir, "plugins");
   mkdirSync(pluginsDir, { recursive: true });
@@ -967,7 +981,7 @@ export function stagePluginInstall(
       rmSync(target, { recursive: true, force: true });
     }
     renameSync(stage, target);
-    upsertPluginRecord(configDir, stagedManifest.name, force);
+    upsertPluginRecord(configDir, stagedManifest.name, force, source);
   } catch (error) {
     // Never orphan the staging dir on a failed copy/validate.
     rmSync(stage, { recursive: true, force: true });
@@ -1000,6 +1014,9 @@ export interface InstallFromArchiveOptions {
   force?: boolean;
   /** Working area; a fresh mkdtemp under TMPDIR is created when omitted. */
   tempRoot?: string;
+  /** npm package name this install came from (npm lane); recorded on the
+   *  plugins.json record for catalog installed-state matching. */
+  source?: string;
 }
 
 /** Extract + validate + stage a local tarball (CLI local .tgz and the
@@ -1031,7 +1048,7 @@ async function installPluginFromArchiveUnlocked(
       );
     }
     const { manifest } = validatePayload(payloadDir);
-    const target = stagePluginInstall(payloadDir, manifest, options.configDir, options.force ?? false);
+    const target = stagePluginInstall(payloadDir, manifest, options.configDir, options.force ?? false, options.source);
     return { target, manifest };
   } finally {
     if (ownsTemp) rmSync(temp, { recursive: true, force: true });
@@ -1095,6 +1112,7 @@ export async function installPluginFromNpm(options: InstallFromNpmOptions): Prom
       configDir: options.configDir,
       force: options.force,
       tempRoot: temp,
+      source: options.spec,
     });
   } finally {
     if (ownsTemp) rmSync(temp, { recursive: true, force: true });

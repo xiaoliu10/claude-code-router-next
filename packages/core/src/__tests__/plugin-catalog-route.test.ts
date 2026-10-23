@@ -159,6 +159,34 @@ describe("GET /api/plugins/catalog", () => {
     ]);
   });
 
+  it("marks an entry installed when its npm name matches a record source (scoped npm name ≠ manifest name)", async () => {
+    // Real-world shape: @wengine-ai/ccr-provider-codex installs as manifest
+    // name "codex"; the catalog entry is the npm name, so only the recorded
+    // source can bridge the two.
+    const { installPluginFromArchive } = await import("@wengine-ai/claude-code-router-shared");
+    const root = join(scratch, "seed-scoped");
+    const inner = join(root, "package", "dist");
+    mkdirSync(inner, { recursive: true });
+    writeFileSync(join(root, "package", "package.json"), JSON.stringify({ name: "@wengine-ai/ccr-provider-codex", version: "1.0.0" }));
+    writeFileSync(join(inner, "plugin.json"), JSON.stringify({ name: "codex", version: "1.0.0", coreApi: "1" }));
+    writeFileSync(join(inner, "plugin.js"), "export const activate = () => ({});\n");
+    const archive = join(scratch, "scoped.tgz");
+    execFileSync("tar", ["-czf", archive, "-C", root, "package"]);
+    await installPluginFromArchive(archive, { configDir, source: "@wengine-ai/ccr-provider-codex" });
+
+    const registry = await startSearchStub({
+      "ccr-provider-plugin": [
+        { name: "@wengine-ai/ccr-provider-codex", keywords: ["ccr-provider-plugin"], version: "1.1.0", description: "scoped npm name" },
+      ],
+    });
+    const app = buildApp(registry.url);
+    const res = await getLocal(app);
+    const body = res.json();
+    expect(body.plugins).toEqual([
+      { name: "@wengine-ai/ccr-provider-codex", description: "scoped npm name", version: "1.1.0", installed: true, installedVersion: "1.0.0" },
+    ]);
+  });
+
   it("tolerates a broken registry: 200 with empty list + warning, no leaked details", async () => {
     // Point the route at a port where nothing listens (both searches fail).
     const app = Fastify({ logger: false });

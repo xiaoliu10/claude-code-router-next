@@ -86,12 +86,15 @@ interface PluginCommandDeps {
   input?: Readable;
   /** stdout sink for prompts (tests); defaults to process.stdout. */
   output?: Writable;
+  /** Override the npm-pack executor (tests): (spec, destDir) => archive path. */
+  npmPackImpl?: (spec: string, destDir: string) => string;
 }
 
 interface ResolvedDeps {
   configDir: string;
   input: Readable;
   output: Writable;
+  npmPackImpl?: (spec: string, destDir: string) => string;
 }
 
 class PluginCommandError extends Error {}
@@ -212,8 +215,10 @@ async function confirmPrompt(question: string, deps: ResolvedDeps): Promise<bool
 
 /** Resolve the user-supplied source into an installable payload directory.
  *  The returned payload may live inside temp (tgz/npm paths) — callers must
- *  not clean temp before the payload has been copied. */
-async function resolveSourcePayload(source: string, temp: string): Promise<{ payloadDir: string; originDescription: string }> {
+ *  not clean temp before the payload has been copied. `npmSpec` is set only
+ *  for the npm lane (the spec the user asked for) so the record can persist
+ *  its origin for catalog installed-state matching. */
+async function resolveSourcePayload(source: string, temp: string, deps: ResolvedDeps): Promise<{ payloadDir: string; originDescription: string; npmSpec?: string }> {
   if (source.startsWith("-")) {
     throw new PluginCommandError(`invalid plugin source "${source}"`);
   }
@@ -237,8 +242,10 @@ async function resolveSourcePayload(source: string, temp: string): Promise<{ pay
     throw new PluginCommandError(`tarball not found: ${source}`);
   }
   console.log(`${BOLDCYAN}Resolving npm package:${RESET} ${source} (offline-first, scripts disabled)`);
-  const archive = npmPack(source, join(temp, "pack"));
-  return tgzPayload(archive, temp, source);
+  const pack = deps.npmPackImpl ?? npmPack;
+  const archive = pack(source, join(temp, "pack"));
+  const resolved = await tgzPayload(archive, temp, source);
+  return { ...resolved, npmSpec: source };
 }
 
 /** Enforce the shared archive caps, extract an npm-style tarball and locate
@@ -275,7 +282,7 @@ async function pluginAdd(
 
   const temp = mkdtempSync(join(tmpdir(), "ccr-plugin-add-"));
   try {
-    const { payloadDir, originDescription } = await resolveSourcePayload(source, temp);
+    const { payloadDir, originDescription, npmSpec } = await resolveSourcePayload(source, temp, deps);
 
     const { manifest } = validatePayload(payloadDir);
 
@@ -289,7 +296,7 @@ async function pluginAdd(
       }
     }
 
-    const target = stagePluginInstall(payloadDir, manifest, configDir, force);
+    const target = stagePluginInstall(payloadDir, manifest, configDir, force, npmSpec);
 
     console.log(`\n${BOLDGREEN}✓ Installed ${manifest.name}@${manifest.version}${RESET}`);
     console.log(`${DIM}Location: ${target}${RESET}`);
@@ -546,6 +553,7 @@ export async function handlePluginCommand(
     configDir: deps?.configDir ?? HOME_DIR,
     input: deps?.input ?? process.stdin,
     output: deps?.output ?? process.stdout,
+    npmPackImpl: deps?.npmPackImpl,
   };
   const [subcommand, ...rest] = args;
   try {

@@ -124,7 +124,16 @@ export async function buildPluginCatalog(
   }
 
   const records = readPluginRecords(configDir);
+  // Catalog entries are keyed by NPM package name; records are keyed by the
+  // installed manifest name (@wengine-ai/ccr-provider-codex installs as
+  // "codex"). The record's `source` field (recorded at install) bridges the
+  // two; a direct name match still covers names that happen to coincide.
   const recordByName = new Map(records.map((r) => [r.name, r]));
+  const recordBySource = new Map(
+    records
+      .filter((r): r is typeof r & { source: string } => typeof r.source === "string" && r.source !== "")
+      .map((r) => [r.source, r])
+  );
   // Installed manifest version comes from the plugin payload, not npm.
   const installedVersion = (name: string): string | null => {
     try {
@@ -139,11 +148,12 @@ export async function buildPluginCatalog(
   const plugins: CatalogEntry[] = [...byName.values()]
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((entry) => {
-      const installed = recordByName.has(entry.name) || existsSync(join(configDir, "plugins", entry.name));
+      const record = recordByName.get(entry.name) ?? recordBySource.get(entry.name);
+      const installed = record !== undefined || existsSync(join(configDir, "plugins", entry.name));
       return {
         ...entry,
         installed,
-        installedVersion: installed ? installedVersion(entry.name) : null,
+        installedVersion: installed ? installedVersion(record ? record.name : entry.name) : null,
       };
     });
   return { ok: true, plugins };

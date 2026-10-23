@@ -404,6 +404,19 @@ describe("installPluginFromArchive", () => {
     expect(readFileSync(credentials, "utf8")).toBe(secret);
   });
 
+  it("records the npm source on the record and preserves it across source-less reinstalls", async () => {
+    const { archive } = makePackedPlugin("sourced");
+    await installPluginFromArchive(archive, { configDir, source: "@wengine-ai/ccr-provider-codex" });
+    expect(readPluginRecords(configDir)).toEqual([
+      { name: "fixture", enabled: true, source: "@wengine-ai/ccr-provider-codex" },
+    ]);
+    const again = makePackedPlugin("sourced-again").archive;
+    await installPluginFromArchive(again, { configDir, force: true });
+    expect(readPluginRecords(configDir)).toEqual([
+      { name: "fixture", enabled: true, source: "@wengine-ai/ccr-provider-codex" },
+    ]);
+  });
+
   it("does not create anything outside the config dir for a rejected archive", async () => {
     const evil = gzipSync(ustar([
       { name: "package/plugin.json", data: Buffer.from(JSON.stringify(manifest({ name: "bad/name" }))) },
