@@ -350,6 +350,15 @@ describe("browser login", () => {
         .status).toBe("error");
       expect((await service.submitCallback(again.loginId, `http://127.0.0.1:1455/other?state=${s}&code=x`))
         .status).toBe("error");
+      // The redirect authority we handed the IdP is always loopback, so a
+      // foreign hostname can never be a real callback (phished or mistyped).
+      for (const foreign of ["attacker.example", "127.0.0.1.evil.example", "evil.example.127.0.0.1"]) {
+        const pasted = await service.submitCallback(
+          again.loginId,
+          `http://${foreign}:1455/auth/callback?state=${s}&code=x`,
+        );
+        expect(pasted.status).toBe("error");
+      }
       await service.cancelLogin(again.loginId);
     } finally {
       await new Promise((r) => busy.close(r));

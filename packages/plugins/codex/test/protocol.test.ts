@@ -309,6 +309,20 @@ describe("config protection", () => {
     expect(next.Providers[2]).toEqual({ name: "anthropic" });
     expect(next.Router).toEqual(prev.Router);
 
+    // A user provider that merely shares our name keeps its own credentials:
+    // the host runs protectors on every generic save, so re-locking by name
+    // alone would silently destroy the user's key.
+    const collision = {
+      Providers: [{ name: CODEX_PROVIDER_NAME, api_key: "sk-USER-OWN-KEY", api_base_url: "https://user.example/v1" }],
+      Router: {},
+    };
+    // prev carries the real managed entry, which is the condition under which
+    // a name-only match used to be treated as the managed provider.
+    protectCodexConfig(collision, { Providers: [managed()], Router: {} });
+    expect(collision.Providers[0]).toEqual({
+      name: CODEX_PROVIDER_NAME, api_key: "sk-USER-OWN-KEY", api_base_url: "https://user.example/v1",
+    });
+
     // Deletion by omission is repaired.
     const stripped = { Providers: [{ name: "anthropic" }], Router: {} };
     protectCodexConfig(stripped, prev);

@@ -85,6 +85,13 @@ export const CODEX_ORIGINATOR = "codex_cli_rs";
 export const CODEX_MARKER_API_KEY = CODEX_API_KEY;
 
 export const CODEX_CALLBACK_PORTS = [1455, 1457] as const;
+
+
+/** Loopback hostnames a pasted callback URL is allowed to name. The redirect
+ *  authority we hand the IdP is always 127.0.0.1, so any other host could not
+ *  have come from a real redirect. */
+export const CODEX_LOOPBACK_HOSTS: readonly string[] = ["127.0.0.1", "localhost", "::1"];
+
 export const CODEX_CALLBACK_PATH = "/auth/callback";
 /** Login lifetime: 10 minutes (same bounded TTL as the other managed lanes). */
 export const CODEX_LOGIN_TTL_MS = 10 * 60 * 1000;
@@ -656,8 +663,12 @@ export function protectCodexConfig(next: any, prev?: any): void {
     if (!Array.isArray(next?.[key])) continue;
     const olds = ((prev?.Providers || prev?.providers || []) as any[]).filter((p: any) => isCodexManagedConfigProvider(p));
     next[key] = next[key].map((p: any) => {
-      const old = olds.find((o: any) => o?.name === p?.name);
-      if (isCodexManagedConfigProvider(p) || (old && p?.name === CODEX_PROVIDER_NAME)) {
+      // Only entries that ARE the managed provider get re-locked. A name match
+      // alone is not identity: the host calls protectors on every generic
+      // config save, so re-locking by name would overwrite (and permanently
+      // lose) a user provider that happens to share our name. A managed entry
+      // whose markers were stripped is restored by the omission loop below.
+      if (isCodexManagedConfigProvider(p)) {
         return lockCodexProvider({ ...p });
       }
       return p;

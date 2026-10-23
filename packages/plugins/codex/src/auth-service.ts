@@ -30,6 +30,7 @@ import type { PluginClassifiedError, PluginHostCapabilities } from "../../../cor
 import {
   CODEX_CALLBACK_PATH,
   CODEX_CALLBACK_PORTS,
+  CODEX_LOOPBACK_HOSTS,
   CODEX_LOGIN_TTL_MS,
   CODEX_PROVIDER_NAME,
   CODEX_REFRESH_LEAD_MS,
@@ -696,7 +697,14 @@ export class CodexAuthService {
       return { status: "error", error: "codex_login_state_rejected" };
     }
     // The pasted URL must target the exact allow-listed redirect authority
-    // we handed the IdP (bound port, or 1455 in paste mode).
+    // we handed the IdP (bound port, or 1455 in paste mode). The host must be
+    // loopback too: the redirect authority is always 127.0.0.1, so accepting a
+    // foreign hostname would mean trusting a URL that could never have come
+    // from the IdP's redirect (a mistyped or phished paste).
+    const host = target.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (!CODEX_LOOPBACK_HOSTS.includes(host)) {
+      return { status: "error", error: "codex_login_state_rejected" };
+    }
     const expectedPort = new URL(job.redirectUri).port;
     if (target.port !== expectedPort) {
       return { status: "error", error: "codex_login_state_rejected" };
