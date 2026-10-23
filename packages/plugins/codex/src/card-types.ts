@@ -12,7 +12,7 @@
 /** Fixed managed provider name (never a user's generic provider named codex). */
 export const CODEX_PROVIDER_NAME = "codex-subscription";
 /** CCR marker api_key; a managed entry never carries a real key. */
-export const CODEX_MARKER_KEY = "ccr-codex-managed";
+export const CODEX_MARKER_KEY = "ccr-managed-codex";
 
 export type CodexConnectionState = "not_connected" | "connected" | "expired" | "error";
 

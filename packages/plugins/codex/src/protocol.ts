@@ -28,6 +28,14 @@
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { PluginClassifiedError } from "../../../core/src/provider-plugins/types";
+import type { CodexRateLimits as QuotaCodexRateLimits } from "./protocol-quota";
+
+/**
+ * Rate-limit observation shape is single-sourced in protocol-quota.ts
+ * (data-plane ownership). Re-exported so existing `from "./protocol"`
+ * importers keep working.
+ */
+export type { CodexRateLimits, CodexRateLimitWindow } from "./protocol-quota";
 
 // ---------------------------------------------------------------------------
 // Provider identity
@@ -40,7 +48,7 @@ export const CODEX_TRANSFORMER_NAME = "codex";
 /** The openai-responses transformer runs first, then the Codex finalizer. */
 export const CODEX_TRANSFORMER_CHAIN = ["openai-responses", CODEX_TRANSFORMER_NAME] as const;
 /** Constant marker api key stored in ordinary config; NEVER forwarded upstream. */
-export const CODEX_API_KEY = "ccr-codex-managed";
+export const CODEX_API_KEY = "ccr-managed-codex";
 
 // ---------------------------------------------------------------------------
 // Endpoints and wire constants
@@ -66,6 +74,15 @@ export const CODEX_WHAM_USAGE_PATH = "/backend-api/wham/usage";
  * maintenance without a code change.
  */
 export const CODEX_DEFAULT_CLIENT_VERSION = "0.160.1";
+
+/** Full Codex turn endpoint: backend base + /responses (pinned wire fact). */
+export const CODEX_UPSTREAM_URL = `${CODEX_BACKEND_BASE}/responses`;
+/** Data-plane alias for the pinned client version (A's value wins over bridge 0.159.0). */
+export const CODEX_CLIENT_VERSION = CODEX_DEFAULT_CLIENT_VERSION;
+/** Fixed originator header value for every data-plane request. */
+export const CODEX_ORIGINATOR = "codex_cli_rs";
+/** Alias used by the data plane for the managed marker; NEVER forwarded upstream. */
+export const CODEX_MARKER_API_KEY = CODEX_API_KEY;
 
 export const CODEX_CALLBACK_PORTS = [1455, 1457] as const;
 export const CODEX_CALLBACK_PATH = "/auth/callback";
@@ -156,13 +173,16 @@ export type CodexAdminCode =
   | "codex_credential_unreadable"
   | "codex_config_write_failed";
 
+/** The managed runtime throws this before any network touch when the account is cooling. */
+export type CodexThrownCode = CodexErrorCode | "codex_account_cooling";
+
 export function codexError(info: {
-  code: CodexErrorCode;
+  code: CodexThrownCode;
   message: string;
   httpStatus: number;
   cooldownMs?: number;
   retryable?: boolean;
-}): Error & { code: CodexErrorCode; statusCode: number; cooldownMs?: number; codex: true; nonRetryable: boolean } {
+}): Error & { code: CodexThrownCode; statusCode: number; cooldownMs?: number; codex: true; nonRetryable: boolean } {
   return Object.assign(new Error(info.message), {
     code: info.code,
     statusCode: info.httpStatus,
@@ -213,12 +233,26 @@ export function epochMs(value: unknown): number | undefined {
  * shared taxonomy. `usage_limit_reached` envelopes carry a unix `resets_at`
  * and become a bounded cooldown. Returns null for nothing-we-recognise.
  */
+/**
+ * Data-plane name for the classified-error shape; structurally identical to
+ * the canonical core PluginClassifiedError (single definition, single source).
+ */
+export type CodexClassifiedErrorInfo = PluginClassifiedError;
+
 export function classifyCodexError(status: number, body: unknown, _systemText?: string): PluginClassifiedError | null {
   const json = parseBody(body) ?? (typeof body === "string" ? {} : body);
   const err = (json as any)?.error;
   const errType = typeof err?.type === "string" ? err.type : "";
   const message = typeof err?.message === "string" ? err.message : bodyText(body);
   const resetMs = epochMs(err?.resets_at ?? (json as any)?.resets_at);
+  const resetInSeconds = Number(err?.resets_in_seconds ?? (json as any)?.resets_in_seconds);
+  const resetInMs = Number.isFinite(resetInSeconds) && resetInSeconds > 0 ? resetInSeconds * 1000 : undefined;
+  const quotaCooldown = (): number | undefined => {
+    const now = Date.now();
+    if (resetMs && resetMs > now) return Math.max(resetMs - now, 60_000);
+    if (resetInMs) return Math.max(resetInMs, 60_000);
+    return undefined;
+  };
   const now = Date.now();
 
   if (/usage_limit_reached|RESOURCE_EXHAUSTED|limit reached/i.test(errType) ||
@@ -227,7 +261,7 @@ export function classifyCodexError(status: number, body: unknown, _systemText?: 
       code: "codex_usage_limit",
       message: CODEX_SAFE_MESSAGES.codex_usage_limit,
       httpStatus: 429,
-      ...(resetMs && resetMs > now ? { cooldownMs: Math.max(resetMs - now, 60_000) } : {}),
+      ...(quotaCooldown() ? { cooldownMs: quotaCooldown() } : {}),
     };
   }
   if (status === 401 || /invalid_grant|token.*(expired|revoked|invalid)|refresh_token/i.test(`${errType} ${message}`)) {
@@ -243,7 +277,7 @@ export function classifyCodexError(status: number, body: unknown, _systemText?: 
       message: CODEX_SAFE_MESSAGES.codex_rate_limited,
       httpStatus: 429,
       retryable: true,
-      ...(resetMs && resetMs > now ? { cooldownMs: Math.max(resetMs - now, 60_000) } : {}),
+      ...(quotaCooldown() ? { cooldownMs: quotaCooldown() } : {}),
     };
   }
   if (status >= 500) {
@@ -579,23 +613,8 @@ export async function fetchCodexUsage(params: {
 // Rate-limit observations (data plane → service; storage seam only)
 // ---------------------------------------------------------------------------
 
-export interface CodexRateLimitWindow {
-  usedPercent: number;
-  windowSeconds?: number;
-  /** Epoch milliseconds. */
-  resetAt?: number;
-}
-
-export interface CodexRateLimits {
-  primary?: CodexRateLimitWindow;
-  secondary?: CodexRateLimitWindow;
-  /** Epoch milliseconds. */
-  observedAt: number;
-  source: "headers" | "sse";
-}
-
 /** True when a window says the account is at 100% with a live reset time. */
-export function rateLimitsSaturated(limits: CodexRateLimits, now: number): boolean {
+export function rateLimitsSaturated(limits: QuotaCodexRateLimits, now: number): boolean {
   for (const w of [limits.primary, limits.secondary]) {
     if (!w) continue;
     if (w.usedPercent >= 100 && typeof w.resetAt === "number" && w.resetAt > now) return true;
@@ -716,7 +735,7 @@ export interface CodexServiceLike {
   isAccountCooling(): Promise<boolean>;
   getModelInstructions(model: string): string | undefined;
   /** Persist a data-plane rate-limit observation (storage/cooling only). Never throws. */
-  noteRateLimits(limits: CodexRateLimits): Promise<void>;
+  noteRateLimits(limits: QuotaCodexRateLimits): Promise<void>;
   /** Latest stored rate-limit observation, if any. */
-  getRateLimits(): Promise<CodexRateLimits | null>;
+  getRateLimits(): Promise<QuotaCodexRateLimits | null>;
 }

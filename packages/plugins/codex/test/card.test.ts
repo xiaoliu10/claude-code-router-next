@@ -257,7 +257,7 @@ describe("self-contained Codex plugin card", () => {
     expect(h.refreshConfig).toHaveBeenCalledTimes(1);
     const merge = h.refreshConfig.mock.calls[0]?.[0] as any;
     const local = { Providers: [{ name: "draft" }], Router: { default: "draft,m" } };
-    const managed = { name: CODEX_PROVIDER_NAME, api_key: "ccr-codex-managed" };
+    const managed = { name: CODEX_PROVIDER_NAME, api_key: "ccr-managed-codex" };
     const out = merge(local, { Providers: [managed] });
     expect(out.Router).toBe(local.Router); // unrelated draft + Router survive
     expect(out.Providers).toEqual([{ name: "draft" }, managed]);
