@@ -188,11 +188,6 @@ export function sanitizeCodexErrorCode(value: unknown): string | null {
   return value;
 }
 
-/** Whether the value renders as a localized usage note (never an error). */
-export function isCodexUsageFailure(value: unknown): boolean {
-  return value === null;
-}
-
 // ---------------------------------------------------------------------------
 // View state
 // ---------------------------------------------------------------------------
