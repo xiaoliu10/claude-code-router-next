@@ -113,12 +113,17 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   const usageStore = readUsageStore();
   const freshUsage = (site: WorkBuddyKind, uid: string): WorkBuddyUsage | null | undefined => {
     const hit = usageStore.entries[site]?.[uid];
-    if (!hit || Date.now() - hit.at > USAGE_CACHE_TTL_MS) return undefined;
-    return hit.value;
+    const now = Date.now();
+    if (!hit || !Number.isFinite(hit.at) || hit.at > now || now - hit.at > USAGE_CACHE_TTL_MS) return undefined;
+    // Storage is untrusted; old null/error entries must not suppress retries.
+    return parseWorkBuddyUsage({ usage: hit.value }) ?? undefined;
   };
   const rememberUsage = (site: WorkBuddyKind, uid: string, value: WorkBuddyUsage | null): void => {
     usageStore.savedAt = Date.now();
-    usageStore.entries[site] = { ...(usageStore.entries[site] || {}), [uid]: { value, at: usageStore.savedAt } };
+    const entries = { ...(usageStore.entries[site] || {}) };
+    if (value === null) delete entries[uid];
+    else entries[uid] = { value, at: usageStore.savedAt };
+    usageStore.entries[site] = entries;
     writeUsageStore(usageStore);
   };
   let toast: string | null = null;
@@ -242,6 +247,10 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     if (!alive || generation !== id) return;
     status = updated; loadFailed = false; confirm = null;
     if (opts.clearUsage || opts.dropUsageUid) {
+      // Invalidation must reach sessionStorage too, not only this mount.
+      if (opts.clearUsage) delete usageStore.entries[site];
+      else if (opts.dropUsageUid) delete usageStore.entries[site]?.[opts.dropUsageUid];
+      writeUsageStore(usageStore);
       const entries = usage[site];
       if (entries) {
         const next: Record<string, WorkBuddyUsage | null> = {};
@@ -296,8 +305,11 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         // scheduling new reads, the in-flight one is read-only and harmless.
         if (!alive || autoUsageStopped || props.disabled || locked || loading) return;
         if (usage[site]?.[account.uid] !== undefined) continue;
+        const requestGeneration = generation;
         const payload = await post<any>("/usage", { site, uid: account.uid }).catch(() => undefined);
-        if (!alive) return;
+        // A user action may have started while this read was in flight. Never
+        // overwrite a newer manual refresh or resurrect a removed account.
+        if (!alive || generation !== requestGeneration) return;
         if (payload === undefined) continue;
         const parsed = parseWorkBuddyUsage(payload);
         usage[site] = { ...(usage[site] || {}), [account.uid]: parsed };

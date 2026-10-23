@@ -319,6 +319,52 @@ describe("self-contained WorkBuddy plugin card", () => {
     }
   });
 
+  it("does not cache unavailable quota and retries on the next mount", async () => {
+    let raw: string | null = null;
+    vi.stubGlobal("sessionStorage", { getItem: () => raw, setItem: (_key: string, value: string) => { raw = value; } });
+    const first = harness({ "/usage": { usage: null } });
+    await tick();
+    expect(first.callApi.mock.calls.filter(([path]) => path === "/usage")).toHaveLength(1);
+    expect(JSON.parse(raw!).entries.workbuddy).toEqual({});
+    unmount(first.host as any);
+    const second = harness({ "/usage": { usage: { plan: "Pro", used: 2, limit: 10, unit: "credits" } } });
+    await tick();
+    expect(second.callApi.mock.calls.filter(([path]) => path === "/usage")).toHaveLength(1);
+    expect(second.host.text()).toContain(en.credits.line.replace("{{plan}}", "Pro").replace("{{used}}", "2").replace("{{limit}}", "10"));
+  });
+
+  it("drops a stale auto-read when a newer manual refresh completes first", async () => {
+    let completeAuto!: (value: unknown) => void;
+    let count = 0;
+    const h = harness({ "/usage": () => ++count === 1
+      ? new Promise(resolve => { completeAuto = resolve; })
+      : { usage: { plan: "New", used: 7, limit: 100, unit: "credits" } } });
+    await tick();
+    h.host.card("workbuddy").click(en.credits.action);
+    await tick();
+    completeAuto({ usage: { plan: "Old", used: 1, limit: 100, unit: "credits" } });
+    await tick();
+    expect(h.host.text()).toContain(en.credits.line.replace("{{plan}}", "New").replace("{{used}}", "7").replace("{{limit}}", "100"));
+    expect(h.host.text()).not.toContain("Old");
+  });
+
+  it("ignores malformed or expired session quota values", async () => {
+    for (const hit of [
+      { value: null, at: Date.now() },
+      { value: { plan: "stale", used: 1, limit: 100, unit: "credits" }, at: Date.now() - 11 * 60_000 },
+      { value: { plan: "bad", used: "wrong", limit: 100, unit: "credits" }, at: Date.now() },
+      { value: { plan: "future", used: 1, limit: 100, unit: "credits" }, at: Date.now() + 60_000 },
+    ]) {
+      vi.stubGlobal("sessionStorage", {
+        getItem: () => JSON.stringify({ entries: { workbuddy: { "uid-123456789": hit } } }), setItem: () => {},
+      });
+      const h = harness({ "/usage": { usage: { plan: "Valid", used: 2, limit: 10, unit: "credits" } } });
+      await tick();
+      expect(h.callApi.mock.calls.filter(([path]) => path === "/usage")).toHaveLength(1);
+      unmount(h.host as any);
+    }
+  });
+
   it("browser authorization runs the sequential login helper and shows the pending link; cancel invalidates the job", async () => {
     const h = harness({
       "/login/poll": () => ({ status: "pending" }),
