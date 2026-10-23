@@ -37,7 +37,7 @@ const stripSourcemapComment = (file: string): void => {
 
 const nodeExternals = []; // fully self-contained: only node: builtins stay external
 
-await esbuild.build({
+const pluginBundle = await esbuild.build({
   entryPoints: [join(root, "src/plugin.ts")],
   bundle: true,
   sourcemap: true,
@@ -50,6 +50,9 @@ await esbuild.build({
   legalComments: "none",
   logLevel: "info",
 });
+
+const hostInputs = Object.keys(pluginBundle.metafile!.inputs).filter(input => /(?:^|\/)core\/src\//.test(input));
+if (hostInputs.length) throw new Error(`Plugin must not bundle host runtime modules: ${hostInputs.join(", ")}`);
 
 await esbuild.build({
   entryPoints: [join(root, "src/card-entry.ts")],

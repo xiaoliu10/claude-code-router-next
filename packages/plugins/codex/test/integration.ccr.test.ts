@@ -619,6 +619,52 @@ describe("codex plugin integration — data plane through the real server", () =
     } finally { await app.app.close(); }
   });
 
+  for (const channel of ["headers", "sse"] as const) {
+    it(`${channel} saturated quota observations persist and cool before the next turn`, async () => {
+      await installViaProductionInstaller();
+      writeCredential();
+      const resetSeconds = Math.floor(Date.now() / 1000) + 1800;
+      let count = 0;
+      const upstream = scenarioUpstream(async () => {
+        count++;
+        const quota = channel === "sse" ? `event: codex.rate_limits\ndata: ${JSON.stringify({
+          type: "codex.rate_limits", rate_limits: { primary: { used_percent: 100, window_minutes: 300, reset_at: resetSeconds } },
+        })}\n\n` : "";
+        return new Response(quota + `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "last allowed turn" })}\n\ndata: [DONE]\n\n`, {
+          headers: { "content-type": "text/event-stream", ...(channel === "headers" ? {
+            "x-codex-primary-used-percent": "100", "x-codex-primary-reset-at": String(resetSeconds), "x-codex-primary-window-minutes": "300",
+          } : {}) },
+        });
+      });
+      vi.stubGlobal("fetch", upstream.impl);
+      const config = managedOnlyConfig();
+      const app = await startServer(config);
+      try {
+        await wire(app, config);
+        const turn = await app.app.inject({ method: "POST", url: "/v1/responses", payload: {
+          model: "codex-subscription,gpt-5.1-codex", stream: true,
+          input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+        } });
+        expect(turn.statusCode, turn.body).toBe(200);
+        let observed: any;
+        for (let i = 0; i < 100; i++) {
+          observed = JSON.parse(readFileSync(join(configDir, "codex-credentials.json"), "utf8"));
+          if (observed.rateLimits?.source === channel && observed.account.rateLimitCooldownUntil > Date.now()) break;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        expect(observed.rateLimits.source).toBe(channel);
+        expect(observed.rateLimits.primary.usedPercent).toBe(100);
+        expect(observed.account.rateLimitCooldownUntil).toBe(resetSeconds * 1000);
+        const next = await app.app.inject({ method: "POST", url: "/v1/responses", payload: {
+          model: "codex-subscription,gpt-5.1-codex", input: [{ role: "user", content: "next" }],
+        } });
+        expect(next.statusCode, next.body).toBe(429);
+        expect(next.body).toContain("codex_account_cooling");
+        expect(count).toBe(1);
+      } finally { await app.app.close(); }
+    });
+  }
+
   it("client disconnect returns promptly (upstream abort is a known host limitation)", async () => {
     await installViaProductionInstaller();
     writeCredential();
