@@ -200,8 +200,13 @@ function finalizeReasoning(body: Record<string, any>): void {
   const reasoning = isPlainObject(body.reasoning) ? body.reasoning : undefined;
   const effort = typeof reasoning?.effort === "string" ? reasoning.effort.trim().toLowerCase() : "";
   if (effort === "none") {
-    // No reasoning at all: the encrypted-content include is meaningless.
-    delete body.include;
+    // No reasoning at all: the encrypted-content include is meaningless, but a
+    // client's OTHER include entries survive — drop only our own.
+    if (Array.isArray(body.include)) {
+      const kept = body.include.filter((v: unknown) => v !== CODEX_ENCRYPTED_REASONING_INCLUDE);
+      if (kept.length) body.include = kept;
+      else delete body.include;
+    }
     if (reasoning) body.reasoning = reasoning;
     return;
   }
@@ -263,7 +268,7 @@ export function codexFinalizeBody(body: any, options: CodexFinalizeOptions = {})
   input = finalizeInstructions(out, input, options.modelInstructions);
   out.input = input;
 
-  if (typeof out.prompt_cache_key !== "string" || out.prompt_cache_key === "") {
+  if (typeof out.prompt_cache_key !== "string" || out.prompt_cache_key.trim() === "") {
     const seed = typeof options.sessionId === "string" && options.sessionId
       ? options.sessionId
       : JSON.stringify([out.instructions ?? "", input[0] ?? null]);

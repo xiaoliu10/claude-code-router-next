@@ -164,10 +164,11 @@ export function codexTerminalError(event: any): Record<string, any> | undefined 
  */
 export function codexClassifiedStreamError(event: any, upstreamStatus = 200): Error & Record<string, any> {
   const probe = codexStreamError(event, upstreamStatus);
+  const terminal = codexTerminalError(event);
   const effectiveStatus =
     probe.statusCode >= 400 ? probe.statusCode : probe.isRateLimit ? 429 : 502;
   const classified: PluginClassifiedError =
-    classifyCodexError(effectiveStatus, event) ??
+    classifyCodexError(effectiveStatus, terminal ? { error: terminal } : event) ??
     { code: "codex_upstream_error", message: "Codex upstream stream failed.", httpStatus: 502, retryable: true };
   const error = codexError({
     code: classified.code as any,
@@ -299,7 +300,6 @@ export class CodexTransformer implements PluginTransformer {
   private inspectStream(response: Response, context?: PluginTransformerContext): Response {
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
     const chunks: Uint8Array[] = [];
     let pending = "";
     let scanned = 0;
@@ -340,8 +340,12 @@ export class CodexTransformer implements PluginTransformer {
           // status from the terminal kind (quota → 429, anything else → 502).
           const effectiveStatus =
             error.statusCode >= 400 ? error.statusCode : (error as any).isRateLimit ? 429 : 502;
+          // Classify the UNWRAPPED terminal error: for response.failed the
+          // failure object lives at event.response.error, which the classifier
+          // (reading .error off the body) would otherwise never see. Wrapping
+          // keeps the top-level error shape identical to the HTTP path.
           const classified =
-            classifyCodexError(effectiveStatus, event) ??
+            classifyCodexError(effectiveStatus, terminal ? { error: terminal } : event) ??
             ({
               code: "codex_upstream_error",
               message: "Codex upstream stream failed.",
@@ -390,8 +394,9 @@ export class CodexTransformer implements PluginTransformer {
             }
             const next = await reader.read();
             if (next.done) {
-              // EOF during inspection: forward the undecoded remainder verbatim.
-              if (pending) chunks.push(encoder.encode(pending));
+              // EOF during inspection: the pending tail's bytes were already
+              // forwarded verbatim with its raw chunk — re-encoding them here
+              // would emit them twice, so just drop the decoded copy.
               pending = "";
               committed = true;
               controller.close();
@@ -402,8 +407,10 @@ export class CodexTransformer implements PluginTransformer {
               chunks.push(next.value);
               scanned += next.value.byteLength;
               pending += decoder.decode(next.value, { stream: true });
-              // Parse complete events out of the buffer; any partial tail stays
-              // in `pending` and, when we commit on EOF, is emitted exactly once.
+              // Parse complete events out of the buffer; a partial tail stays
+              // in `pending` as the carry-over for the NEXT chunk — an event
+              // split across a chunk boundary is routine on real networks and
+              // must still be seen (quota observation, terminal errors).
               const events = pending.split(/\r\n\r\n|\n\n|\r\r/);
               pending = events.pop() ?? "";
               for (const raw of events) {
@@ -415,10 +422,11 @@ export class CodexTransformer implements PluginTransformer {
                 if (!data) continue;
                 if (await handleEvent(data)) { committed = true; break; }
               }
-              // The parsed events came from the raw chunk(s) already queued in
-              // `chunks`; drop the decoded copy so nothing is emitted twice.
-              pending = "";
               if (scanned >= CODEX_RATE_LIMIT_SCAN_BYTES) committed = true;
+              // Only once committed may the decoded copy be dropped: the raw
+              // chunk(s) queued in `chunks` now own the bytes. While still
+              // inspecting, `pending` is the only parse carry-over there is.
+              if (committed) pending = "";
             }
           }
         } catch (error: any) {

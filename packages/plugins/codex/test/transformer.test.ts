@@ -153,6 +153,19 @@ describe("CodexTransformer — terminal stream errors", () => {
     });
   });
 
+  it("cools the account on a quota failure nested under response.failed", async () => {
+    const service = stubService();
+    const t = new CodexTransformer({ service });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "response.failed", response: { id: "r", error: { type: "usage_limit_reached", resets_in_seconds: 300 } } },
+    ]);
+    await expect(readAll(await t.transformResponseOut(sseResponse(text), {} as any))).rejects.toMatchObject({
+      code: "codex_usage_limit", statusCode: 429,
+    });
+    expect(service.errors.at(-1)).toMatchObject({ code: "codex_usage_limit", cooldownMs: 300_000 });
+  });
+
   it("passes response.incomplete and response.completed as normal completions", async () => {
     const t = new CodexTransformer({ service: stubService() });
     const text = sse([{ type: "response.incomplete", response: { id: "r", status: "incomplete" } }]);
@@ -170,6 +183,81 @@ describe("CodexTransformer — terminal stream errors", () => {
     const error = codexStreamError({ type: "error", error: { type: "usage_limit_reached" } }, 200);
     expect(error.isRateLimit).toBe(true);
     expect(error.statusCode).toBe(200);
+  });
+});
+
+describe("CodexTransformer — chunk-boundary inspection", () => {
+  // Real upstreams split an SSE event across TCP/TLS/HTTP2 chunks routinely;
+  // the parser carry-over must survive every boundary (B1 regression).
+  const sseChunks = (events: any[], cutAt: (whole: string) => [string, string]): ReadableStream<Uint8Array> => {
+    const whole = sse(events);
+    const [a, b] = cutAt(whole);
+    const enc = new TextEncoder();
+    return new ReadableStream({
+      start(controller) { controller.enqueue(enc.encode(a)); controller.enqueue(enc.encode(b)); controller.close(); },
+    });
+  };
+
+  it("observes a codex.rate_limits event split across two chunks", async () => {
+    const service = stubService();
+    const t = new CodexTransformer({ service });
+    const events = [
+      { type: "codex.rate_limits", rate_limits: { primary: { used_percent: 91, window_minutes: 10080, reset_at: 1800000000 } } },
+      { type: "response.output_text.delta", delta: "x" },
+    ];
+    const whole = sse(events);
+    for (const cut of [10, Math.floor(whole.length / 2), whole.length - 14, whole.length - 1]) {
+      service.observed.length = 0;
+      const body = new ReadableStream({
+        start(c) {
+          const enc = new TextEncoder();
+          c.enqueue(enc.encode(whole.slice(0, cut)));
+          c.enqueue(enc.encode(whole.slice(cut)));
+          c.close();
+        },
+      });
+      const res = new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+      await readAll(await t.transformResponseOut(res, {} as any));
+      expect(service.observed.some((o) => o.source === "sse"), `cut=${cut}`).toBe(true);
+    }
+  });
+
+  it("throws (not truncates) on a terminal error event split across two chunks", async () => {
+    const service = stubService();
+    const t = new CodexTransformer({ service });
+    const events = [
+      { type: "response.created", response: { id: "r" } },
+      { type: "error", error: { type: "usage_limit_reached", message: "limit", resets_in_seconds: 120 } },
+    ];
+    const whole = sse(events);
+    const cut = whole.indexOf("usage_limit") - 3;
+    const body = new ReadableStream({
+      start(c) {
+        const enc = new TextEncoder();
+        c.enqueue(enc.encode(whole.slice(0, cut)));
+        c.enqueue(enc.encode(whole.slice(cut)));
+        c.close();
+      },
+    });
+    const res = new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    await expect(readAll(await t.transformResponseOut(res, {} as any))).rejects.toMatchObject({
+      code: "codex_usage_limit", pluginClassified: true,
+    });
+    expect(service.errors.at(-1)).toMatchObject({ code: "codex_usage_limit" });
+  });
+
+  it("forwards every byte verbatim even when an event straddles a boundary", async () => {
+    const service = stubService();
+    const t = new CodexTransformer({ service });
+    const events = [
+      { type: "codex.rate_limits", rate_limits: { primary: { used_percent: 10, window_minutes: 300, reset_at: 1800000000 } } },
+      { type: "response.output_text.delta", delta: "hello world" },
+    ];
+    const whole = sse(events);
+    const cut = Math.floor(whole.length / 2);
+    const body = sseChunks(events, (w) => [w.slice(0, cut), w.slice(cut)]);
+    const res = new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    expect(await readAll(await t.transformResponseOut(res, {} as any))).toBe(whole);
   });
 });
 

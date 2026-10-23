@@ -112,10 +112,13 @@ export function createCodexLogin(
     try {
       startedAt = Date.now();
       const start = await api.start();
-      if (controller.signal.aborted) return null;
       const parsed = parseCodexLoginStart(start);
       if (!parsed) throw Object.assign(new Error("invalid login response"), { reason: "login_invalid_response" });
       job = parsed;
+      // A cancel that raced the in-flight start must still invalidate the
+      // freshly created server-side job — otherwise it parks in the server's
+      // pending set until its full TTL and every retry gets login_busy.
+      if (controller.signal.aborted) { await invalidate(); return null; }
       onReady(job);
       while (!controller.signal.aborted) {
         if (Date.now() >= hardDeadline(job)) { expired = true; break; }
@@ -465,10 +468,17 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         pasteField = null;
         if (!connected) return; // cancelled (or superseded) — close quietly
         pasteDraft = "";
+        // A fresh login may be a DIFFERENT account: the per-page quota cache
+        // (and any rendered windows) belong to the previous one. Reset so the
+        // card re-reads instead of showing the old plan until the TTL lapses.
+        clearCodexUsageCache();
+        usage = null; usageUpdatedAt = null; usagePhase = "idle";
         const { fresh, reconcileFailed: failed } = await settle(id);
         if (!alive || generation !== id) return;
         reconcileFailed = failed;
         toast = fresh?.email ? t("login_success", { email: fresh.email }) : t("login_success_unknown");
+        // Read the NEW account's quota in the background (cache was reset above).
+        void readUsage(id, true);
       } else if (kind === "sync") {
         const result = parseCodexMutation(await post<unknown>("/sync", {}, undefined, 60_000));
         if (!result.success) {

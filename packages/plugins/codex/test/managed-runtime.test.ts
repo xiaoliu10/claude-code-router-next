@@ -115,6 +115,26 @@ describe("createCodexManagedRuntime — signRequest header hygiene", () => {
     expect(next.Accept).toBe("text/event-stream");
   });
 
+  it("never lets a differently-cased duplicate of an injected identity header join its value upstream", async () => {
+    const rt = build(stubService());
+    // A spoof under another case must not survive as a second object key:
+    // Headers/map consumers join duplicate names into "spoof, real".
+    const next = await rt.signRequest!({
+      headers: { "ChatGPT-Account-ID": "spoof", ORIGINATOR: "spoof", "VERSION": "0.0.0", accept: "text/plain" },
+      requestBody: {}, provider: {} as any,
+    });
+    const lowerKeys = Object.keys(next).map((k) => k.toLowerCase());
+    expect(lowerKeys.filter((k) => k === "chatgpt-account-id")).toEqual(["chatgpt-account-id"]);
+    expect(next["chatgpt-account-id"]).toBe("acct-123");
+    expect(lowerKeys.filter((k) => k === "originator")).toHaveLength(1);
+    expect(next.originator).toBe(CODEX_ORIGINATOR);
+    expect(lowerKeys.filter((k) => k === "version")).toHaveLength(1);
+    expect(next.version).toBe(CODEX_CLIENT_VERSION);
+    expect(lowerKeys.filter((k) => k === "accept")).toHaveLength(1);
+    expect(next.Accept).toBe("text/event-stream");
+    expect(JSON.stringify(next)).not.toContain("spoof");
+  });
+
   it("never forwards the marker api_key", async () => {
     const rt = build(stubService());
     const next = await rt.signRequest!({ headers: { Authorization: `Bearer ${CODEX_MARKER_API_KEY}` }, requestBody: {}, provider: {} as any });

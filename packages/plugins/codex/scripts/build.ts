@@ -35,7 +35,7 @@ const stripSourcemapComment = (file: string): void => {
   writeFileSync(file, source.replace(/\n?\/\/# sourceMappingURL=[^\n]*\n?$/, "\n"));
 };
 
-const nodeExternals = []; // fully self-contained: only node: builtins stay external
+const nodeExternals: string[] = []; // fully self-contained: only node: builtins stay external
 
 const pluginBundle = await esbuild.build({
   entryPoints: [join(root, "src/plugin.ts")],

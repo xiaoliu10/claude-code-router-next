@@ -267,6 +267,51 @@ describe("self-contained Codex plugin card", () => {
     expect(h.onBusy.mock.calls.map(([busy]) => busy)).toEqual([true, false]);
   });
 
+  it("a successful login re-reads the new account's quota (cache reset, no stale previous plan)", async () => {
+    const usages: any[] = [
+      { plan: "pro", primary: { usedPercent: 90, windowSeconds: 18_000, resetAt: Date.now() + 3_600_000 } },
+      { plan: "free", primary: { usedPercent: 10, windowSeconds: 18_000, resetAt: Date.now() + 3_600_000 } },
+    ];
+    let usageIdx = 0;
+    let authorized = false;
+    let polls = 0;
+    const h = harness({
+      "/status": () => (authorized ? CONNECTED : NOT_CONNECTED),
+      "/usage": () => usages[Math.min(usageIdx++, usages.length - 1)],
+      "/login/poll": () => {
+        polls += 1;
+        if (polls >= 2) { authorized = true; return { status: "connected", models: ["m1"], modelCount: 1 }; }
+        return { status: "pending" };
+      },
+      "/login/start": () => LOGIN_START,
+    });
+    await tick();
+    expect(h.callApi.mock.calls.some(([p]) => p === "/usage")).toBe(false); // not connected yet
+    h.host.click(en.browser_login);
+    await pause(1_400); await tick(); await tick();
+    const usageCalls = h.callApi.mock.calls.filter(([p]) => p === "/usage");
+    expect(usageCalls.length).toBe(1); // exactly one background quota read for the NEW account
+    expect(h.host.text()).toContain(en.login_success.replace("{{email}}", "user@example.test"));
+  });
+
+  it("cancel that races an in-flight login/start still invalidates the server job", async () => {
+    let resolveStart!: (value: unknown) => void;
+    const cancels: string[] = [];
+    const session = createCodexLogin({
+      start: () => new Promise(done => { resolveStart = done; }),
+      poll: async () => ({ status: "pending" }),
+      complete: async () => ({ status: "pending" }),
+      cancel: async (loginId) => { cancels.push(loginId); },
+    }, () => {}, { intervalMs: 1_200, deadlineMs: 5_000 });
+    const done = session.done;
+    await tick();
+    await session.cancel();          // cancel while start() is still in flight
+    resolveStart(LOGIN_START);
+    await tick(); await tick();
+    expect(await done).toBeNull();
+    expect(cancels).toEqual([LOGIN_START.loginId]); // the freshly created job is invalidated
+  });
+
   it("paste mode: help copy renders; invalid paste is rejected locally; valid paste rides the SAME sequential loop", async () => {
     const h = harness({
       "/status": () => NOT_CONNECTED,

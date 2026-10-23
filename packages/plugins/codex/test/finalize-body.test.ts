@@ -74,9 +74,12 @@ describe("codexFinalizeBody — reasoning", () => {
     expect(codexFinalizeBody(base({ reasoning: { effort: "ultra" } })).reasoning.effort).toBe("max");
   });
 
-  it("drops include entirely when effort is none", () => {
-    const out = codexFinalizeBody(base({ reasoning: { effort: "none" }, include: [CODEX_ENCRYPTED_REASONING_INCLUDE] }));
-    expect(out).not.toHaveProperty("include");
+  it("drops only the encrypted-content include when effort is none, keeping client includes", () => {
+    const out = codexFinalizeBody(base({
+      reasoning: { effort: "none" },
+      include: [CODEX_ENCRYPTED_REASONING_INCLUDE, "file_search_call.results"],
+    }));
+    expect(out.include).toEqual(["file_search_call.results"]);
   });
 });
 
@@ -194,6 +197,13 @@ describe("codexFinalizeBody — prompt_cache_key and session key", () => {
     const a = codexFinalizeBody(base(), { sessionId: "s1" });
     const b = codexFinalizeBody(base(), { sessionId: "s2" });
     expect(a.prompt_cache_key).not.toBe(b.prompt_cache_key);
+  });
+
+  it("regenerates prompt_cache_key when the client value is whitespace-only", () => {
+    const out = codexFinalizeBody(base({ prompt_cache_key: "   " }));
+    expect(out.prompt_cache_key).not.toBe("   ");
+    expect(typeof out.prompt_cache_key).toBe("string");
+    expect(out.prompt_cache_key.length).toBeGreaterThan(0);
   });
 });
 

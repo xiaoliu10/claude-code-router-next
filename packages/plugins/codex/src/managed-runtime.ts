@@ -123,11 +123,20 @@ export function createCodexManagedRuntime(options: CodexRuntimeOptions): Managed
     signRequest: async ({ headers, requestBody }) => {
       const accessToken = await service.getAccessToken();
       const accountId = await service.getAccountId().catch(() => undefined);
+      const injected = codexAccountHeaders({ accessToken, accountId, requestBody });
+      const injectedNames = new Set(Object.keys(injected).map((k) => k.toLowerCase()));
       const next: Record<string, string> = {};
       for (const [key, value] of Object.entries(headers ?? {})) {
-        if (!STRIPPED.has(key.toLowerCase())) next[key] = value;
+        const lower = key.toLowerCase();
+        if (STRIPPED.has(lower)) continue;
+        // The runtime returns "the headers object to send": a client-supplied
+        // identity header under a different case must not survive as a second
+        // entry, or any consumer building Headers/map from this object joins
+        // both values into one field (spoof rides along).
+        if (injectedNames.has(lower)) continue;
+        next[key] = value;
       }
-      return { ...next, ...codexAccountHeaders({ accessToken, accountId, requestBody }) };
+      return { ...next, ...injected };
     },
 
     classifyError: (status: number, body: unknown, systemText: string): PluginClassifiedError | null => {
