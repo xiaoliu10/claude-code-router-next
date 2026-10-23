@@ -64,6 +64,9 @@ await esbuild.build({
 });
 
 copyFileSync(join(root, "plugin.json"), join(dist, "plugin.json"));
+for (const document of ["README.md", "THIRD_PARTY_NOTICES.md"]) {
+  copyFileSync(join(root, document), join(dist, document));
+}
 writeFileSync(join(dist, "package.json"), JSON.stringify({ type: "module" }, null, 2) + "\n");
 
 // Emit the shipped artifacts without the sourcemap reference comment.
