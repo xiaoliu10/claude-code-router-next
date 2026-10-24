@@ -6,7 +6,7 @@ import { PLUGIN_CORE_API } from "./types";
 import { getTestPluginRegistry, type PluginRegistry } from "./registry";
 import { reloadProviderRuntime } from "./host";
 import { readConfigFile, readConfigFileRaw, writeConfigFile } from "../ccr/config";
-import { getDirectDispatcher } from "@/services/proxy";
+import { getDirectDispatcher, getSubscriptionDispatcher, getSubscriptionProxyUrl } from "@/services/proxy";
 
 interface PluginInstallRecord { name: string; enabled: boolean; }
 export interface PluginLoadResult {
@@ -60,6 +60,20 @@ function readPluginFile(configDir: string, name: string, file: string): Buffer {
   } finally { closeSync(fd); }
 }
 
+/** Resolve the subscription-plugin dispatcher for one server instance: the
+ *  explicit SUBSCRIPTION_PROXY_URL from the live config when a server/config
+ *  service exists, else the initConfig env mirror (host-less loaders). Exported
+ *  for tests — this is the exact closure the plugin host hands out. */
+export function resolveSubscriptionDispatcher(server: unknown): unknown {
+  const configService = (server as { configService?: unknown } | null | undefined)?.configService as
+    | Parameters<typeof getSubscriptionProxyUrl>[0]
+    | undefined;
+  const proxyUrl = configService
+    ? getSubscriptionProxyUrl(configService)
+    : String(process.env.SUBSCRIPTION_PROXY_URL ?? "").trim() || undefined;
+  return getSubscriptionDispatcher(proxyUrl);
+}
+
 export async function loadInstalledPlugins(deps: {
   configDir: string;
   log: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
@@ -75,6 +89,10 @@ export async function loadInstalledPlugins(deps: {
     writeConfig: (next: any) => writeConfigFile(next),
     reloadRuntime: async (config?: any) => reloadProviderRuntime(deps.getServer(), config ?? (await readConfigFile()), log),
     getDirectDispatcher,
+    // Fixed subscription origins honor the explicit SUBSCRIPTION_PROXY_URL
+    // opt-in from the live server config; isolated hosts without a server
+    // fall back to the initConfig env mirror. Unset stays fully direct.
+    getSubscriptionDispatcher: () => resolveSubscriptionDispatcher(deps.getServer()),
   };
   const result: PluginLoadResult = { loaded: [], failed: [], skipped: [] };
   const seen = new Set<string>();

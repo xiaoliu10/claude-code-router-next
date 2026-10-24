@@ -30,6 +30,8 @@
 
 `src/plugins/` 是既有输出插件体系（token-speed）；供应商插件使用独立命名空间。下列片段为最初概念草案，准确运行时类型以 `provider-plugins/types.ts` 为准：当前实现拆分为 `ensureUsable` / `lockUpstream` / `signRequest` / `classifyError`，并通过 `ctx.host` 注入配置读写、重载和 dispatcher，禁止打包宿主有状态模块。
 
+**固定上游与代理**：订阅插件的固定上游（`chatgpt.com`、`daily-cloudcode-pa.googleapis.com`）默认走 `ctx.host.getDirectDispatcher()`（裸 undici Agent，无视 `PROXY_URL` 与代理环境变量——防止固定上游被劫持/重定向、订阅 token 流经意外跳板）。部署在无透明代理（TUN）的机器上时，可用 config.json 顶层键 `SUBSCRIPTION_PROXY_URL`（http/https only，仅接受字符串值，显式 opt-in）：有 server 的宿主从活跃配置读取、绝不读环境变量；无 server 的隔离 loader 退回 `process.env.SUBSCRIPTION_PROXY_URL`（initConfig 启动镜像，等价的显式值）。配置后宿主经 `getSubscriptionDispatcher()` 返回 `ProxyAgent`；旧核心无此 host 方法时插件 feature-detect 退回直连。
+
 ```ts
 export interface ProviderPlugin {
   manifest: { name: string; version: string; coreApi: string };  // coreApi=语义化兼容标记

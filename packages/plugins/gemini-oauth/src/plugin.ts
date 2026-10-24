@@ -47,6 +47,14 @@ export const manifest = {
 };
 
 async function activate(ctx: PluginContext): Promise<void> {
+  // Fixed subscription origins honor the host's explicit SUBSCRIPTION_PROXY_URL
+  // opt-in when the running core provides it; older cores (and an unset value)
+  // stay fully direct. One resolver covers every fixed-origin lane: the data
+  // plane (lockUpstream), the auth/login exchange and model/project discovery.
+  const upstreamDispatcher = (): unknown =>
+    ctx.host.getSubscriptionDispatcher
+      ? ctx.host.getSubscriptionDispatcher()
+      : ctx.host.getDirectDispatcher();
   // Tokens live ONLY in the plugin's private 0600 file under the CCR config
   // dir — never in config.json, logs, admin responses or this bundle.
   const store = new GeminiOauthCredentialStore(join(ctx.host.configDir, "gemini-oauth-credentials.json"));
@@ -59,7 +67,7 @@ async function activate(ctx: PluginContext): Promise<void> {
           : await ctx.host.readConfig(),
       writeConfig: (next) => ctx.host.writeConfig(next),
       reloadRuntime: (config) => ctx.host.reloadRuntime(config),
-      getDirectDispatcher: () => ctx.host.getDirectDispatcher(),
+      getDirectDispatcher: upstreamDispatcher,
     },
     logger: ctx.log,
   });
@@ -92,8 +100,9 @@ async function activate(ctx: PluginContext): Promise<void> {
       config.url = new URL(GEMINI_OAUTH_SSE_PATH, GEMINI_OAUTH_DATA_PLANE).toString();
       // Never follow a redirect away from the fixed origin.
       config.redirect = "error";
-      // Fixed Google origins ignore configured CCR/proxy environment routing.
-      (config as any).dispatcher = ctx.host.getDirectDispatcher();
+      // Fixed Google origins bypass env routing; SUBSCRIPTION_PROXY_URL is the
+      // only explicit way to place a proxy in front of them.
+      (config as any).dispatcher = upstreamDispatcher();
     },
     signRequest: async ({ headers }) => {
       // The marker api_key must never reach Google, and a client-supplied

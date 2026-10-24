@@ -40,12 +40,23 @@ export const manifest = {
 };
 
 async function activate(ctx: PluginContext): Promise<void> {
+  // Fixed subscription origins honor the host's explicit SUBSCRIPTION_PROXY_URL
+  // opt-in when the running core provides it; older cores (and an unset value)
+  // stay fully direct. One host override covers every fixed-origin lane: the
+  // data plane (lockUpstream), the auth/login exchange and model/quota fetches.
+  const upstreamHost: PluginContext["host"] = {
+    ...ctx.host,
+    getDirectDispatcher: (): unknown =>
+      ctx.host.getSubscriptionDispatcher
+        ? ctx.host.getSubscriptionDispatcher()
+        : ctx.host.getDirectDispatcher(),
+  };
   // The service reads raw config itself through host.readRawConfig (no wrapper
   // — interpolation must not be baked back into config.json) and keeps its
   // 0600 credential file directly under the host config dir.
   const service = new CodexAuthService({
     configDir: ctx.host.configDir,
-    host: ctx.host,
+    host: upstreamHost,
     logger: ctx.log,
   });
 
@@ -58,7 +69,7 @@ async function activate(ctx: PluginContext): Promise<void> {
     }
   }
 
-  const runtime = createCodexManagedRuntime({ service, host: ctx.host, log: ctx.log });
+  const runtime = createCodexManagedRuntime({ service, host: upstreamHost, log: ctx.log });
 
   ctx.registerTransformer(ActivatedCodexTransformer as unknown as new () => any);
   ctx.registerManagedRuntime(runtime);

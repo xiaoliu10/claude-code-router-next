@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { ProxyAgent } from "undici";
 import {
   validateProxyUrl,
   findInvalidProxyUrls,
   PROXY_URL_KEYS,
+  SUBSCRIPTION_PROXY_URL_KEY,
+  getSubscriptionProxyUrl,
+  getSubscriptionDispatcher,
+  getDirectDispatcher,
 } from "../services/proxy";
 
 describe("validateProxyUrl", () => {
@@ -90,5 +95,52 @@ describe("findInvalidProxyUrls", () => {
     expect(PROXY_URL_KEYS).toContain("HTTPS_PROXY");
     expect(PROXY_URL_KEYS).toContain("https_proxy");
     expect(PROXY_URL_KEYS).toContain("httpsProxy");
+  });
+});
+
+describe("SUBSCRIPTION_PROXY_URL (subscription plugins' fixed origins)", () => {
+  const configServiceOf = (config: Record<string, unknown>) => ({
+    get: <T,>(key: string): T => config[key] as T,
+  });
+
+  it("is a separate explicit key, but its value is validated by the same save gate", () => {
+    expect(PROXY_URL_KEYS).not.toContain(SUBSCRIPTION_PROXY_URL_KEY);
+    expect(findInvalidProxyUrls({ [SUBSCRIPTION_PROXY_URL_KEY]: "socks5://localhost:1080" })).toEqual([
+      { key: SUBSCRIPTION_PROXY_URL_KEY, error: expect.stringContaining("socks5:") },
+    ]);
+    expect(findInvalidProxyUrls({ [SUBSCRIPTION_PROXY_URL_KEY]: "http://127.0.0.1:7897" })).toEqual([]);
+  });
+
+  it("getSubscriptionProxyUrl resolves the trimmed value, undefined when unset/blank", () => {
+    expect(getSubscriptionProxyUrl(configServiceOf({}))).toBeUndefined();
+    expect(getSubscriptionProxyUrl(configServiceOf({ [SUBSCRIPTION_PROXY_URL_KEY]: "" }))).toBeUndefined();
+    expect(getSubscriptionProxyUrl(configServiceOf({ [SUBSCRIPTION_PROXY_URL_KEY]: "   " }))).toBeUndefined();
+    expect(getSubscriptionProxyUrl(configServiceOf({ [SUBSCRIPTION_PROXY_URL_KEY]: " http://127.0.0.1:7897 " }))).toBe("http://127.0.0.1:7897");
+  });
+
+  it("getSubscriptionProxyUrl treats non-string values as unset (never a garbage URL)", () => {
+    for (const garbage of [true, false, 1, 0, {}, []]) {
+      expect(getSubscriptionProxyUrl(configServiceOf({ [SUBSCRIPTION_PROXY_URL_KEY]: garbage }))).toBeUndefined();
+    }
+    // And the dispatcher for such a value is the direct agent, not a throw.
+    expect(getSubscriptionDispatcher(getSubscriptionProxyUrl(configServiceOf({ [SUBSCRIPTION_PROXY_URL_KEY]: true })))).toBe(getDirectDispatcher());
+  });
+
+  it("getSubscriptionDispatcher falls back to the shared direct agent when unset", () => {
+    expect(getSubscriptionDispatcher(undefined)).toBe(getDirectDispatcher());
+    expect(getSubscriptionDispatcher("")).toBe(getDirectDispatcher());
+  });
+
+  it("returns a cached ProxyAgent for a configured http(s) URL", () => {
+    const a = getSubscriptionDispatcher("http://127.0.0.1:17897");
+    const b = getSubscriptionDispatcher("http://127.0.0.1:17897");
+    expect(a).toBe(b);
+    expect(a).toBeInstanceOf(ProxyAgent);
+    // A different URL must not share the dispatcher.
+    expect(getSubscriptionDispatcher("http://127.0.0.1:17898")).not.toBe(a);
+  });
+
+  it("throws on unsupported proxy protocols — fails loudly, never silently direct", () => {
+    expect(() => getSubscriptionDispatcher("socks5://127.0.0.1:1080")).toThrow(TypeError);
   });
 });

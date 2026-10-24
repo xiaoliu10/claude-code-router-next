@@ -13,6 +13,13 @@ export const PROXY_URL_KEYS = [
   "PROXY_URL",
 ] as const;
 
+/** Explicit opt-in proxy for the subscription plugins' fixed origins (codex,
+ *  gemini-oauth). Unlike PROXY_URL this is never applied implicitly and never
+ *  read from the environment: unset keeps those plugins fully direct (the
+ *  supported no-config deployment is an OS-level transparent proxy, e.g. TUN
+ *  mode). Same http(s)-only contract as PROXY_URL. */
+export const SUBSCRIPTION_PROXY_URL_KEY = "SUBSCRIPTION_PROXY_URL";
+
 // Matches environment-variable placeholders ($VAR or ${VAR}) used in raw config
 // files. When a proxy URL contains such a placeholder we cannot statically
 // validate the final URL (it is resolved at runtime via interpolateEnvVars),
@@ -68,7 +75,7 @@ export function findInvalidProxyUrls(
   config: Record<string, unknown>
 ): Array<{ key: string; error: string }> {
   const errors: Array<{ key: string; error: string }> = [];
-  for (const key of PROXY_URL_KEYS) {
+  for (const key of [...PROXY_URL_KEYS, SUBSCRIPTION_PROXY_URL_KEY]) {
     const value = config[key];
     if (value === undefined || value === null) continue;
     const result = validateProxyUrl(value);
@@ -86,6 +93,27 @@ let directDispatcher: Agent | undefined;
 export function getDirectDispatcher(): Agent {
   if (!directDispatcher) directDispatcher = new Agent({ connect: { timeout: 15_000 } });
   return directDispatcher;
+}
+
+/** Resolve the explicit subscription-proxy opt-in from live config. Only a
+ *  string value counts: non-string config values (hand-edited booleans,
+ *  numbers) mean "unset" — they must never become garbage proxy URLs. */
+export function getSubscriptionProxyUrl(
+  configService: Pick<ConfigService, "get">
+): string | undefined {
+  const value = configService.get<unknown>(SUBSCRIPTION_PROXY_URL_KEY);
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return normalized || undefined;
+}
+
+/** Dispatcher for the subscription plugins' fixed-origin calls: the shared
+ *  direct agent when SUBSCRIPTION_PROXY_URL is unset, else the cached
+ *  ProxyAgent for it. Unsupported protocols throw (same contract as
+ *  getProxyDispatcher) so a typo fails loudly instead of silently sending
+ *  subscription traffic directly. */
+export function getSubscriptionDispatcher(proxyUrl: string | undefined): Agent | ProxyAgent {
+  if (!proxyUrl) return getDirectDispatcher();
+  return getProxyDispatcher(proxyUrl);
 }
 
 /**

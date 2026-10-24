@@ -151,6 +151,13 @@ export interface PluginHostCapabilities {
   reloadRuntime(config?: any): Promise<void>;
   /** undici Agent that bypasses CCR/proxy env routing (for fixed subscription origins). */
   getDirectDispatcher(): unknown;
+  /**
+   * Dispatcher for fixed subscription origins honoring the explicit
+   * SUBSCRIPTION_PROXY_URL opt-in: the direct agent when unset, a ProxyAgent
+   * for the configured URL otherwise. Optional for backward compatibility —
+   * hosts that predate it only offer getDirectDispatcher (fully direct).
+   */
+  getSubscriptionDispatcher?(): unknown;
 }
 
 export interface PluginContext {
