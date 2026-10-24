@@ -41,6 +41,7 @@ import { initQuotaStorePersistence } from "./services/quota-store";
 import { closeProxyDispatchers, resolveProviderProxyUrl } from "./services/proxy";
 import { applyClientAdapter } from "./clients/adapters";
 import { normalizeResponsesBody } from "./api/routes";
+import { PluginRegistry } from "./provider-plugins/registry";
 import type { CcrPreHandlerCallbacks } from "./ccr/request-pipeline";
 
 // Extend FastifyRequest to include custom properties
@@ -82,11 +83,33 @@ function createApp(options: FastifyServerOptions = {}): FastifyInstance {
 // Server class
 class Server {
   public app: FastifyInstance;
+  readonly pluginRegistry = new PluginRegistry();
+  private namespaceProviders: Array<{ name: string; config: ConfigService; providers: ProviderService }> = [];
+
+  /** Reload in place: registered namespaces must not retain stale provider maps. */
+  reloadProviders(config: any): void {
+    const nextProviders = config?.Providers ?? config?.providers ?? [];
+    this.configService.set("providers", nextProviders);
+    this.providerService.reload();
+    for (const namespace of this.namespaceProviders) {
+      // Presets retain their own provider authority; only re-resolve their
+      // transformer instances against this host's committed definitions.
+      namespace.providers.reload();
+    }
+  }
+  /** Explicit namespace-owned config update; never merge root provider authority. */
+  reloadNamespaceProviders(name: string, providers: any[]): void {
+    const namespace = this.namespaceProviders.find(item => item.name === name);
+    if (!namespace) throw new Error(`unknown namespace ${name}`);
+    namespace.config.set("providers", providers);
+    namespace.providers.reload();
+  }
   configService: ConfigService;
   providerService!: ProviderService;
   transformerService: TransformerService;
   tokenizerService: TokenizerService;
   activeProbeService?: ActiveProbeService;
+  /** Gemini OAuth (Antigravity) managed-provider auth service. */
   recordUsage?: (data: any) => void;
   private readonly readiness: Promise<void>;
   private mainNamespaceRegistered = false;
@@ -108,6 +131,10 @@ class Server {
       logger: fastifyOptions.logger ?? true,
     });
     this.app._server = this;
+    this.app.addHook("onClose", async () => {
+      this.pluginRegistry.dispose();
+      this.tokenizerService?.dispose();
+    });
     // Do not forward absent options as explicit `undefined` values. ConfigService
     // establishes defaults before spreading its input options, so an undefined
     // `useJsonFile` would otherwise overwrite the default `true` and silently
@@ -129,14 +156,15 @@ class Server {
       this.configService,
       this.app.log
     );
-
     // Readiness is explicit and fail-fast: namespaces and listen must wait until
     // transformer, provider, and tokenizer initialization have all completed.
+    const transformerService = this.transformerService;
     this.readiness = (async () => {
       await Promise.all([
         this.transformerService.initialize(),
         this.tokenizerService.initialize(),
       ]);
+      this.pluginRegistry.attachTransformerService(transformerService);
       this.providerService = new ProviderService(
         this.configService,
         this.transformerService,
@@ -215,10 +243,13 @@ class Server {
         transformerService.initialize(),
         tokenizerService.initialize(),
       ]);
+      this.pluginRegistry.attachTransformerService(transformerService);
       providerService = new ProviderService(configService, transformerService, this.app.log);
+      this.namespaceProviders.push({ name, config: configService, providers: providerService });
     }
 
     const registerNamespacePlugin = async (fastify: any) => {
+      fastify.decorate('pluginRegistry', this.pluginRegistry);
       fastify.decorate('configService', configService);
       fastify.decorate('transformerService', transformerService);
       fastify.decorate('providerService', providerService);

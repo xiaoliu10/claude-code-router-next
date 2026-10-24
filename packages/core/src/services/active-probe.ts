@@ -49,7 +49,7 @@ const DEFAULT_CONFIG: Required<ActiveProbeConfig> = {
   excludeProviders: [],
 };
 
-export type ProviderProbeStatus = 'healthy' | 'slow' | 'error' | 'timeout';
+export type ProviderProbeStatus = 'healthy' | 'slow' | 'error' | 'timeout' | 'skipped';
 export type ProviderProbeErrorKind = 'timeout' | 'network' | 'http';
 export type ProviderProbeSource = 'health' | 'manual' | 'rate-limit-headers';
 
@@ -67,6 +67,7 @@ export interface ProviderProbeTelemetry {
 
 interface ProbeResult {
   success: boolean;
+  skipped?: boolean;
   error?: string;
   headers?: Headers;
   latencyMs: number;
@@ -75,12 +76,20 @@ interface ProbeResult {
 
 export interface ManualProbeResult {
   success: boolean;
+  skipped?: boolean;
   latencyMs: number;
   status: ProviderProbeStatus;
   isSlow: boolean;
   errorKind?: ProviderProbeErrorKind;
   error?: string;
 }
+
+/** Marker keys are identifiers, never credentials for generic network probes. */
+function needsManagedProbe(provider: LLMProvider): boolean {
+  return typeof provider.apiKey === "string" && provider.apiKey.startsWith("ccr-managed-");
+}
+
+const MANAGED_PROBE_SKIP = "Managed provider requires its plugin's authenticated model sync";
 
 function isConfigEnabled(value: any): boolean {
   return value === true || value === 'true' || value === 1 || value === '1';
@@ -151,6 +160,12 @@ async function probeProvider(
 ): Promise<ProbeResult> {
   const startedAt = performance.now();
   const elapsed = () => Math.max(0, Math.round(performance.now() - startedAt));
+  // Managed marker keys are identifiers, not credentials. Generic /models
+  // probing must never send them upstream (whether the plugin is installed or
+  // missing); subscription management/model sync owns its authenticated calls.
+  if (needsManagedProbe(provider)) {
+    return { success: false, skipped: true, error: MANAGED_PROBE_SKIP, latencyMs: elapsed() };
+  }
   const modelsUrl = deriveModelsEndpoint(provider.baseUrl);
 
   if (!modelsUrl) {
@@ -237,7 +252,8 @@ async function wakeupProvider(
   timeoutMs: number,
   proxyUrl?: string,
   logger?: any
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; skipped?: boolean; error?: string }> {
+  if (needsManagedProbe(provider)) return { success: false, skipped: true, error: MANAGED_PROBE_SKIP };
   const modelToWakeup = provider.wakeupModel || (Array.isArray(provider.models) ? provider.models[0] : undefined);
   if (!modelToWakeup) {
     return { success: false, error: 'No models configured for provider' };
@@ -304,7 +320,8 @@ async function pingProviderModel(
   timeoutMs: number,
   proxyUrl?: string,
   logger?: any
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; skipped?: boolean; error?: string }> {
+  if (needsManagedProbe(provider)) return { success: false, skipped: true, error: MANAGED_PROBE_SKIP };
   // The configured baseUrl is the full chat endpoint (e.g. .../v1/messages or .../chat/completions).
   // Use it directly without appending any suffix paths.
   const chatUrl = provider.baseUrl;
@@ -536,7 +553,7 @@ export class ActiveProbeService {
    */
   private async runQuotaProbe(): Promise<void> {
     const providers = this.getProviders().filter(
-      p => p?.name && p.enabled !== false && !this.config.excludeProviders.includes(p.name)
+      p => p?.name && p.enabled !== false && !needsManagedProbe(p) && !this.config.excludeProviders.includes(p.name)
     );
     const healthStore = getHealthStore();
 
@@ -655,7 +672,7 @@ export class ActiveProbeService {
   private async runHealthProbe(): Promise<void> {
     const healthStore = getHealthStore();
     const providers = this.getProviders().filter(
-      p => p?.name && p.enabled !== false && !this.config.excludeProviders.includes(p.name)
+      p => p?.name && p.enabled !== false && !needsManagedProbe(p) && !this.config.excludeProviders.includes(p.name)
     );
 
     if (providers.length === 0) return;
@@ -680,6 +697,7 @@ export class ActiveProbeService {
 
       if (result.status === 'fulfilled') {
         const probeResult = result.value;
+        if (probeResult.skipped) continue;
         this.recordProbe(provider.name, probeResult, 'health');
         if (probeResult.success) {
           let recoveredCount = 0;
@@ -763,6 +781,8 @@ export class ActiveProbeService {
       const [providerName, ...modelParts] = key.split(',');
       const modelName = modelParts.join(',');
       if (!providerName || !modelName) continue;
+      const managed = providers.find(p => p?.name === providerName);
+      if (managed && needsManagedProbe(managed)) continue;
 
       // Check if cooldown expired (auto-recovered via isAvailable check, but just in case)
       const state = healthStore.getState(providerName, modelName);
@@ -830,7 +850,7 @@ export class ActiveProbeService {
     }
 
     const providers = this.getProviders().filter(
-      p => p?.name && p.enabled !== false && p.wakeupEnabled === true
+      p => p?.name && p.enabled !== false && !needsManagedProbe(p) && p.wakeupEnabled === true
     );
     if (providers.length === 0) return;
 
@@ -933,6 +953,11 @@ export class ActiveProbeService {
       this.config.probeTimeoutMs,
       this.resolveProxyUrl?.(provider)
     );
+    // An unsupported check is not a failed health observation: do not add
+    // telemetry, increment failures, recover a circuit or extend cooldowns.
+    if (result.skipped) {
+      return { success: false, skipped: true, latencyMs: result.latencyMs, status: "skipped", isSlow: false, error: result.error };
+    }
     const telemetry = this.recordProbe(provider.name, result, 'manual');
 
     const models = Array.isArray(provider.models) ? provider.models : [];

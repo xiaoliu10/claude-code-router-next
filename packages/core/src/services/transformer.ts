@@ -21,6 +21,15 @@ export class TransformerService {
     private readonly logger: any
   ) {}
 
+  /** Construct without mutation so plugin activation can validate every service first. */
+  preparePluginTransformer(cls: new () => any): Transformer | TransformerConstructor {
+    if (typeof (cls as any).TransformerName === "string") return cls as TransformerConstructor;
+    const instance = new cls();
+    if (!instance?.name) throw new Error("plugin transformer has no name");
+    instance.logger = this.logger;
+    return instance;
+  }
+
   registerTransformer(name: string, transformer: Transformer): void {
     this.transformers.set(name, transformer);
     this.logger.info(

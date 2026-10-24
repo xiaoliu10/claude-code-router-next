@@ -17,6 +17,13 @@ export class ProviderService {
     this.initializeCustomProviders();
   }
 
+  /** Preserve the object decorated into every Fastify namespace. */
+  reload(): void {
+    const next = new ProviderService(this.configService, this.transformerService, this.logger);
+    this.providers = next.providers;
+    this.modelRoutes = next.modelRoutes;
+  }
+
   private initializeCustomProviders() {
     const providersConfig =
       this.configService.get<ConfigProvider[]>("providers");
@@ -101,6 +108,10 @@ export class ProviderService {
           name: providerConfig.name,
           baseUrl: providerConfig.api_base_url,
           apiKey: providerConfig.api_key,
+          // CCR-managed subscription providers carry a generic managed flag so
+          // their provider plugin can recognize the entry and lock its fixed
+          // upstream URL and auth headers.
+          pluginManaged: (providerConfig as any).ccr_managed === true,
           models: providerConfig.models || [],
           quotaToken: (providerConfig as any).quota_token,
           quotaSecToken: (providerConfig as any).quota_sec_token,

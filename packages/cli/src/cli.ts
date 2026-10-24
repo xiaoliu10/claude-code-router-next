@@ -16,8 +16,9 @@ import {getPresetDir, loadConfigFromManifest, PID_FILE, readPresetFile, REFERENC
 import fs, { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { parseStatusLineData, StatusLineInput } from "./utils/statusline";
-import {handlePresetCommand} from "./utils/preset";
+import { handlePresetCommand} from "./utils/preset";
 import { handleInstallCommand } from "./utils/installCommand";
+import { handlePluginCommand } from "./utils/pluginCommand";
 import {
   disableConfiguredClientsForStop,
   enableConfiguredClientsForStart,
@@ -38,6 +39,7 @@ const KNOWN_COMMANDS = [
   "model",
   "preset",
   "install",
+  "plugin",
   "clients",
   "activate",
   "env",
@@ -62,6 +64,7 @@ Commands:
   model --project  Configure model routing for the current project only
   preset        Manage presets (export, install, list, delete)
   install       Install preset from GitHub marketplace
+  plugin        Manage provider plugins (add, list, remove, enable, disable)
   clients       Manage client integrations (Claude Code, Codex)
   activate      Output environment variables for shell integration
   ui            Open the web UI in browser
@@ -81,6 +84,8 @@ Examples:
   ccr preset install /path/to/preset     # Install a preset from directory
   ccr preset list                        # List all presets
   ccr install my-preset                  # Install preset from marketplace
+  ccr plugin add /path/to/plugin-pkg     # Install a provider plugin
+  ccr plugin list                        # List installed provider plugins
   ccr clients list
   ccr clients enable claudeCode codex
   eval "$(ccr activate)"  # Set environment variables globally
@@ -222,10 +227,12 @@ async function main() {
   switch (command) {
     case "start":
       await run();
-      try { await enableConfiguredClientsForStart(); } catch {}
+      // Client-integration env hooks are best-effort; a broken integration
+      // must not stop the router from starting.
+      try { await enableConfiguredClientsForStart(); } catch { /* best-effort */ }
       break;
     case "stop":
-      try { await disableConfiguredClientsForStop(); } catch {}
+      try { await disableConfiguredClientsForStop(); } catch { /* best-effort */ }
       try {
         const pid = parseInt(readFileSync(PID_FILE, "utf-8"));
         process.kill(pid);
@@ -285,6 +292,13 @@ async function main() {
       const presetName = process.argv[3];
       await handleInstallCommand(presetName);
       break;
+    case "plugin": {
+      // handlePluginCommand reports failures on stderr and returns the exit
+      // code (0 ok, 1 usage/validation failure).
+      const pluginExitCode = await handlePluginCommand(process.argv.slice(3));
+      if (pluginExitCode !== 0) process.exit(pluginExitCode);
+      break;
+    }
     case "clients":
       await handleClientsCommand(process.argv.slice(3));
       break;
@@ -448,9 +462,9 @@ async function main() {
       console.log(`claude-code-router version: ${version}`);
       break;
     case "restart":
-      try { await disableConfiguredClientsForStop(); } catch {}
+      try { await disableConfiguredClientsForStop(); } catch { /* best-effort */ }
       await restartService();
-      try { await enableConfiguredClientsForStart(); } catch {}
+      try { await enableConfiguredClientsForStart(); } catch { /* best-effort */ }
       break;
     case "-h":
     case "help":

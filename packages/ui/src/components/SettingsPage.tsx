@@ -10,6 +10,8 @@ import { MultiCombobox } from "@/components/ui/multi-combobox";
 import { useConfig } from "./ConfigProvider";
 import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
+import { PluginCardArea } from "./PluginCardArea";
+import { PluginMarketArea } from "./PluginMarketArea";
 import { ProjectsPage } from "./ProjectsPage";
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { LogViewer } from '@/components/LogViewer';
@@ -31,6 +33,20 @@ import type { ModelFamilyConfig } from "@/types";
 
 const FALLBACK_SCENARIOS = ["default", "think", "longContext", "extendedContext", "webSearch", "image"] as const;
 
+/** Both plugin lanes publish a busy flag into one page-level gate. Each lane
+ *  reports only its own state, so the combined flag must be "any lane busy"
+ *  rather than "last writer wins". */
+function useBusyLanes(setBusy: (busy: boolean) => void) {
+  const lanes = useRef({ cards: false, market: false });
+  const publish = useCallback(() => {
+    setBusy(lanes.current.cards || lanes.current.market);
+  }, [setBusy]);
+  return useMemo(() => ({
+    cards: (busy: boolean) => { lanes.current.cards = busy; publish(); },
+    market: (busy: boolean) => { lanes.current.market = busy; publish(); },
+  }), [publish]);
+}
+
 export function SettingsPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
@@ -39,6 +55,10 @@ export function SettingsPage() {
   const [isStatusLineConfigOpen, setIsStatusLineConfigOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  // Managed subscription cards share one "a management action is running" gate
+  // so a full Save cannot race an in-flight OAuth login or disconnect.
+  const [managedProviderBusy, setManagedProviderBusy] = useState(false);
+  const busyLanes = useBusyLanes(setManagedProviderBusy);
   const [isRestarting, setIsRestarting] = useState(false);
   const [isLogViewerOpen, setIsLogViewerOpen] = useState(false);
   const [isNewVersionAvailable, setIsNewVersionAvailable] = useState(false);
@@ -50,7 +70,7 @@ export function SettingsPage() {
   const [isApplyingClients, setIsApplyingClients] = useState(false);
   const [restoringClientId, setRestoringClientId] = useState<ClientId | null>(null);
   const tabFromUrl = new URLSearchParams(location.search).get("tab");
-  const initialTab = ["general", "clients", "router", "projects", "usage", "tools"].includes(tabFromUrl || "")
+  const initialTab = ["general", "providers", "clients", "router", "projects", "usage", "tools"].includes(tabFromUrl || "")
     ? tabFromUrl || "general"
     : "general";
 
@@ -339,6 +359,7 @@ export function SettingsPage() {
   // request is sent. The server will reject the save with HTTP 400 regardless,
   // so the dialog is purely a UX affordance to avoid a round-trip.
   const runSaveWithProxyCheck = (action: "save" | "saveAndRestart") => {
+    if (isSaving || isRestarting || managedProviderBusy) return;
     const errors = findInvalidProxyUrls((config || {}) as Record<string, unknown>);
     if (errors.length > 0) {
       setProxyValidationErrors(errors);
@@ -369,6 +390,7 @@ export function SettingsPage() {
   };
 
   const saveConfig = async () => {
+    if (managedProviderBusy) return;
     setIsSaving(true);
     try {
       const response = await api.updateConfig(config);
@@ -385,6 +407,7 @@ export function SettingsPage() {
   };
 
   const saveAndRestart = async () => {
+    if (managedProviderBusy) return;
     setIsRestarting(true);
     try {
       const response = await api.updateConfig(config);
@@ -422,11 +445,11 @@ export function SettingsPage() {
           <h1 className="text-2xl font-bold tracking-tight text-foreground">{t('toplevel.title')}</h1>
         </div>
         <div className="flex items-center gap-3">
-          <Button variant="outline" onClick={() => runSaveWithProxyCheck("save")} disabled={isSaving || isRestarting} className="rounded-xl border-white/10 bg-white/5 hover:bg-white/10 h-10 px-6">
+          <Button variant="outline" onClick={() => runSaveWithProxyCheck("save")} disabled={isSaving || isRestarting || managedProviderBusy} className="rounded-xl border-white/10 bg-white/5 hover:bg-white/10 h-10 px-6">
             <Save className="mr-2 h-4 w-4" />
             {t('app.save')}
           </Button>
-          <Button onClick={() => runSaveWithProxyCheck("saveAndRestart")} disabled={isSaving || isRestarting} className="rounded-xl h-10 px-6 shadow-lg shadow-primary/20">
+          <Button onClick={() => runSaveWithProxyCheck("saveAndRestart")} disabled={isSaving || isRestarting || managedProviderBusy} className="rounded-xl h-10 px-6 shadow-lg shadow-primary/20">
             <RefreshCw className="mr-2 h-4 w-4" />
             {t('app.save_and_restart')}
           </Button>
@@ -435,15 +458,29 @@ export function SettingsPage() {
 
       <main className="h-[calc(100vh-4rem)] overflow-auto p-6">
         <div className="w-full">
-          <Tabs defaultValue={initialTab} className="w-full">
+          <Tabs value={initialTab} onValueChange={tab => navigate(`/settings?tab=${tab}`, { replace: true })} className="w-full">
             <TabsList className="w-full justify-start mb-4">
               <TabsTrigger value="general">{t("settings.tabs.general")}</TabsTrigger>
+              <TabsTrigger value="providers">{t("settings.tabs.providers")}</TabsTrigger>
               <TabsTrigger value="clients">{t("settings.tabs.clients")}</TabsTrigger>
               <TabsTrigger value="router">{t("settings.tabs.router")}</TabsTrigger>
               <TabsTrigger value="projects">{t("settings.tabs.projects")}</TabsTrigger>
               <TabsTrigger value="usage">{t("settings.tabs.usage")}</TabsTrigger>
               <TabsTrigger value="tools">{t("settings.tabs.tools")}</TabsTrigger>
             </TabsList>
+
+            <TabsContent value="providers" className="space-y-4">
+              {location.state?.geminiOauthManagedNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("geminiOauth.managed_notice")}</p>}
+              {/* Managed providers are contributed by installed plugin cards. A
+                  row's managed navigation lands here with a generic notice and
+                  a one-shot focus key the owning card consumes. */}
+              {location.state?.managedProviderNotice && <p role="note" className="rounded-lg border p-3 text-sm text-muted-foreground">{t("pluginCards.managed_notice")}</p>}
+              <PluginCardArea disabled={isSaving || isRestarting} onBusyChange={busyLanes.cards} focusKey={(location.state as { managedProviderFocus?: string | null } | null)?.managedProviderFocus ?? null} />
+              {/* Marketplace: installable provider plugins from npm with the
+                  marker keyword. Install is local-only + one click; activation
+                  needs the explicit restart flow. */}
+              <PluginMarketArea disabled={isSaving || isRestarting} onBusyChange={busyLanes.market} />
+            </TabsContent>
 
             {/* General Tab */}
             <TabsContent value="general" className="space-y-4">

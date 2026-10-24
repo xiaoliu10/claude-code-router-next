@@ -1,10 +1,22 @@
 import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeResponse, ProjectConfigEntry, ProjectTakeoverClientId, ProjectsResponse, ProviderHealthResponse, ProviderQuotaResponse } from '@/types';
+import type { GeminiOauthDisconnectResponse, GeminiOauthLoginPollResponse, GeminiOauthLoginStartResponse, GeminiOauthStatusResponse, GeminiOauthSyncResponse, PluginInfo } from '@/types';
+import { isSameOriginCardUrl, sanitizePluginErrorCode } from '../utils/plugin-card.ts';
 
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
   private baseUrl: string;
   private apiKey: string;
   private tempApiKey: string | null;
+  private configWrites = 0;
+  private managedProviderBusy = false;
+
+  // Shared with top-level Save: a stale full-config write must not race a
+  // managed import/disconnect, including the subsequent config reconciliation.
+  acquireProviderManagement(): (() => void) | null {
+    if (this.managedProviderBusy || this.configWrites > 0) return null;
+    this.managedProviderBusy = true;
+    return () => { this.managedProviderBusy = false; };
+  }
 
   constructor(baseUrl: string = '/api', apiKey: string = '') {
     this.baseUrl = baseUrl;
@@ -58,9 +70,11 @@ class ApiClient {
   // Generic fetch wrapper with base URL and authentication.
   // An optional `timeoutMs` on `options` aborts the request after that many
   // milliseconds so a hung server can't leave the caller pending forever.
-  private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
+  private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number; plugin?: string } = {}): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
-    const { timeoutMs, ...rest } = options;
+    const pluginName = (options as any).plugin as string | undefined;
+    const isPluginApi = typeof pluginName === 'string' && pluginName.length > 0;
+    const { timeoutMs, plugin: _plugin, ...rest } = options;
 
     const config: RequestInit = {
       ...rest,
@@ -70,8 +84,9 @@ class ApiClient {
       },
     };
 
-    if (timeoutMs && config.signal === undefined) {
-      config.signal = AbortSignal.timeout(timeoutMs);
+    if (timeoutMs) {
+      const timeout = AbortSignal.timeout(timeoutMs);
+      config.signal = config.signal ? AbortSignal.any([config.signal, timeout]) : timeout;
     }
 
     try {
@@ -86,7 +101,21 @@ class ApiClient {
         // We'll dispatch a custom event that the app can listen to
         window.dispatchEvent(new CustomEvent('unauthorized'));
         // Return a promise that never resolves to prevent further execution
+        if (isPluginApi) throw Object.assign(new Error('Plugin request failed'), { reason: 'request_failed', plugin: pluginName });
         return new Promise(() => {}) as Promise<T>;
+      }
+
+      if (!response.ok && isPluginApi) {
+        // Plugin cards own their error codes; the host passes through only a
+        // well-formed code token (never the raw message) so an upstream string
+        // can't reach the DOM through this boundary.
+        let code = 'request_failed';
+        try {
+          const data = await response.json();
+          const candidate = sanitizePluginErrorCode(data.reason ?? data.error);
+          if (candidate) code = candidate;
+        } catch { /* use the safe default */ }
+        throw Object.assign(new Error(`Plugin ${pluginName} request failed`), { reason: code, plugin: pluginName });
       }
 
       if (!response.ok) {
@@ -111,9 +140,85 @@ class ApiClient {
       return text ? JSON.parse(text) : ({} as T);
 
     } catch (error) {
+      if (isPluginApi) {
+        const reason = error instanceof DOMException && error.name === 'TimeoutError'
+          ? 'request_failed'
+          : error && typeof error === 'object' && 'reason' in error && typeof error.reason === 'string'
+            ? error.reason : 'request_failed';
+        throw Object.assign(new Error(`Plugin ${pluginName} request failed`), { reason, plugin: pluginName,
+          timedOut: error instanceof DOMException && error.name === 'TimeoutError' });
+      }
       console.error('API request error:', error);
       throw error;
     }
+  }
+
+  /**
+   * Fetch the installed provider-plugin manifest from /api/plugins.
+   */
+  getPlugins(): Promise<{ plugins: PluginInfo[] }> {
+    return this.get<{ plugins: PluginInfo[] }>('/plugins', ApiClient.MANAGEMENT_READ_TIMEOUT_MS);
+  }
+
+  /**
+   * Marketplace catalog: installable provider plugins from the npm registry
+   * (marker keyword), merged/deduped and annotated with installed state.
+   * A registry outage resolves with an empty list + warning — never throws
+   * raw upstream errors into the UI.
+   */
+  getPluginCatalog(): Promise<{ ok: true; plugins: import('@/types').PluginMarketCatalogEntry[]; warning?: string }> {
+    return this.get('/plugins/catalog', ApiClient.MANAGEMENT_READ_TIMEOUT_MS);
+  }
+
+  /**
+   * One-click install via the local-only POST /api/plugins/install. Same
+   * validated install as the CLI; the response's restartRequired is always
+   * true — activation requires the existing restart flow.
+   */
+  installPlugin(name: string, force = false): Promise<{ ok: true; name: string; version: string; restartRequired: boolean }> {
+    return this.post('/plugins/install', { name, force }, 60_000);
+  }
+
+  /**
+   * Authenticated, sanitized fetch for provider-plugin cards. Cards never call
+   * fetch() directly: the host supplies this bridge so API-key handling, the
+   * 401 trap and error sanitization stay in exactly one place.
+   */
+  callPluginApi<T = unknown>(plugin: string, path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
+    if (!/^[a-z0-9][a-z0-9-]*$/i.test(plugin)) {
+      return Promise.reject(Object.assign(new Error('Plugin request failed'), { reason: 'request_failed' }));
+    }
+    if (!path.startsWith('/')) path = `/${path}`;
+    return this.apiFetch<T>(`/${plugin}${path}`, { ...init, plugin } as any);
+  }
+
+  /**
+   * Host lane for authenticated card-module loading. A native
+   * `import(cardUrl)` cannot attach the admin API key, so on a non-loopback
+   * authenticated UI the /plugins/<name>/card.js request failed the global
+   * auth middleware (401) and the card silently vanished. The host fetches
+   * the declared card URL through this authenticated boundary instead and
+   * imports a same-origin Blob URL (see PluginCardArea): the JS endpoint
+   * stays fully authenticated, no API key ever appears in a URL and no
+   * server-side auth exemption is introduced. The Blob URL is revoked by the
+   * caller on cleanup.
+   */
+  async fetchPluginCardSource(cardUrl: string): Promise<string> {
+    const origin = (typeof location !== 'undefined' && location && location.origin) || '';
+    if (!isSameOriginCardUrl(cardUrl, origin)) {
+      // Never send admin credentials to a non same-origin target.
+      throw new Error('Refusing to load a plugin card from a non same-origin URL');
+    }
+    const response = await fetch(cardUrl, { headers: this.createHeaders(''), credentials: 'same-origin' });
+    if (response.status === 401) {
+      localStorage.removeItem('apiKey');
+      window.dispatchEvent(new CustomEvent('unauthorized'));
+      throw new Error('Plugin card request failed: unauthorized');
+    }
+    if (!response.ok) {
+      throw new Error(`Plugin card request failed: ${response.status} ${response.statusText}`);
+    }
+    return response.text();
   }
 
   // GET request
@@ -165,7 +270,13 @@ class ApiClient {
 
   // Update entire configuration
   async updateConfig(config: Config): Promise<{ success: boolean; message?: string }> {
-    return this.post<{ success: boolean; message?: string }>('/config', config);
+    if (this.managedProviderBusy) return { success: false };
+    this.configWrites += 1;
+    try {
+      return await this.post<{ success: boolean; message?: string }>('/config', config);
+    } finally {
+      this.configWrites -= 1;
+    }
   }
 
   // Restart service
@@ -385,6 +496,41 @@ class ApiClient {
       '/providers/quota',
       ApiClient.MANAGEMENT_READ_TIMEOUT_MS,
     );
+  }
+
+  // ========== Gemini subscription (Antigravity OAuth) provider API methods ==========
+
+  // Local status only: no polling, no upstream call, no token field of any kind.
+  getGeminiOauthStatus(): Promise<GeminiOauthStatusResponse> {
+    return this.callPluginApi('gemini-oauth', '/status', { method: 'GET', timeoutMs: ApiClient.MANAGEMENT_READ_TIMEOUT_MS });
+  }
+
+  // Opens one loopback callback server with a 10 minute TTL. Called ONLY after
+  // the user confirmed the risk dialog — never on mount, never automatically.
+  startGeminiOauthLogin(): Promise<GeminiOauthLoginStartResponse> {
+    return this.callPluginApi('gemini-oauth', '/login/start', { method: 'POST', body: '{}', timeoutMs: 30_000 });
+  }
+
+  pollGeminiOauthLogin(loginId: string, signal: AbortSignal): Promise<GeminiOauthLoginPollResponse> {
+    return this.callPluginApi('gemini-oauth', '/login/poll', {
+      method: 'POST', body: JSON.stringify({ loginId }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+    });
+  }
+
+  cancelGeminiOauthLogin(loginId: string): Promise<{ ok?: boolean; success?: boolean }> {
+    return this.callPluginApi('gemini-oauth', '/login/cancel', { method: 'POST', body: JSON.stringify({ loginId }), timeoutMs: 30_000 });
+  }
+
+  // Re-reads the available model list; a failure keeps the previous models.
+  syncGeminiOauthModels(): Promise<GeminiOauthSyncResponse> {
+    return this.callPluginApi('gemini-oauth', '/sync', { method: 'POST', body: '{}', timeoutMs: 60_000 });
+  }
+
+  // Deletes the managed provider and the private credential file. Router
+  // references are preserved and may stop working; CCR says so in the UI.
+  disconnectGeminiOauth(): Promise<GeminiOauthDisconnectResponse> {
+    return this.callPluginApi('gemini-oauth', '/disconnect', { method: 'POST', body: '{}', timeoutMs: 30_000 });
   }
 
   async probeProvider(providerName: string): Promise<ManualProbeResponse> {

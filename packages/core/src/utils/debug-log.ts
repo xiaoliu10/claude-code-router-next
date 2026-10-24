@@ -8,6 +8,11 @@ const SENSITIVE_HEADERS = new Set([
   "set-cookie",
 ]);
 
+// Defence in depth: mask ANY header whose name looks credential-bearing, so a
+// future provider-specific secret header can never reach the debug log even
+// if the explicit set above is not updated.
+const SENSITIVE_HEADER_PATTERN = /token|secret|credential|passwd|password/i;
+
 interface DebugLogOptions {
   maxBodyLength: number;
   maxStreamChunks: number;
@@ -47,7 +52,8 @@ export function maskHeaders(
 ): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
-    if (SENSITIVE_HEADERS.has(key.toLowerCase())) {
+    const lower = key.toLowerCase();
+    if (SENSITIVE_HEADERS.has(lower) || (SENSITIVE_HEADER_PATTERN.test(lower) && !/^(?:x-|anthropic-)?ratelimit-/.test(lower))) {
       result[key] = "***MASKED***";
     } else {
       result[key] = value;
