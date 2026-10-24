@@ -60,7 +60,18 @@ await esbuild.build({
   logLevel: "info",
 });
 
-copyFileSync(join(root, "plugin.json"), join(dist, "plugin.json"));
+// dist/plugin.json is DERIVED: the npm version comes from package.json (the
+// only version npm publish reads), so a stale root plugin.json must never
+// ship a mismatched install manifest. Also guard the runtime manifest const
+// in src/plugin.ts so the two sources cannot drift again.
+const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const manifestJson = JSON.parse(readFileSync(join(root, "plugin.json"), "utf8"));
+manifestJson.version = pkg.version;
+writeFileSync(join(dist, "plugin.json"), JSON.stringify(manifestJson, null, 2) + "\n");
+const declaredVersion = readFileSync(join(root, "src/plugin.ts"), "utf8").match(/version:\s*"([^"]+)"/)?.[1];
+if (declaredVersion !== pkg.version) {
+  throw new Error(`src/plugin.ts manifest version ${declaredVersion} != package.json ${pkg.version}; keep them in sync`);
+}
 writeFileSync(join(dist, "package.json"), JSON.stringify({ type: "module" }, null, 2) + "\n");
 
 // F3: emit the shipped artifacts without the sourcemap reference comment.
