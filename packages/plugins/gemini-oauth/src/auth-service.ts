@@ -545,7 +545,7 @@ export class GeminiOauthAuthService {
   /**
    * Start one browser authorization: binds the loopback callback server
    * (127.0.0.1:0, /oauth-callback), builds the PKCE + state authorize URL.
-   * At most one login runs at a time; TTL 10 minutes.
+   * At most one login runs at a time; TTL 30 minutes.
    */
   startLogin(): Promise<{ loginId: string; url: string; expiresAt: number }> {
     if (!isGeminiOauthConfigured()) {

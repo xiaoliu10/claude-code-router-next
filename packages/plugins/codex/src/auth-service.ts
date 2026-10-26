@@ -787,7 +787,13 @@ export class CodexAuthService {
         fetchImpl: (url, init) => this.directFetch(url, init),
       });
     } catch (error: any) {
-      this.log.warn(`[codex] token exchange failed: ${error?.code === "codex_reauth_required" ? "rejected" : "upstream"}`);
+      // Diagnostics: status-only for HTTP responses; for transport failures
+      // (status=none) the node error message (DNS/connect/TLS) — neither ever
+      // contains credentials, bodies or headers.
+      const detail = error?.statusCode !== undefined
+        ? `status=${error.statusCode} ${String(error?.message ?? "").slice(0, 120)}`
+        : `transport=${error?.cause?.code ?? error?.code ?? "?"} ${String(error?.message ?? "").slice(0, 120)}`;
+      this.log.warn(`[codex] token exchange failed: ${error?.code === "codex_reauth_required" ? "rejected" : "upstream"} (${detail})`);
       return fail("codex_login_exchange_failed");
     }
     // Cancelled/disconnected, or already terminal (e.g. TTL expired while the
@@ -808,7 +814,8 @@ export class CodexAuthService {
         fetchImpl: (url, init) => this.directFetch(url, init),
       });
     } catch (error: any) {
-      this.log.warn(`[codex] model discovery after login failed: ${error?.code ?? "upstream"}`);
+      const cause = error?.cause?.code ?? error?.cause?.message ?? "";
+      this.log.warn(`[codex] model discovery after login failed: ${error?.code ?? error?.name ?? "upstream"} ${cause} ${String(error?.message ?? "").slice(0, 120)}`);
     }
 
     const previous = await this.store.load().catch((): CodexCredentialData | null => null);

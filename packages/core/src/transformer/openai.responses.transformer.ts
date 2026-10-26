@@ -273,6 +273,33 @@ export class OpenAIResponsesTransformer implements Transformer {
   async transformResponseOut(response: Response): Promise<Response> {
     const contentType = response.headers.get("Content-Type") || "";
 
+    // Some upstreams return SSE under an UNLABELED (or garbage) content-type —
+    // the real chatgpt.com backend answers with no content-type at all, and
+    // Clash/TUN middleboxes can strip it. Peek first: an SSE-shaped body is
+    // rebuilt with the correct type and re-dispatched, so neither the JSON
+    // branch nor the fall-through below can silently drop its content.
+    if (!contentType.includes("text/event-stream") && !contentType.includes("application/json") && response.body) {
+      const peeked = await peekBodyForSSE(response);
+      if (peeked?.isSSE && peeked.body) {
+        const rebuilt = new Response(peeked.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: new Headers({
+            ...Object.fromEntries(response.headers.entries()),
+            "content-type": "text/event-stream",
+          }),
+        });
+        return this.transformResponseOut(rebuilt);
+      }
+      if (peeked?.body) {
+        response = new Response(peeked.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      }
+    }
+
     // Some upstreams (Codex relay) label an SSE body with an application/json
     // Content-Type. Peek the first meaningful content: when the body actually
     // looks like SSE, re-dispatch as a stream so the SSE pass-through below

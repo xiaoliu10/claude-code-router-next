@@ -93,8 +93,11 @@ export const CODEX_CALLBACK_PORTS = [1455, 1457] as const;
 export const CODEX_LOOPBACK_HOSTS: readonly string[] = ["127.0.0.1", "localhost", "::1"];
 
 export const CODEX_CALLBACK_PATH = "/auth/callback";
-/** Login lifetime: 10 minutes (same bounded TTL as the other managed lanes). */
-export const CODEX_LOGIN_TTL_MS = 10 * 60 * 1000;
+/** Login lifetime: 30 minutes. Raised from the original 10: real users routinely
+ *  exceed 10 minutes across password/2FA/org-SSO, and every TTL expiry looks
+ *  identical to a broken callback (dead loopback listener → connection refused).
+ *  Still bounded so a forgotten session cannot hold the single login slot. */
+export const CODEX_LOGIN_TTL_MS = 30 * 60 * 1000;
 /** Refresh lead time: refresh while at least 5 minutes of the JWT remain. */
 export const CODEX_REFRESH_LEAD_MS = 5 * 60 * 1000;
 /** Bound every auth/management-plane call; a hung upstream must not park login. */
@@ -131,6 +134,9 @@ export function codexManagementHeaders(accessToken: string, accountId: string | 
     version: codexClientVersion(),
     "User-Agent": codexUserAgent(),
     Accept: "application/json",
+    // Same rationale as the token exchange: a compressed body without
+    // content-encoding hands undecodable bytes to text(); identity is plain.
+    "Accept-Encoding": "identity",
   };
 }
 
@@ -358,7 +364,13 @@ export async function exchangeCodexCode(params: {
 }): Promise<CodexTokens> {
   const res = await params.fetchImpl(`${params.issuer ?? codexIssuer()}${CODEX_TOKEN_PATH}`, boundedFetchInit({
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      // Some paths (middleboxes on the TUN/direct route) answer with a binary
+      // compressed body missing content-type/content-encoding, which fetch then
+      // hands through undecoded. identity = plain JSON, always parseable.
+      "Accept-Encoding": "identity",
+    },
     body: new URLSearchParams({
       grant_type: "authorization_code",
       code: params.code,
@@ -413,7 +425,7 @@ async function readTokenResponse(res: Response, stage: string): Promise<CodexTok
       code: reauth ? "codex_reauth_required" : "codex_upstream_error",
       message: reauth
         ? CODEX_SAFE_MESSAGES.codex_reauth_required
-        : `Codex OAuth ${stage} failed.`,
+        : `Codex OAuth ${stage} failed (HTTP ${res.status}, ct=${res.headers.get("content-type") ?? "?"}, body=${text.slice(0, 160)}).`,
       httpStatus: reauth ? 401 : 502,
     });
   }
@@ -546,7 +558,7 @@ export async function fetchCodexModels(params: {
     const classified = classifyCodexError(res.status, json || text);
     throw codexError({
       code: classified?.code === "codex_reauth_required" ? "codex_reauth_required" : "codex_upstream_error",
-      message: classified?.message ?? "Codex model list could not be loaded.",
+      message: classified?.message ?? `Codex model list could not be loaded (HTTP ${res.status}, ct=${res.headers.get("content-type") ?? "?"}, body=${text.slice(0, 120)}).`,
       httpStatus: classified?.httpStatus ?? 502,
     });
   }

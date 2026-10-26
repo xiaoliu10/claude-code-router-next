@@ -22,7 +22,7 @@ import {
   CODEX_CALLBACK_PORTS,
   CODEX_PROVIDER_NAME,
   CODEX_API_KEY,
-  CODEX_TRANSFORMER_NAME,
+  CODEX_TRANSFORMER_NAME,  CODEX_LOGIN_TTL_MS,
 } from "../src/protocol";
 
 function jwt(claims: Record<string, any>): string {
@@ -324,7 +324,7 @@ describe("browser login", () => {
     const up = fakeUpstream();
     (h.service as any).options.fetchImpl = up.impl;
     const start = await h.service.startLogin();
-    clock.t += 11 * 60 * 1000; // past TTL
+    clock.t += CODEX_LOGIN_TTL_MS + 60 * 1000; // past TTL
     const poll = await h.service.pollLogin(start.loginId);
     expect(poll.status).toBe("expired");
     expect(up.calls.filter((c) => c.includes("/oauth/token"))).toEqual([]);

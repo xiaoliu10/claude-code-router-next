@@ -56,8 +56,12 @@ export const GEMINI_OAUTH_MGMT_PLANE = "https://cloudcode-pa.googleapis.com";
 export const GEMINI_OAUTH_SSE_PATH = "/v1internal:streamGenerateContent?alt=sse";
 export const GEMINI_OAUTH_CALLBACK_PATH = "/oauth-callback";
 export const GEMINI_OAUTH_DEFAULT_VERSION = "2.9.1";
-/** Login callback server TTL (contract §1: 10 minutes). */
-export const GEMINI_OAUTH_LOGIN_TTL_MS = 10 * 60 * 1000;
+/** Login callback server TTL: 30 minutes. Raised from the original 10 (contract
+ *  §1) — real users routinely exceed 10 minutes across password/2FA/org-SSO,
+ *  and every TTL expiry looks identical to a broken callback (dead loopback
+ *  listener → connection refused). Still bounded so a forgotten session cannot
+ *  hold the single login slot. */
+export const GEMINI_OAUTH_LOGIN_TTL_MS = 30 * 60 * 1000;
 
 export const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 

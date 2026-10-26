@@ -162,8 +162,10 @@ beforeEach(() => {
   execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", tmpdir()], {
     cwd: PLUGIN_PKG, env: { ...process.env, npm_config_pack_destination: undefined },
   });
-  // npm names it after the package; rename to a deterministic path.
-  const produced = join(tmpdir(), "wengine-ai-ccr-provider-codex-1.0.0.tgz");
+  // npm names it after the package version; resolve dynamically instead of
+  // hardcoding (the version bumps every release).
+  const pkg = JSON.parse(readFileSync(join(PLUGIN_PKG, "package.json"), "utf8"));
+  const produced = join(tmpdir(), `wengine-ai-ccr-provider-codex-${pkg.version}.tgz`);
   rmSync(tarballPath, { force: true });
   execFileSync("mv", [produced, tarballPath]);
 });

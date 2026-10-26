@@ -23,7 +23,8 @@ it("real createCcrServer: tarball activation, admin auth/guards, both endpoint t
   expect(HOME_DIR).toContain("ccr-codex-plugin-test-home");
   mkdirSync(HOME_DIR, { recursive: true });
   execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", HOME_DIR], { cwd: pkg, stdio: "pipe" });
-  const archive = join(HOME_DIR, "wengine-ai-ccr-provider-codex-1.0.0.tgz");
+  const { version } = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8"));
+  const archive = join(HOME_DIR, `wengine-ai-ccr-provider-codex-${version}.tgz`);
   await installPluginFromArchive(archive, { configDir: HOME_DIR });
   const config = { Providers: [provider], Router: { default: "codex-subscription,fixture-model", enableFallback: false },
     APIKEY: "fixture-admin-secret", HOST: "127.0.0.1", PORT: 0, LOG: false, ACTIVE_PROBE_ENABLED: false,

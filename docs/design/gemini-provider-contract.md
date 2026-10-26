@@ -35,7 +35,7 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
 
 > M1 核实修订：OAuth client 参考来源为 magpie `google.go/antigravityApp`，本实现通过以上环境变量配置；缺失时返回稳定的配置未就绪错误，不回显值。禁止字符串拆分/编码绕过 GitHub Push Protection。未来若提交被拦截的公开常量，须由维护者走 GitHub 官方审查/allow 流程。M1 提交后暂停，独立审查通过再进入 M2。
 
-- OAuth：授权码 + PKCE(S256)；code 换 token POST form（grant_type=authorization_code, client_id, client_secret, code_verifier, code, redirect_uri）。**登录回调服务器 10 分钟超时**。
+- OAuth：授权码 + PKCE(S256)；code 换 token POST form（grant_type=authorization_code, client_id, client_secret, code_verifier, code, redirect_uri）。**登录回调服务器 30 分钟超时**（v1.0.3 起，原 10 分钟对真人密码/2FA 流程过紧）。
 - token 刷新：内存缓存按 refresh_token 键；有效期 >2min 复用；否则 grant_type=refresh_token 刷新；单飞（并发请求共享同一次刷新）；刷新失败→错误码 `gemini_oauth_reauth_required`。未返回 refresh_token 时保留原值；若返回替换值须安全持久化后更新缓存身份，不能假设永不轮换。
 - 项目发现：POST `{mgmtProd}/v1internal:loadCodeAssist`，body `{metadata:{ideType:"ANTIGRAVITY"}}`；读取回复顶层 `cloudaicompanionProject`（不从 currentTier 内读取）；否则取 `allowedTiers` default tier 调 `{dataPlane}/v1internal:onboardUser`（snake_case：`{tier_id, metadata:{ide_type, ide_name, ide_version}}`），LRO 轮询 2s×5 次。**实现前必须 gh api 读 magpie `internal/provider/google.go` 的 `geminiProject`/`antigravityProject`/`onboard`/`entitlements`（约 L600-742）核对细节**。
 - 模型发现：`fetchAvailableModels`（同管理面）；失败回退静态表。**静态表必须从 magpie 源码抄真实模型 ID**（`google.go` `antigravityModels`/`fallbackModels` 约 L1145-1156 与 `antigravity_models.go` 全文——含模型 ID 变体折叠规则），禁止发明模型名。
