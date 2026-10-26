@@ -100,6 +100,32 @@ function stubSequence(first: () => Response, second: () => Response = success) {
 }
 
 describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () => {
+  it("international unlabeled SSE errors still rotate before content and successful text is aggregated", async () => {
+    const h = await harness();
+    const upstream = vi.fn(async () => new Response(new TextEncoder().encode(
+      event({ model: "m", choices: [{ delta: { content: "international healthy" }, finish_reason: "stop" }] }) + "data: [DONE]\n\n"
+    )));
+    vi.stubGlobal("fetch", upstream);
+    const response = await h.send("workbuddy-ai", "m", false);
+    expect(response.statusCode).toBe(200);
+    expect(response.json().model).toBe("m");
+    expect(response.json().choices[0].message.content).toBe("international healthy");
+    expect(String(upstream.mock.calls[0][0])).toBe(AI);
+  });
+
+  it("unlabeled pre-content 6004 is classified and rotates with no body leak", async () => {
+    const h = await harness();
+    const f = stubSequence(
+      () => new Response(new TextEncoder().encode(event({ code: 6004, msg: "private-upstream-body" }))),
+      () => new Response(new TextEncoder().encode(event({ choices: [{ delta: { content: "healthy" }, finish_reason: "stop" }] }) + "data: [DONE]\n\n")),
+    );
+    const response = await h.send();
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("healthy");
+    expect(response.body).not.toContain("private-upstream-body");
+    expect(f.headers.map(headers => headers.get("x-user-id"))).toEqual(["b", "a"]);
+  });
+
   it("active-sticky b receives 6004; a succeeds with fresh auth; model cooldown persisted", async () => {
     const h = await harness();
     // The per-attempt credential reaches the final header injection through

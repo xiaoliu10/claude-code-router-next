@@ -137,3 +137,77 @@ describe("ProviderHealthStore", () => {
     });
   });
 });
+
+describe("expired rateLimitUntil recovery (managed-provider stuck-open fix)", () => {
+  let store: ProviderHealthStore;
+  beforeEach(() => { store = new ProviderHealthStore({ enabled: true }); });
+
+  it("a real success clears an EXPIRED cooldown and a second success closes the breaker", () => {
+    store.forceOpen("workbuddy", "deepseek-v4.1-flash", "old failure");
+    const state = store.getState("workbuddy", "deepseek-v4.1-flash")!;
+    state.rateLimitUntil = Date.now() - 1000; // expired yesterday-style cooldown
+    state.lastError = "Provider plugin returned an invalid upstream response.";
+
+    // Success while cooldown expired: open → half-open (like a probe success).
+    store.recordSuccess("workbuddy", "deepseek-v4.1-flash");
+    let after = store.getState("workbuddy", "deepseek-v4.1-flash")!;
+    expect(after.status).toBe("half-open");
+    expect(after.rateLimitUntil).toBeUndefined();
+
+    // Second success reaches halfOpenSuccessThreshold (2) → fully closed.
+    store.recordSuccess("workbuddy", "deepseek-v4.1-flash");
+    expect(store.getState("workbuddy", "deepseek-v4.1-flash")).toBeUndefined();
+    expect(store.isAvailable("workbuddy", "deepseek-v4.1-flash")).toBe(true);
+  });
+
+  it("recovers an expired cooldown immediately when the success threshold is one", () => {
+    const one = new ProviderHealthStore({ enabled: true, halfOpenSuccessThreshold: 1 });
+    one.forceOpen("workbuddy", "m", "old failure");
+    one.getState("workbuddy", "m")!.rateLimitUntil = Date.now() - 1000;
+    one.recordSuccess("workbuddy", "m");
+    expect(one.getState("workbuddy", "m")).toBeUndefined();
+  });
+
+  it("preserves no-cooldown recovery when the threshold is one", () => {
+    const one = new ProviderHealthStore({ enabled: true, halfOpenSuccessThreshold: 1 });
+    one.forceOpen("workbuddy", "m", "old failure");
+    one.recordSuccess("workbuddy", "m");
+    expect(one.getState("workbuddy", "m")?.status).toBe("half-open");
+    one.recordSuccess("workbuddy", "m");
+    expect(one.getState("workbuddy", "m")).toBeUndefined();
+  });
+
+  it("allows stale managed failures to recover through authenticated routed requests only", () => {
+    store.forceOpen("workbuddy-ai", "m", "old network failure");
+    const state = store.getState("workbuddy-ai", "m")!;
+    state.lastFailureTime = Date.now() - 6 * 60_000;
+    expect(store.isAvailable("workbuddy-ai", "m")).toBe(false);
+    expect(store.isAvailable("workbuddy-ai", "m", true)).toBe(true);
+    expect(state.status).toBe("half-open");
+    store.recordSuccess("workbuddy-ai", "m");
+    store.recordSuccess("workbuddy-ai", "m");
+    expect(store.getState("workbuddy-ai", "m")).toBeUndefined();
+  });
+
+  it("keeps recent managed failures and active quota locks closed to recovery probes", () => {
+    store.forceOpen("workbuddy-ai", "m", "recent failure");
+    expect(store.isAvailable("workbuddy-ai", "m", true)).toBe(false);
+    const state = store.getState("workbuddy-ai", "m")!;
+    state.lastFailureTime = Date.now() - 6 * 60_000;
+    state.rateLimitUntil = Date.now() + 60_000;
+    expect(store.isAvailable("workbuddy-ai", "m", true)).toBe(false);
+    expect(state.status).toBe("open");
+  });
+
+  it("an UNEXPIRED cooldown still blocks recovery (quota lock preserved)", () => {
+    store.forceOpen("workbuddy", "m", "failure");
+    const state = store.getState("workbuddy", "m")!;
+    state.rateLimitUntil = Date.now() + 3_600_000;
+
+    store.recordSuccess("workbuddy", "m");
+    const after = store.getState("workbuddy", "m")!;
+    expect(after.status).toBe("open");
+    expect(after.rateLimitUntil).toBeGreaterThan(Date.now());
+    expect(store.isAvailable("workbuddy", "m")).toBe(false);
+  });
+});

@@ -207,6 +207,18 @@ export class WorkBuddyTransformer implements PluginTransformer {
     const names: Map<string, string> | undefined = context?.workbuddyToolNames;
     const contentType = response.headers.get("Content-Type") ?? "";
 
+    // International responses can carry valid SSE without MIME headers. Probe
+    // any non-stream body, retaining the untouched branch exactly once.
+    if (!contentType.includes("stream") && response.body) {
+      const peeked = await peekBodyForSSE(response);
+      if (peeked) {
+        const headers = new Headers(response.headers);
+        if (peeked.isSSE) headers.set("Content-Type", "text/event-stream");
+        response = new Response(peeked.body, { status: response.status, statusText: response.statusText, headers });
+        if (peeked.isSSE) return this.dispatchSSE(response, names, context);
+      }
+    }
+
     if (contentType.includes("application/json")) {
       if (!response.body) return response;
       const peeked = await peekBodyForSSE(response);

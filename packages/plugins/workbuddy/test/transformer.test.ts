@@ -161,6 +161,21 @@ describe("WorkBuddy non-stream aggregation (contract §13 Q1)", () => {
     }), { headers: { "Content-Type": "text/event-stream" } });
   };
 
+  it.each([undefined, "text/plain", "application/json"])("recognizes fragmented SSE with MIME %s for non-stream clients", async (mime) => {
+    const { transformer } = await harness();
+    const context = { workbuddyClientStream: false, workbuddyUpstreamStream: true };
+    const raw = `data: ${JSON.stringify({ model: "deepseek-v4.1-flash", choices: [{ delta: { content: "正常" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`;
+    const bytes = new TextEncoder().encode(raw);
+    const upstream = new Response(new ReadableStream({
+      start(c) { c.enqueue(bytes.slice(0, 2)); c.enqueue(bytes.slice(2)); c.close(); },
+    }), { headers: mime ? { "content-type": mime } : {} });
+    const out = await transformer.transformResponseOut(upstream, context);
+    expect(out.headers.get("content-type")).toBe("application/json");
+    const json: any = await out.json();
+    expect(json.model).toBe("deepseek-v4.1-flash");
+    expect(json.choices[0].message.content).toBe("正常");
+  });
+
   it("aggregates SSE into one chat.completion JSON for a non-stream client", async () => {
     const { transformer } = await harness();
     const context: any = {};

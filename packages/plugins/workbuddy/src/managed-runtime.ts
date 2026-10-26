@@ -37,6 +37,7 @@
  */
 import type { ManagedRuntime, PluginClassifiedError } from "./core-types";
 import type { WorkBuddyAuthService } from "./auth-service";
+import { peekBodyForSSE } from "./response-body";
 import {
   classifyWorkBuddyError,
   conversationHeaders,
@@ -112,8 +113,16 @@ function normalizeSseProtocolError(error: any): any {
  * envelope predicate come from the plugin's protocol module.)
  */
 async function inspectWorkBuddySse(response: Response): Promise<Response> {
-  if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) return response;
-  const reader = response.body.getReader();
+  if (!response.body) return response;
+  if (!response.headers.get("content-type")?.includes("text/event-stream")) {
+    const peeked = await peekBodyForSSE(response);
+    if (!peeked) return response;
+    const headers = new Headers(response.headers);
+    if (peeked.isSSE) headers.set("content-type", "text/event-stream");
+    response = new Response(peeked.body, { status: response.status, statusText: response.statusText, headers });
+    if (!peeked.isSSE) return response;
+  }
+  const reader = response.body!.getReader();
   const chunks: Uint8Array[] = [];
   const decoder = new TextDecoder();
   let pending = "", bytes = 0, done = false, committed = false;

@@ -722,7 +722,7 @@ async function handleFallback(
       const fbModel = configuredFallback.model;
 
       // Skip if model is in fail pool (open state)
-      if (!healthStore.isAvailable(fbProviderName, fbModel)) {
+      if (!healthStore.isAvailable(fbProviderName, fbModel, configuredFallback.provider.apiKey?.startsWith("ccr-managed-") === true)) {
         req.log.warn(`Fallback model ${fallbackModel} unavailable (fail pool), skipping`);
         continue;
       }
