@@ -154,11 +154,21 @@ export const calculateTokenCount = (
           } else if (contentPart.type === "tool_use") {
             tokenCount += enc.encode(JSON.stringify(contentPart.input)).length;
           } else if (contentPart.type === "tool_result") {
-            tokenCount += enc.encode(
-              typeof contentPart.content === "string"
-                ? contentPart.content
-                : JSON.stringify(contentPart.content)
-            ).length;
+            const raw = contentPart.content;
+            if (Array.isArray(raw)) {
+              // Image blocks are vision input, not text: skip their base64
+              // payload so routing thresholds match the actual wire shape.
+              for (const part of raw) {
+                if (part?.type === "image") continue;
+                tokenCount += enc.encode(
+                  part?.type === "text" ? String(part.text ?? "") : JSON.stringify(part)
+                ).length;
+              }
+            } else {
+              tokenCount += enc.encode(
+                typeof raw === "string" ? raw : JSON.stringify(raw)
+              ).length;
+            }
           }
         });
       }

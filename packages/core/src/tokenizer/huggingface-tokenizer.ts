@@ -197,11 +197,22 @@ export class HuggingFaceTokenizer implements ITokenizer {
             } else if (contentPart.type === "tool_use" && contentPart.input) {
               parts.push(JSON.stringify(contentPart.input));
             } else if (contentPart.type === "tool_result") {
-              parts.push(
-                typeof contentPart.content === "string"
-                  ? contentPart.content
-                  : JSON.stringify(contentPart.content)
-              );
+              // Same vision-vs-text rule as the tiktoken counter: never push
+              // image base64 into the text parts that get encoded.
+              if (Array.isArray(contentPart.content)) {
+                for (const part of contentPart.content) {
+                  if (part?.type === "image") continue;
+                  parts.push(
+                    part?.type === "text" ? String(part.text ?? "") : JSON.stringify(part)
+                  );
+                }
+              } else {
+                parts.push(
+                  typeof contentPart.content === "string"
+                    ? contentPart.content
+                    : JSON.stringify(contentPart.content)
+                );
+              }
             }
           }
         }

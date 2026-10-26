@@ -190,6 +190,16 @@ export class ApiTokenizer implements ITokenizer {
           } else if (part.type === "tool_use" && part.input) {
             return JSON.stringify(part.input);
           } else if (part.type === "tool_result") {
+            // Image blocks are vision input, not text: their base64 must not
+            // be shipped to the counting API as if it were prompt text.
+            if (Array.isArray(part.content)) {
+              return part.content
+                .filter((sub: any) => sub?.type !== "image")
+                .map((sub: any) =>
+                  sub?.type === "text" ? String(sub.text ?? "") : JSON.stringify(sub)
+                )
+                .join("\n");
+            }
             return typeof part.content === "string"
               ? part.content
               : JSON.stringify(part.content);
