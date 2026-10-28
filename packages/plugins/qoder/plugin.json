@@ -1,0 +1,6 @@
+{
+  "name": "qoder",
+  "version": "0.1.0",
+  "coreApi": "1",
+  "description": "Qoder (qoder.com) subscription provider with PAT sign-in, model management and usage."
+}
