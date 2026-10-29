@@ -49,6 +49,22 @@ function sse(chunks: string[]) {
   }), { headers: { "content-type": "text/event-stream" } });
 }
 const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
+
+/**
+ * Render an epoch in the +08:00 wall clock WorkBuddy CN uses in its 6004 reset
+ * strings. The vendor sends a bare wall clock (no zone), and classifyWorkBuddyError
+ * reads it as UTC+8, so a test that formatted with the runner's LOCAL zone passed
+ * only on UTC+8 machines and booked the 15 minute default on CI's UTC runners.
+ */
+function beijingMinuteStamp(epochMs: number): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(epochMs));
+  const value = (type: string) => parts.find(part => part.type === type)!.value;
+  return `${value("year")}-${value("month")}-${value("day")} ${value("hour")}:${value("minute")}`;
+}
+
 async function harness(hiddenModels: string[] = []) {
   const dir = mkdtempSync(join(tmpdir(), "wb-failover-"));
   // Same path the plugin activation chose (ctx.host.configDir): the harness
@@ -391,9 +407,7 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
     ["window longer than the default is respected", 20 * 60_000, (elapsed: number) => elapsed > 15 * 60_000],
   ])("SSE 6004 books the upstream reset window, not a flat 15 minutes (%s)", async (_name, windowMs, within) => {
     const h = await harness();
-    const reset = new Date(Date.now() + windowMs);
-    const pad = (n: number) => String(n).padStart(2, "0");
-    const stamp = `${reset.getFullYear()}-${pad(reset.getMonth() + 1)}-${pad(reset.getDate())} ${pad(reset.getHours())}:${pad(reset.getMinutes())}`;
+    const stamp = beijingMinuteStamp(Date.now() + windowMs);
     stubSequence(() => sse([event({ code: 6004, msg: `您的使用量已超出频率限制，将在 ${stamp} 重置` })]), () => sse([event({ code: 6004, msg: "频率限制" })]));
     const before = Date.now();
     expect((await h.send()).statusCode).toBe(400);
@@ -411,9 +425,7 @@ describe("WorkBuddy §16 request account rotation (temp store, stub fetch)", () 
   });
   it("HTTP 6004 with a reset window keeps booking the exact window (unchanged path)", async () => {
     const h = await harness();
-    const reset = new Date(Date.now() + 5.5 * 60_000);
-    const pad = (n: number) => String(n).padStart(2, "0");
-    const stamp = `${reset.getFullYear()}-${pad(reset.getMonth() + 1)}-${pad(reset.getDate())} ${pad(reset.getHours())}:${pad(reset.getMinutes())}`;
+    const stamp = beijingMinuteStamp(Date.now() + 5.5 * 60_000);
     stubSequence(() => json({ code: 6004, msg: `频率限制，将在 ${stamp} 重置` }, 429), () => success());
     const before = Date.now();
     expect((await h.send()).statusCode).toBe(200);
