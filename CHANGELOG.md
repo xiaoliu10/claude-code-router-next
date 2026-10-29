@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2415] - 2026-10-29
+
+### Added
+
+- **Qoder 订阅 provider（qoder.com + qoder.cn）** (#83): 新增 PAT 订阅 provider 插件，同插件同引擎支持国际站与国内站（COSY 信封逐字节一致，仅 host 不同）。双 managed provider（`qoder-subscription` / `qoder-cn-subscription`）各自拥有独立凭据文件、管理路由（`/api/qoder`、`/api/qoder/cn`）与设置卡片双区块（中英双语）。引擎覆盖 PAT 交换/刷新单飞/PAT 再交换恢复、模型列表、队列（10605）等待重发、SSE 解析与用量读取；宿主侧含 401 单次刷新重放、abort/deadline 语义、按 configDir 串行化的整配置写队列、每帧 1 MiB UTF-8 字节上限与 0600 凭据文件。离线测试 135 项 + 真实安装器/loader 冒烟。
+
+### Fixed
+
+- **WorkBuddy 6004 重置时间戳时区** (#81): 测试用 runner 本地时区渲染时间戳而解析按 +08:00，UTC CI 必挂（booked 900s vs 330s）。测试改用 Asia/Shanghai 渲染，三时区验证通过。
+- **tool_result 图片按 base64 文本发送** (#82): Anthropic `tool_result` 内 image 块被整体 stringify 成纯文本，10 张截图 ≈ 204 万 tokens 并触发上游 `context_length_exceeded`。现在图片抽为紧随 tool 消息的 user 视觉块，不支持图片的模型降级占位，token 计数口径恢复。
+
+
 ## [2.3.2414] - 2026-10-16
 
 ### Added
