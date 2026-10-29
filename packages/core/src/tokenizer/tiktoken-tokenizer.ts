@@ -49,11 +49,21 @@ export class TiktokenTokenizer implements ITokenizer {
                 JSON.stringify(contentPart.input)
               ).length;
             } else if (contentPart.type === "tool_result") {
-              const content =
-                typeof contentPart.content === "string"
-                  ? contentPart.content
-                  : JSON.stringify(contentPart.content);
-              tokenCount += encoding.encode(content).length;
+              const raw = contentPart.content;
+              if (Array.isArray(raw)) {
+                // Image blocks are vision input, not text: never encode their
+                // base64 payload (one screenshot would otherwise add hundreds
+                // of thousands of phantom tokens to routing and usage).
+                for (const part of raw) {
+                  if (part?.type === "image") continue;
+                  tokenCount += encoding.encode(
+                    part?.type === "text" ? String(part.text ?? "") : JSON.stringify(part)
+                  ).length;
+                }
+              } else {
+                const content = typeof raw === "string" ? raw : JSON.stringify(raw);
+                tokenCount += encoding.encode(content).length;
+              }
             }
           });
         }

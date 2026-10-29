@@ -816,7 +816,6 @@ export class OpenAIResponsesTransformer implements Transformer {
     }
 
     if (content.type === "image_url") {
-      console.log(content);
       const imagePayload: Record<string, unknown> = {
         type: role === "assistant" ? "output_image" : "input_image",
       };
