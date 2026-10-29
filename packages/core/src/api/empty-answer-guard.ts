@@ -46,6 +46,17 @@ const CONTENT_MARKERS = [
   "content_block_stop",
 ];
 
+/**
+ * Chat-completions deltas may omit `object` entirely, so the presence of a
+ * non-empty `delta` payload is checked directly. A bare `choices: []` or a
+ * delta with no content does NOT count — that is exactly the empty turn.
+ */
+function chatStreamHasContent(text: string): boolean {
+  if (!text.includes("\"delta\"")) return false;
+  // Any of the payload kinds a real answer carries.
+  return /"delta"\s*:\s*\{[^}]*"(content|tool_calls|reasoning_content|reasoning|function_call)"\s*:\s*("|\[|\{)/.test(text);
+}
+
 /** Terminal events; reaching one without content means "empty". */
 const TERMINAL_MARKERS = ["message_stop", "response.completed", "response.incomplete", "[DONE]"];
 
@@ -96,6 +107,8 @@ export function inspectAnswerPrefix(text: string): AnswerVerdict {
     if (TERMINAL_MARKERS.some((marker) => line.includes(marker))) sawTerminal = true;
   }
   if (sawContent) return "content";
+  // Chat-completions streams carry their answer inside `choices[].delta`.
+  if (chatStreamHasContent(text)) return "content";
   return sawTerminal ? "empty" : "pending";
 }
 

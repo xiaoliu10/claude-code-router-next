@@ -130,6 +130,29 @@ describe("Responses-format answers (codex-subscription)", () => {
   });
 });
 
+describe("chat-completions streams", () => {
+  // `/v1/chat/completions` providers (WorkBuddy-style) answer with
+  // `choices[].delta`; `[DONE]` alone is only a terminator. Missing this shape
+  // made a real answer look like an empty turn.
+  const CHAT_TEXT =
+    'data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}\n\n' +
+    "data: [DONE]\n\n";
+  const CHAT_EMPTY = 'data: {"object":"chat.completion.chunk","choices":[]}\n\ndata: [DONE]\n\n';
+
+  it("accepts a chat stream that carries content", () => {
+    expect(inspectAnswerPrefix(CHAT_TEXT)).toBe("content");
+  });
+
+  it("still flags a chat stream that ends with no content", () => {
+    expect(inspectAnswerPrefix(CHAT_EMPTY)).toBe("empty");
+  });
+
+  it("accepts tool_calls-only chat deltas", () => {
+    const tool = 'data: {"choices":[{"delta":{"tool_calls":[{"id":"c1"}]}}]}\n\ndata: [DONE]\n\n';
+    expect(inspectAnswerPrefix(tool)).toBe("content");
+  });
+});
+
 describe("probeAnswer deadline", () => {
   it("loses no bytes when the deadline fires mid-stream", async () => {
     // A stream that emits one chunk, then stalls past the deadline, then resumes.
