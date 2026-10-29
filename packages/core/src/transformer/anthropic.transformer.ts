@@ -20,6 +20,7 @@ import {
 } from "./response-body";
 import { formatBase64 } from "@/utils/image";
 import { convertToAnthropic } from "@/utils/converter";
+import { modelSupportsImages } from "@/utils/router";
 
 /**
  * Read a client's thinking switch. "adaptive" and boolean true both mean the
@@ -128,18 +129,75 @@ export class AnthropicTransformer implements Transformer {
               (c: any) => c.type === "tool_result" && c.tool_use_id
             );
             if (toolParts.length) {
+              // Images inside tool_result are vision input, not text. Flattening
+              // the whole content array with JSON.stringify turned every
+              // screenshot's base64 into plain text (a 480KB PNG ≈ 340k tokens).
+              const allowImages = modelSupportsImages(String(request.model ?? ""));
+              const toolResultImages: any[] = [];
               toolParts.forEach((tool: any) => {
+                const contentParts = Array.isArray(tool.content) ? tool.content : null;
+                const imageParts = contentParts
+                  ? contentParts.filter((part: any) => part?.type === "image" && part?.source)
+                  : [];
+                let toolContent: any =
+                  typeof tool.content === "string"
+                    ? tool.content
+                    : JSON.stringify(tool.content);
+                if (imageParts.length > 0) {
+                  const remainingText = contentParts!
+                    .filter((part: any) => !(part?.type === "image" && part?.source))
+                    .map((part: any) =>
+                      part?.type === "text" ? String(part.text ?? "") : JSON.stringify(part)
+                    )
+                    .filter((text: string) => text.length > 0)
+                    .join("\n");
+                  if (allowImages) {
+                    // function_call_output.output is documented as the tool's
+                    // output string — an empty string is fragile upstream.
+                    toolContent = remainingText || "[tool image]";
+                    toolResultImages.push(...imageParts);
+                  } else {
+                    toolContent = [
+                      remainingText,
+                      ...imageParts.map(
+                        () => "(tool image omitted: target model does not support image input)"
+                      ),
+                    ]
+                      .filter((text: string) => text.length > 0)
+                      .join("\n");
+                    this.logger?.debug?.({
+                      type: "tool_image_omitted",
+                      model: String(request.model ?? ""),
+                      count: imageParts.length,
+                    });
+                  }
+                }
                 const toolMessage: UnifiedMessage = {
                   role: "tool",
-                  content:
-                    typeof tool.content === "string"
-                      ? tool.content
-                      : JSON.stringify(tool.content),
+                  content: toolContent,
                   tool_call_id: tool.tool_use_id,
                   cache_control: tool.cache_control,
                 };
                 messages.push(toolMessage);
               });
+              // ONE image message after ALL tool messages: a per-tool user
+              // message would split the tool-result group away from the
+              // assistant tool_calls turn in the Responses/Chat wire shapes.
+              if (toolResultImages.length > 0) {
+                messages.push({
+                  role: "user",
+                  content: toolResultImages.map((part: any) => ({
+                    type: "image_url",
+                    image_url: {
+                      url:
+                        part.source?.type === "base64"
+                          ? formatBase64(part.source.data, part.source.media_type)
+                          : part.source.url,
+                    },
+                    media_type: part.source.media_type,
+                  })),
+                });
+              }
             }
 
             const textAndMediaParts = msg.content.filter(
