@@ -90,9 +90,16 @@ export class ProviderHealthStore {
     // Rate-limited models must NOT be recovered by a generic models-endpoint probe.
     // They can only be recovered by the dedicated rate-limit recovery probe
     // (runRateLimitProbe) which sends real chat requests.
-    if (state.rateLimitUntil) {
+    // An EXPIRED cooldown no longer gates recovery: while still open, a real
+    // success transitions open → half-open exactly like a probe success, so a
+    // subsequent success closes the breaker. Without this, an expired
+    // rateLimitUntil (presence-only check) left the model stuck "open" forever
+    // for managed providers that generic probes skip (workbuddy/codex/gemini).
+    if (state.rateLimitUntil && state.rateLimitUntil > Date.now()) {
       return;
     }
+    const expiredCooldown = !!state.rateLimitUntil;
+    state.rateLimitUntil = undefined;
 
     if (state.status === 'half-open') {
       if (state.successCount >= this.config.halfOpenSuccessThreshold) {
@@ -106,6 +113,12 @@ export class ProviderHealthStore {
       state.status = 'half-open';
       state.successCount = 1;
       state.failureCount = 0;
+    }
+    // half-open → closed for a model whose cooldown had expired: a second real
+    // success fully recovers it (same threshold semantics as probe recovery).
+    if (expiredCooldown && state.status === 'half-open' && state.successCount >= this.config.halfOpenSuccessThreshold) {
+      this.clearPromotionsForPrimary(provider, model);
+      this.states.delete(key);
     }
   }
 
@@ -178,7 +191,7 @@ export class ProviderHealthStore {
    * Check if a provider/model is available for routing
    * closed = available, half-open = available (lower priority), open = unavailable
    */
-  isAvailable(provider: string, model: string): boolean {
+  isAvailable(provider: string, model: string, allowRecoveryProbe = false): boolean {
     if (!this.config.enabled) return true;
 
     const key = this.getKey(provider, model);
@@ -201,6 +214,16 @@ export class ProviderHealthStore {
       return true;
     }
 
+    // Managed subscriptions cannot use unauthenticated background probes.
+    // After the normal retry interval, let one real routed request probe the
+    // original model. Never bypass an active quota lock (handled above).
+    if (state.status === 'open' && allowRecoveryProbe &&
+        Date.now() - Math.max(state.lastFailureTime, state.lastProbeTime) >= this.config.probeIntervalMinutes * 60_000) {
+      state.status = 'half-open';
+      state.successCount = 0;
+      state.lastProbeTime = Date.now();
+      return true;
+    }
     return state.status !== 'open';
   }
 

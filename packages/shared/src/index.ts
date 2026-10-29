@@ -1,4 +1,5 @@
 export * from "./constants";
+export * from "./plugin-install";
 export * from "./temp-file-key";
 export * from "./sqlite-driver";
 export * from "./client-integrations";

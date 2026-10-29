@@ -7,7 +7,7 @@ interface ConfigContextType {
   config: Config | null;
   setConfig: Dispatch<SetStateAction<Config | null>>;
   error: Error | null;
-  refreshConfig: () => Promise<void>;
+  refreshConfig: (merge?: (current: Config, server: Config) => Config) => Promise<void>;
 }
 
 const ConfigContext = createContext<ConfigContextType | undefined>(undefined);
@@ -137,16 +137,21 @@ export function ConfigProvider({ children }: ConfigProviderProps) {
     fetchConfig();
   }, [hasFetched, apiKey]);
 
-  const refreshConfig = async () => {
+  const refreshConfig = async (merge?: (current: Config, server: Config) => Config) => {
     try {
       const validConfig = await loadConfigFromServer();
-      setConfig(validConfig);
+      // Optional narrow refresh for server-managed providers: preserve Router
+      // drafts and unrelated local edits, including edits made during the read.
+      setConfig(current => merge && current ? merge(current, validConfig) : validConfig);
       setError(null);
     } catch (err) {
       console.error('Failed to refresh config:', err);
       if ((err as Error).message !== 'Unauthorized') {
         setError(err as Error);
       }
+      // Narrow management refreshes must not report a successful action when
+      // the UI could not reconcile the newly persisted provider.
+      if (merge) throw new Error('Configuration refresh failed');
     }
   };
 

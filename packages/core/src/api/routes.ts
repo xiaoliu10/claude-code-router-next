@@ -7,6 +7,9 @@ import {
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
+import { type PluginRegistry, pluginErrorFrom } from "../provider-plugins/registry";
+import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "./plugin-request-state";
+import { pluginResponseError } from "./plugin-response-error";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -32,7 +35,7 @@ import {
   readBodyForSSE,
 } from "../transformer/response-body";
 import { router, findProviderModel, ProjectRoutingError } from "@/utils/router";
-import { resolveProviderProxyUrl } from "@/services/proxy";
+import { resolveProviderProxyUrl, getDirectDispatcher } from "@/services/proxy";
 
 // Matches the CCR model-family aliases that CCR injects into managed clients
 // (e.g. "ccr-opus", "ccr-sonnet[1m]"). Codex sends one of these as a bare model
@@ -158,6 +161,7 @@ export function normalizeResponsesBody(body: any): void {
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
   interface FastifyInstance {
+    pluginRegistry: PluginRegistry;
     configService: ConfigService;
     providerService: ProviderService;
     transformerService: TransformerService;
@@ -182,6 +186,8 @@ async function handleTransformerEndpoint(
 ) {
   const body = req.body as any;
   ((req as any).ccrHookOrder ||= []).push("handler");
+  // Initialize on the original request before any fallback spreads it.
+  ensurePluginRequestState(req);
 
   // Normalize Responses API (Codex) format into a unified chat request BEFORE
   // provider resolution. This must happen first so that a CCR family alias can be
@@ -296,15 +302,20 @@ async function handleTransformerEndpoint(
       normalizeResponsesBody(body);
     }
 
+    // One shared transformer context per request. Provider transformers stash
+    // request-phase state on it (e.g. provider-plugin tool-name maps and the
+    // client's original stream flag) that the response-phase transformers of
+    // the SAME request must see; building a fresh object per phase silently
+    // drops that state.
+    const transformerContext: any = { req, isCodexOnMessagesEndpoint, pluginRegistry: fastify.pluginRegistry };
+
     // Process request transformer chain
     const { requestBody, config, bypass } = await processRequestTransformers(
       body,
       provider,
       transformer,
       req.headers,
-      {
-        req,
-      }
+      transformerContext
     );
 
     // Hoist system messages to the front of the messages array and dedupe exact
@@ -344,9 +355,7 @@ async function handleTransformerEndpoint(
       fastify,
       bypass,
       transformer,
-      {
-        req,
-      }
+      transformerContext
     );
 
     // Capture rate limit headers from upstream response
@@ -363,10 +372,7 @@ async function handleTransformerEndpoint(
       provider,
       transformer,
       bypass,
-      {
-        req,
-        isCodexOnMessagesEndpoint,
-      }
+      transformerContext
     );
 
     finalResponse = await validateStreamingResponse(body, finalResponse, provider.name || providerName);
@@ -390,7 +396,13 @@ async function handleTransformerEndpoint(
     // Double-check: retry the same model once before falling back.
     // Transient provider errors (network jitter, momentary overload, empty SSE)
     // often resolve on a second attempt, avoiding unnecessary model switches.
-    if (!(req as any).__retryAttempted) {
+    // Provider-plugin pool/terminal failures already exhausted their bounded
+    // account budget (a classified nonRetryable error records the terminal
+    // budget through rememberPluginFailure — the generic seam semantics that
+    // replaced the per-provider inline checks); generic transient errors
+    // (5xx/empty stream/network) keep one retry.
+    const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error, provider);
+    if (!terminalPluginFailure && !(req as any).__retryAttempted) {
       (req as any).__retryAttempted = true;
       try {
         return await handleTransformerEndpoint(req, reply, fastify, transformer);
@@ -553,10 +565,14 @@ async function handleFallback(
     (error?.message && isRateLimitError(error.message));
 
   if (originalProvider && originalModel) {
-    // Use markRateLimited for rate-limit errors instead of recordFailure
-    // so the model is immediately isolated (bypassing the 3-failure threshold)
-    // and auto-recovers after a cooldown period.
+    // Provider plugins own their precise account/model cooldowns (booked by
+    // the managed runtime's own credential store before this point); the
+    // shared health store isolates generically: classified 429s via the
+    // rate-limit branch, everything else via the failure threshold.
     if (isRateLimit) {
+      // Use markRateLimited for rate-limit errors instead of recordFailure
+      // so the model is immediately isolated (bypassing the 3-failure threshold)
+      // and auto-recovers after a cooldown period.
       healthStore.markRateLimited(originalProvider, originalModel, 120, error?.message);
       req.log.warn(`Primary model ${originalProvider},${originalModel} rate-limited, will try fallbacks`);
     } else {
@@ -706,11 +722,16 @@ async function handleFallback(
       const fbModel = configuredFallback.model;
 
       // Skip if model is in fail pool (open state)
-      if (!healthStore.isAvailable(fbProviderName, fbModel)) {
+      if (!healthStore.isAvailable(fbProviderName, fbModel, configuredFallback.provider.apiKey?.startsWith("ccr-managed-") === true)) {
         req.log.warn(`Fallback model ${fallbackModel} unavailable (fail pool), skipping`);
         continue;
       }
 
+      const fallbackRuntime = fastify.pluginRegistry.getManagedRuntimeFor(configuredFallback.provider);
+      // Provider-scoped: one runtime may own several independent managed
+      // providers (e.g. per-site subscriptions); a terminal failure of one
+      // site's provider must never skip another site's fallback entry.
+      if (fallbackRuntime && pluginAttemptBudget(req, fallbackRuntime, { name: fbProviderName }).terminalError) continue;
       let fallbackError: any;
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
@@ -729,13 +750,22 @@ async function handleFallback(
 
           const provider = configuredFallback.provider;
 
+          // One shared transformer context per fallback attempt (same reason
+          // as the primary path): request-phase state must reach the
+          // response-phase transformers of the same attempt.
+          const fbContext: any = {
+            pluginRegistry: fastify.pluginRegistry,
+            req: newReq,
+            isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
+          };
+
           // Process request transformer chain
           const { requestBody, config, bypass } = await processRequestTransformers(
             newBody,
             provider,
             transformer,
             req.headers,
-            { req: newReq }
+            fbContext
           );
 
           // Send request to LLM provider
@@ -746,7 +776,7 @@ async function handleFallback(
             fastify,
             bypass,
             transformer,
-            { req: newReq }
+            fbContext
           );
 
           // Capture rate limit headers from upstream response
@@ -764,10 +794,7 @@ async function handleFallback(
             provider,
             transformer,
             bypass,
-            {
-              req: newReq,
-              isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
-            }
+            fbContext
           );
           finalResponse = await validateStreamingResponse(newBody, finalResponse, fbProviderName);
 
@@ -817,6 +844,9 @@ async function handleFallback(
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
           fallbackError = error;
+          // A classified nonRetryable plugin failure never restarts its
+          // account-pool attempt budget on a fallback retry.
+          if (rememberPluginFailure(req, fallbackRuntime, error, { name: fbProviderName })) break;
           if (attempt === 1) {
             req.log.warn(`Fallback model ${fbProviderName},${fbModel} failed, retrying once: ${error.message}`);
             continue;
@@ -861,6 +891,22 @@ async function processRequestTransformers(
   headers: any,
   context: any
 ) {
+  // A managed marker is not a credential. Hard-cut external plugins must fail
+  // closed if absent/disabled; never send their marker to an upstream through
+  // the ordinary-provider path (configuration and credential files stay intact).
+  if (typeof provider.apiKey === "string" && provider.apiKey.startsWith("ccr-managed-") &&
+      !context.pluginRegistry.getManagedRuntimeFor(provider)) {
+    throw createApiError("Provider plugin missing or disabled; install and enable its provider plugin.", 503, "plugin_missing");
+  }
+  const runtime = context.pluginRegistry.getManagedRuntimeFor(provider);
+  if (runtime) {
+    // Keyed by (runtime, provider): a terminal on one managed subscription
+    // must not short-circuit a sibling provider served by the same runtime.
+    const terminal = pluginAttemptBudget(context.req, runtime, provider).terminalError;
+    if (terminal) throw terminal;
+    // Run before any transformer can refresh credentials or contact upstream.
+    await runtime.ensureUsable?.();
+  }
   // Deep clone the request body to preserve original messages for caching
   // and to ensure thinking blocks are not lost when switching between models
   let requestBody = JSON.parse(JSON.stringify(body));
@@ -1055,7 +1101,42 @@ function isCodexClient(req: any): boolean {
  * Send request to LLM provider
  * Handle authentication, build request config, send request and handle errors
  */
+/** Dispatch to one provider: a managed runtime's bounded dispatchRequest owns
+ * any multi-attempt loop (e.g. rotating local credentials); everything else is
+ * a single ordinary attempt. */
 async function sendRequestToProvider(
+  requestBody: any, config: any, provider: any, fastify: FastifyInstance,
+  bypass: boolean, transformer: any, context: any
+): Promise<Response> {
+  // Runtime-owned bounded dispatch (docs/design/provider-plugins.md §2.2): a
+  // wrapper rotates its own local credentials around the core's ordinary
+  // single attempt; the generic same-model retry and fallback chains stay in
+  // this module and are never re-implemented by the wrapper.
+  const dispatchRuntime = fastify.pluginRegistry.getManagedRuntimeFor(provider);
+  if (dispatchRuntime?.dispatchRequest) {
+    return dispatchRuntime.dispatchRequest({
+      attempt: () => sendProviderAttempt(requestBody, config, provider, fastify, bypass, transformer, context),
+      requestBody,
+      config,
+      provider,
+      req: context?.req,
+    });
+  }
+  return sendProviderAttempt(requestBody, config, provider, fastify, bypass, transformer, context);
+}
+
+/**
+ * Only the SYSTEM text decides the identity-block heuristic (contract §1.6).
+ * Scanning the whole body would let a user message containing the marker words
+ * trip a 6h account cooldown on an ordinary quota 429.
+ */
+function geminiSystemText(requestBody: any): string {
+  const parts = requestBody?.request?.systemInstruction?.parts ?? requestBody?.systemInstruction?.parts;
+  if (!Array.isArray(parts)) return "";
+  return parts.map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("\n");
+}
+
+async function sendProviderAttempt(
   requestBody: any,
   config: any,
   provider: any,
@@ -1064,6 +1145,16 @@ async function sendRequestToProvider(
   transformer: any,
   context: any
 ) {
+  // Generic provider-plugin runtime (docs/design/provider-plugins.md): the
+  // managed-subscription semantics (fixed upstream lock, cooling breaker, live
+  // token injection, error taxonomy, 401-once-refresh) are contributed by the
+  // provider's plugin — gemini-oauth included. The core only knows this seam.
+  const pluginRuntime = fastify.pluginRegistry.getManagedRuntimeFor(provider);
+  if (pluginRuntime) {
+    // Circuit breaker before any network touch — including token refresh.
+    await pluginRuntime.ensureUsable?.();
+    await pluginRuntime.lockUpstream?.(config, provider);
+  }
   const url = config.url || new URL(provider.baseUrl);
 
   // Apply timeout from config
@@ -1076,7 +1167,7 @@ async function sendRequestToProvider(
 
   // Handle authentication in passthrough mode
   if (bypass && typeof transformer.auth === "function") {
-    const auth = await transformer.auth(requestBody, provider);
+    const auth = await transformer.auth(requestBody, provider, context);
     if (auth.body) {
       requestBody = auth.body;
       let headers = config.headers || {};
@@ -1100,11 +1191,17 @@ async function sendRequestToProvider(
 
   // Send HTTP request
   // Prepare headers
-  const requestHeaders: Record<string, string> = {
+  let requestHeaders: Record<string, string> = {
     Authorization: `Bearer ${provider.apiKey}`,
     ...(config?.headers || {}),
   };
 
+  if (pluginRuntime) {
+    // Body is final here: body-derived headers (Codex session-id) work. The
+    // per-attempt config lets dispatch wrappers re-sign with the credential
+    // they selected for THIS attempt.
+    requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider, config });
+  }
   stampUpstreamSessionId(requestHeaders, context?.req);
 
   for (const key in requestHeaders) {
@@ -1119,7 +1216,7 @@ async function sendRequestToProvider(
   }
 
   // Debug: log outgoing request to provider
-  if (isDebugLogEnabled(fastify.configService)) {
+  if (!pluginRuntime?.suppressDebugLog && isDebugLogEnabled(fastify.configService)) {
     logProviderRequest(fastify.log, context.req.id, {
       url: String(url),
       headers: requestHeaders,
@@ -1127,21 +1224,61 @@ async function sendRequestToProvider(
     });
   }
 
-  const response = await sendUnifiedRequest(
+  let response: Response;
+  const dispatchUpstream = () => sendUnifiedRequest(
     url,
     requestBody,
     {
       ...config,
       headers: JSON.parse(JSON.stringify(requestHeaders)),
-      httpsProxy: resolveProviderProxyUrl(fastify.configService, provider),
+      httpsProxy: pluginRuntime ? undefined : resolveProviderProxyUrl(fastify.configService, provider),
     },
     context,
-    fastify.log
+    pluginRuntime ? undefined : fastify.log
   );
+  try {
+    response = await dispatchUpstream();
+  } catch (sendError: any) {
+    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), { errorName: sendError?.name });
+    throw sendError;
+  }
+
+  // Provider-plugin 401 handling: one forced refresh + one re-dispatch —
+  // nothing has been committed to the client yet. Only the forced-refresh
+  // resend is allowed; a second 401 is terminal so the outer generic retry
+  // cannot produce a third upstream call.
+  if (!response.ok && pluginRuntime?.authRefresh && response.status === 401 && !pluginAttemptBudget(context.req, pluginRuntime, provider).refreshUsed) {
+    // The one-refresh budget is per (runtime, provider): independent managed
+    // subscriptions served by one runtime refresh independently. The shared
+    // state survives primary/fallback request spreads.
+    pluginAttemptBudget(context.req, pluginRuntime, provider).refreshUsed = true;
+    try {
+      await pluginRuntime.authRefresh.forceRefresh();
+      requestHeaders = await pluginRuntime.signRequest({ headers: requestHeaders, requestBody, provider });
+      response = await dispatchUpstream();
+    } catch {
+      // Refresh failed: fall through to classification of the original 401.
+    }
+    if (response.status === 401) (context.req as any).__retryAttempted = true;
+  }
 
   // Handle request errors
   if (!response.ok) {
-    const errorText = await response.text();
+    let errorText: string;
+    try { errorText = await response.text(); } catch (readError) {
+      if (pluginRuntime) throw await pluginResponseError(pluginRuntime, response.status, undefined, geminiSystemText(requestBody));
+      throw readError;
+    }
+    // Installed plugin runtimes classify first: the taxonomy belongs to the
+    // plugin, the core only turns it into a thrown error. Classification and
+    // redaction happen BEFORE any log or client-facing error is built — a raw
+    // upstream envelope must never reach the log stream, and a subscription
+    // token must never be recoverable from an error message.
+    if (pluginRuntime) {
+      const error = await pluginResponseError(pluginRuntime, response.status, errorText, geminiSystemText(requestBody));
+      fastify.log.error(`[provider_response_error] Plugin(${pluginRuntime.name}) status=${response.status} code=${error.code}`);
+      throw error;
+    }
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
     );
@@ -1168,9 +1305,9 @@ async function sendRequestToProvider(
     // content-type (e.g. text/event-stream for non-streaming requests), which
     // would bypass the JSON-only hidden error check and forward garbage to the client.
     if (!isStreamRequest || contentType.includes("application/json")) {
-      const cloned = response.clone();
       let bodyText = "";
       try {
+        const cloned = response.clone();
         bodyText = await cloned.text();
         if (!bodyText || bodyText.trim() === "") {
           throw new SyntaxError("Empty JSON body");
@@ -1186,6 +1323,14 @@ async function sendRequestToProvider(
           return response;
         }
         const bodyJson = JSON.parse(bodyText);
+        // Plugin HTTP-200 envelope detection — the SECONDARY net (see
+        // provider-plugins/types.ts): runtimes with a dispatch wrapper must
+        // classify such envelopes INSIDE the wrapper (before the response is
+        // returned) so rotation still happens; this only catches bodies a
+        // wrapper already returned.
+        if (pluginRuntime?.isErrorEnvelope?.(bodyJson)) {
+          throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody));
+        }
         // Check if the response contains an error object
         if (bodyJson && typeof bodyJson === 'object' && bodyJson.error) {
           // If error is null or explicitly empty, it might not be a real error
@@ -1194,6 +1339,12 @@ async function sendRequestToProvider(
             (typeof bodyJson.error === 'object' && Object.keys(bodyJson.error).length > 0);
 
           if (hasRealError) {
+            // Installed plugin runtimes classify hidden HTTP-200 errors too:
+            // same taxonomy, same noteUpstreamError bookkeeping, thrown through
+            // the shared seam so fallback engages.
+            if (pluginRuntime) {
+              throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody));
+            }
             fastify.log.error(
               `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
             );
@@ -1210,7 +1361,13 @@ async function sendRequestToProvider(
             throw error;
           }
         }
-      } catch (e) {
+      } catch (e: any) {
+        if (pluginRuntime) {
+          if (e?.pluginClassified === true) throw e;
+          // Includes malformed/empty JSON, HTML interception and body read
+          // errors. Nothing below may log or forward rawBody for a plugin.
+          throw await pluginResponseError(pluginRuntime, response.status, undefined, geminiSystemText(requestBody));
+        }
         // Empty or malformed JSON body on HTTP 200 — the provider returned an
         // invalid response. Throw to trigger fallback instead of forwarding
         // the empty response to the client, which would cause a different error.
@@ -1234,12 +1391,12 @@ async function sendRequestToProvider(
   }
 
   // Debug: log non-stream response from provider
-  if (!requestBody.stream && isDebugLogEnabled(fastify.configService)) {
+  if (!pluginRuntime?.suppressDebugLog && !requestBody.stream && isDebugLogEnabled(fastify.configService)) {
     const cloned = response.clone();
     const bodyText = await cloned.text();
     logProviderResponse(fastify.log, context.req.id, {
       status: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
+      headers: Object.fromEntries(Array.from(response.headers as any)),
       body: bodyText,
     });
   }
@@ -1385,7 +1542,7 @@ async function formatResponse(response: any, reply: FastifyReply, _body: any, fa
     reply.header("Connection", "keep-alive");
 
     // Debug: tee stream to log SSE chunks
-    if (fastify && isDebugLogEnabled(fastify.configService)) {
+    if (fastify && !fastify.pluginRegistry.getManagedRuntimeFor(fastify.providerService.getProvider(reply.request.provider || "") as any)?.suppressDebugLog && isDebugLogEnabled(fastify.configService)) {
       const [debugStream, clientStream] = response.body.tee();
       const options = getDebugLogOptions(fastify.configService);
       readStreamForDebug(debugStream, fastify.log, reply.request.id, options);

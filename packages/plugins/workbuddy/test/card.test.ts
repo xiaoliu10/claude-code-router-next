@@ -1,0 +1,462 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mount, unmount } from "../src/card-entry";
+import { workbuddyLocales } from "../src/locales";
+
+/** Minimal DOM test double: exercise real mount/unmount/event handlers without
+ * shipping or requiring a DOM framework in the production card chunk. */
+class Element {
+  children: Element[] = [];
+  textContent = "";
+  tag: string;
+  type = "";
+  disabled = false;
+  href = "";
+  target = "";
+  rel = "";
+  tabIndex = -1;
+  style = { cssText: "" };
+  className = "";
+  dataset: Record<string, string> = {};
+  parent: Element | null = null;
+  attrs: Record<string, string> = {};
+  onclick?: () => void;
+  firstChild: Element | null = null;
+  constructor(tag: string) { this.tag = tag; }
+  append(...nodes: Element[]) { for (const n of nodes) { n.parent = this; this.children.push(n); } this.firstChild = this.children[0] ?? null; }
+  appendChild(child: Element) { this.append(child); return child; }
+  prepend(...nodes: Element[]) { for (const n of nodes.reverse()) { n.parent = this; this.children.unshift(n); } this.firstChild = this.children[0] ?? null; }
+  insertBefore(child: Element, before: Element | null) {
+    const at = before ? this.children.indexOf(before) : -1;
+    child.parent = this;
+    if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+    this.firstChild = this.children[0] ?? null;
+    return child;
+  }
+  querySelector(selector: string): Element | null {
+    const match = selector.match(/^\[data-testid="(.+)"\]$/);
+    if (!match) return null;
+    return this.all().find(n => n.dataset?.testid === match[1]) ?? null;
+  }
+  replaceChildren(...nodes: Element[]) { this.children = nodes; for (const n of nodes) n.parent = this; this.firstChild = nodes[0] ?? null; }
+  setAttribute(name: string, value: string) { this.attrs[name] = value; }
+  all(): Element[] { return [this, ...this.children.flatMap(n => n.all())]; }
+  button(text: string) {
+    const result = this.all().filter(n => n.tag === "button" && n.textContent === text).at(-1);
+    if (!result) throw new Error(`button missing: ${text}`);
+    return result;
+  }
+  card(site: string) { return this.all().filter(n => n.dataset?.testid === `workbuddy-card-${site}`).at(-1)!; }
+  click(text: string) { const b = this.button(text); if (!b.disabled) b.onclick?.(); }
+  text(): string { return this.all().map(n => n.textContent).join("\n"); }
+}
+const tick = async () => { for (let i = 0; i < 15; ++i) await Promise.resolve(); };
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  cleanups.splice(0).forEach(f => f());
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  // Node ships a real (session-persisting) sessionStorage; the card caches
+  // quota there, so each test starts from a fresh tab equivalent.
+  (globalThis as any).sessionStorage?.clear?.();
+});
+
+const siteStatus = (extra: Record<string, any> = {}) => ({
+  status: "connected", providerName: "workbuddy", activeUid: "u-1",
+  accounts: [{ uid: "uid-123456789", displayName: "Nick", source: "browser", active: true, expiresAt: 0 }],
+  models: ["glm-5.3"], hiddenModels: [], modelCount: 1, lastSyncAt: null, lastError: null,
+  ...extra,
+});
+const status = { sites: { workbuddy: siteStatus(), "workbuddy-ai": siteStatus({ providerName: "workbuddy-ai", status: "not_connected", accounts: [], models: [] }) } };
+
+function harnessFocus(focusKey: string | null, scrolled: string[]) {
+  // Every element this mount creates carries the scroll/focus spies, so the
+  // one-shot demand is observable on the site section itself.
+  vi.stubGlobal("document", { createElement: (tag: string) => {
+    const el = new Element(tag) as any;
+    el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
+    el.focus = function () { scrolled.push(`focus:${this.dataset?.testid}`); };
+    return el;
+  } , createElementNS: () => new Element("svg") as any });
+  const host = new Element("div");
+  const callApi = vi.fn(async () => status);
+  let hostListener: (() => void) | null = null;
+  mount(host as any, {
+    callApi: callApi as any, locale: "en", locales: workbuddyLocales,
+    disabled: false, plugin: { name: "workbuddy", version: "1" }, log: console,
+    onBusy: vi.fn(), refreshConfig: vi.fn(async () => {}),
+    onHostChange: (listener: () => void) => { hostListener = listener; return () => { hostListener = null; }; },
+    focusKey,
+  } as any);
+  return { host, callApi, notify: () => hostListener?.() };
+}
+function harness(overrides: Record<string, any> = {}, disabled = false, heldLease = false) {
+  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any });
+  const host = new Element("div");
+  const callApi = vi.fn(async (path: string, init?: any) => {
+    if (overrides[path]) {
+      const value = typeof overrides[path] === "function" ? await overrides[path](init) : overrides[path];
+      if (value instanceof Error) throw value;
+      return value;
+    }
+    if (path === "/status") return status;
+    if (path === "/login/start") return { ok: true, site: "workbuddy", loginId: "a".repeat(48), url: "https://copilot.tencent.com/login", expiresAt: Date.now() + 60_000 };
+    if (path === "/login/poll") return { status: "pending" };
+    if (path === "/sync") return { success: true, status: "connected", models: ["glm-5.3", "kimi-k3-1"], modelCount: 2 };
+    return { ok: true, success: true };
+  });
+  // Mirrors ApiClient.acquireProviderManagement: null while a managed action
+  // or config write holds the shared lease; the release is a spy.
+  let lock = false;
+  const release = vi.fn(() => { lock = false; });
+  const refreshConfig = vi.fn(async (_merge: (current: any, server: any) => any) => {});
+  let hostListener: (() => void) | null = null;
+  let unsubscribed = 0;
+  const props = {
+    callApi: callApi as any, locale: "en", locales: workbuddyLocales,
+    disabled, plugin: { name: "workbuddy", version: "1" }, log: console,
+    acquireManagement: () => (heldLease || lock ? null : (lock = true, release)), onBusy: vi.fn(), refreshConfig,
+    onHostChange: (listener: () => void) => {
+      hostListener = listener;
+      return () => { if (hostListener === listener) hostListener = null; unsubscribed += 1; };
+    },
+  };
+  mount(host as any, props);
+  cleanups.push(() => unmount(host as any));
+  return {
+    host, callApi, release, onBusy: props.onBusy, refreshConfig,
+    get lock() { return lock; },
+    get unsubscribed() { return unsubscribed; },
+    notify() { hostListener?.(); },
+    statusReads() { return callApi.mock.calls.filter(([path]) => path === "/status").length; },
+  };
+}
+const en = workbuddyLocales.en.workbuddy as any;
+const CN = en.site.workbuddy as string;
+
+describe("self-contained WorkBuddy plugin card", () => {
+  it("mounts with a local status read only and renders both §16 site cards", async () => {
+    const h = harness();
+    await tick();
+    expect(h.statusReads()).toBe(1);
+    expect(h.callApi.mock.calls.every(([path]) => path !== "/sync" && !String(path).startsWith("/login"))).toBe(true);
+    // Quota auto-reads once for connected accounts after the status lands.
+    const usageCalls = h.callApi.mock.calls.filter(([path]) => path === "/usage");
+    expect(usageCalls).toEqual([["/usage", { method: "POST", body: JSON.stringify({ site: "workbuddy", uid: "uid-123456789" }), timeoutMs: 30_000 }]]);
+    expect(h.host.card("workbuddy")).toBeTruthy();
+    expect(h.host.card("workbuddy-ai")).toBeTruthy();
+    expect(h.host.text()).toContain(CN);
+    expect(h.host.card("workbuddy").text()).toContain(en.status.connected);
+    // Account row: masked uid (first 3 + … + last 2), source badge, per-account actions.
+    expect(h.host.card("workbuddy").text()).toContain("uid\u202689");
+    expect(h.host.button(en["credits"].action)).toBeTruthy();
+    expect(h.host.text()).toContain(en.source_badge.browser);
+    // Visual contract: the pre-migration look is expressed through host
+    // stylesheet classes (glass card, badges, primary/outline button
+    // hierarchy) — never inline cssText anymore.
+    expect(h.host.card("workbuddy").className).toContain("glass-card");
+    expect(h.host.card("workbuddy").className).toContain("rounded-2xl");
+    const addAccount = h.host.card("workbuddy").button(en.add_account);
+    expect(addAccount.className).toContain("bg-primary");
+    expect(addAccount.style.cssText).toBe("");
+    const sync = h.host.card("workbuddy").button(en.sync);
+    expect(sync.className).toContain("border-input");
+    expect(h.host.card("workbuddy").all().filter(n => n.tag === "svg").length).toBeGreaterThanOrEqual(2); // ShieldCheck + RefreshCw icons
+    const builtinBadge = h.host.card("workbuddy").all().find(n => n.textContent === en.builtin)!;
+    expect(builtinBadge.className).toContain("border-white/10");
+    const statusBadge = h.host.card("workbuddy").all().find(n => n.textContent === en.status.connected && n.attrs?.role === "status")!;
+    expect(statusBadge.className).toContain("bg-white/5");
+  });
+
+  it("a failed status read renders a visible recovery note instead of an empty area", async () => {
+    const h = harness({ "/status": new Error("down") });
+    await tick();
+    expect(h.host.text()).toContain(en.errors.request_failed);
+    expect(h.host.text()).toContain(en.status.error);
+  });
+
+  it("sync runs through the lease, settles with a toast and re-reads status", async () => {
+    const h = harness();
+    await tick();
+    h.host.card("workbuddy").click(en.sync);
+    await tick();
+    expect(h.callApi.mock.calls.some(([path, init]) => path === "/sync" && JSON.parse(init.body).site === "workbuddy")).toBe(true);
+    expect(h.refreshConfig).toHaveBeenCalled();
+    expect(h.statusReads()).toBeGreaterThanOrEqual(2);
+    expect(h.host.text()).toContain(en.synced.replace("{{count}}", "2"));
+    expect(h.release).toHaveBeenCalled();
+  });
+
+  it("model chips hide through the explicit endpoint and settle via the Router reconciliation merge", async () => {
+    const h = harness({ "/models/hide": { ok: true, clearedRefs: ["default"], removedModelRefs: ["workbuddy,glm-5.3"], defaultFallback: "" } });
+    await tick();
+    const hide = h.host.card("workbuddy").all().find(n => n.tag === "button" && n.attrs?.["aria-label"] === en.hide_model.replace("{{model}}", "glm-5.3"));
+    expect(hide, "chip hide button").toBeTruthy();
+    hide!.onclick!();
+    await tick();
+    expect(h.callApi.mock.calls.some(([path, init]) => path === "/models/hide" && JSON.parse(init.body).model === "glm-5.3")).toBe(true);
+    // The hide merge (not the default provider merge) reached the host.
+    const merge = h.refreshConfig.mock.calls.at(-1)![0];
+    const merged = merge({ Providers: [], Router: { default: "workbuddy,glm-5.3" } }, { Providers: [], Router: { default: "" } });
+    expect(merged.Router.default).toBe("");
+    expect(h.host.text()).toContain(en.cleared_refs.replace("{{refs}}", "Default route"));
+  });
+
+  it("switch and remove send exact per-site uid bodies and reconcile after successful routes", async () => {
+    const uid = "backup-123456789";
+    const h = harness({ "/status": { sites: { workbuddy: siteStatus({ accounts: [
+      { uid, source: "desktop", active: false, displayName: "Backup" },
+    ] }) } } });
+    await tick();
+    h.host.card("workbuddy").click(en.set_active); await tick();
+    expect(h.callApi.mock.calls.some(([path, init]) => path === "/account/switch" && init.method === "POST" && init.body === JSON.stringify({ site: "workbuddy", uid }))).toBe(true);
+    expect(h.refreshConfig).toHaveBeenCalled();
+    h.host.card("workbuddy").click(en.remove);
+    expect(h.host.text()).toContain(en.account_remove_warning);
+    h.host.click(en.account_remove_confirm); await tick();
+    expect(h.callApi.mock.calls.some(([path, init]) => path === "/account/remove" && init.body === JSON.stringify({ site: "workbuddy", uid }))).toBe(true);
+  });
+  it("a matching focusKey scrolls to and focuses that site's section, exactly once", async () => {
+    const scrolled: string[] = [];
+    vi.stubGlobal("document", { createElement: (tag: string) => {
+      const el = new Element(tag) as any;
+      el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
+      el.focus = function () { scrolled.push(`focus:${this.dataset?.testid}`); };
+      return el;
+    } , createElementNS: () => new Element("svg") as any });
+    try {
+      const cn = harnessFocus("workbuddy", scrolled);
+      for (let i = 0; i < 4; ++i) await tick();
+      // Deferred to the render microtask: the matching site section (only) was
+      // scrolled into view and focused.
+      expect(scrolled).toEqual(["workbuddy-card-workbuddy", "focus:workbuddy-card-workbuddy"]);
+      expect(cn.host.card("workbuddy").tabIndex).toBe(-1);
+      // Re-renders (host change) never re-trigger the one-shot focus.
+      cn.notify();
+      for (let i = 0; i < 6; ++i) await tick();
+      expect(scrolled).toEqual(["workbuddy-card-workbuddy", "focus:workbuddy-card-workbuddy"]);
+
+      const ai = harnessFocus("workbuddy-ai", scrolled);
+      await tick();
+      expect(scrolled).toEqual(["workbuddy-card-workbuddy", "focus:workbuddy-card-workbuddy",
+        "workbuddy-card-workbuddy-ai", "focus:workbuddy-card-workbuddy-ai"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("an unknown focusKey is ignored entirely (no section scrolled)", async () => {
+    const scrolled: string[] = [];
+    vi.stubGlobal("document", { createElement: (tag: string) => {
+      const el = new Element(tag) as any;
+      el.scrollIntoView = function () { scrolled.push(this.dataset?.testid); };
+      return el;
+    } , createElementNS: () => new Element("svg") as any });
+    try {
+      harnessFocus("gemini-oauth", scrolled);
+      await tick();
+      expect(scrolled).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("hidden models restore singly or all with exact site bodies, never Router adoption", async () => {
+    const h = harness({ "/status": { sites: { workbuddy: siteStatus({ hiddenModels: ["hidden"] }) } } });
+    await tick();
+    h.host.card("workbuddy").click(en.restore); await tick();
+    h.host.card("workbuddy").click(en.restore_all); await tick();
+    expect(h.callApi.mock.calls.filter(([path]) => path === "/models/restore").map(([, init]) => JSON.parse(init.body)))
+      .toEqual([{ site: "workbuddy", model: "hidden" }, { site: "workbuddy" }]);
+    const merge = h.refreshConfig.mock.calls.at(-1)![0];
+    const router = { default: "local,draft" };
+    expect(merge({ Providers: [], Router: router }, { Providers: [], Router: { default: "server,different" } }).Router).toBe(router);
+  });
+  it("credits are an explicit per-account read whose failure hides the line", async () => {
+    const h = harness({ "/usage": { usage: { plan: "Pro", used: 1, limit: 10, unit: "credits" } } });
+    await tick();
+    h.host.card("workbuddy").click(en["credits"].action);
+    await tick();
+    expect(h.host.text()).toContain(en["credits"].line.replace("{{plan}}", "Pro").replace("{{used}}", "1").replace("{{limit}}", "10"));
+    const failing = harness({ "/usage": new Error("quota") });
+    await tick();
+    failing.host.card("workbuddy").click(en["credits"].action);
+    await tick();
+    expect(failing.host.text()).not.toContain("quota");
+  });
+
+  it("auto-reads quota once per mount without touching the busy mutex; failures stay silent", async () => {
+    const failing = harness({ "/usage": new Error("quota") });
+    await tick();
+    // Failed auto-reads leave the line hidden (no fabricated failure text)
+    // and never acquire the shared management mutex or the busy signal.
+    expect(failing.callApi.mock.calls.filter(([path]) => path === "/usage").length).toBe(1);
+    expect(failing.host.text()).not.toContain("quota");
+    expect(failing.onBusy).not.toHaveBeenCalled();
+    expect(failing.lock).toBe(false);
+  });
+
+  it("a fresh session cache seeds quota and skips the auto-read; the button still refreshes", async () => {
+    const store = {
+      savedAt: Date.now(),
+      entries: { workbuddy: { "uid-123456789": { value: { plan: "Pro", used: 3, limit: 100, unit: "credits" }, at: Date.now() } } },
+    };
+    vi.stubGlobal("sessionStorage", {
+      getItem: (k: string) => (k === "wb-usage-cache-v1" ? JSON.stringify(store) : null),
+      setItem: () => {},
+    });
+    try {
+      const h = harness({ "/usage": { usage: { plan: "Max", used: 9, limit: 90, unit: "credits" } } });
+      await tick();
+      // Cache hit: no /usage call on mount, cached numbers rendered.
+      expect(h.callApi.mock.calls.filter(([path]) => path === "/usage").length).toBe(0);
+      expect(h.host.text()).toContain(en["credits"].line.replace("{{plan}}", "Pro").replace("{{used}}", "3").replace("{{limit}}", "100"));
+      // Explicit click still refreshes through the API.
+      h.host.card("workbuddy").click(en["credits"].action);
+      await tick();
+      expect(h.host.text()).toContain(en["credits"].line.replace("{{plan}}", "Max").replace("{{used}}", "9").replace("{{limit}}", "90"));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not cache unavailable quota and retries on the next mount", async () => {
+    let raw: string | null = null;
+    vi.stubGlobal("sessionStorage", { getItem: () => raw, setItem: (_key: string, value: string) => { raw = value; } });
+    const first = harness({ "/usage": { usage: null } });
+    await tick();
+    expect(first.callApi.mock.calls.filter(([path]) => path === "/usage")).toHaveLength(1);
+    expect(JSON.parse(raw!).entries.workbuddy).toEqual({});
+    unmount(first.host as any);
+    const second = harness({ "/usage": { usage: { plan: "Pro", used: 2, limit: 10, unit: "credits" } } });
+    await tick();
+    expect(second.callApi.mock.calls.filter(([path]) => path === "/usage")).toHaveLength(1);
+    expect(second.host.text()).toContain(en.credits.line.replace("{{plan}}", "Pro").replace("{{used}}", "2").replace("{{limit}}", "10"));
+  });
+
+  it("drops a stale auto-read when a newer manual refresh completes first", async () => {
+    let completeAuto!: (value: unknown) => void;
+    let count = 0;
+    const h = harness({ "/usage": () => ++count === 1
+      ? new Promise(resolve => { completeAuto = resolve; })
+      : { usage: { plan: "New", used: 7, limit: 100, unit: "credits" } } });
+    await tick();
+    h.host.card("workbuddy").click(en.credits.action);
+    await tick();
+    completeAuto({ usage: { plan: "Old", used: 1, limit: 100, unit: "credits" } });
+    await tick();
+    expect(h.host.text()).toContain(en.credits.line.replace("{{plan}}", "New").replace("{{used}}", "7").replace("{{limit}}", "100"));
+    expect(h.host.text()).not.toContain("Old");
+  });
+
+  it("ignores malformed or expired session quota values", async () => {
+    for (const hit of [
+      { value: null, at: Date.now() },
+      { value: { plan: "stale", used: 1, limit: 100, unit: "credits" }, at: Date.now() - 11 * 60_000 },
+      { value: { plan: "bad", used: "wrong", limit: 100, unit: "credits" }, at: Date.now() },
+      { value: { plan: "future", used: 1, limit: 100, unit: "credits" }, at: Date.now() + 60_000 },
+    ]) {
+      vi.stubGlobal("sessionStorage", {
+        getItem: () => JSON.stringify({ entries: { workbuddy: { "uid-123456789": hit } } }), setItem: () => {},
+      });
+      const h = harness({ "/usage": { usage: { plan: "Valid", used: 2, limit: 10, unit: "credits" } } });
+      await tick();
+      expect(h.callApi.mock.calls.filter(([path]) => path === "/usage")).toHaveLength(1);
+      unmount(h.host as any);
+    }
+  });
+
+  it("browser authorization runs the sequential login helper and shows the pending link; cancel invalidates the job", async () => {
+    const h = harness({
+      "/login/poll": () => ({ status: "pending" }),
+    });
+    await tick();
+    // CN is connected → the primary button is "add account"; it still starts a login.
+    h.host.card("workbuddy").button(en.add_account).onclick!();
+    await tick();
+    expect(h.host.text()).toContain(en.login_pending);
+    const link = h.host.card("workbuddy").all().find(n => n.tag === "a")!;
+    expect(link.href).toContain("https://");
+    expect(link.rel).toContain("noopener");
+    h.host.card("workbuddy").click(en["app.cancel"] ?? "Cancel");
+    await tick();
+    expect(h.callApi.mock.calls.some(([path]) => path === "/login/cancel")).toBe(true);
+  });
+
+  it("local host poll timeouts retry within the authorization deadline, never expose raw text", async () => {
+    vi.useFakeTimers();
+    try {
+      let polls = 0;
+      const h = harness({ "/login/poll": () => {
+        if (++polls === 1) throw Object.assign(new Error("private-marker"), { timedOut: true });
+        return { status: "connected", success: true, models: ["m"], accountCount: 2, accountChange: "added" };
+      } });
+      await tick();
+      h.host.card("workbuddy").button(en.add_account).onclick!();
+      await tick();
+      expect(polls).toBe(1); expect(h.host.text()).not.toContain("private-marker");
+      await vi.advanceTimersByTimeAsync(1200); await tick();
+      expect(polls).toBe(2);
+      expect(h.host.text()).toContain(en.account_added.replace("{{count}}", "2"));
+    } finally { vi.useRealTimers(); }
+  });
+  it("a connected login settles with the committed-upsert outcome message", async () => {
+    const h = harness({
+      "/login/start": { ok: true, site: "workbuddy-ai", loginId: "b".repeat(48), url: "https://www.workbuddy.ai/login", expiresAt: Date.now() + 60_000 },
+      "/login/poll": { status: "connected", success: true, models: ["gpt-5.5"], accountChange: "added", accountCount: 2 },
+    });
+    await tick();
+    // The AI site is offline → its primary button reads browser_login.
+    h.host.card("workbuddy-ai").button(en.browser_login).onclick!();
+    await tick();
+    await tick();
+    expect(h.host.text()).toContain(en.account_added.replace("{{count}}", "2"));
+  });
+
+  it("disconnect needs the explicit confirmation dialog; the remove flow names the account", async () => {
+    const h = harness();
+    await tick();
+    h.host.card("workbuddy").click(en.disconnect);
+    expect(h.host.text()).toContain(en.disconnect_warning);
+    // Cancel keeps everything.
+    h.host.click(en["app.cancel"] ?? "Cancel");
+    h.host.card("workbuddy").click(en.disconnect);
+    h.host.button(en.disconnect).onclick!();
+    await tick();
+    expect(h.callApi.mock.calls.some(([path, init]) => path === "/disconnect" && JSON.parse(init.body).site === "workbuddy")).toBe(true);
+    expect(h.host.text()).toContain(en.disconnected);
+  });
+
+  it("host disable re-renders in place with the other-edit note; busy gate blocks actions", async () => {
+    const h = harness({}, false);
+    await tick();
+    h.notify();
+    expect(h.statusReads()).toBe(1); // in-place render, no remount
+    const gated = harness({}, true);
+    await tick();
+    expect(gated.host.text()).toContain(en.other_edit);
+    expect(gated.host.button(en.sync).disabled).toBe(true);
+  });
+
+  it("a busy lease shows the busy recovery note instead of starting a second action", async () => {
+    // heldLease: acquireManagement returns null while a save is in flight —
+    // the card must refuse the action visibly and POST nothing.
+    const h = harness({}, false, true);
+    await tick();
+    const before = h.callApi.mock.calls.filter(([path]) => path === "/sync").length;
+    h.host.card("workbuddy").click(en.sync);
+    await tick();
+    expect(h.host.text()).toContain(en.errors.busy);
+    expect(h.callApi.mock.calls.filter(([path]) => path === "/sync").length).toBe(before);
+  });
+
+  it("unmount cancels a pending login session and unsubscribes from host changes", async () => {
+    const h = harness({ "/login/poll": () => ({ status: "pending" }) });
+    await tick();
+    h.host.card("workbuddy").button(en.add_account).onclick!();
+    await tick();
+    expect(h.host.card("workbuddy").text()).toContain(en.login_pending);
+    unmount(h.host as any);
+    expect(h.callApi.mock.calls.some(([path]) => path === "/login/cancel")).toBe(true);
+    expect(h.unsubscribed).toBe(1);
+  });
+});

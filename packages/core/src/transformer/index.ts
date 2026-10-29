@@ -49,5 +49,5 @@ export default {
   KimiTransformer,
   OpenCodeTransformer,
   DefaultThinkingTransformer,
-  AmdTransformer
+  AmdTransformer,
 };

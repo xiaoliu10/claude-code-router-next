@@ -26,7 +26,9 @@
   },
   "license": "MIT",
   "scripts": {
-    "build": "node ../../scripts/build-cli.js"
+    "build": "node ../../scripts/build-cli.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@wengine-ai/llms": "workspace:*",
@@ -52,7 +54,8 @@
     "@inquirer/select": "^2.3.0",
     "@inquirer/confirm": "^3.1.4",
     "@inquirer/checkbox": "^2.3.0",
-    "@inquirer/password": "^2.1.4"
+    "@inquirer/password": "^2.1.4",
+    "vitest": "^4.1.9"
   },
   "files": [
     "dist/*",

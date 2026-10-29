@@ -6,6 +6,8 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { useConfig } from "./ConfigProvider";
 import { ProviderList } from "./ProviderList";
+import { useNavigate } from "react-router-dom";
+import { geminiOauthErrorKey, isManagedGeminiOauth } from "@/utils/gemini-oauth";
 import {
   Dialog,
   DialogContent,
@@ -123,10 +125,39 @@ function cleanUpConfigModels(config: any, deletedModels: string[], providerName?
   return newConfig;
 }
 
+// The host knows only generic managed signals, never a plugin's site names.
+// The CCR self-referential preset ("ccr", ccr_managed) is a local loopback
+// endpoint carrying the user's real admin key — it is edited/deleted like any
+// ordinary provider, never captured by the plugin-card management guard.
+// Mirrors shared isCcrSelfProvider: the CCR self-referential preset
+// ("ccr", ccr_managed) is a local loopback endpoint carrying the user's real
+// admin key — it is edited/deleted like any ordinary provider, never captured
+// by the plugin-card management guard.
+const isCcrSelfProvider = (provider: ProviderType | null | undefined): boolean =>
+  Boolean(provider && provider.name === "ccr" && provider.ccr_managed === true);
+
+const isManagedProvider = (provider: ProviderType | null | undefined) =>
+  !isCcrSelfProvider(provider) &&
+  (provider?.ccr_managed === true || provider?.api_key?.startsWith("ccr-managed-") === true);
+
 export function Providers() {
   const { t } = useTranslation();
   const { config, refreshConfig } = useConfig();
   const [isSaving, setIsSaving] = useState(false);
+  const navigate = useNavigate();
+  // Plugin-owned managed entries are edited/disconnected on their own cards.
+  // The managed provider's NAME is the only host-known identity; the settings
+  // area forwards it as a generic focus key so the owning card can scroll to
+  // and focus its section (a card that does not own the name ignores it).
+  const showManagedProviderManagement = (providerName?: string) =>
+    navigate('/settings?tab=providers', {
+      state: { managedProviderNotice: true, managedProviderFocus: providerName ?? null },
+    });
+  // Contract D7: the Gemini subscription provider is managed on its Settings
+  // card; the generic dialog never edits it.
+  const showGeminiOauthManagement = () => {
+    navigate('/settings?tab=providers', { state: { geminiOauthManagedNotice: true } });
+  };
   const [editingProviderIndex, setEditingProviderIndex] = useState<number | null>(null);
   const [deletingProviderIndex, setDeletingProviderIndex] = useState<number | null>(null);
   const [hasFetchedModels, setHasFetchedModels] = useState<Record<number, boolean>>({});
@@ -304,6 +335,7 @@ export function Providers() {
   // Used by enabled toggle and proxy toggle so both go through the same
   // POST /api/config path and refreshConfig afterwards.
   const persistProviderPatch = async (filteredIndex: number, patch: Partial<Provider>) => {
+    if (isSaving) return;
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     if (actualIndex === -1) return;
 
@@ -346,6 +378,9 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[index]);
     const provider = config.Providers[actualIndex];
+    if (isManagedProvider(provider)) { showManagedProviderManagement(provider.name); return; }
+    if (isManagedGeminiOauth(provider)) { showGeminiOauthManagement(); return; }
+    if (isSaving) return;
     setEditingProviderIndex(actualIndex);
     setEditingProviderData(JSON.parse(JSON.stringify(provider))); // 深拷贝
     setIsNewProvider(false);
@@ -359,7 +394,19 @@ export function Providers() {
   };
 
   const handleSaveProvider = async () => {
-    if (!editingProviderData) return;
+    if (!editingProviderData || isSaving) return;
+    // Defense in depth: never allow the generic editor to mutate a managed
+    // identity, key, URL, model set or transformer, even if config refreshed.
+    if (isManagedProvider(editingProviderData) ||
+        (editingProviderIndex !== null && isManagedProvider(config.Providers[editingProviderIndex]))) {
+      showManagedProviderManagement(editingProviderData.name);
+      return;
+    }
+    if (isManagedGeminiOauth(editingProviderData) ||
+        (editingProviderIndex !== null && isManagedGeminiOauth(config.Providers[editingProviderIndex]))) {
+      showGeminiOauthManagement();
+      return;
+    }
     
     // Validate name
     if (!editingProviderData.name || editingProviderData.name.trim() === '') {
@@ -465,6 +512,12 @@ export function Providers() {
 
   // Handle deletion by setting the correct index in the state
   const handleSetDeletingProviderIndex = (filteredIndex: number) => {
+    if (isSaving) return;
+    const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
+    if (isManagedProvider(config.Providers[actualIndex])) { showManagedProviderManagement(config.Providers[actualIndex].name); return; }
+    // Contract D7: the Gemini subscription row is removed on its own card, so
+    // delete navigates there instead of opening the generic confirmation.
+    if (isManagedGeminiOauth(config.Providers[actualIndex])) { showGeminiOauthManagement(); return; }
     setDeletingProviderIndex(filteredIndex);
   };
 
@@ -473,6 +526,27 @@ export function Providers() {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     const deletedProvider = config.Providers[actualIndex];
+    if (isManagedProvider(deletedProvider)) { showManagedProviderManagement(deletedProvider.name); return; }
+    setDeletingProviderIndex(null);
+    if (isSaving) return;
+    if (isManagedGeminiOauth(deletedProvider)) {
+      // Defense in depth for a config that changed under the dialog: explicit
+      // disconnect of the subscription provider, never an omission save.
+      setIsSaving(true);
+      try {
+        const response = await api.disconnectGeminiOauth();
+        setToast({
+          message: response?.ok === true ? t('geminiOauth.disconnected') : t(`geminiOauth.errors.${geminiOauthErrorKey(response)}`),
+          type: response?.ok === true ? 'success' : 'error',
+        });
+      } catch (e) {
+        setToast({ message: t(`geminiOauth.errors.${geminiOauthErrorKey(e)}`), type: 'error' });
+      } finally {
+        await refreshConfig();
+        setIsSaving(false);
+      }
+      return;
+    }
     const deletedModels = deletedProvider?.models || [];
     const deletedProviderName = deletedProvider?.name;
     const newProviders = [...config.Providers];
@@ -883,7 +957,7 @@ export function Providers() {
               <RefreshCw className={`h-4 w-4 mr-1 ${isProbingAllProviders ? "animate-spin" : ""}`} />
               {t("providers.probe_all")}
             </Button>
-            <Button onClick={handleAddProvider} size="sm" className="h-9 px-4 rounded-xl">
+            <Button onClick={handleAddProvider} disabled={isSaving} size="sm" className="h-9 px-4 rounded-xl">
               <Plus className="h-4 w-4 mr-1" />
               {t("providers.add")}
             </Button>
@@ -1649,7 +1723,7 @@ export function Providers() {
       </Dialog>
 
       {/* Delete Confirmation Dialog */}
-      <Dialog open={deletingProviderIndex !== null} onOpenChange={() => setDeletingProviderIndex(null)}>
+      <Dialog open={deletingProviderIndex !== null} onOpenChange={() => { setDeletingProviderIndex(null); }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t("providers.delete")}</DialogTitle>
@@ -1658,8 +1732,10 @@ export function Providers() {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeletingProviderIndex(null)}>{t("providers.cancel")}</Button>
-            <Button variant="destructive" onClick={() => deletingProviderIndex !== null && handleRemoveProvider(deletingProviderIndex)}>{t("providers.delete")}</Button>
+            <Button variant="outline" onClick={() => { setDeletingProviderIndex(null); }}>{t("providers.cancel")}</Button>
+            <Button variant="destructive" onClick={() => deletingProviderIndex !== null && handleRemoveProvider(deletingProviderIndex)}>
+              {t("providers.delete")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

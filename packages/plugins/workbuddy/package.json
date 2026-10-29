@@ -1,0 +1,33 @@
+{
+  "name": "@wengine-ai/ccr-provider-workbuddy",
+  "version": "1.0.0",
+  "description": "WorkBuddy (CN + international) provider plugin for claude-code-router: dual-site account pool, browser login + desktop import, transformer, managed runtime, admin routes, config protector and UI card.",
+  "type": "module",
+  "main": "dist/plugin.js",
+  "scripts": {
+    "build": "node --import tsx scripts/build.ts",
+    "test": "vitest run",
+    "verify": "tsc --noEmit && vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "claude-code-router",
+    "workbuddy",
+    "provider-plugin",
+    "ccr-provider-plugin"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.15",
+    "esbuild": "^0.25.1",
+    "fastify": "^5.4.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.2",
+    "vitest": "^4.1.9"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/*.json",
+    "dist/*.md"
+  ]
+}

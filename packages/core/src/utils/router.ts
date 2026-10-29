@@ -474,7 +474,7 @@ export function diagnoseResolutionFailure(
     };
   }
   const healthStore = getHealthStore();
-  if (!healthStore.isAvailable(provider.name, String(model))) {
+  if (!healthStore.isAvailable(provider.name, String(model), provider.apiKey?.startsWith("ccr-managed-") === true || provider.api_key?.startsWith("ccr-managed-") === true)) {
     return {
       reason: `model "${routeModel}" in provider "${providerName}" is temporarily unavailable (health fail-pool)`,
       code: "model_unhealthy",
@@ -574,7 +574,7 @@ function resolveConfiguredModel(
   // Check health status - skip if model is in fail pool
   if (!skipHealthCheck) {
     const healthStore = getHealthStore();
-    if (!healthStore.isAvailable(found.provider.name, found.model)) {
+    if (!healthStore.isAvailable(found.provider.name, found.model, found.provider.apiKey?.startsWith("ccr-managed-") === true || found.provider.api_key?.startsWith("ccr-managed-") === true)) {
       return null; // Model is unavailable, return null to signal skip
     }
   }

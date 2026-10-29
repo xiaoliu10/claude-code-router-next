@@ -9,6 +9,7 @@
     "build:cli": "pnpm --filter @wengine-ai/claude-code-router-next build",
     "build:server": "pnpm --filter @wengine-ai/claude-code-router-server build",
     "build:ui": "node scripts/build-ui.js",
+    "check:plugin-purity": "node scripts/check-plugin-purity.js",
     "build:docs": "pnpm --filter claude-code-router-docs build",
     "release": "pnpm build && bash scripts/release.sh all",
     "release:npm": "pnpm build && bash scripts/release.sh npm",

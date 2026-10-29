@@ -232,6 +232,11 @@ export interface LLMProvider {
   wakeupEnabled?: boolean;
   wakeupTime?: string;
   wakeupModel?: string;
+  /** Set for CCR-managed subscription providers (config `ccr_managed`) so
+   *  provider plugins can recognize their managed entries as one of their
+   *  managed-provider signals (fixed upstream lock, own auth headers). */
+  pluginManaged?: boolean;
+
 }
 
 export type RegisterProviderRequest = LLMProvider;
@@ -276,4 +281,5 @@ export interface ConfigProvider {
   wakeup_enabled?: boolean;
   wakeup_time?: string;
   wakeup_model?: string;
+
 }

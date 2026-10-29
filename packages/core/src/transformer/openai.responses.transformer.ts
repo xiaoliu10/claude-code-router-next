@@ -273,6 +273,33 @@ export class OpenAIResponsesTransformer implements Transformer {
   async transformResponseOut(response: Response): Promise<Response> {
     const contentType = response.headers.get("Content-Type") || "";
 
+    // Some upstreams return SSE under an UNLABELED (or garbage) content-type —
+    // the real chatgpt.com backend answers with no content-type at all, and
+    // Clash/TUN middleboxes can strip it. Peek first: an SSE-shaped body is
+    // rebuilt with the correct type and re-dispatched, so neither the JSON
+    // branch nor the fall-through below can silently drop its content.
+    if (!contentType.includes("text/event-stream") && !contentType.includes("application/json") && response.body) {
+      const peeked = await peekBodyForSSE(response);
+      if (peeked?.isSSE && peeked.body) {
+        const rebuilt = new Response(peeked.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: new Headers({
+            ...Object.fromEntries(response.headers.entries()),
+            "content-type": "text/event-stream",
+          }),
+        });
+        return this.transformResponseOut(rebuilt);
+      }
+      if (peeked?.body) {
+        response = new Response(peeked.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      }
+    }
+
     // Some upstreams (Codex relay) label an SSE body with an application/json
     // Content-Type. Peek the first meaningful content: when the body actually
     // looks like SSE, re-dispatch as a stream so the SSE pass-through below
@@ -372,9 +399,11 @@ export class OpenAIResponsesTransformer implements Transformer {
 
       const isAnthropic = firstChunk.includes("message_start") || firstChunk.includes("content_block_start");
       if (isAnthropic) {
-        // Reconstruct the stream with the peeked first chunk prepended
-        const restoredStream = this.prependToStream(firstChunk, bodyStream);
-        return new Response(restoredStream, {
+        // bodyStream is the untouched tee'd branch — the peeked first chunk is
+        // still in it, so it must be passed through directly. (Prepending the
+        // peeked text here duplicated the first event, and when the first chunk
+        // ended mid-JSON it produced malformed events.)
+        return new Response(bodyStream, {
           status: response.status,
           statusText: response.statusText,
           headers: response.headers,
@@ -388,17 +417,16 @@ export class OpenAIResponsesTransformer implements Transformer {
         firstChunk.includes("response.in_progress") ||
         firstChunk.includes("response.output_item.added");
       if (isAlreadyResponsesAPI) {
-        const restoredStream = this.prependToStream(firstChunk, bodyStream);
-        return new Response(restoredStream, {
+        return new Response(bodyStream, {
           status: response.status,
           statusText: response.statusText,
           headers: response.headers,
         });
       }
 
-      // OpenAI Chat SSE — proceed with Responses API → Chat conversion below
-      // (prepend the peeked chunk so nothing is lost)
-      const sourceStream = this.prependToStream(firstChunk, bodyStream);
+      // OpenAI Chat SSE — proceed with Responses API → Chat conversion below.
+      // bodyStream still contains the peeked first chunk, so feed it straight
+      // into the converter without re-prepending anything.
 
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
@@ -408,7 +436,7 @@ export class OpenAIResponsesTransformer implements Transformer {
       const transformer = this;
       const stream = new ReadableStream({
         async start(controller) {
-          const reader = sourceStream.getReader();
+          const reader = bodyStream.getReader();
 
           // Index tracking — only increments when event type changes
           let currentIndex = -1;
@@ -879,40 +907,6 @@ export class OpenAIResponsesTransformer implements Transformer {
     } catch {
       return response;
     }
-  }
-
-  /**
-   * Prepend a string chunk to the beginning of an existing ReadableStream.
-   * Used when we've peeked at the first chunk and need to feed it back into
-   * the converter along with the rest of the stream.
-   */
-  private prependToStream(firstChunk: string, rest: ReadableStream): ReadableStream {
-    const encoder = new TextEncoder();
-    const firstBytes = encoder.encode(firstChunk);
-    const reader = rest.getReader();
-    let firstEmitted = false;
-
-    return new ReadableStream({
-      async pull(controller) {
-        if (!firstEmitted) {
-          firstEmitted = true;
-          controller.enqueue(firstBytes);
-        }
-        try {
-          const { done, value } = await reader.read();
-          if (done) {
-            controller.close();
-          } else {
-            controller.enqueue(value);
-          }
-        } catch (e) {
-          controller.error(e);
-        }
-      },
-      cancel() {
-        reader.cancel().catch(() => {});
-      },
-    });
   }
 
   /**

@@ -2,6 +2,15 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Provider-plugin card visual contract (packages/plugins/*\/src/card-entry.ts):
+ * the plugin cards render inside this page and style themselves with host
+ * utilities only. Tailwind emits just the classes it scans from host sources,
+ * so the handful of utilities no surviving host component references are
+ * safelisted here — keep them generated for the served card chunks. */
+@source inline("grid-cols-[auto_minmax(0,1fr)] max-w-[10rem] max-w-full border-primary/30 bg-primary/5 border-primary/40 border-red-500/30 bg-muted-foreground/30 border-green-500/25 bg-green-500/10 gap-x-3 gap-y-1 whitespace-normal");
+@source inline("{sm:}{w-[210px],items-start,justify-between}");
+@source inline("{hover:}{bg-white/20,text-foreground,shadow-primary/30}");
+
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
