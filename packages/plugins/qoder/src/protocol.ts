@@ -1,46 +1,162 @@
 import type { PluginClassifiedError } from "./core-types";
 
-export const QODER_OPENAPI = "https://openapi.qoder.sh";
-export const QODER_API = "https://api3.qoder.sh";
+/** The one chat path Qoder's client uses; only the site's API host differs. */
+const CHAT_PATH = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1";
+
+export type QoderSiteId = "qoder" | "qoder-cn";
+
+/**
+ * Everything that differs between qoder.com (international) and qoder.cn
+ * (Qoder CN): the fixed origins, the managed provider name, its marker
+ * credential, the private credential file and the admin route base. The
+ * protocol itself (PAT exchange, listing, chat, usage, error taxonomy) is the
+ * same on both sites.
+ */
+export interface QoderSiteDescriptor {
+  id: QoderSiteId;
+  label: string;
+  openapi: string;
+  api: string;
+  web: string;
+  chatUrl: string;
+  /** Managed provider name in the CCR config. */
+  provider: string;
+  /** Placeholder credential the managed provider carries instead of a key. */
+  marker: string;
+  /** Private credential file inside the host config dir. */
+  credentialFile: string;
+  /** Admin route base (the card reaches it through the host's plugin bridge). */
+  routeBase: string;
+}
+
+export const QODER_SITES: readonly QoderSiteDescriptor[] = Object.freeze([
+  {
+    id: "qoder", label: "Qoder",
+    openapi: "https://openapi.qoder.sh", api: "https://api3.qoder.sh", web: "https://qoder.com",
+    chatUrl: `https://api3.qoder.sh${CHAT_PATH}`,
+    provider: "qoder-subscription", marker: "ccr-managed-qoder",
+    credentialFile: "qoder-credentials.json", routeBase: "/api/qoder",
+  },
+  {
+    id: "qoder-cn", label: "Qoder CN",
+    openapi: "https://openapi.qoder.com.cn", api: "https://gateway.qoder.com.cn", web: "https://qoder.cn",
+    chatUrl: `https://gateway.qoder.com.cn${CHAT_PATH}`,
+    provider: "qoder-cn-subscription", marker: "ccr-managed-qoder-cn",
+    credentialFile: "qoder-cn-credentials.json", routeBase: "/api/qoder/cn",
+  },
+]);
+
+/** International defaults, kept as named exports for the existing call sites. */
 /** The one chat endpoint Qoder's client uses; locked into the managed config. */
-export const QODER_CHAT = `${QODER_API}/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
-export const QODER_PROVIDER = "qoder-subscription";
-export const QODER_MARKER = "ccr-managed-qoder";
+export const QODER_CHAT = QODER_SITES[0].chatUrl;
+export const QODER_PROVIDER = QODER_SITES[0].provider;
+export const QODER_MARKER = QODER_SITES[0].marker;
+
+/**
+ * Resolve a site descriptor. Anything that is not a known site id (missing,
+ * or an Array.prototype index leaked by a bare `find(isQoderManaged)` call)
+ * falls back to the international site.
+ */
+export function qoderSite(site?: QoderSiteId): QoderSiteDescriptor {
+  return QODER_SITES.find(s => s.id === site) ?? QODER_SITES[0];
+}
+
+/**
+ * Path prefix the UI card uses for a site, relative to the host's plugin
+ * bridge (which already prepends `/api/<plugin>`). Derived from the intl route
+ * base so the two spellings cannot drift: "" for intl, "/cn" for Qoder CN.
+ */
+export function qoderCardPrefix(site: QoderSiteId): string {
+  const base = QODER_SITES[0].routeBase;
+  return qoderSite(site).routeBase.slice(base.length);
+}
 
 export function qoderError(code: string, status = 422): Error & { code: string; statusCode: number } {
   return Object.assign(new Error(code), { code, statusCode: status, nonRetryable: true });
 }
 
-export function isQoderManaged(p: any): boolean {
-  return p?.qoder_managed === true || p?.qoderManaged === true ||
-    (p?.name === QODER_PROVIDER && (p.api_key ?? p.apiKey) === QODER_MARKER);
+/**
+ * Managed-entry recognition. A provider named after a site belongs to exactly
+ * that site, so the two managed runtimes can share the registry without
+ * claiming each other's providers. Nameless or renamed entries can only mean
+ * the default (international) site: pre-CN configs never had another owner,
+ * and the legacy boolean flags stay honoured for them.
+ */
+export function isQoderManaged(p: any, site: QoderSiteId = "qoder"): boolean {
+  const managedBy = qoderSite(site);
+  const name = p?.name;
+  const owner = typeof name === "string" ? QODER_SITES.find(s => s.provider === name) : undefined;
+  if (owner) {
+    return owner.id === managedBy.id &&
+      (p?.qoder_managed === true || p?.qoderManaged === true || (p?.api_key ?? p?.apiKey) === managedBy.marker);
+  }
+  if (managedBy.id !== QODER_SITES[0].id) return false;
+  return p?.qoder_managed === true || p?.qoderManaged === true;
 }
 
-export function lockQoderProvider(p: any): any {
-  // Single-transformer chain, exactly cursor's lockProvider shape ("qoder").
-  return { ...p, name: QODER_PROVIDER, qoder_managed: true, qoderManaged: true,
-    api_base_url: QODER_CHAT, api_key: QODER_MARKER, transformer: { use: ["qoder"] } };
+export function lockQoderProvider(p: any, site: QoderSiteId = "qoder"): any {
+  const managedBy = qoderSite(site);
+  // Single-transformer chain, exactly cursor's lockProvider shape ("qoder" / "qoder-cn").
+  return { ...p, name: managedBy.provider, qoder_managed: true, qoderManaged: true,
+    api_base_url: managedBy.chatUrl, api_key: managedBy.marker, transformer: { use: [managedBy.id] } };
 }
 
+/**
+ * ONE protector for BOTH sites: every managed entry in the incoming config is
+ * re-locked in place, and a site whose managed entry vanished is re-added from
+ * the previous config (intl first, then CN — the descriptor order).
+ */
 export function protectQoderConfig(next: any, previous: any): void {
-  const old = (previous?.Providers ?? previous?.providers ?? []).find(isQoderManaged);
-  const key = Array.isArray(next?.providers) && !Array.isArray(next?.Providers) ? "providers" : "Providers";
   if (!next || typeof next !== "object") return;
-  const list = Array.isArray(next[key]) ? next[key] : [];
-  next[key] = list.map((p: any) => isQoderManaged(p) || (old && p?.name === QODER_PROVIDER) ? lockQoderProvider(p) : p);
-  if (old && !next[key].some(isQoderManaged)) next[key].push(lockQoderProvider(old));
+  const key = Array.isArray(next?.providers) && !Array.isArray(next?.Providers) ? "providers" : "Providers";
+  const old = (previous?.Providers ?? previous?.providers ?? []) as any[];
+  const list: any[] = Array.isArray(next[key]) ? next[key] : [];
+  next[key] = list.map((p: any) => {
+    for (const managedBy of QODER_SITES) {
+      const previousEntry = old.find(o => isQoderManaged(o, managedBy.id));
+      if (isQoderManaged(p, managedBy.id) || (previousEntry && p?.name === managedBy.provider)) {
+        return lockQoderProvider(p, managedBy.id);
+      }
+    }
+    return p;
+  });
+  for (const managedBy of QODER_SITES) {
+    const previousEntry = old.find(o => isQoderManaged(o, managedBy.id));
+    if (previousEntry && !next[key].some((p: any) => isQoderManaged(p, managedBy.id))) {
+      next[key].push(lockQoderProvider(previousEntry, managedBy.id));
+    }
+  }
 }
 
-export function mergeQoderProvider(current: any, server: any): any {
+/** Reconcile ONE site's managed entry into the UI's config draft. */
+export function mergeQoderProvider(current: any, server: any, site: QoderSiteId = "qoder"): any {
+  const managedBy = qoderSite(site);
   const next = { ...current };
   const key = Array.isArray(current?.providers) && !Array.isArray(current?.Providers) ? "providers" : "Providers";
-  const managed = (server?.Providers ?? server?.providers ?? []).find(isQoderManaged);
+  const managed = (server?.Providers ?? server?.providers ?? []).find((p: any) => isQoderManaged(p, managedBy.id));
   const list = [...(current?.[key] ?? [])];
-  const at = list.findIndex(isQoderManaged);
+  const at = list.findIndex((p: any) => isQoderManaged(p, managedBy.id));
   if (at >= 0) { if (managed) list[at] = managed; else list.splice(at, 1); }
-  else if (managed && !list.some(p => p?.name === QODER_PROVIDER)) list.push(managed);
+  else if (managed && !list.some(p => p?.name === managedBy.provider)) list.push(managed);
   next[key] = list;
   return next;
+}
+
+/**
+ * Serialize whole-config read-modify-write ACROSS provider instances.
+ *
+ * The card hosts two Qoder services (intl + CN) in one process, and every
+ * mutation rewrites the ENTIRE config.json. Per-instance queues cannot see
+ * each other, so an intl sync racing a CN connect would drop the loser's
+ * managed provider entry (its credential file stays, but routing 404s). One
+ * queue per config dir closes that hole for every plugin instance sharing it.
+ */
+const configWriteQueues = new Map<string, Promise<unknown>>();
+export function serializeQoderConfigWrite<T>(configDir: string, fn: () => Promise<T>): Promise<T> {
+  const previous = configWriteQueues.get(configDir) ?? Promise.resolve();
+  const job = previous.then(fn, fn);
+  configWriteQueues.set(configDir, job.catch(() => {}));
+  return job;
 }
 
 const RETRY_AFTER_MIN_MS = 30_000;

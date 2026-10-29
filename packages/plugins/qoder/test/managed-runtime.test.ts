@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { createQoderManagedRuntime } from "../src/managed-runtime";
-import { QODER_CHAT } from "../src/protocol";
+import { QODER_CHAT, QODER_SITES } from "../src/protocol";
 import type { PluginHostCapabilities } from "../src/core-types";
 
 function hostStub(): PluginHostCapabilities & { direct: any; subscription: any } {
@@ -90,7 +90,7 @@ describe("Qoder managed runtime", () => {
   it("applies the request deadline from config.TIMEOUT with a floor back to the default", async () => {
     const hanging = fakeService({ dispatch: (_b: any, signal: AbortSignal) => new Promise<Response>((_, reject) =>
       signal.addEventListener("abort", () => reject(new Error("deadline")))) });
-    const runtime = createQoderManagedRuntime(hanging, hostStub(), 60);
+    const runtime = createQoderManagedRuntime(hanging, hostStub(), "qoder", 60);
     const started = Date.now();
     await expect(runtime.dispatchRequest!({ attempt: async () => new Response(), requestBody: {}, config: { TIMEOUT: 80 }, provider: {} as any, req: { raw: new EventEmitter() } }))
       .rejects.toMatchObject({ name: "AbortError" });
@@ -190,5 +190,60 @@ describe("Qoder managed runtime", () => {
     await reader.cancel("client left");
     expect(infiniteCancel).toHaveBeenCalled();
     expect(req.raw.listenerCount("aborted")).toBe(0);
+  });
+});
+
+describe("Qoder CN managed runtime", () => {
+  it("replays CN's data-plane 401 once and records CN cooling through its own service", async () => {
+    const responses = [
+      jsonResponse(401, { error: { type: "qoder_error", code: 401 } }),
+      new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+    ];
+    const replaying = fakeService({ dispatch: vi.fn(async () => responses.shift()) });
+    const runtime = createQoderManagedRuntime(replaying, hostStub(), "qoder-cn");
+    const response = await runtime.dispatchRequest!({ attempt: async () => new Response(), requestBody: { model: "m" },
+      config: {}, provider: {} as any, req: { raw: Object.assign(new EventEmitter(), { socket: new EventEmitter() }) } });
+    expect(response.status).toBe(200);
+    expect(replaying.dispatch).toHaveBeenCalledTimes(2);
+    expect(replaying.forceTokenRefresh).toHaveBeenCalledTimes(1);
+
+    const limited = fakeService({ dispatch: vi.fn(async () => jsonResponse(429, {
+      error: { message: "slow down", type: "qoder_error", code: 429 }, retry_after: 45,
+    })) });
+    const limitedRuntime = createQoderManagedRuntime(limited, hostStub(), "qoder-cn");
+    await expect(limitedRuntime.dispatchRequest!({ attempt: async () => new Response(), requestBody: { model: "m" },
+      config: {}, provider: {} as any, req: { raw: new EventEmitter() } }))
+      .rejects.toMatchObject({ code: "qoder_rate_limited", statusCode: 429 });
+    expect(limited.noteUpstreamError).toHaveBeenCalledWith(expect.objectContaining({
+      code: "qoder_rate_limited", httpStatus: 429, cooldownMs: 45_000,
+    }));
+  });
+
+  it("pins the CN chat upstream and claims only the CN provider", async () => {
+    const host = hostStub();
+    const service = fakeService();
+    const runtime = createQoderManagedRuntime(service, host, "qoder-cn");
+    const intlRuntime = createQoderManagedRuntime(fakeService(), host);
+    expect(runtime.name).toBe("qoder-cn");
+    expect(intlRuntime.name).toBe("qoder");
+    expect(runtime.isManaged({ name: "qoder-cn-subscription", api_key: "ccr-managed-qoder-cn" })).toBe(true);
+    expect(runtime.isManaged({ name: "qoder-subscription", api_key: "ccr-managed-qoder" })).toBe(false);
+    expect(intlRuntime.isManaged({ name: "qoder-cn-subscription", api_key: "ccr-managed-qoder-cn" })).toBe(false);
+    expect(intlRuntime.isManaged({ name: "qoder-subscription", api_key: "ccr-managed-qoder" })).toBe(true);
+
+    const config: any = { url: "https://evil.invalid", dispatcher: "ambient" };
+    await runtime.lockUpstream!(config, {} as any);
+    expect(config.url).toBe(QODER_SITES[1].chatUrl);
+    expect(config.url).toContain("https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation");
+    expect(config.redirect).toBe("error");
+    expect(config.dispatcher).toEqual(host.subscription);
+    // classification is site-independent
+    expect(runtime.classifyError!(429, { retry_after: 60 }, "")).toMatchObject({ code: "qoder_rate_limited", cooldownMs: 60_000 });
+
+    // the wrapper dispatches through ITS OWN service (bookkeeping stays per site)
+    const response = await runtime.dispatchRequest!({ attempt: async () => new Response(), requestBody: { model: "m" },
+      config: {}, provider: {} as any, req: { raw: Object.assign(new EventEmitter(), { socket: new EventEmitter() }) } });
+    expect(response.status).toBe(200);
+    expect(service.dispatch).toHaveBeenCalledTimes(1);
   });
 });

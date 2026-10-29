@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createQoderEngine, type QoderCredential, type QoderEngine, type QoderModelInfo } from "./vendor/engine.mjs";
 import type { PluginHostCapabilities } from "./core-types";
-import { QODER_PROVIDER, isQoderManaged, lockQoderProvider, qoderError, validPAT } from "./protocol";
+import { isQoderManaged, lockQoderProvider, qoderError, qoderSite, serializeQoderConfigWrite, validPAT, type QoderSiteDescriptor, type QoderSiteId } from "./protocol";
 
 /**
  * Normalized model record kept in the private credential file: exactly the
@@ -18,6 +18,8 @@ type Saved = { version: 1; credential: QoderCredential; models: QoderModelRecord
 export interface QoderServiceOptions {
   host: PluginHostCapabilities;
   fetch?: typeof fetch;
+  /** Subscription site; the provider name, marker, credential file and engine site follow it. */
+  site?: QoderSiteId;
   /** Test seam: inject a fake engine; the real one is built from the host dispatcher. */
   engine?: QoderEngine;
 }
@@ -80,6 +82,7 @@ function toRecord(m: QoderModelInfo): QoderModelRecord {
  */
 export class QoderAuthService {
   readonly engine: QoderEngine;
+  readonly site: QoderSiteDescriptor;
   readonly file: string;
   private loaded?: Promise<void>;
   private saved?: Saved;
@@ -94,6 +97,7 @@ export class QoderAuthService {
   private usage?: QoderUsageSnapshot & { observedAt: number };
   private usageJob?: Promise<QoderUsageSnapshot>;
   constructor(readonly options: QoderServiceOptions) {
+    this.site = qoderSite(options.site);
     // The internal-refresh seam is wired BEFORE the engine exists. A PAT
     // re-exchange rotates access/refresh/expires while renew() keeps the rest
     // of the credential (uid/pat/machineId come from the spread of the prior
@@ -116,8 +120,10 @@ export class QoderAuthService {
       // rotation delivered after a disconnect+reconnect (even with the SAME
       // PAT) cannot overwrite the new connection.
       onRefresh: n => this.handleEngineRefresh(n),
+      // The engine resolves its hosts from the site (see vendor/engine.mjs).
+      site: this.site.id,
     });
-    this.file = join(options.host.configDir, "qoder-credentials.json");
+    this.file = join(options.host.configDir, this.site.credentialFile);
   }
   /**
    * Persist a credential the engine rotated on its own during a request
@@ -205,16 +211,20 @@ export class QoderAuthService {
     return structuredClone(await this.options.host.readRawConfig());
   }
   private async updateConfig(saved?: Saved): Promise<void> {
+    // Whole-config read-modify-write is shared by every Qoder service (intl +
+    // CN) in this process: per-instance queues cannot see each other, so a
+    // concurrent write would drop the other site's managed provider entry.
+    await serializeQoderConfigWrite(this.options.host.configDir, async () => {
     const cfg = await this.rawConfig();
     const before = structuredClone(cfg);
     const key = Array.isArray(cfg.providers) && !Array.isArray(cfg.Providers) ? "providers" : "Providers";
     const list: any[] = cfg[key] ?? [];
-    const at = list.findIndex(isQoderManaged);
+    const at = list.findIndex((p: any) => isQoderManaged(p, this.site.id));
     if (saved) {
-      if (at < 0 && list.some(p => p?.name === QODER_PROVIDER)) throw qoderError("qoder_provider_name_conflict");
+      if (at < 0 && list.some(p => p?.name === this.site.provider)) throw qoderError("qoder_provider_name_conflict");
       const provider = lockQoderProvider({ ...(at >= 0 ? list[at] : {}),
         models: saved.models.filter(m => !saved.hiddenModels.includes(m.key)).map(m => m.key),
-        enabled: at >= 0 ? list[at].enabled !== false : true });
+        enabled: at >= 0 ? list[at].enabled !== false : true }, this.site.id);
       if (at >= 0) list[at] = provider; else list.push(provider);
     } else if (at >= 0) list.splice(at, 1);
     cfg[key] = list;
@@ -223,6 +233,7 @@ export class QoderAuthService {
       await this.options.host.writeConfig(before).then(() => this.options.host.reloadRuntime(before)).catch(() => {});
       throw qoderError("qoder_config_write_failed", 500);
     }
+    });
   }
   /** Exchange a PAT for a job token: persist FIRST, then config, rollback on failure. */
   async connectPAT(pat: unknown): Promise<{ success: true }> {
@@ -395,7 +406,7 @@ export class QoderAuthService {
     }));
     return {
       status: saved ? "connected" : "not_connected",
-      providerName: QODER_PROVIDER,
+      providerName: this.site.provider,
       account: saved ? maskEmail(saved.credential.email) ?? maskEmail(saved.credential.accountId) ?? undefined : undefined,
       models, modelCount: models.length,
       ...(this.coolingUntil > Date.now() ? { coolingUntil: this.coolingUntil } : {}),

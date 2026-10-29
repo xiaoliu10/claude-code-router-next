@@ -6,9 +6,11 @@
  * provenance header). Tests exercise the real engine directly; the host
  * service additionally accepts an injected engine for isolated unit tests.
  *
- * Scope: qoder.com international only, PAT sign-in. All network access flows
- * through the `fetch` the host injects at factory time (no ambient fetch, no
- * env, no home directory, no network at import).
+ * Scope: qoder.com (international) and qoder.cn (Qoder CN), PAT sign-in. Every
+ * host (openapi, api, web) resolves from the selected `site`; the protocol
+ * paths are identical on both. All network access flows through the `fetch`
+ * the host injects at factory time (no ambient fetch, no env, no home
+ * directory, no network at import).
  */
 
 /** Credential the engine derives from a PAT exchange (L362-413 of upstream). */
@@ -58,6 +60,12 @@ export interface QoderUsageResult {
 export interface QoderEngineOptions {
   /** Host dispatcher fetch (redirect: "error" is the caller's duty). */
   fetch: typeof fetch;
+  /**
+   * Subscription site whose hosts the engine talks to (default "qoder", the
+   * international qoder.com endpoints). The host always passes it; an engine
+   * that predates the option simply ignores it.
+   */
+  site?: "qoder" | "qoder-cn";
   /** Lifetime signal: governs in-flight work; dispose() aborts nothing. */
   signal?: AbortSignal;
   /** Injectable clock for expiry/lead math (tests). */

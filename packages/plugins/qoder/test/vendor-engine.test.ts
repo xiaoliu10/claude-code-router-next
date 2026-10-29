@@ -12,6 +12,8 @@ vi.mock("node:crypto", async (original) => ({
 const NOW = 1_800_000_000_000
 const OPENAPI = "https://openapi.qoder.sh"
 const API = "https://api3.qoder.sh"
+const CN_OPENAPI = "https://openapi.qoder.com.cn"
+const CN_API = "https://gateway.qoder.com.cn"
 const credential = (fields = {}) => ({ access: "test-access", refresh: "test-refresh", expires: NOW + 86_400_000,
   uid: "test-user", email: "example@example.invalid", name: "Example", accountId: "example@example.invalid",
   machineId: "test-machine", pat: "pt-test-fixture", ...fields })
@@ -51,7 +53,7 @@ describe("vendor engine codec and COSY envelope", () => {
 
   it("signs the exact wire body and stripped path with deterministic ts/uuid", () => {
     const p = make()._internal
-    const headers = p.cosyHeaders(API + "/algo/api/v2/model/list?Encode=1", credential(), "wire-data", p.SITES_qoder, 1234)
+    const headers = p.cosyHeaders(API + "/algo/api/v2/model/list?Encode=1", credential(), "wire-data", p.SITES.qoder, 1234)
     const [, payload, sig] = headers.Authorization.split(".")
     const decoded = JSON.parse(Buffer.from(payload, "base64").toString())
     expect(decoded).toMatchObject({ version: "v1", requestId: "00112233445566778899aabbccddeeff", cosyVersion: "1.1.69", ideVersion: "" })
@@ -62,7 +64,7 @@ describe("vendor engine codec and COSY envelope", () => {
       "Cosy-ClientType": "10", "Cosy-ClientIp": "test-machine", "Cosy-Date": "1234", "Cosy-User": "test-user",
       "Cosy-MachineToken": "test-machine", "Cosy-MachineType": "5", "Cosy-Version": "1.1.69", "Cosy-Scene": "app", "Login-Version": "v2" })
     expect(headers["Cosy-MachineOS"]).toBe(p.machineOS())
-    expect(p.cosyHeaders(API + "/algo/api/v2/model/list?Encode=1", credential(), "wire-data", p.SITES_qoder, 1234)).toEqual(headers)
+    expect(p.cosyHeaders(API + "/algo/api/v2/model/list?Encode=1", credential(), "wire-data", p.SITES.qoder, 1234)).toEqual(headers)
     expect(() => p.cosyHeaders(API, { uid: "u" }, "")).toThrow("machine id")
   })
 })
@@ -568,5 +570,87 @@ describe("vendor engine aborts", () => {
     await ready
     controller.abort()
     await expect(result).rejects.toMatchObject({ name: "AbortError" })
+  })
+})
+
+describe("vendor engine CN site", () => {
+  it("defaults to the qoder site and refuses an unknown one", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(Response.json({ token: "job", refresh_token: "refresh" }))
+      .mockResolvedValueOnce(Response.json({ id: "uid" }))
+    const engine = make(fetch)
+    expect(engine._internal.site).toBe(engine._internal.SITES.qoder)
+    await engine.connectPAT("pt-fixture")
+    expect(fetch.mock.calls.map(([url]) => String(url)))
+      .toEqual([OPENAPI + "/api/v1/jobToken/exchange", OPENAPI + "/api/v1/userinfo"])
+    expect(() => createQoderEngine({ fetch: vi.fn(), site: "qoder-us" })).toThrow('unknown site "qoder-us"')
+  })
+
+  it("exchanges a PAT and reads userinfo on the CN openapi", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(Response.json({ token: "cn-job", expire_time: "2030-01-01T00:00:00Z" }))
+      .mockResolvedValueOnce(Response.json({ user_id: "cn-uid", email: "cn@example.invalid", name: "CN" }))
+    const engine = make(fetch, { site: "qoder-cn" })
+    expect(engine._internal.site).toBe(engine._internal.SITES["qoder-cn"])
+    const cred = await engine.connectPAT("pt-fixture")
+    expect(cred).toMatchObject({ access: "cn-job", uid: "cn-uid", accountId: "cn@example.invalid", machineId: "00112233-4455-6677-8899-aabbccddeeff", pat: "pt-fixture" })
+    expect(fetch.mock.calls.map(([url]) => String(url)))
+      .toEqual([CN_OPENAPI + "/api/v1/jobToken/exchange", CN_OPENAPI + "/api/v1/userinfo"])
+    expect(fetch.mock.calls[1][1].headers.Authorization).toBe("Bearer cn-job")
+  })
+
+  it("refreshes and re-exchanges a refused PAT on the CN openapi", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(Response.json({ token: "next-access", refresh_token: "next-refresh", expires_in: 999999 }))
+    const engine = make(fetch, { site: "qoder-cn" })
+    expect((await engine.refresh(credential({ refresh: "cn-refresh-1" }))).access).toBe("next-access")
+    expect(String(fetch.mock.calls[0][0])).toBe(CN_OPENAPI + "/api/v1/jobToken/refresh")
+    fetch.mockReset()
+    fetch.mockResolvedValueOnce(new Response("refused", { status: 401 }))
+      .mockResolvedValueOnce(Response.json({ token: "re-exchanged", refresh_token: "re-exchanged-refresh" }))
+      .mockResolvedValueOnce(Response.json({ id: "cn-uid" }))
+    expect((await engine.refresh(credential({ refresh: "cn-refresh-2" }))).access).toBe("re-exchanged")
+    expect(fetch.mock.calls.map(([url]) => String(url)))
+      .toEqual([CN_OPENAPI + "/api/v1/jobToken/refresh", CN_OPENAPI + "/api/v1/jobToken/exchange", CN_OPENAPI + "/api/v1/userinfo"])
+  })
+
+  it("lists CN models with the same COSY envelope as intl", async () => {
+    const fetch = vi.fn(async () => listing())
+    const engine = make(fetch, { site: "qoder-cn" })
+    const models = await engine.models(credential({ refresh: "cn-refresh-3" }))
+    expect(models.map((m) => m.key)).toEqual(["test-model"])
+    expect(String(fetch.mock.calls[0][0])).toBe(CN_API + "/algo/api/v2/model/list?Encode=1")
+    const cn = fetch.mock.calls[0][1].headers
+    const intl = engine._internal.cosyHeaders(API + "/algo/api/v2/model/list?Encode=1", credential(), "", engine._internal.SITES.qoder)
+    expect(cn).toMatchObject({ "Cosy-ClientType": "10", "Cosy-Business-Product": "app", "Cosy-Scene": "app", "Cosy-Business-Type": "agent" })
+    expect(Object.keys(cn)).toEqual(Object.keys(intl))
+    expect(cn).toEqual(engine._internal.cosyHeaders(CN_API + "/algo/api/v2/model/list?Encode=1", credential(), "", engine._internal.SITES["qoder-cn"]))
+  })
+
+  it("reads CN usage from the CN openapi", async () => {
+    const fetch = vi.fn(async () => Response.json({ displayMode: "qoder", qoderUsage: { user_type: "Pro", user_quota: { total: 100, used: 25 } } }))
+    const usage = await make(fetch, { site: "qoder-cn" }).usage(credential({ refresh: "cn-refresh-4" }))
+    expect(String(fetch.mock.calls[0][0])).toBe(CN_OPENAPI + "/sash/api/v2/me/usage")
+    expect(fetch.mock.calls[0][1].headers).toMatchObject({ Authorization: "Bearer test-access", "Cosy-ClientType": "10" })
+    expect(usage).toMatchObject({ plan: "Pro", signIn: "kept", windows: [{ name: "Credits", used: 25, display: "25 / 100 credits" }] })
+  })
+
+  it("chats on the CN gateway with the same COSY envelope and body defaults", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(listing()).mockResolvedValueOnce(successful())
+    const engine = make(fetch, { site: "qoder-cn" })
+    const response = await engine.chat(credential({ refresh: "cn-refresh-5" }), input())
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(String(fetch.mock.calls[0][0])).toBe(CN_API + "/algo/api/v2/model/list?Encode=1")
+    const [url, init] = fetch.mock.calls[1]
+    expect(String(url)).toBe(CN_API + "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
+    const intl = engine._internal.cosyHeaders(String(url).replace(CN_API, API), credential(), init.body, engine._internal.SITES.qoder)
+    // Chat sets Accept back to text/event-stream over the envelope's
+    // application/json and adds Cache-Control and the model's own headers,
+    // so every other envelope header is compared by name and value.
+    for (const [name, value] of Object.entries(intl)) if (name !== "Accept") expect(init.headers[name]).toBe(value)
+    expect(init.headers).toMatchObject({ Accept: "text/event-stream", "X-Model-Key": "test-model", "X-Model-Source": "system" })
+    const [, payload, sig] = init.headers.Authorization.split(".")
+    expect(sig).toBe(createHash("md5").update(`${payload}\n${init.headers["Cosy-Key"]}\n${Math.floor(NOW / 1000)}\n${init.body}\n/api/v2/service/pro/sse/agent_chat_generation`).digest("hex"))
+    const body = JSON.parse(engine._internal.decodeBody(init.body))
+    expect(body).toMatchObject({ session_type: "app", agent_id: "agent_common", task_id: "common",
+      business: { product: "app", version: "1.1.69", type: "agent" } })
   })
 })

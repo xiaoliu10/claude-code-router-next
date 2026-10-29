@@ -23,12 +23,31 @@ SOFTWARE.
 */
 // Extracted from magpie-community/plugins packages/qoder/index.mjs
 // @ bace91473b4f113a719a49b7d8ce81fe1f5b5760
-// (@magpie-community/opencode-qoder-auth 0.2.40), qoder.com + PAT subset.
+// (@magpie-community/opencode-qoder-auth 0.2.40), qoder.com/qoder.cn + PAT subset.
 // Locally modified for CCR: injected transport/clock, scoped caches and lifecycle.
 import { createCipheriv, createHash, publicEncrypt, randomUUID, constants } from "node:crypto"
 
+// SITES are the sites this engine serves, one protocol family with its own
+// hosts apiece: qoder.com for international accounts and qoder.cn for CN.
+// Everything else in the protocol — the paths, the COSY defaults and the RSA
+// key — is shared, so a site is only where it is reached.
+const SITES = Object.freeze({
+  qoder: Object.freeze({
+    id: "qoder", name: "Qoder", web: "https://qoder.com",
+    openapi: "https://openapi.qoder.sh", api: "https://api3.qoder.sh",
+  }),
+  "qoder-cn": Object.freeze({
+    id: "qoder-cn", name: "Qoder CN", web: "https://qoder.cn",
+    openapi: "https://openapi.qoder.com.cn", api: "https://gateway.qoder.com.cn",
+  }),
+})
+
 export function createQoderEngine(options) {
   if (typeof options?.fetch !== "function") throw new TypeError("Qoder requires an injected fetch")
+  // The site every request takes its hosts from: qoder.com unless the host
+  // asks for another of SITES.
+  const site = SITES[options.site ?? "qoder"]
+  if (!site) throw new TypeError(`Qoder: unknown site "${options.site}"`)
   const now = options.now ?? (() => Date.now())
   const combine = (...signals) => AbortSignal.any([options.signal, ...signals].filter(Boolean))
   const checkAbort = (signal) => {
@@ -1620,12 +1639,6 @@ function parseUsage(env) {
   return out
 }
 
-
-const SITES_qoder = Object.freeze({
-  id: "qoder", name: "Qoder", web: "https://qoder.com",
-  openapi: "https://openapi.qoder.sh", api: "https://api3.qoder.sh",
-})
-
 // A spent refresh token can be presented again until the host has saved the
 // new pair. Keep that rotation local to this credential lifetime.
 let lock = Promise.resolve()
@@ -1655,21 +1668,21 @@ const spend = (refresh, got) => {
 const connectPAT = async (pat) => {
   if (typeof pat !== "string" || !pat.startsWith("pt-") || pat.length > 4096)
     throw new Error("PAT must start with pt- and be at most 4096 characters")
-  const cred = await patSignIn(SITES_qoder, pat)
+  const cred = await patSignIn(site, pat)
   checkAbort()
   return cred
 }
 const renew = async (cred, signal) => {
   let jt
   try {
-    jt = await refreshJob(SITES_qoder, cred.refresh, cred.accountId || cred.email || cred.uid, signal)
+    jt = await refreshJob(site, cred.refresh, cred.accountId || cred.email || cred.uid, signal)
     checkAbort(signal)
   } catch (e) {
     checkAbort(signal)
     if (!(e instanceof SignInGone) || !cred.pat) throw e
     let exchanged
     try {
-      exchanged = await patSignIn(SITES_qoder, cred.pat, signal)
+      exchanged = await patSignIn(site, cred.pat, signal)
       checkAbort(signal)
     } catch (p) {
       checkAbort(signal)
@@ -1717,7 +1730,7 @@ const listings = new Map()
 const modelsFor = async (cred, again = false, signal) => {
   let listing = listings.get(cred.uid)
   if (!listing || again) {
-    listing = modelInfos(await fetchListing(SITES_qoder, cred, signal), SITES_qoder)
+    listing = modelInfos(await fetchListing(site, cred, signal), site)
     checkAbort(signal)
     listings.set(cred.uid, listing)
   }
@@ -1731,7 +1744,7 @@ const models = async (cred, again = false) => {
 const usage = async (cred) => {
   const current = await fresh(cred)
   checkAbort()
-  const env = await fetchUsage(SITES_qoder, current.access)
+  const env = await fetchUsage(site, current.access)
   checkAbort()
   // parseUsage intentionally preserves an enterprise payload without credit
   // windows; normalize the public surface so callers always get an array
@@ -1756,10 +1769,10 @@ const chat = async (credential, chatBody, { session = "", signal: requestSignal 
     if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chatBody.model}"` })
     const name = m.name?.trim()
     const servedName = name && name !== m.key ? name : chatBody.model
-    const api = SITES_qoder.api
+    const api = site.api
     const url = api + CHAT_PATH
     const task = taskOf(sessionOf(chatBody, session), chatBody)
-    const body = qoderBody(chatBody, m, session, task, SITES_qoder)
+    const body = qoderBody(chatBody, m, session, task, site)
     const deadline = QUEUE.now() + QUEUE.budget
     const ask = { requestSetId: body.request_set_id, requestId: body.request_id, sessionId: body.session_id, modelKey: m.key }
     for (let waited = 0; ; waited++) {
@@ -1770,7 +1783,7 @@ const chat = async (credential, chatBody, { session = "", signal: requestSignal 
       }
       const wire = encodeBody(JSON.stringify(body))
       const headers = {
-        ...cosyHeaders(url, cred, wire, SITES_qoder),
+        ...cosyHeaders(url, cred, wire, site),
         Accept: "text/event-stream", "Cache-Control": "no-cache",
         "X-Model-Key": m.key, "X-Model-Source": m.source,
       }
@@ -1805,7 +1818,7 @@ const chat = async (credential, chatBody, { session = "", signal: requestSignal 
         checkAbort(signal)
         return result
       }
-      if (!(await queueWait(api, cred, ask, f.queue, signal, deadline, SITES_qoder))) {
+      if (!(await queueWait(api, cred, ask, f.queue, signal, deadline, site))) {
         checkAbort(signal)
         return errorResponse(f)
       }
@@ -1822,6 +1835,6 @@ return {
   dispose() { listings.clear(); spent.clear(); TASKS.clear() },
   _internal: { cosyHeaders, userBlob, machineOS, encodeBody, decodeBody, segmentEncode, swapThirds,
     qoderBody, qoderMessages, cacheMarked, sessionOf, taskOf, failure, errorResponse,
-    parseUsage, modelInfo, typedUnions, events, QUEUE, SITES_qoder },
+    parseUsage, modelInfo, typedUnions, events, QUEUE, SITES, site },
 }
 }

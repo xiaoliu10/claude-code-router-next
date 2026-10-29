@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { QoderAuthService } from "../src/auth-service";
 import type { PluginHostCapabilities } from "../src/core-types";
-import { QODER_CHAT, QODER_MARKER, QODER_PROVIDER } from "../src/protocol";
+import { QODER_CHAT, QODER_MARKER, QODER_PROVIDER, QODER_SITES, type QoderSiteId } from "../src/protocol";
 import type { QoderCredential, QoderEngine } from "../src/vendor/engine.mjs";
 
 const PAT = "pt-fixture-token";
@@ -34,7 +34,7 @@ function fakeEngine(over: Partial<QoderEngine> = {}): QoderEngine & {
   return engine as any;
 }
 
-function fixture(engine = fakeEngine()) {
+function fixture(engine = fakeEngine(), site?: QoderSiteId) {
   const root = mkdtempSync(join(tmpdir(), "qoder-fixture-"));
   const configDir = join(root, "ccr");
   mkdirSync(configDir, { mode: 0o700 });
@@ -48,10 +48,11 @@ function fixture(engine = fakeEngine()) {
     reloadRuntime: vi.fn(async () => {}),
     getDirectDispatcher: () => direct, getSubscriptionDispatcher: () => subscription,
   };
-  const service = new QoderAuthService({ host, engine });
+  const service = new QoderAuthService({ host, engine, site });
   return {
     root, configDir, host, engine, service,
     config: () => config,
+    providerEntry: (name: string) => config.Providers.find((p: any) => p?.name === name),
     managed: () => config.Providers.find((p: any) => p?.name === QODER_PROVIDER),
     file: service.file,
     cleanup: async () => { await service.disconnect().catch(() => {}); rmSync(root, { recursive: true, force: true }); },
@@ -59,7 +60,7 @@ function fixture(engine = fakeEngine()) {
 }
 
 const fixtures: ReturnType<typeof fixture>[] = [];
-const make = (engine?: QoderEngine) => { const f = fixture(engine as any); fixtures.push(f); return f; };
+const make = (engine?: QoderEngine, site?: QoderSiteId) => { const f = fixture(engine as any, site); fixtures.push(f); return f; };
 afterEach(async () => { for (const f of fixtures.splice(0)) await f.cleanup(); });
 
 describe("QoderAuthService isolated PAT lifecycle", () => {
@@ -400,5 +401,109 @@ describe("QoderAuthService isolated PAT lifecycle", () => {
     await expect(f.service.connectPAT(PAT)).rejects.toMatchObject({ code: "qoder_raw_config_required" });
     expect(existsSync(f.file)).toBe(false);
     expect(f.host.readConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("QoderAuthService Qoder CN site", () => {
+  const cnSite = QODER_SITES[1];
+
+  it("writes the CN credential file and CN provider entry, and removes only its own", async () => {
+    const f = make(undefined, "qoder-cn");
+    expect(f.service.site.id).toBe("qoder-cn");
+    expect(f.file.endsWith("qoder-cn-credentials.json")).toBe(true);
+    await f.service.connectPAT(PAT);
+    const managed = f.providerEntry("qoder-cn-subscription");
+    expect(managed).toMatchObject({ qoder_managed: true, api_key: "ccr-managed-qoder-cn",
+      api_base_url: cnSite.chatUrl, enabled: true, models: [] });
+    expect(managed.transformer.use).toEqual(["qoder-cn"]);
+    // the international managed entry is never created here
+    expect(f.providerEntry(QODER_PROVIDER)).toBeUndefined();
+    expect(existsSync(join(f.configDir, "qoder-credentials.json"))).toBe(false);
+    expect((await f.service.getStatus()).providerName).toBe("qoder-cn-subscription");
+    await f.service.disconnect();
+    expect(f.providerEntry("qoder-cn-subscription")).toBeUndefined();
+    expect(f.config().Providers).toHaveLength(1);
+  });
+
+  it("keeps both managed entries under concurrent whole-config writes from the two services", async () => {
+    const f = make();
+    await f.service.connectPAT(PAT);
+    const cn = new QoderAuthService({ host: f.host, engine: f.engine, site: "qoder-cn" });
+    await cn.connectPAT(PAT);
+    await f.service.syncModels();
+    await cn.syncModels();
+    // Regression guard (NOT a race repro): the actual interleaving that loses
+    // an entry needs two browser tabs driving both services at once, which a
+    // single-threaded unit test cannot schedule deterministically. What this
+    // pins is the invariant the shared serializeQoderConfigWrite queue exists
+    // to preserve: whichever order the writers land in, every config they
+    // produce still lists BOTH managed providers.
+    const settle = f.host.writeConfig as any;
+    const observed: string[][] = [];
+    f.host.writeConfig = vi.fn(async (cfg: any) => {
+      observed.push((cfg.Providers ?? []).map((p: any) => p?.name).filter(Boolean));
+      await new Promise(r => setTimeout(r, 5)); // widen any interleave window
+      await settle(cfg);
+    });
+    await Promise.all([
+      f.service.setModelHidden("claude-fast", true),
+      cn.setModelHidden("qoder-max", true),
+      f.service.syncModels(),
+      cn.syncModels(),
+    ]);
+    // every intermediate write already carried both entries
+    for (const snapshot of observed) {
+      expect(snapshot).toContain(QODER_PROVIDER);
+      expect(snapshot).toContain("qoder-cn-subscription");
+    }
+    expect(f.providerEntry(QODER_PROVIDER)).toBeTruthy();
+    expect(f.providerEntry("qoder-cn-subscription")).toBeTruthy();
+    expect(existsSync(join(f.configDir, "qoder-credentials.json"))).toBe(true);
+    expect(existsSync(join(f.configDir, "qoder-cn-credentials.json"))).toBe(true);
+    expect((await f.service.getStatus()).status).toBe("connected");
+    expect((await cn.getStatus()).status).toBe("connected");
+  });
+
+  it("coexists with the international service in one config, each with its own file", async () => {
+    const f = make();
+    const cn = new QoderAuthService({ host: f.host, engine: f.engine, site: "qoder-cn" });
+    await f.service.connectPAT(PAT);
+    await cn.connectPAT(PAT);
+    expect(existsSync(join(f.configDir, "qoder-credentials.json"))).toBe(true);
+    expect(existsSync(join(f.configDir, "qoder-cn-credentials.json"))).toBe(true);
+    expect(f.providerEntry(QODER_PROVIDER)).toMatchObject({ api_key: QODER_MARKER, api_base_url: QODER_CHAT });
+    expect(f.providerEntry("qoder-cn-subscription")).toMatchObject({ api_key: "ccr-managed-qoder-cn", api_base_url: cnSite.chatUrl });
+    // the CN service only owns the CN file: it reports not_connected for itself
+    expect((await cn.getStatus()).status).toBe("connected");
+    await cn.disconnect();
+    expect(f.providerEntry("qoder-cn-subscription")).toBeUndefined();
+    expect(f.providerEntry(QODER_PROVIDER)).toBeTruthy();
+    expect(existsSync(join(f.configDir, "qoder-credentials.json"))).toBe(true);
+    expect((await f.service.getStatus()).status).toBe("connected");
+  });
+
+  it("builds its engine for the CN site and the intl default for the intl service", async () => {
+    const f = make();
+    const captured: any[] = [];
+    vi.resetModules();
+    vi.doMock("../src/vendor/engine.mjs", () => ({
+      createQoderEngine: (options: any) => { captured.push(options); return fakeEngine(); },
+    }));
+    try {
+      const { QoderAuthService: FreshService } = await import("../src/auth-service");
+      const cn = new FreshService({ host: f.host, site: "qoder-cn" });
+      expect(captured.at(-1)).toMatchObject({ site: "qoder-cn" });
+      expect(cn.file.endsWith("qoder-cn-credentials.json")).toBe(true);
+      await cn.connectPAT(PAT);
+      expect(f.providerEntry("qoder-cn-subscription")).toBeTruthy();
+      await cn.disconnect();
+
+      const intl = new FreshService({ host: f.host });
+      expect(captured.at(-1)).toMatchObject({ site: "qoder" });
+      expect(intl.file.endsWith("qoder-credentials.json")).toBe(true);
+    } finally {
+      vi.doUnmock("../src/vendor/engine.mjs");
+      vi.resetModules();
+    }
   });
 });

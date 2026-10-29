@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { QoderAuthService } from "./auth-service";
-import { validPAT } from "./protocol";
+import { qoderSite, validPAT, type QoderSiteId } from "./protocol";
 
 /** Socket identity wins over req.ip (which may honor X-Forwarded-For). */
 export function assertLocalQoderRequest(req: any, app: Pick<FastifyInstance, "server">): void {
@@ -19,7 +19,14 @@ export function assertLocalQoderRequest(req: any, app: Pick<FastifyInstance, "se
   }
 }
 
-export function registerQoderAdminRoutes(app: FastifyInstance, service: QoderAuthService): void {
+/**
+ * Admin surface of ONE site: identical handlers and safe codes, registered
+ * under that site's route base (`/api/qoder` or `/api/qoder/cn`), each with
+ * the same loopback-only guard. The codes are the shared taxonomy, so the
+ * prefix never changes them.
+ */
+export function registerQoderAdminRoutes(app: FastifyInstance, service: QoderAuthService, site: QoderSiteId = "qoder"): void {
+  const routeBase = qoderSite(site).routeBase;
   const routes: Array<["GET" | "POST", string, (body: any) => Promise<any>]> = [
     ["GET", "status", () => service.getStatus()],
     ["POST", "connect", body => {
@@ -36,7 +43,7 @@ export function registerQoderAdminRoutes(app: FastifyInstance, service: QoderAut
     ["POST", "disconnect", () => service.disconnect()],
   ];
   const safe = new Set(["qoder_unauthorized", "qoder_pat_invalid", "qoder_already_connected", "qoder_not_connected", "qoder_reauth_required", "qoder_persist_failed", "qoder_config_write_failed", "qoder_provider_name_conflict", "qoder_credential_invalid", "qoder_credential_unreadable", "qoder_raw_config_required", "qoder_proxy_invalid", "qoder_upstream_error", "qoder_rate_limited", "qoder_request_failed", "qoder_model_unknown"]);
-  for (const [method, path, action] of routes) app.route({ method, url: `/api/qoder/${path}`, handler: async (req, reply) => {
+  for (const [method, path, action] of routes) app.route({ method, url: `${routeBase}/${path}`, handler: async (req, reply) => {
     try { assertLocalQoderRequest(req, app); return await action(req.body); }
     catch (e: any) {
       const unauthorized = e?.statusCode === 403;

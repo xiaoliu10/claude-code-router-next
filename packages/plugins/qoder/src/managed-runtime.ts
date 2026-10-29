@@ -1,6 +1,6 @@
 import type { ManagedRuntime, PluginClassifiedError, PluginHostCapabilities } from "./core-types";
 import type { QoderAuthService } from "./auth-service";
-import { QODER_CHAT, classifyQoderError, isQoderErrorEnvelope, isQoderManaged, qoderError } from "./protocol";
+import { classifyQoderError, isQoderErrorEnvelope, isQoderManaged, qoderError, qoderSite, type QoderSiteId } from "./protocol";
 
 /**
  * The engine folds every upstream failure into an errorResponse JSON whose
@@ -37,12 +37,14 @@ function streamError(error: unknown, aborted: boolean): Error {
   return qoderError("qoder_upstream_error", 502);
 }
 
-export function createQoderManagedRuntime(service: QoderAuthService, host: PluginHostCapabilities, timeoutMs = 600_000): ManagedRuntime {
+export function createQoderManagedRuntime(service: QoderAuthService, host: PluginHostCapabilities, site: QoderSiteId = "qoder", timeoutMs = 600_000): ManagedRuntime {
+  const managedBy = qoderSite(site);
   return {
-    name: "qoder", isManaged: isQoderManaged, suppressDebugLog: true,
+    // Name = site id: the core keys runtimes (and 401 bookkeeping) by it.
+    name: managedBy.id, isManaged: (provider: any) => isQoderManaged(provider, managedBy.id), suppressDebugLog: true,
     ensureUsable: () => service.ensureUsable(),
     lockUpstream: async config => {
-      config.url = QODER_CHAT; config.redirect = "error";
+      config.url = managedBy.chatUrl; config.redirect = "error";
       config.dispatcher = host.getSubscriptionDispatcher?.() ?? host.getDirectDispatcher();
     },
     // COSY signing happens inside the vendored engine's chat(); the core's
