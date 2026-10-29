@@ -1,0 +1,6 @@
+{
+  "name": "qoder",
+  "version": "0.1.0",
+  "coreApi": "1",
+  "description": "Qoder subscription provider (qoder.com and qoder.cn): Personal Access Token sign-in, fixed chat upstream, model management and quota."
+}

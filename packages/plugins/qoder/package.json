@@ -1,0 +1,32 @@
+{
+  "name": "@wengine-ai/ccr-provider-qoder",
+  "version": "0.1.0",
+  "description": "Qoder subscription provider (qoder.com and qoder.cn): Personal Access Token sign-in, fixed agent_chat_generation upstream, model management and usage.",
+  "type": "module",
+  "main": "dist/plugin.js",
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "claude-code-router",
+    "qoder",
+    "provider-plugin",
+    "ccr-provider-plugin"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.15",
+    "esbuild": "^0.25.1",
+    "fastify": "^5.4.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.2",
+    "vitest": "^4.1.9"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/*.json",
+    "dist/*.md"
+  ]
+}
