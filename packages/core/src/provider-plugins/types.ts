@@ -62,6 +62,32 @@ export interface PluginDispatchInput {
 }
 
 /**
+ * Outcome of a level-1 account-state check.
+ *
+ * `available: false` parks the provider without a network call; `parkedUntil`
+ * lets the plugin tell the core when the account frees up (e.g. a quota reset
+ * epoch), so the probe does not re-check before then.
+ */
+export interface ManagedProbeVerdict {
+  available: boolean;
+  /** Epoch ms after which the account may be usable again. */
+  parkedUntil?: number;
+  /** Stable reason used for logging only — never shown to a client. */
+  reason?: string;
+}
+
+/** Input for a runtime-owned liveness probe. */
+export interface ManagedProbeInput {
+  /** One ordinary core dispatch attempt (same seam as `PluginDispatchInput.attempt`). */
+  attempt(): Promise<Response>;
+  /** Model to probe with (the first circuit-open model of the provider). */
+  model: string;
+  provider: LLMProvider;
+  /** Per-attempt config; the core sets `TIMEOUT` so a probe cannot outlive its budget. */
+  config: any;
+}
+
+/**
  * Managed-subscription semantics for one provider family. Everything the data
  * plane needs to talk to a subscription upstream without the core knowing it:
  * fixed upstream, token injection, error taxonomy, cooling circuit breaker.
@@ -114,6 +140,36 @@ export interface ManagedRuntime {
    * hard attempt bound and must never swallow client aborts.
    */
   dispatchRequest?(input: PluginDispatchInput): Promise<Response>;
+  /**
+   * Cheap account-state check used by the background recovery probe.
+   *
+   * Two-level probing exists because account state and reachability fail
+   * independently: a parked/over-quota account must NOT spend a network call
+   * (the Gemini lesson), while a healthy-but-unreachable account must not be
+   * restored to the model list on the strength of its state alone. The core
+   * calls this FIRST and only issues the (expensive) real request when it
+   * resolves.
+   *
+   * Resolve to use the `available` hint semantics below; throw a classified
+   * error (e.g. `*_account_cooling`) to report the account as unusable. When
+   * absent, the core falls back to `ensureUsable()` — which is the same check
+   * every real request already performs — so plugins that only implement the
+   * circuit breaker still work.
+   */
+  probeAccountState?(): Promise<ManagedProbeVerdict>;
+  /**
+   * Optional runtime-owned liveness probe (level 2).
+   *
+   * Called only after `probeAccountState`/`ensureUsable` reported the account as
+   * usable. Implementations should make the cheapest request that still proves
+   * the upstream answers for THIS account (a quota/status endpoint is ideal,
+   * otherwise a 1-token chat). Must honour the supplied signal/timeout and must
+   * not persist cooldowns that a probe is not allowed to set.
+   *
+   * When absent the core performs a generic 1-token request through
+   * `dispatchRequest` (see `PluginDispatchInput`).
+   */
+  probeLiveness?(input: ManagedProbeInput): Promise<Response>;
   /**
    * Opt-in 401 handling: when set, the core performs ONE forced refresh and
    * re-dispatch on 401 before classifying. `refresh` must persist rotated

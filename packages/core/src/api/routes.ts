@@ -7,6 +7,7 @@ import {
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
+import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
 import { type PluginRegistry, pluginErrorFrom } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "./plugin-request-state";
 import { pluginResponseError } from "./plugin-response-error";
@@ -518,7 +519,23 @@ async function validateStreamingResponse(
     },
   });
 
-  return new Response(remainingStream, {
+  // An HTTP 200 answer that ends without opening any content block is an upstream
+  // failure, not a successful empty turn. Decide it HERE, before the caller
+  // records a success: throwing sends this request into the same-model retry and
+  // then the fallback chain instead of forwarding "no response" and keeping the
+  // unhealthy model in rotation. A healthy answer is released as soon as its
+  // first content block arrives (with a hard byte and time ceiling), so this
+  // never delays or buffers a real stream.
+  const probe = await probeAnswer(remainingStream);
+  if (probe.verdict === "empty") {
+    throw createApiError(
+      `Provider ${providerName} returned an empty answer (200 with no content blocks)`,
+      400,
+      "provider_response_error"
+    );
+  }
+
+  return new Response(rebuildAnswerStream(probe.chunks, probe.rest), {
     headers: finalResponse.headers,
     status: finalResponse.status,
     statusText: finalResponse.statusText,

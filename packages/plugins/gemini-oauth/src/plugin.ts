@@ -27,6 +27,7 @@ import {
   GEMINI_OAUTH_DATA_PLANE,
   GEMINI_OAUTH_SSE_PATH,
   classifyGeminiOauthError,
+  fetchAvailableModels,
   geminiOauthError,
   isGeminiOauthRuntime,
   protectGeminiOauthConfig,
@@ -92,6 +93,54 @@ async function activate(ctx: PluginContext): Promise<void> {
           message: "Gemini OAuth 账号处于冷却期（配额/验证/风控拦截），请稍后再试或重新授权。",
           httpStatus: 429,
           retryable: false,
+        });
+      }
+    },
+
+    /**
+     * Level 1 of the background recovery probe: skip the network call entirely
+     * for a parked account (over quota / verification / risk-blocked). Testing
+     * reachability for an account that cannot answer wastes calls and risks a
+     * longer cooldown.
+     */
+    probeAccountState: async () => {
+      const svc = requireService();
+      if (!(await svc.isAccountCooling?.())) return { available: true };
+      let parkedUntil: number | undefined;
+      try {
+        const status: any = await svc.getStatus?.();
+        const candidate = status?.cooldownUntil ?? status?.cooldown?.until;
+        if (typeof candidate === "number" && candidate > Date.now()) parkedUntil = candidate;
+      } catch {
+        // Status is best-effort; parking without an epoch is still correct.
+      }
+      return { available: false, reason: "account_cooling", parkedUntil };
+    },
+
+    /**
+     * Level 2: the account state says "usable", but that says nothing about the
+     * network or the upstream. Make a real authenticated call to the model-list
+     * endpoint: it exercises token → upstream → response and is the cheapest such
+     * round trip (no chat quota).
+     *
+     * Deliberately NOT `getAccessToken()`: that returns the CACHED token when warm,
+     * so it would report healthy even with the network completely down — a false
+     * positive that would put a dead account back in the model list.
+     */
+    probeLiveness: async ({ config }) => {
+      const svc = requireService();
+      try {
+        const token = await svc.getAccessToken();
+        const project = await svc.getProject();
+        const models = await fetchAvailableModels(token, project, "");
+        return new Response(JSON.stringify({ ok: true, count: models.length }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      } catch (error: any) {
+        return new Response(JSON.stringify({ error: error?.code ?? "probe_failed" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
         });
       }
     },

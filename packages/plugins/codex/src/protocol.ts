@@ -761,4 +761,42 @@ export interface CodexServiceLike {
   noteRateLimits(limits: QuotaCodexRateLimits): Promise<void>;
   /** Latest stored rate-limit observation, if any. */
   getRateLimits(): Promise<QuotaCodexRateLimits | null>;
+  /** Account status snapshot (used by the recovery probe to report the parked
+   *  window). Optional so older hosts keep working. */
+  getStatus?(): Promise<any>;
+  /** Remote usage/windows — the cheapest authenticated liveness check. Optional
+   *  so older hosts keep working. */
+  getUsage?(): Promise<any>;
+}
+
+/**
+ * True when a completed Responses turn actually carries output.
+ *
+ * Judged on the whole `output` array (not on text) so tool-only, reasoning-only
+ * and refusal turns all count as real answers: they each contribute an output
+ * item. An empty array is the "nothing happened" turn this check exists for.
+ */
+export function responseHasOutput(response: any): boolean {
+  const output = response?.output;
+  if (Array.isArray(output) && output.length > 0) return true;
+  // Some upstreams report the answer only through counts.
+  const usage = response?.usage;
+  return typeof usage?.output_tokens === "number" && usage.output_tokens > 0;
+}
+
+/**
+ * The upstream completed a turn without producing anything.
+ *
+ * Retryable on purpose: an empty turn is usually transient (upstream hiccup or a
+ * model that dropped the answer), so the value is in letting the generic
+ * same-model retry and fallback chain run instead of handing the client a 200
+ * with no content.
+ */
+export function codexEmptyAnswerError(): Error {
+  return codexError({
+    code: "codex_upstream_error",
+    message: "Codex returned an empty answer (completed with no output).",
+    httpStatus: 502,
+    retryable: true,
+  });
 }
