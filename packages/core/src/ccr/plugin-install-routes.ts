@@ -22,6 +22,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   NPM_SPEC_PATTERN,
+  PLUGIN_NAME_PATTERN,
   PluginInstallError,
   installPluginFromNpm,
   readPluginRecords,
@@ -45,6 +46,17 @@ export interface CatalogEntry {
   version: string;
   installed: boolean;
   installedVersion: string | null;
+  /**
+   * Present only when `installed` and the versions differ: the client shows an
+   * update affordance for exactly these entries. Compares the npm `version`
+   * against the installed manifest version, so a downgrade is also surfaced
+   * rather than silently hidden.
+   */
+  updateAvailable?: boolean;
+  /** True for a plugin installed locally that npm search did not return (unlisted,
+   *  renamed, or an offline/local-only install). No npm version is known, so the
+   *  row shows the installed version without an update affordance. */
+  localOnly?: boolean;
 }
 
 export interface CatalogResult {
@@ -136,6 +148,10 @@ export async function buildPluginCatalog(
   );
   // Installed manifest version comes from the plugin payload, not npm.
   const installedVersion = (name: string): string | null => {
+    // The same allowlist the CLI listing helper applies before reading a
+    // record's directory: a hand-edited plugins.json entry like "../x" would
+    // otherwise reach a filesystem read with a traversal-shaped name.
+    if (!PLUGIN_NAME_PATTERN.test(name)) return null;
     try {
       const raw = JSON.parse(
         readFileSync(join(configDir, "plugins", name, "plugin.json"), "utf8")
@@ -150,12 +166,62 @@ export async function buildPluginCatalog(
     .map((entry) => {
       const record = recordByName.get(entry.name) ?? recordBySource.get(entry.name);
       const installed = record !== undefined || existsSync(join(configDir, "plugins", entry.name));
+      const manifestVersion = installed ? installedVersion(record ? record.name : entry.name) : null;
       return {
         ...entry,
         installed,
-        installedVersion: installed ? installedVersion(record ? record.name : entry.name) : null,
+        installedVersion: manifestVersion,
+        // Update affordance when the installed manifest version differs from
+        // the npm version. String inequality is deliberate: semver parsing here
+        // would be a second implementation of version ordering, and any
+        // difference — upgrade OR downgrade — is exactly what the client needs
+        // to surface.
+        ...(installed && manifestVersion !== null && manifestVersion !== entry.version
+          ? { updateAvailable: true }
+          : {}),
       };
     });
+  // Locally installed plugins that npm search did not return (unlisted,
+  // renamed, or local-only installs) still belong in the list: the client
+  // shows them as installed rows, without an update affordance, instead of
+  // making them invisible just because the registry does not know them.
+  //
+  // Two sources, because a local install (`ccr plugin add /path` or a .tgz)
+  // records no npm `source`: those are enumerated by manifest name, while
+  // npm-named-but-unlisted packages are keyed by their recorded source.
+  const listedNames = new Set(plugins.map((p) => p.name));
+  // A record whose dir is already covered above (its npm source matched a
+  // listed entry) must not be re-added by its manifest name below — that is
+  // how "codex" would otherwise appear twice next to its own npm-named row.
+  const coveredDirs = new Set<string>();
+  const localCandidates = new Map<string, string>();
+  for (const [npmName, record] of recordBySource) {
+    // Track the dir even when the npm name is already listed: the record's
+    // manifest name must not be re-added below as a separate localOnly row.
+    coveredDirs.add(record.name);
+    if (listedNames.has(npmName)) continue;
+    localCandidates.set(npmName, record.name);
+  }
+  for (const record of records) {
+    if (listedNames.has(record.name)) continue;
+    if (coveredDirs.has(record.name)) continue;
+    localCandidates.set(record.name, record.name);
+  }
+  for (const [displayName, dirName] of localCandidates) {
+    if (!PLUGIN_NAME_PATTERN.test(dirName)) continue;
+    if (!existsSync(join(configDir, "plugins", dirName))) continue;
+    const manifestVersion = installedVersion(dirName);
+    if (manifestVersion === null) continue;
+    plugins.push({
+      name: displayName,
+      description: "",
+      version: manifestVersion,
+      installed: true,
+      installedVersion: manifestVersion,
+      localOnly: true,
+    });
+  }
+  plugins.sort((a, b) => a.name.localeCompare(b.name));
   return { ok: true, plugins };
 }
 
