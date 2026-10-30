@@ -105,12 +105,18 @@ it("real createCcrServer: tarball activation, admin auth/guards, both endpoint t
             expect(result.body).toContain("codex_overloaded");
             expect(result.body).not.toContain("fixture private upstream detail");
           } else {
-            expect(result.statusCode, result.body).toBe(200);
             if (endpoint === "/v1/messages") {
-              // Known CORE double-conversion defect; not a successful semantic turn.
+              // Known CORE double-conversion defect: this path produces an empty
+              // `output`. An empty turn is now a reported failure rather than a
+              // silent 200, so the request must surface an error instead of
+              // handing the client nothing.
               expect(result.headers["x-codex-on-messages"]).toBe("true");
-              expect(result.body).toContain('"output":[]');
-            } else expect(result.body).toContain(scenario === "tool" ? "weather" : "fixture healthy");
+              expect(result.body).toContain("empty answer");
+              expect(result.statusCode).toBeGreaterThanOrEqual(400);
+            } else {
+              expect(result.statusCode, result.body).toBe(200);
+              expect(result.body).toContain(scenario === "tool" ? "weather" : "fixture healthy");
+            }
             const body = JSON.parse(calls.at(-1).init.body);
             expect(body.store).toBe(false); expect(body.stream).toBe(true);
             if (scenario === "tool") expect(body.tools[0].name).toBe("weather");

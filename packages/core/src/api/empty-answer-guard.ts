@@ -61,19 +61,30 @@ function chatStreamHasContent(text: string): boolean {
 const TERMINAL_MARKERS = ["message_stop", "response.completed", "response.incomplete", "[DONE]"];
 
 /**
- * A Responses-API stream is out of scope for the empty-answer judgement.
+ * Events carrying real output on the OpenAI Responses wire format.
  *
- * Detected from ANY Responses event name or type, not just the lifecycle events:
- * a turn may carry only `response.output_text.delta` before `[DONE]`, and
- * mistaking that for an Anthropic stream would classify a real answer as empty.
- *
- * This only matters for streams CCR forwards WITHOUT the Responses→Anthropic
- * conversion (native `/v1/responses` clients and the plugin tests that exercise
- * that bridge directly). A converted turn reaches here as ordinary
- * `message_start` / `content_block_*` events — which is why real Codex traffic
- * through `/v1/messages` is still judged normally and its empty answers are
- * still caught.
+ * A Codex client reaches this point as Responses events (the Responses→Anthropic
+ * bridge converts in the other direction), and a Codex turn that "completes" with
+ * no output at all is the exact failure this guard exists to catch, so the format
+ * is judged rather than skipped.
  */
+const RESPONSES_CONTENT_MARKERS = [
+  "response.output_text.delta",
+  "response.output_item.added",
+  "response.output_item.done",
+  "response.function_call_arguments.delta",
+  "response.reasoning_summary_text.delta",
+  "response.reasoning_text.delta",
+];
+
+/**
+ * True when the payload carries a non-empty `response.output` array, which some
+ * upstreams send only on the terminal frame (no deltas at all).
+ */
+function responsesFrameHasOutput(text: string): boolean {
+  return /"output"\s*:\s*\[\s*\{/.test(text);
+}
+
 function isResponsesStream(text: string): boolean {
   return /"type"\s*:\s*"response\.[A-Za-z0-9_.]+"/.test(text) ||
     /(^|\n)\s*(event:\s*)?response\.[A-Za-z0-9_.]+/.test(text);
@@ -90,10 +101,18 @@ export type AnswerVerdict = "content" | "empty" | "pending";
  * across reads, so a marker scan stays correct and cheap on every chunk.
  */
 export function inspectAnswerPrefix(text: string): AnswerVerdict {
-  // Responses-API streams are out of scope (see CONTENT_MARKERS): the core's
-  // Responses→Anthropic bridge may legitimately emit an empty output for tool
-  // turns, so judging them here would turn a known defect into a hard error.
-  if (isResponsesStream(text)) return "pending";
+  if (isResponsesStream(text)) {
+    // Judge Responses traffic on its own markers. A `response.completed` with no
+    // output item is an empty turn, whether the client is Codex or a plain
+    // Anthropic client behind the Responses→Anthropic bridge.
+    if (RESPONSES_CONTENT_MARKERS.some((marker) => text.includes(marker))) return "content";
+    if (responsesFrameHasOutput(text)) return "content";
+    // `response.incomplete` means the answer was cut short — a legitimate
+    // terminal state the client must see, never "empty".
+    if (text.includes("response.incomplete")) return "pending";
+    if (text.includes("response.completed")) return "empty";
+    return "pending";
+  }
 
   let sawContent = false;
   let sawTerminal = false;
@@ -199,12 +218,6 @@ export async function probeAnswer(
       if (verdict === "empty") {
         await reader.cancel().catch(() => {});
         return finish("empty", null);
-      }
-      // A Responses-API stream is never judged (see CONTENT_MARKERS): release it
-      // immediately instead of holding it to the byte/time budget, so proxied
-      // Responses traffic pays no latency for a check that cannot apply to it.
-      if (isResponsesStream(text)) {
-        return finish("pending", tail(reader));
       }
       if (bytes >= limitBytes) return finish("pending", tail(reader));
     }
