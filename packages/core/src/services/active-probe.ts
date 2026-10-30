@@ -387,6 +387,10 @@ export class ActiveProbeService {
   private resolveProxyUrl?: (provider: LLMProvider) => string | undefined;
   private logger?: any;
   private getConfig?: (key: string) => any;
+  /** Resolves the installed plugin runtime that owns a managed provider. */
+  private resolveManagedRuntime?: (provider: LLMProvider) => any;
+  /** Periodic timer for managed-subscription recovery probing. */
+  private managedProbeTimer?: NodeJS.Timeout;
   private running = false;
   // Latest reachability probe telemetry per provider. In-memory only: latency
   // is a transient signal and stale values must not survive a restart.
@@ -397,13 +401,15 @@ export class ActiveProbeService {
     config?: ActiveProbeConfig,
     resolveProxyUrl?: (provider: LLMProvider) => string | undefined,
     logger?: any,
-    getConfig?: (key: string) => any
+    getConfig?: (key: string) => any,
+    resolveManagedRuntime?: (provider: LLMProvider) => any
   ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.getProviders = getProviders;
     this.resolveProxyUrl = resolveProxyUrl;
     this.logger = logger;
     this.getConfig = getConfig;
+    this.resolveManagedRuntime = resolveManagedRuntime;
   }
 
   /**
@@ -505,6 +511,13 @@ export class ActiveProbeService {
         () => this.runRateLimitProbe(),
         2 * 60 * 1000
       );
+
+      // Managed (subscription) recovery probe — the only background path that can
+      // pull a plugin-owned provider back out of the fail pool.
+      this.managedProbeTimer = setInterval(
+        () => this.runManagedRecoveryProbe(),
+        this.config.quotaProbeIntervalMinutes * 60 * 1000
+      );
     }
 
     // Periodic scheduled wake-up check every minute
@@ -530,6 +543,11 @@ export class ActiveProbeService {
     if (this.healthProbeTimer) {
       clearInterval(this.healthProbeTimer);
       this.healthProbeTimer = undefined;
+    }
+
+    if (this.managedProbeTimer) {
+      clearInterval(this.managedProbeTimer);
+      this.managedProbeTimer = undefined;
     }
 
     if (this.rateLimitProbeTimer) {
@@ -767,6 +785,190 @@ export class ActiveProbeService {
    * Rate-limited models are NOT probed by runHealthProbe — they have a separate timer
    * so they can be checked more frequently (every 2 minutes) without affecting normal probes.
    */
+  /**
+   * Recover circuit-open MANAGED (subscription) providers with one real request.
+   *
+   * runHealthProbe deliberately skips managed providers: their credentials are
+   * plugin-owned, so an unauthenticated GET /v1/models would fail for reasons
+   * unrelated to health. The consequence was that a subscription provider whose
+   * circuit opened (exhausted quota, revoked token, upstream outage) had NO
+   * background path back to healthy — it stayed circuit-open and the only way it
+   * ever recovered was a real user request hitting it again, which is exactly the
+   * "keeps failing and keeps being called" behaviour.
+   *
+   * This closes that loop: for each managed provider with a circuit-open model
+   * whose probe interval has elapsed, issue one minimal request through the
+   * plugin's own dispatcher (so token refresh, account rotation and the plugin's
+   * error taxonomy all apply) and restore its models only when the upstream
+   * actually answered.
+   */
+  async runManagedRecoveryProbe(): Promise<void> {
+    const healthStore = getHealthStore();
+    if (!this.resolveManagedRuntime) return;
+
+    const openKeys = healthStore.getFailPoolModels();
+    if (openKeys.length === 0) return;
+
+    // One probe per provider: a subscription shares an account-level limit, so
+    // probing every model separately would burn quota for the same answer.
+    const byProvider = new Map<string, string[]>();
+    for (const key of openKeys) {
+      const [providerName, ...modelParts] = key.split(",");
+      const modelName = modelParts.join(",");
+      if (!providerName || !modelName) continue;
+      const list = byProvider.get(providerName) ?? [];
+      list.push(modelName);
+      byProvider.set(providerName, list);
+    }
+
+    for (const [providerName, modelNames] of byProvider) {
+      const provider = this.getProviders().find(
+        (p) => p?.name === providerName && p.enabled !== false
+      );
+      if (!provider) continue;
+      const runtime = this.resolveManagedRuntime(provider);
+      if (!runtime) continue;
+
+      const model = modelNames[0]!;
+      const state = healthStore.getState(providerName, model);
+      if (!state || state.status !== "open") continue;
+      // An active quota lock belongs to the plugin's cooldown machinery;
+      // probing it would defeat the lock.
+      if (state.rateLimitUntil && Date.now() < state.rateLimitUntil) continue;
+      // Same interval gate as every other probe, so a permanently dead account
+      // is never hammered.
+      const lastSeen = Math.max(state.lastFailureTime ?? 0, state.lastProbeTime ?? 0);
+      if (Date.now() - lastSeen < this.config.quotaProbeIntervalMinutes * 60_000) continue;
+
+      // Level 1 — account state. A parked or over-quota account must not spend a
+      // network call, and network health says nothing about a parked account, so
+      // this runs first and vetoes the expensive check.
+      const accountUsable = await this.probeManagedAccountState(providerName, runtime, provider, model, modelNames, healthStore);
+      if (!accountUsable) continue;
+
+      // Level 2 — liveness. Account state alone is not proof: the network, proxy
+      // or upstream may be down while the account is perfectly fine.
+      await this.probeManagedLiveness(providerName, runtime, provider, model, modelNames, healthStore);
+    }
+  }
+
+  /**
+   * Level 1 of the managed recovery probe: is the ACCOUNT usable at all?
+   *
+   * Returns false when the account is parked (quota exhausted / verification
+   * needed / risk-blocked), in which case the caller must skip the liveness call
+   * entirely — testing the network for an account that cannot answer is pure
+   * waste and, for subscription providers, a rate-limit risk.
+   */
+  private async probeManagedAccountState(
+    providerName: string,
+    runtime: any,
+    provider: LLMProvider,
+    model: string,
+    modelNames: string[],
+    healthStore: any
+  ): Promise<boolean> {
+    try {
+      if (typeof runtime.probeAccountState === "function") {
+        const verdict = await runtime.probeAccountState();
+        if (verdict && verdict.available === false) {
+          healthStore.recordProbeAttempt?.(providerName, model);
+          // Honour the reset epoch the plugin reported, so the next check waits
+          // for the window instead of polling a known-parked account.
+          if (typeof verdict.parkedUntil === "number" && verdict.parkedUntil > Date.now()) {
+            healthStore.markParkedUntil?.(providerName, model, verdict.parkedUntil);
+          }
+          this.logger?.debug?.(
+            `Managed probe: ${providerName} account parked (${verdict.reason ?? "unavailable"}), skipping liveness`
+          );
+          return false;
+        }
+        return true;
+      }
+      // Fallback: ensureUsable() is exactly the circuit breaker every real
+      // request runs first, so plugins that only implement it behave the same.
+      if (typeof runtime.ensureUsable === "function") {
+        await runtime.ensureUsable();
+      }
+      return true;
+    } catch (error: any) {
+      healthStore.recordProbeAttempt?.(providerName, model);
+      this.logger?.debug?.(
+        `Managed probe: ${providerName} account unusable (${error?.code || error?.message || error}), skipping liveness`
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Level 2 of the managed recovery probe: does the upstream actually answer?
+   *
+   * Uses a runtime-owned `probeLiveness` when the plugin provides one (a quota or
+   * status endpoint costs no chat quota), otherwise performs a generic 1-token
+   * request through the runtime's dispatcher. The dispatcher input carries a real
+   * `attempt()` and a per-attempt `config` — both are REQUIRED by
+   * `PluginDispatchInput`, and omitting them made wrappers fail unconditionally.
+   */
+  private async probeManagedLiveness(
+    providerName: string,
+    runtime: any,
+    provider: LLMProvider,
+    model: string,
+    modelNames: string[],
+    healthStore: any
+  ): Promise<void> {
+    const timeoutMs = this.config.probeTimeoutMs;
+    const requestBody = {
+      model,
+      max_tokens: 1,
+      messages: [{ role: "user", content: "ping" }],
+      stream: false,
+    };
+    // The core attempt performed inside the plugin wrapper. A probe must never
+    // turn into a real user turn, so this stays a single minimal request.
+    const attempt = async () => {
+      const url = (provider as any).baseUrl || (provider as any).api_base_url;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(provider as any).apiKey
+            ? { authorization: `Bearer ${(provider as any).apiKey}` }
+            : {},
+        },
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(timeoutMs),
+      } as any);
+      return res;
+    };
+    const config = { TIMEOUT: timeoutMs };
+
+    try {
+      this.logger?.debug?.(`Managed liveness probe for ${providerName} (${model})`);
+      const response: Response =
+        typeof runtime.probeLiveness === "function"
+          ? await runtime.probeLiveness({ attempt, model, provider, config })
+          : typeof runtime.dispatchRequest === "function"
+            ? await runtime.dispatchRequest({ attempt, requestBody, config, provider })
+            : await attempt();
+
+      if (response?.ok) {
+        for (const m of modelNames) healthStore.recover(providerName, m);
+        this.logger?.info?.(
+          `Managed liveness probe succeeded for ${providerName}, restored ${modelNames.length} model(s)`
+        );
+      } else {
+        healthStore.recordProbeAttempt?.(providerName, model);
+        this.logger?.debug?.(`Managed liveness probe failed for ${providerName}: HTTP ${response?.status}`);
+      }
+    } catch (error: any) {
+      healthStore.recordProbeAttempt?.(providerName, model);
+      this.logger?.debug?.(
+        `Managed liveness probe errored for ${providerName}: ${error?.message || error}`
+      );
+    }
+  }
+
   private async runRateLimitProbe(): Promise<void> {
     const healthStore = getHealthStore();
     const rateLimitedKeys = healthStore.getRateLimitedModels();
@@ -994,10 +1196,11 @@ export function getActiveProbeService(
   config?: ActiveProbeConfig,
   resolveProxyUrl?: (provider: LLMProvider) => string | undefined,
   logger?: any,
-  getConfig?: (key: string) => any
+  getConfig?: (key: string) => any,
+  resolveManagedRuntime?: (provider: LLMProvider) => any
 ): ActiveProbeService {
   if (!activeProbeService) {
-    activeProbeService = new ActiveProbeService(getProviders, config, resolveProxyUrl, logger, getConfig);
+    activeProbeService = new ActiveProbeService(getProviders, config, resolveProxyUrl, logger, getConfig, resolveManagedRuntime);
   }
   return activeProbeService;
 }
@@ -1010,9 +1213,10 @@ export function startActiveProbe(
   config?: ActiveProbeConfig,
   resolveProxyUrl?: (provider: LLMProvider) => string | undefined,
   logger?: any,
-  getConfig?: (key: string) => any
+  getConfig?: (key: string) => any,
+  resolveManagedRuntime?: (provider: LLMProvider) => any
 ): ActiveProbeService {
-  const service = getActiveProbeService(getProviders, config, resolveProxyUrl, logger, getConfig);
+  const service = getActiveProbeService(getProviders, config, resolveProxyUrl, logger, getConfig, resolveManagedRuntime);
   service.start();
   return service;
 }

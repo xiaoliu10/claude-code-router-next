@@ -67,6 +67,22 @@ import AdmZip from "adm-zip";
 import { query as queryUsage, querySummary as queryUsageSummary, clear as clearUsage } from "./usage-store";
 import { listAnthropicCompatibleModels } from "./models";
 
+/**
+ * The model list a client should see: models whose circuit is open are hidden.
+ *
+ * Degradation is provider-agnostic on purpose. Any provider — plain API key,
+ * OAuth subscription, or plugin — books its failures in the shared health pool,
+ * so a single rule hides exhausted quota, revoked credentials and hard upstream
+ * outages alike instead of only the subscription providers that happen to have
+ * their own cooldown surface. The model still routes if a fallback chain or an
+ * explicit request names it; it just stops being offered for new sessions until
+ * the background probe closes its circuit again.
+ */
+function listAvailableModels(config: any) {
+  const health = getHealthStore();
+  return listAnthropicCompatibleModels(config, (provider, model) => health.isAvailable(provider, model));
+}
+
 interface ProviderQuotaUsage {
   provider: string;
   used5h: number;
@@ -170,7 +186,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
   });
 
   _app.get("/v1/models", async () => {
-    const data = listAnthropicCompatibleModels(config);
+    const data = listAvailableModels(config);
     return {
       object: "list",
       data,
@@ -182,7 +198,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
 
   _app.get("/v1/models/:modelId", async (req: any, reply: any) => {
     const modelId = decodeURIComponent(req.params.modelId);
-    const model = listAnthropicCompatibleModels(config).find((item) => item.id === modelId);
+    const model = listAvailableModels(config).find((item) => item.id === modelId);
     if (!model) {
       reply.status(404);
       return {

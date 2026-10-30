@@ -1563,6 +1563,9 @@ export interface GeminiOauthAuthServiceLike {
   forceTokenRefresh?(): Promise<void>;
   /** True while the account is parked by a recorded cooldown. */
   isAccountCooling?(): Promise<boolean>;
+  /** Account status snapshot (used by the recovery probe to report the parked
+   *  window). Optional so older hosts keep working. */
+  getStatus?(): Promise<any>;
 }
 
 let geminiOauthRuntime: { authService?: GeminiOauthAuthServiceLike } | null = null;

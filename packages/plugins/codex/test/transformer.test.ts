@@ -102,6 +102,40 @@ describe("CodexTransformer — response phase, happy path", () => {
     expect(await readAll(out)).toBe(text);
   });
 
+  it("rejects a completed turn that produced no output (success + output 0)", async () => {
+    // The reported symptom: upstream answers 200 and completes with nothing.
+    // Committing it would hand the client an empty turn; it must throw so the
+    // core retries and then falls back.
+    const t = new CodexTransformer({ service: stubService() });
+    const text = sse([
+      { type: "response.created", response: { id: "r", output: [] } },
+      { type: "response.completed", response: { id: "r", output: [], usage: { output_tokens: 0 } } },
+    ]);
+    const out = await t.transformResponseOut(sseResponse(text), {} as any);
+    await expect(readAll(out)).rejects.toMatchObject({ code: "codex_upstream_error" });
+  });
+
+  it("accepts a completed turn whose output sits only on the terminal frame", async () => {
+    // Some upstreams stream no deltas but report the answer in `response.output`.
+    const t = new CodexTransformer({ service: stubService() });
+    const text = sse([
+      { type: "response.created", response: { id: "r", output: [] } },
+      { type: "response.completed", response: { id: "r", output: [{ type: "message", content: [{ type: "output_text", text: "hi" }] }] } },
+    ]) + "data: [DONE]\n\n";
+    const out = await t.transformResponseOut(sseResponse(text), {} as any);
+    expect(await readAll(out)).toBe(text);
+  });
+
+  it("accepts a tool-only completed turn (empty text is legitimate)", async () => {
+    const t = new CodexTransformer({ service: stubService() });
+    const text = sse([
+      { type: "response.function_call_arguments.delta", delta: "{}" },
+      { type: "response.completed", response: { id: "r", output: [{ type: "function_call" }] } },
+    ]) + "data: [DONE]\n\n";
+    const out = await t.transformResponseOut(sseResponse(text), {} as any);
+    expect(await readAll(out)).toBe(text);
+  });
+
   it("leaves a non-stream JSON body untouched", async () => {
     const t = new CodexTransformer({ service: stubService() });
     const body = JSON.stringify({ object: "response", output: [] });

@@ -63,7 +63,40 @@ function createAnthropicModelInfo(id: string, displayName = id): AnthropicModelI
   };
 }
 
-export function listAnthropicCompatibleModels(config: any): AnthropicModelInfo[] {
+/**
+ * Predicate used to hide a provider/model pair from the model list.
+ *
+ * Pairs it returns true for are still routed (fallback, an explicit request for
+ * that exact model) but the client never sees them, so an unhealthy model stops
+ * being picked session after session.
+ */
+export type ModelAvailabilityFilter = (provider: string, model: string) => boolean;
+
+/**
+ * True when the model must be hidden from the list.
+ *
+ * Only `open` (circuit-open) models are hidden: `half-open` is the recovery
+ * state a background probe transitions into, so hiding it would make a
+ * recovering model invisible until it fully closed and then pop it back in.
+ */
+function isHiddenForClient(
+  filter: ModelAvailabilityFilter | undefined,
+  providerName: string,
+  model: string
+): boolean {
+  if (!filter) return false;
+  try {
+    return !filter(providerName, model);
+  } catch {
+    // A broken filter must never break model discovery.
+    return false;
+  }
+}
+
+export function listAnthropicCompatibleModels(
+  config: any,
+  isAvailable?: ModelAvailabilityFilter
+): AnthropicModelInfo[] {
   const models = new Map<string, AnthropicModelInfo>();
   const addModel = (id: string, displayName = id) => {
     if (!id || models.has(id)) return;
@@ -81,8 +114,13 @@ export function listAnthropicCompatibleModels(config: any): AnthropicModelInfo[]
     if (!provider?.name || !Array.isArray(provider.models)) continue;
     for (const model of provider.models) {
       if (typeof model !== "string" || !model) continue;
-      addModel(model, model);
-      addModel(`${provider.name},${model}`, `${provider.name}/${model}`);
+      // Hide the pair (and the provider-qualified alias below) when the health
+      // pool has the model circuit-open. The bare id is kept only if some other
+      // provider still serves it, which the Map-first-wins ordering already
+      // enforces per branch below.
+      const hidden = isHiddenForClient(isAvailable, provider.name, model);
+      if (!hidden) addModel(model, model);
+      if (!hidden) addModel(`${provider.name},${model}`, `${provider.name}/${model}`);
     }
   }
 

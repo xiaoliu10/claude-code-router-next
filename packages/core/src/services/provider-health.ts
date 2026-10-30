@@ -271,6 +271,42 @@ export class ProviderHealthStore {
   }
 
   /**
+   * Stamp a background probe attempt without changing circuit state.
+   *
+   * Recovery probes need this: a failed probe must keep the model circuit-open
+   * but move `lastProbeTime` forward, otherwise the interval gate in
+   * isAvailable()/the probe loop would re-probe on every tick.
+   */
+  recordProbeAttempt(provider: string, model: string): void {
+    if (!this.config.enabled) return;
+    const key = this.getKey(provider, model);
+    if (!key) return;
+    const state = this.states.get(key);
+    if (!state) return;
+    state.lastProbeTime = Date.now();
+  }
+
+  /**
+   * Park a model until the account's own reset epoch.
+   *
+   * A plugin that reports its quota window (e.g. `resets_at`) knows better than
+   * a fixed probe interval when the account can answer again. Setting
+   * `rateLimitUntil` keeps the model hidden from the list AND stops the recovery
+   * probe from spending network calls on a known-parked account.
+   */
+  markParkedUntil(provider: string, model: string, until: number): void {
+    if (!this.config.enabled) return;
+    const key = this.getKey(provider, model);
+    if (!key) return;
+    const state = this.states.get(key);
+    if (!state) return;
+    if (!Number.isFinite(until) || until <= Date.now()) return;
+    // Never shorten an existing lock.
+    if (state.rateLimitUntil && state.rateLimitUntil >= until) return;
+    state.rateLimitUntil = until;
+  }
+
+  /**
    * Get all models in half-open state
    */
   getHalfOpenModels(): string[] {

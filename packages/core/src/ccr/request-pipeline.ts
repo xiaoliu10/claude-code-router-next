@@ -42,6 +42,17 @@ import { apiKeyAuth } from "./auth";
 import { normalizeResponsesBody } from "../api/routes";
 
 /**
+ * Longest `onResponse` waits for the background usage/TTFT readers before it
+ * finalizes the record.
+ *
+ * The readers consume a tee'd branch of the response and normally finish as soon
+ * as the client does, so this bound is not on the happy path — it exists so a
+ * stalled upstream (or a tee branch that never drains) cannot hang the request's
+ * completion hook, which would also leave the usage row forever unrecorded.
+ */
+const USAGE_CAPTURE_DRAIN_MS = 1500;
+
+/**
  * Classify rate-limit responses from any upstream provider. Used to isolate
  * rate-limited models in the health store (time-based auto-recover) instead of
  * applying the generic 3-failure breaker threshold.
@@ -462,6 +473,55 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         req.usageCapturePromise = read(clonedStream);
         return done(null, originalStream)
       }
+      // Streaming request WITHOUT agent tools — the common case (Codex, Pi, any
+      // plain Claude Code turn). No usage reader ran on this path: the agent
+      // branch above owns the only one, so a healthy streamed turn was recorded
+      // with output_tokens 0. That zero is what made working subscription
+      // responses look like empty answers in the usage UI. Read a tee'd branch so
+      // the client still receives an untouched stream, and merge usage in stream
+      // order so the trailing frame (message_delta / response.completed) stays
+      // authoritative over the leading message_start zero.
+      if (payload instanceof ReadableStream) {
+        const [passthroughStream, usageStream] = payload.tee();
+        req.usageCapturePromise = (async () => {
+          const reader = usageStream
+            .pipeThrough(new TextDecoderStream())
+            .pipeThrough(new SSEParserTransform() as any)
+            .getReader();
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const event = (value as any).event;
+              const frdata = (value as any).data;
+              if (event === 'message_start' && frdata?.message?.model) {
+                req.upstreamModel = frdata.message.model;
+              }
+              if (event === 'response.completed' && frdata?.response?.model) {
+                req.upstreamModel = frdata.response.model;
+              }
+              const frame = frdata?.usage ?? frdata?.response?.usage;
+              if (frame) {
+                const normalized = normalizeUsagePayload(frame);
+                const existing = sessionUsageCache.get(usageCacheKey) || {};
+                // message_start resets the base (it opens a new answer); every
+                // other frame merges, so a trailing real count is never
+                // overwritten by a leading zero.
+                const merged = mergeUsageCapture(existing, normalized, event === 'message_start');
+                sessionUsageCache.put(usageCacheKey, merged);
+              }
+            }
+          } catch (readError: any) {
+            if (readError?.name !== 'AbortError' && readError?.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+              req.log?.warn?.({ phase: 'usage_capture_plain_stream', err: String(readError) });
+            }
+          } finally {
+            reader.releaseLock();
+          }
+        })();
+        return done(null, passthroughStream);
+      }
+
       const nonStreamMeta = extractNonStreamMeta(payload);
       if (nonStreamMeta?.usage) {
         sessionUsageCache.put(usageCacheKey, nonStreamMeta.usage);
@@ -519,12 +579,27 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     releaseRequestLease(req);
     if (!req.pathname?.endsWith("/v1/messages") && !req.pathname?.endsWith("/v1/responses")) return;
     try {
-      if (req.usageCapturePromise) {
-        await req.usageCapturePromise;
-      }
-      if (req.tokenSpeedCapturePromise) {
-        await req.tokenSpeedCapturePromise;
-      }
+      // Bounded drain: the usage/TTFT readers tee the response and normally end
+      // with the client, but an upstream that stops mid-stream would otherwise
+      // block this hook (and the usage record) forever.
+      const drain = async (promise: Promise<any> | undefined) => {
+        if (!promise) return;
+        // Clear the deadline timer when the promise wins: leaving it armed leaks a
+        // timer per request on the happy path.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            promise,
+            new Promise((resolve) => {
+              timer = setTimeout(resolve, USAGE_CAPTURE_DRAIN_MS);
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+      await drain(req.usageCapturePromise);
+      await drain(req.tokenSpeedCapturePromise);
       const usageSessionId = getUsageSessionId(req);
       // Two distinct keys with different jobs:
       // - speedStatsKey: per-request stats-file key. It MUST equal the key the

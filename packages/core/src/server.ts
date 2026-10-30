@@ -417,7 +417,10 @@ class Server {
           probeConfig,
           (provider) => resolveProviderProxyUrl(this.configService, provider),
           this.app.log,
-          (key: string) => this.configService.get(key)
+          (key: string) => this.configService.get(key),
+          // Managed subscriptions are recovered by a real plugin-dispatched
+          // request; the registry is the only place that owns those runtimes.
+          (provider) => this.pluginRegistry?.getManagedRuntimeFor(provider)
         );
       } catch (probeError: any) {
         this.app.log.warn?.(`Failed to start active probe service: ${probeError.message}`);

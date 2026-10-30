@@ -30,7 +30,7 @@
  */
 import { codexFinalizeBody, codexSessionKey } from "./finalize-body";
 import type { CodexRateLimitWindow, CodexRateLimits } from "./protocol-quota";
-import { classifyCodexError, codexError } from "./protocol";
+import { classifyCodexError, codexError, codexEmptyAnswerError, responseHasOutput } from "./protocol";
 import type { CodexServiceLike } from "./protocol";
 import type { PluginClassifiedError, PluginTransformer, PluginTransformerContext, PluginUnifiedChatRequest } from "./core-types";
 
@@ -306,6 +306,9 @@ export class CodexTransformer implements PluginTransformer {
     let committed = false;
     let finished = false;
     let rateLimitsSeen = false;
+    // Set when the upstream emitted any real output. A terminal event without it
+    // is an empty turn, not a successful one.
+    let sawOutput = false;
 
     const handleEvent = async (data: string): Promise<boolean> => {
       // true => commit (stop inspecting)
@@ -366,14 +369,31 @@ export class CodexTransformer implements PluginTransformer {
       }
       // Content-bearing events commit the stream: after this point a failure is
       // the client's problem, not a retry decision.
-      return typeof event?.type === "string" && (
+      if (typeof event?.type === "string" && (
         event.type.startsWith("response.output_text") ||
         event.type.startsWith("response.function_call_arguments") ||
         event.type.startsWith("response.reasoning") ||
-        event.type === "response.output_item.done" ||
-        event.type === "response.completed" ||
-        event.type === "response.incomplete"
-      );
+        event.type === "response.output_item.done"
+      )) {
+        sawOutput = true;
+        return true;
+      }
+      // A `response.completed` only commits the stream if the turn actually
+      // produced output. An empty completed turn is the upstream failure this
+      // transformer has to surface: committing it would hand the client a 200
+      // with nothing in it — the "message sent, nothing happens" symptom.
+      //
+      // `response.incomplete` is deliberately NOT judged: it means the answer was
+      // cut short, which is a legitimate terminal state the client must see.
+      if (event.type === "response.completed") {
+        if (sawOutput || responseHasOutput(event.response)) {
+          sawOutput = true;
+          return true;
+        }
+        throw codexEmptyAnswerError();
+      }
+      if (event.type === "response.incomplete") return true;
+      return false;
     };
 
     const stream = new ReadableStream<Uint8Array>({

@@ -114,6 +114,40 @@ export function createCodexManagedRuntime(options: CodexRuntimeOptions): Managed
       }
     },
 
+    /**
+     * Level 1 of the background recovery probe: report the parked window so the
+     * core skips the network call for an account that cannot answer yet.
+     */
+    probeAccountState: async () => {
+      if (!(await service.isAccountCooling())) return { available: true };
+      // Surface the reset epoch when the status carries one, so the core waits for
+      // the real window instead of re-checking on a fixed interval.
+      let parkedUntil: number | undefined;
+      try {
+        const status: any = await service.getStatus?.();
+        const candidate = status?.cooldownUntil ?? status?.rateLimitCooldownUntil ?? status?.resetsAt;
+        if (typeof candidate === "number" && candidate > Date.now()) parkedUntil = candidate;
+      } catch {
+        // Status is best-effort; parking without an epoch is still correct.
+      }
+      return { available: false, reason: "account_cooling", parkedUntil };
+    },
+
+    /**
+     * Level 2: prove the account is alive AND reachable. `getUsage()` is the
+     * cheapest authenticated call that exercises the same token path as a chat, so
+     * a restored model is one the next real turn can actually use. A null answer
+     * means "could not confirm", which must keep the circuit open rather than
+     * restore a model on a guess.
+     */
+    probeLiveness: async () => {
+      const usage = await service.getUsage?.();
+      return new Response(JSON.stringify(usage ?? null), {
+        status: usage ? 200 : 503,
+        headers: { "content-type": "application/json" },
+      });
+    },
+
     // Pin the upstream: a config-supplied base_url can never win, a redirect
     // away from the fixed origin is an error, and the fixed origin ignores
     // CCR/proxy environment routing.
