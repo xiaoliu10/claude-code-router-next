@@ -1,6 +1,6 @@
 {
   "name": "@wengine-ai/ccr-provider-gemini-oauth",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Gemini OAuth (Antigravity) provider plugin for claude-code-router: transformer, managed runtime, admin routes, config protector and UI card.",
   "type": "module",
   "main": "dist/plugin.js",
