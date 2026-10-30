@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ## [2.3.2418] - 2026-10-29
 
+> 2.3.2417 shipped a bundle built before this change (the npm publish path does not
+> rebuild), so it lacks the fixes below and is deprecated on npm. 2.3.2416 is
+> unaffected — it was built by CI after the fix landed.
+
 ### Fixed
 
 - **Empty answers now retry and fall back instead of being recorded as successes** (#85): an upstream that answered `200` + `end_turn` with an empty `content` array threw nothing, so the fallback chain never ran and the turn was even booked as a provider success — the broken model stayed in rotation for every later request. The response is now probed before `recordSuccess`: a turn that ends without opening a single content block is treated as an upstream failure. The verdict is judged on the whole content set rather than the text, so `tool_use`-only, `stop_sequence` and refusal turns keep flowing; probing is bounded by bytes and a deadline, and the in-flight read is handed to the forwarding stream so a slow-but-alive answer loses no bytes. Chat-completions streams (`choices[].delta`) are recognised too. Codex answers arrive as Responses events after the Anthropic conversion (which legitimately emits an empty output for some tool turns), so the codex transformer now rejects a `response.completed` carrying no output while `response.incomplete` stays a valid terminal state.
@@ -17,6 +21,10 @@ All notable changes to this project will be documented in this file.
 - **空回复现在会重试并降级，不再被记成成功** (#85)：上游返回 `200` + `end_turn` 且 `content` 为空数组时不会抛任何异常，fallback 链因此从不触发，这一回合还被记成 provider 成功——坏模型就留在轮转里，后续每个请求继续打到它。现在在 `recordSuccess` 之前先探测响应：整个回合结束时没有任何 content block，即判定为上游故障。判据看的是整个 content 集合而非 text，因此 `tool_use`-only、`stop_sequence`、refusal 回合照常放行；探测有字节与时间上限，进行中的 read 会交给转发流，慢但仍存活的回答不会丢字节。Chat Completions 格式（`choices[].delta`）也已识别。Codex 的应答经 Anthropic 转换后是 Responses 事件（该桥接对部分 tool 回合本就产出空 output），因此由 codex transformer 拦住不带输出的 `response.completed`，而 `response.incomplete` 仍是合法终止态。
 - **流式回合不再记录 `output_tokens: 0`** (#85)：读取 SSE usage 的实现只挂在 agent 工具分支里，普通流式回合（Codex、Pi、普通 Claude Code）被记成全零输出且没有 TTFT——健康回复在用量 UI 里看起来就像空回复。现在普通路径也会从 tee 分支采集 usage，按流序合并，尾部真实值不会被头部的 `message_start` 零值覆盖；`onResponse` 对这两个读取器有等待上限，上游卡住不会把记录永久挂起。
 - **不健康的 provider 会被从模型列表降级剔除，且对所有 provider 类型生效** (#85)：`/v1/models` 现在隐藏处于熔断（`open`）的模型，恢复后自动放回（`half-open` 保持可见）。订阅类 provider 因凭据归插件管理而被通用探活刻意跳过，导致其熔断后没有任何后台路径能恢复——唯一的“恢复方式”是真实用户请求再撞一次死账号，也就是「一直报错还一直调用」的死循环。现在有专门的后台探活按间隔两级执行：先查账号状态（限额或冷却的账号不发任何网络请求），再通过插件自己的通道发一次真实最小请求。Codex 探测 usage 端点，Gemini 发真实 model-list 调用（不用缓存 token——那会在网络已断时误报健康），Qoder 与 WorkBuddy 走各自 dispatcher。
+
+## [2.3.2417] - 2026-10-29
+
+Broken: published a stale bundle (missing the 2.3.2418 fixes). Deprecated on npm.
 
 ## [2.3.2415] - 2026-10-29
 
