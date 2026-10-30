@@ -185,6 +185,28 @@ export function geminiOauthError(info: GeminiOauthErrorInfo) {
 export const GEMINI_OAUTH_IDENTITY_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h (contract §1.6)
 export const GEMINI_OAUTH_VALIDATION_COOLDOWN_MS = 30 * 60 * 1000; // 30min
 export const GEMINI_OAUTH_QUOTA_COOLDOWN_MS = 15 * 60 * 1000; // 15min default
+/**
+ * Cooldown for an expired/revoked login. Waiting never fixes it — only a
+ * re-authorization does — so this is deliberately LONG: it exists to stop the
+ * recovery probe from spending a real request every few minutes on an account
+ * that cannot authenticate until the user acts. `isAccountCooling()` reads this
+ * same field, so without it a 401 kept the model "available" and the probe
+ * looped forever against a dead token.
+ */
+export const GEMINI_OAUTH_REAUTH_COOLDOWN_MS = 60 * 60 * 1000; // 60min
+
+/**
+ * An error that stays reported until a fresh login clears it.
+ *
+ * Quota/validation/identity errors are transient in the sense that waiting can
+ * resolve them, so they are shown only while their cooldown is live. A reauth
+ * error cannot be waited out — only re-authorizing clears it — so it must stay
+ * visible after its cooldown lapses. The cooldown exists purely to bound the
+ * recovery probe's network spend, NOT to mean "the problem went away".
+ */
+export function isStickyGeminiOauthError(code: string | null | undefined): boolean {
+  return code === "gemini_oauth_reauth_required";
+}
 
 // ---------------------------------------------------------------------------
 // Error taxonomy (contract §1.6 — shared by service and transformer)
@@ -342,6 +364,10 @@ export function classifyGeminiOauthError(input: {
       code: "gemini_oauth_reauth_required",
       message: "Gemini OAuth 登录态已失效，请重新授权登录。",
       httpStatus: 401,
+      // Park the account: without a cooldown this state left isAccountCooling()
+      // false, so the background recovery probe kept sending a real request
+      // every probe interval against a token that cannot authenticate.
+      cooldownMs: GEMINI_OAUTH_REAUTH_COOLDOWN_MS,
     };
   }
 
@@ -491,10 +517,17 @@ export async function refreshAccessToken(
       if (!res.ok || !json?.access_token) {
         // Refresh failed → the stored refresh token is no longer accepted:
         // re-auth required, no automatic rotation (contract §1).
+        //
+        // The cooldown matters as much as the code: a thrown refresh error never
+        // reaches noteUpstreamError (no data-plane response to classify), so
+        // without it this — the most common way a login expires — left no
+        // account state at all. The recovery probe then found nothing parked and
+        // spent a real refresh call on the dead token every interval.
         throw geminiOauthError({
           code: "gemini_oauth_reauth_required",
           message: "Gemini OAuth 登录态已失效，请重新授权登录。",
           httpStatus: 401,
+          cooldownMs: GEMINI_OAUTH_REAUTH_COOLDOWN_MS,
         });
       }
       const expiresIn = Number.isFinite(json.expires_in) ? Number(json.expires_in) : 3600;

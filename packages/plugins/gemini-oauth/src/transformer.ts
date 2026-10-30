@@ -47,6 +47,7 @@ import {
   getGeminiOauthAuthService,
   normalizeChunkToolNames,
   unwrapCodeAssistFrame,
+  isStickyGeminiOauthError,
   type GeminiOauthAuthServiceLike,
   type GeminiOauthErrorInfo,
 } from "./protocol";
@@ -138,10 +139,18 @@ export class GeminiOauthTransformer implements PluginTransformer {
     // Check before refreshing credentials: the route's later send guard alone
     // cannot stop a token-endpoint request initiated by this transformer.
     if (await service.isAccountCooling?.()) {
+      // A cooling account is parked for one of several reasons, and they demand
+      // different user action: quota/validation clears on its own, an expired
+      // login never does. Say which one instead of a blanket "try later",
+      // which for a dead token is advice that cannot work.
+      const status: any = await service.getStatus?.().catch(() => null);
+      const reauth = isStickyGeminiOauthError(status?.lastError?.code);
       throw geminiOauthError({
         code: "gemini_oauth_account_cooling",
-        message: "Gemini OAuth 账号处于冷却期（配额/验证/风控拦截），请稍后再试或重新授权。",
-        httpStatus: 429,
+        message: reauth
+          ? "Gemini OAuth 登录态已失效，请重新授权登录（等待无法恢复）。"
+          : "Gemini OAuth 账号处于冷却期（配额/验证/风控拦截），请稍后再试或重新授权。",
+        httpStatus: reauth ? 401 : 429,
         retryable: false,
       });
     }
