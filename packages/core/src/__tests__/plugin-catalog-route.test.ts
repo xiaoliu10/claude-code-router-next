@@ -154,7 +154,7 @@ describe("GET /api/plugins/catalog", () => {
     const res = await getLocal(app);
     const body = res.json();
     expect(body.plugins).toEqual([
-      { name: "already", description: "latest differs from installed", version: "1.2.0", installed: true, installedVersion: "0.9.9" },
+      { name: "already", description: "latest differs from installed", version: "1.2.0", installed: true, installedVersion: "0.9.9", updateAvailable: true },
       { name: "fresh", description: "not installed", version: "4.0.0", installed: false, installedVersion: null },
     ]);
   });
@@ -183,7 +183,7 @@ describe("GET /api/plugins/catalog", () => {
     const res = await getLocal(app);
     const body = res.json();
     expect(body.plugins).toEqual([
-      { name: "@wengine-ai/ccr-provider-codex", description: "scoped npm name", version: "1.1.0", installed: true, installedVersion: "1.0.0" },
+      { name: "@wengine-ai/ccr-provider-codex", description: "scoped npm name", version: "1.1.0", installed: true, installedVersion: "1.0.0", updateAvailable: true },
     ]);
   });
 
@@ -225,6 +225,80 @@ describe("GET /api/plugins/catalog", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().plugins.map((p: any) => p.name)).toEqual(["ccr-provider-partial"]);
     expect(res.json().warning).toBeUndefined();
+  });
+
+  it("does not list the manifest name separately when the npm source matched a listed entry", async () => {
+    // Real shape of @wengine-ai/ccr-provider-codex: npm name listed, manifest
+    // dir "codex". The row must appear ONCE (npm-named), not also as a
+    // localOnly duplicate keyed by its manifest name.
+    const { installPluginFromArchive } = await import("@wengine-ai/claude-code-router-shared");
+    const root = join(scratch, "seed-dup");
+    const inner = join(root, "package", "dist");
+    mkdirSync(inner, { recursive: true });
+    writeFileSync(join(root, "package", "package.json"), JSON.stringify({ name: "@wengine-ai/ccr-provider-codex", version: "1.0.0" }));
+    writeFileSync(join(inner, "plugin.json"), JSON.stringify({ name: "codex", version: "1.0.0", coreApi: "1" }));
+    writeFileSync(join(inner, "plugin.js"), "export const activate = () => ({});\n");
+    const archive = join(scratch, "dup.tgz");
+    execFileSync("tar", ["-czf", archive, "-C", root, "package"]);
+    await installPluginFromArchive(archive, { configDir, source: "@wengine-ai/ccr-provider-codex" });
+
+    const registry = await startSearchStub({
+      "ccr-provider-plugin": [
+        { name: "@wengine-ai/ccr-provider-codex", keywords: ["ccr-provider-plugin"], version: "1.1.0", description: "listed" },
+      ],
+    });
+    const app = buildApp(registry.url);
+    const res = await getLocal(app);
+    const names = res.json().plugins.map((p: any) => p.name);
+    expect(names).toEqual(["@wengine-ai/ccr-provider-codex"]);
+    expect(res.json().plugins[0].localOnly).toBeUndefined();
+  });
+
+  it("does not flag updateAvailable when installed version equals npm version", async () => {
+    await seedInstalled("same", "1.0.0");
+    const registry = await startSearchStub({
+      "ccr-provider-plugin": [
+        { name: "same", keywords: ["ccr-provider-plugin"], version: "1.0.0", description: "in sync" },
+      ],
+    });
+    const app = buildApp(registry.url);
+    const res = await getLocal(app);
+    expect(res.json().plugins).toEqual([
+      { name: "same", description: "in sync", version: "1.0.0", installed: true, installedVersion: "1.0.0" },
+    ]);
+  });
+
+  it("lists a locally installed plugin absent from npm search as localOnly with no npm version", async () => {
+    const { installPluginFromArchive } = await import("@wengine-ai/claude-code-router-shared");
+    const root = join(scratch, "seed-unlisted");
+    const inner = join(root, "package", "dist");
+    mkdirSync(inner, { recursive: true });
+    writeFileSync(join(root, "package", "package.json"), JSON.stringify({ name: "@x/ccr-provider-unlisted", version: "0.4.2" }));
+    writeFileSync(join(inner, "plugin.json"), JSON.stringify({ name: "unlisted", version: "0.4.2", coreApi: "1" }));
+    writeFileSync(join(inner, "plugin.js"), "export const activate = () => ({});\n");
+    const archive = join(scratch, "unlisted.tgz");
+    execFileSync("tar", ["-czf", archive, "-C", root, "package"]);
+    await installPluginFromArchive(archive, { configDir, source: "@x/ccr-provider-unlisted" });
+
+    // Registry only knows an unrelated plugin; the installed one is unlisted.
+    const registry = await startSearchStub({
+      "ccr-provider-plugin": [
+        { name: "ccr-provider-other", keywords: ["ccr-provider-plugin"], version: "1.0.0", description: "listed" },
+      ],
+    });
+    const app = buildApp(registry.url);
+    const res = await getLocal(app);
+    const unlisted = res.json().plugins.find((p: any) => p.name === "@x/ccr-provider-unlisted");
+    expect(unlisted).toEqual({
+      name: "@x/ccr-provider-unlisted",
+      description: "",
+      version: "0.4.2",
+      installed: true,
+      installedVersion: "0.4.2",
+      localOnly: true,
+    });
+    // localOnly rows never get an update affordance.
+    expect(unlisted.updateAvailable).toBeUndefined();
   });
 
   it("rejects non-loopback callers and spoofed authorities with 403 local_only", async () => {

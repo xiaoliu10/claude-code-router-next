@@ -13,7 +13,7 @@ process.env.TMPDIR = "/tmp/ccr-plugin-market-tests-home/market/tmp";
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
-  createPluginMarketController, renderPluginMarketState, sanitizeMarketErrorCode,
+  createMarketplaceBridge, createPluginMarketController, renderPluginMarketState, sanitizeMarketErrorCode,
   type PluginMarketBridge, type PluginMarketCatalogEntry,
 } from "../src/utils/plugin-market.ts";
 
@@ -125,6 +125,7 @@ function fixtureBridge(overrides: Partial<PluginMarketBridge> = {}) {
     catalogEntry({ name: "ccr-provider-second", description: "Second", version: "2.0.0" }),
   ];
   const calls: LogCall[] = [];
+  const installCalls: Array<{ name: string; force: boolean }> = [];
   const log = {
     info: (...args: unknown[]) => calls.push({ level: "info", args }),
     warn: (...args: unknown[]) => calls.push({ level: "warn", args }),
@@ -132,15 +133,16 @@ function fixtureBridge(overrides: Partial<PluginMarketBridge> = {}) {
   };
   const bridge: PluginMarketBridge = {
     getCatalog: async () => ({ ok: true, plugins: catalog }),
-    installPlugin: async (name: string) => {
+    installPlugin: async (name: string, force = false) => {
+      installCalls.push({ name, force });
       const entry = catalog.find((e) => e.name === name);
-      if (entry) entry.installed = true;
+      if (entry) { entry.installed = true; entry.installedVersion = entry.version; }
       return { ok: true, name, version: "9.9.9", restartRequired: true };
     },
     log,
     ...overrides,
   };
-  return { bridge, catalog, catalogEntry, calls };
+  return { bridge, catalog, catalogEntry, calls, installCalls };
 }
 
 const t = (key: string, params?: Record<string, unknown>) => {
@@ -150,6 +152,14 @@ const t = (key: string, params?: Record<string, unknown>) => {
     "pluginMarket.loading": "Loading…",
     "pluginMarket.empty": "No installable provider plugins found.",
     "pluginMarket.empty_all_installed": "All installed ({{count}}).",
+    "pluginMarket.installed_title": "Installed plugins",
+    "pluginMarket.available_title": "Available plugins",
+    "pluginMarket.version_ok": "v{{version}} · installed",
+    "pluginMarket.version_outdated": "v{{installed}} → v{{latest}}",
+    "pluginMarket.update": "Update",
+    "pluginMarket.updating": "Updating…",
+    "pluginMarket.local_only": "Local install",
+    "pluginMarket.empty_available": "Every plugin in the marketplace is already installed.",
     "pluginMarket.registry_warning": "npm registry unavailable",
     "pluginMarket.install": "Install",
     "pluginMarket.installing": "Installing…",
@@ -168,37 +178,44 @@ const t = (key: string, params?: Record<string, unknown>) => {
 // Renderer + controller
 // ---------------------------------------------------------------------------
 
-test("catalog renders installable entries with name, version, description and install buttons; installed entries are not listed", async () => {
+test("catalog renders installable entries with install buttons; installed up-to-date entries render in the installed section", async () => {
   const fx = fixtureBridge();
-  fx.catalog.push(fx.catalogEntry({ name: "ccr-provider-already", installed: true, installedVersion: "0.9.0" }));
+  fx.catalog.push(fx.catalogEntry({ name: "ccr-provider-already", installed: true, installedVersion: "1.0.0", version: "1.0.0" }));
   const controller = createPluginMarketController(fx.bridge);
   await controller.refresh();
   const host = new El("div");
   renderPluginMarketState(host, controller.getState(), t, {
-    onInstall: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
+    onInstall: () => {}, onUpdate: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
   });
 
   const section = host.byTestId("plugin-market-section");
   assert.ok(section, "section rendered");
+  // Installable rows only contain the two not-installed entries.
   const rows = host.allByTestId("plugin-market-entry");
   assert.equal(rows.length, 2);
   assert.deepEqual(rows.map((r) => r.dataset.name), ["ccr-provider-fixture", "ccr-provider-second"]);
   const firstRow = rows[0];
   assert.ok(firstRow.textContent.includes("A fixture plugin"));
   assert.ok(firstRow.textContent.includes("v1.0.0"));
-  assert.ok(firstRow.textContent.includes("ccr-provider-already") === false);
   const buttons = host.allByTestId("plugin-market-install");
   assert.equal(buttons.length, 2);
   for (const button of buttons) assert.equal(button.disabled, false);
   assert.ok(host.byTestId("plugin-market-restart-notice") === null);
+
+  // The installed entry is listed in its own section, read-only (no update button).
+  const installedRows = host.allByTestId("plugin-market-installed-entry");
+  assert.deepEqual(installedRows.map((r) => r.dataset.name), ["ccr-provider-already"]);
+  assert.ok(installedRows[0].textContent.includes("v1.0.0 · installed"));
+  assert.ok(host.byTestId("plugin-market-update") === null);
 });
+;
 
 test("loading and registry-unavailable states render their own safe surfaces", async () => {
   const fx = fixtureBridge();
   const controller = createPluginMarketController(fx.bridge);
   const host = new El("div");
   renderPluginMarketState(host, controller.getState(), t, {
-    onInstall: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
+    onInstall: () => {}, onUpdate: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
   });
   assert.ok(host.byTestId("plugin-market-loading"), "loading surface before refresh");
 
@@ -211,7 +228,7 @@ test("loading and registry-unavailable states render their own safe surfaces", a
   assert.equal(controller2.getState().status, "unavailable");
   const host2 = new El("div");
   renderPluginMarketState(host2, controller2.getState(), t, {
-    onInstall: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
+    onInstall: () => {}, onUpdate: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
   });
   const warning = host2.byTestId("plugin-market-warning");
   assert.ok(warning, "warning surface");
@@ -236,6 +253,7 @@ test("install: buttons disabled while busy, success shows restart notice + refre
   let restartClicks = 0;
   const handlers = {
     onInstall: (name: string) => { void controller.install(name); },
+    onUpdate: (name: string) => { void controller.update(name); },
     onRetry: () => {},
     onRestart: () => { restartClicks += 1; },
     onDismissNotice: () => controller.dismissNotice(),
@@ -299,6 +317,7 @@ test("install failure renders the SAFE code only — raw upstream text never rea
   await controller.refresh();
   const handlers = {
     onInstall: (name: string) => { void controller.install(name); },
+    onUpdate: (name: string) => { void controller.update(name); },
     onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
   };
   const host = new El("div");
@@ -348,13 +367,13 @@ test("controller never logs secret-bearing material — names and stable codes o
   }
 });
 
-test("empty catalog renders the empty surface (with an all-installed variant)", async () => {
+test("all-installed catalog lists installed entries and an empty available section", async () => {
   const fx = fixtureBridge({
     getCatalog: async () => ({
       ok: true,
       plugins: [
-        fx.catalogEntry({ name: "ccr-provider-one", installed: true, installedVersion: "1.0.0" }),
-        fx.catalogEntry({ name: "ccr-provider-two", installed: true, installedVersion: "2.0.0" }),
+        fx.catalogEntry({ name: "ccr-provider-one", installed: true, installedVersion: "1.0.0", version: "1.0.0" }),
+        fx.catalogEntry({ name: "ccr-provider-two", installed: true, installedVersion: "2.0.0", version: "2.0.0" }),
       ],
     }),
   });
@@ -362,13 +381,121 @@ test("empty catalog renders the empty surface (with an all-installed variant)", 
   await controller.refresh();
   const host = new El("div");
   renderPluginMarketState(host, controller.getState(), t, {
-    onInstall: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
+    onInstall: () => {}, onUpdate: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
   });
   assert.equal(controller.getState().hiddenInstalled, 2);
-  const empty = host.byTestId("plugin-market-empty")!;
-  assert.ok(empty, "empty surface");
-  assert.ok(empty.textContent.includes("2"));
+  assert.deepEqual(
+    host.allByTestId("plugin-market-installed-entry").map((r) => r.dataset.name),
+    ["ccr-provider-one", "ccr-provider-two"],
+  );
+  const emptyAvailable = host.byTestId("plugin-market-empty-available")!;
+  assert.ok(emptyAvailable, "empty available surface");
   assert.ok(host.byTestId("plugin-market-install") === null);
+});
+
+test("outdated installed entry shows version delta and an Update button that installs with force", async () => {
+  const fx = fixtureBridge({
+    getCatalog: async () => ({
+      ok: true,
+      plugins: [
+        fx.catalogEntry({ name: "ccr-provider-old", installed: true, installedVersion: "1.0.0", version: "1.2.0", updateAvailable: true }),
+        fx.catalogEntry({ name: "ccr-provider-ok", installed: true, installedVersion: "2.0.0", version: "2.0.0" }),
+      ],
+    }),
+  });
+  const controller = createPluginMarketController(fx.bridge);
+  await controller.refresh();
+  const handlers = {
+    onInstall: () => {},
+    onUpdate: (name: string) => { void controller.update(name); },
+    onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
+  };
+  const host = new El("div");
+  const render = () => renderPluginMarketState(host, controller.getState(), t, handlers);
+  render();
+
+  const updateButtons = host.allByTestId("plugin-market-update");
+  assert.equal(updateButtons.length, 1, "exactly one outdated row gets an Update button");
+  assert.equal(updateButtons[0].dataset.name, "ccr-provider-old");
+  const outdatedRow = host.allByTestId("plugin-market-installed-entry").find((r) => r.dataset.name === "ccr-provider-old")!;
+  assert.ok(outdatedRow.textContent.includes("v1.0.0 → v1.2.0"), "version delta shown");
+  assert.equal(updateButtons[0].textContent, "Update");
+
+  // Clicking update calls install with force=true.
+  updateButtons[0].click();
+  await tickUntil(() => fx.installCalls.length > 0);
+  assert.deepEqual(fx.installCalls, [{ name: "ccr-provider-old", force: true }]);
+});
+
+test("local-only installed entry renders with a Local install tag and no update affordance", async () => {
+  const fx = fixtureBridge({
+    getCatalog: async () => ({
+      ok: true,
+      plugins: [
+        fx.catalogEntry({ name: "ccr-provider-local", description: "", version: "0.3.0", installed: true, installedVersion: "0.3.0", localOnly: true }),
+      ],
+    }),
+  });
+  const controller = createPluginMarketController(fx.bridge);
+  await controller.refresh();
+  const host = new El("div");
+  renderPluginMarketState(host, controller.getState(), t, {
+    onInstall: () => {}, onUpdate: () => {}, onRetry: () => {}, onRestart: () => {}, onDismissNotice: () => {},
+  });
+  const rows = host.allByTestId("plugin-market-installed-entry");
+  assert.deepEqual(rows.map((r) => r.dataset.name), ["ccr-provider-local"]);
+  assert.ok(host.byTestId("plugin-market-local-only"), "local-only tag shown");
+  assert.ok(host.byTestId("plugin-market-update") === null, "no update button for local-only");
+});
+;
+
+// ---------------------------------------------------------------------------
+// Production bridge adapter (regression: force forwarding)
+// ---------------------------------------------------------------------------
+
+test("marketplace bridge forwards force to the API client — install defaults false, update sends true", async () => {
+  const forwarded: Array<{ name: string; force: boolean }> = [];
+  const apiClient = {
+    getCatalog: async () => ({ ok: true as const, plugins: [] as PluginMarketCatalogEntry[] }),
+    getPluginCatalog: async () => ({ ok: true as const, plugins: [] as PluginMarketCatalogEntry[] }),
+    installPlugin: async (name: string, force?: boolean) => {
+      forwarded.push({ name, force: force === true });
+      return { ok: true as const, name, version: "1.0.0", restartRequired: true };
+    },
+  };
+  const bridge = createMarketplaceBridge(apiClient);
+
+  await bridge.installPlugin("ccr-provider-x");
+  await bridge.installPlugin("ccr-provider-x", true);
+
+  // A plain install must NOT force (it would replace an existing dir), and an
+  // update MUST force (otherwise the lane answers already_installed and the
+  // button never replaces anything).
+  assert.deepEqual(forwarded, [
+    { name: "ccr-provider-x", force: false },
+    { name: "ccr-provider-x", force: true },
+  ]);
+});
+
+test("controller update() reaches the bridge with force=true through the production adapter", async () => {
+  const forwarded: Array<{ name: string; force: boolean }> = [];
+  const apiClient = {
+    getPluginCatalog: async () => ({
+      ok: true as const,
+      plugins: [{
+        name: "ccr-provider-x", description: "", version: "2.0.0",
+        installed: true, installedVersion: "1.0.0", updateAvailable: true,
+      }],
+    }),
+    installPlugin: async (name: string, force?: boolean) => {
+      forwarded.push({ name, force: force === true });
+      return { ok: true as const, name, version: "2.0.0", restartRequired: true };
+    },
+  };
+  const controller = createPluginMarketController(createMarketplaceBridge(apiClient));
+  await controller.refresh();
+  await controller.update("ccr-provider-x");
+  assert.deepEqual(forwarded, [{ name: "ccr-provider-x", force: true }]);
 });
 
 // ---------------------------------------------------------------------------
