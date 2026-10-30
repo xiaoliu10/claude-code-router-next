@@ -1,6 +1,6 @@
 {
   "name": "@wengine-ai/ccr-provider-codex",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Codex subscription provider plugin for claude-code-router: browser OAuth login, fixed-origin responses data plane, transformer, managed runtime, admin routes, config protector and UI card.",
   "type": "module",
   "main": "dist/plugin.js",
