@@ -23,7 +23,7 @@
 | D6 | **不动 Router**：导入/同步/断开都不改 `config.Router`、不自动设默认路由 | 锁定 |
 | D7 | 普通 provider 编辑对话框不得把 WorkBuddy 托管 provider 变成"API key 输入框"或可改外网目标 | 锁定 |
 | D8 | **desktop** 不保存/花费共享 refreshToken，临期同站同账号只读续期；**browser** 独享 refreshToken 仅存 0600 私有文件并轮换续期。status 均不读源文件 | 用户修订（§15） |
-| D11 | **不做自动签到**：调研确认 magpie WorkBuddy 插件无任何 checkin/签到功能；WorkBuddy 免费额度是服务端每日自动发放的 slice package（`DAILY_CODE`，每天 0 点重置），无需客户端动作 | 锁定（§14 新增） |
+| D11 | **签到仅 CN 站（/v2 meter）、手动触发、per 活跃账号**。原结论基于当时 magpie 版本，2026-11-01 复核 magpie 0.2.8 已支持，基于本次用户需求覆盖旧 D11 后实现；不运行后台自动签到 | 用户需求变更（2026-11-01） |
 | D9 | 不做 FLAGGED prompt 重写（对抗性适配，ban risk）；识别 `unapproved channel` 后给可执行错误 | 锁定 |
 | D10 | 外部插件安装 / 额外网关进程 / Magpie 依赖：**零** | 锁定 |
 
@@ -780,7 +780,7 @@ const isManagedWorkBuddy = editingProvider?.name === "workbuddy" && editingProvi
 ## 14. 双站支持与功能对齐（2026-10-19 修订，优先于 D2/D8）
 
 > 触发：用户要求"支持国际版账号、对齐 magpie 功能"。本节所有论断均有 magpie pin 的行号证据；
-> 凡标注"未证实"的，不得在实现或 PR 中当作事实。**自动签到经调研确认不存在，不做（D11）。**
+> 凡标注"未证实"的，不得在实现或 PR 中当作事实。**旧 D11 的“不存在签到”结论已于 2026-11-01 被用户需求覆盖：magpie 0.2.8 支持 CN 签到；实现仅手动触发、per 活跃账号，不运行自动任务。**
 
 ### 14.1 站点定义（证据：P:L62-84 `SITES`）
 
@@ -874,7 +874,7 @@ CCR 选择零风险路径：**不保存、不使用 refreshToken 于任何请求
 
 ### 14.7 明确不做
 
-- 自动签到 / 积分任务（D11：不存在该功能）。
+- 后台自动签到 / 积分任务。2026-11-01 用户需求覆盖旧 D11：CN 手动签到通过 `POST /api/workbuddy/checkin` 对当前活跃账号领取，国际站无入口。
 - 浏览器登录 flow（D3 不变）。
 - packages/price 商品码明细（§14.4）。
 - 账号池 / 多账号轮换（B 方案已否）。

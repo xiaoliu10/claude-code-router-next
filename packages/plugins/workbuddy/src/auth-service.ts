@@ -17,6 +17,7 @@
  *    copy/spend shared desktop refresh secrets (§14). No static models or plugins.
  */
 import { createHash, randomBytes } from "node:crypto";
+import { checkinOf, WorkBuddyActiveAccountChangedError, type WorkBuddyCheckinResponse } from "./checkin";
 import {
   WORKBUDDY_AI_PROVIDER_NAME,
   WORKBUDDY_API_KEY,
@@ -82,6 +83,7 @@ export interface WorkBuddyServiceHost {
   writeConfig(next: any): Promise<void>;
   reloadRuntime(config?: any): void | Promise<void>;
   getDirectDispatcher(): unknown;
+  getSubscriptionDispatcher?(): unknown;
 }
 
 export type WorkBuddyFailureReason = "sealed" | "source_missing" | "source_invalid" | "models_fetch_failed";
@@ -1270,6 +1272,22 @@ export class WorkBuddyAuthService {
       message,
       modelsUnchanged: false,
     };
+  }
+
+  /** Claim for the sticky CN account, ignoring inference cooldown/failover. */
+  async checkin(options: { waits?: readonly number[]; expectedActiveUid?: string | null } = {}): Promise<WorkBuddyCheckinResponse> {
+    const data = await this.store.loadData().catch(() => null);
+    const state = data?.sites.workbuddy;
+    const account = state?.accounts.find(a => a.uid === state.activeUid);
+    const uid = account?.uid ?? null;
+    if (options.expectedActiveUid !== undefined && options.expectedActiveUid !== uid) {
+      throw new WorkBuddyActiveAccountChangedError();
+    }
+    if (!account) return { uid, outcome: "failed", message: "Not signed in" };
+    // Snapshot the active identity once. Never let inference selection rotate
+    // this explicit account operation to a backup account.
+    return { ...await checkinOf(this.withSite("workbuddy", account), this.fetchImpl,
+      this.options.host.getSubscriptionDispatcher?.() ?? this.options.host.getDirectDispatcher(), options), uid };
   }
 
   // -------------------------------------------------------------- credits ---

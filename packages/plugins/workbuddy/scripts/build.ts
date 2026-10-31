@@ -60,7 +60,15 @@ await esbuild.build({
   logLevel: "info",
 });
 
-copyFileSync(join(root, "plugin.json"), join(dist, "plugin.json"));
+// Derive the install manifest from the npm version and guard the runtime copy.
+const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const manifestJson = JSON.parse(readFileSync(join(root, "plugin.json"), "utf8"));
+const declaredVersion = readFileSync(join(root, "src/plugin.ts"), "utf8").match(/version:\s*"([^"]+)"/)?.[1];
+if (declaredVersion !== pkg.version) {
+  throw new Error(`src/plugin.ts manifest version ${declaredVersion} != package.json ${pkg.version}; keep them in sync`);
+}
+manifestJson.version = pkg.version;
+writeFileSync(join(dist, "plugin.json"), JSON.stringify(manifestJson, null, 2) + "\n");
 copyFileSync(join(root, "THIRD_PARTY_NOTICES.md"), join(dist, "THIRD_PARTY_NOTICES.md"));
 writeFileSync(join(dist, "package.json"), JSON.stringify({ type: "module" }, null, 2) + "\n");
 

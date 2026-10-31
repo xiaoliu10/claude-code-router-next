@@ -43,3 +43,15 @@ describe("shared build identity", () => {
     expect(readFileSync(join(repoUi, "src", "utils", "plugin-card.ts"), "utf8")).toContain("PluginCardMountProps");
   });
 });
+
+
+it("pins npm, install and runtime manifest versions and keeps the build drift guard", async () => {
+  const { manifest } = await import("../src/plugin");
+  const pkg = JSON.parse(read("package.json"));
+  expect(pkg.version).toBe("1.0.1");
+  expect(manifest.version).toBe(pkg.version);
+  expect(JSON.parse(read("plugin.json")).version).toBe(pkg.version);
+  const build = read("scripts/build.ts");
+  expect(build).toContain("manifestJson.version = pkg.version");
+  expect(build).toContain("declaredVersion !== pkg.version");
+});

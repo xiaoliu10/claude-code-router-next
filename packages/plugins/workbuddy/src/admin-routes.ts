@@ -1,3 +1,4 @@
+import { WorkBuddyActiveAccountChangedError } from "./checkin";
 /**
  * WorkBuddy (CN + international) — local-only, explicit-user-action admin
  * routes for the dual-site account pools, MOVED VERBATIM from the former
@@ -266,6 +267,27 @@ app.post("/api/workbuddy/usage", async (req: any, reply: any) => {
   } catch (error: any) {
     if (error?.statusCode === 403) { reply.status(403); return { error: "workbuddy_unauthorized" }; }
     return { ok: true, usage: null };
+  }
+});
+
+/** Explicit CN check-in for the current active account; no uid override. */
+app.post("/api/workbuddy/checkin", async (req: any, reply: any) => {
+  try {
+    assertLocalWorkBuddyRequest(req);
+    const body = req.body as Record<string, unknown> | undefined;
+    if (body && (body.uid !== undefined || (body.site !== undefined && body.site !== "workbuddy")
+      || (body.expectedActiveUid !== undefined && body.expectedActiveUid !== null && typeof body.expectedActiveUid !== "string"))) {
+      reply.status(422);
+      return { error: "source_invalid" };
+    }
+    await ensureWorkBuddyMigration();
+    return await requireWorkBuddyService().checkin({ expectedActiveUid: body?.expectedActiveUid as string | null | undefined });
+  } catch (error: unknown) {
+    if (error instanceof WorkBuddyActiveAccountChangedError) {
+      reply.status(409);
+      return { error: "workbuddy_active_account_changed" };
+    }
+    return workBuddyRouteError(error, reply, "checkin", "workbuddy_checkin_failed");
   }
 });
 

@@ -89,7 +89,7 @@ function harnessFocus(focusKey: string | null, scrolled: string[]) {
   } as any);
   return { host, callApi, notify: () => hostListener?.() };
 }
-function harness(overrides: Record<string, any> = {}, disabled = false, heldLease = false) {
+function harness(overrides: Record<string, any> = {}, disabled = false, heldLease = false, locale = "en") {
   vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any });
   const host = new Element("div");
   const callApi = vi.fn(async (path: string, init?: any) => {
@@ -112,7 +112,7 @@ function harness(overrides: Record<string, any> = {}, disabled = false, heldLeas
   let hostListener: (() => void) | null = null;
   let unsubscribed = 0;
   const props = {
-    callApi: callApi as any, locale: "en", locales: workbuddyLocales,
+    callApi: callApi as any, locale, locales: workbuddyLocales,
     disabled, plugin: { name: "workbuddy", version: "1" }, log: console,
     acquireManagement: () => (heldLease || lock ? null : (lock = true, release)), onBusy: vi.fn(), refreshConfig,
     onHostChange: (listener: () => void) => {
@@ -459,4 +459,74 @@ describe("self-contained WorkBuddy plugin card", () => {
     expect(h.callApi.mock.calls.some(([path]) => path === "/login/cancel")).toBe(true);
     expect(h.unsubscribed).toBe(1);
   });
+});
+
+
+describe("daily check-in card", () => {
+  it.each(["en", "zh"])("renders a CN-only button and all outcomes in %s", async locale => {
+    const words = (workbuddyLocales[locale].workbuddy as any).checkin;
+    for (const outcome of ["claimed", "done", "inactive", "ineligible", "failed"]) {
+      const h = harness({ "/checkin": { uid: "u-1", outcome, credit: 8, streak: 3, message: "secret-marker" } }, false, false, locale);
+      await tick();
+      expect(h.host.card("workbuddy").button(words.action).disabled).toBe(false);
+      expect(h.host.card("workbuddy-ai").all().some(n => n.textContent === words.action)).toBe(false);
+      h.host.card("workbuddy").click(words.action); await tick();
+      expect(h.host.text()).toContain(words[outcome]);
+      if (["claimed", "done"].includes(outcome)) expect(h.host.text()).toContain("+8 credits");
+      if (outcome === "claimed") expect(h.host.text()).toContain(words.streak.replace("{{count}}", "3"));
+      expect(h.host.text()).not.toContain("secret-marker");
+      expect(h.callApi.mock.calls.find(([path]) => path === "/checkin")?.[1].body).toBe(JSON.stringify({ expectedActiveUid: "u-1" }));
+      unmount(h.host as any);
+    }
+  });
+  it("disables while pending and prevents duplicate requests", async () => {
+    let resolve!: (value: unknown) => void;
+    const h = harness({ "/checkin": () => new Promise(r => { resolve = r; }) });
+    await tick(); h.host.card("workbuddy").click(en.checkin.action); await tick();
+    const pending = h.host.card("workbuddy").button(en.checkin.pending);
+    expect(pending.disabled).toBe(true); expect(pending.attrs["aria-busy"]).toBe("true");
+    h.host.card("workbuddy").click(en.checkin.pending);
+    expect(h.callApi.mock.calls.filter(([path]) => path === "/checkin")).toHaveLength(1);
+    resolve({ uid: "u-1", outcome: "done" }); await tick();
+    expect(h.host.card("workbuddy").button(en.checkin.action).disabled).toBe(false);
+    expect(h.release).toHaveBeenCalled();
+  });
+  it("disables when signed out and renders network failure safely", async () => {
+    const offline = harness({ "/status": { sites: {} } }); await tick();
+    expect(offline.host.card("workbuddy").button(en.checkin.action).disabled).toBe(true);
+    const failing = harness({ "/checkin": new Error("secret-marker") }); await tick();
+    failing.host.card("workbuddy").click(en.checkin.action); await tick();
+    expect(failing.host.text()).toContain(en.checkin.failed); expect(failing.host.text()).not.toContain("secret-marker");
+  });
+});
+
+it("MAJOR-1: stale A card labels B result only after refreshing to B", async () => {
+  let serverUid = "A";
+  let visibleUid = "A";
+  const h = harness({
+    "/status": () => ({ sites: { workbuddy: siteStatus({ activeUid: visibleUid, accounts: [
+      { uid: visibleUid, displayName: `Account ${visibleUid}`, source: "browser", active: true },
+    ] }) } }),
+    "/checkin": () => ({ uid: serverUid, outcome: "claimed", credit: 17 }),
+  });
+  await tick(); serverUid = "B"; h.notify();
+  h.host.card("workbuddy").click(en.checkin.action); await tick();
+  expect(h.host.text()).not.toContain("+17 credits");
+  expect(h.statusReads()).toBe(2);
+  expect(JSON.parse(h.callApi.mock.calls.find(([path]) => path === "/checkin")![1].body)).toEqual({ expectedActiveUid: "A" });
+  visibleUid = "B";
+  h.host.card("workbuddy").click(en.checkin.action); await tick();
+  expect(h.host.text()).toContain("Account B");
+  expect(h.host.text()).toContain("+17 credits");
+});
+it("MAJOR-1: conflict refreshes status without attaching a claim result to either account", async () => {
+  let uid = "A";
+  const h = harness({
+    "/status": () => ({ sites: { workbuddy: siteStatus({ activeUid: uid }) } }),
+    "/checkin": () => { uid = "B"; return new Error("workbuddy_active_account_changed"); },
+  });
+  await tick(); h.host.card("workbuddy").click(en.checkin.action); await tick();
+  expect(h.statusReads()).toBe(2);
+  expect(h.host.text()).not.toContain(en.checkin.claimed);
+  expect(h.host.text()).toContain(en.checkin.failed);
 });
