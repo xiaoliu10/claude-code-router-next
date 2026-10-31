@@ -157,3 +157,44 @@ describe("Qoder card: two independent site sections", () => {
     unmountCard(el);
   });
 });
+
+describe("Qoder card check-in", () => {
+  it.each([
+    ["en", "claimed", "+12 credits"], ["en", "done", "Already claimed today"],
+    ["en", "inactive", "No campaign today"], ["en", "ineligible", "Unavailable"], ["en", "failed", "Check-in failed: Claim: HTTP 502"],
+    ["zh", "claimed", "+12 积分"], ["zh", "done", "今日已领"],
+    ["zh", "inactive", "今日无活动"], ["zh", "ineligible", "不可用"], ["zh", "failed", "签到失败: Claim: HTTP 502"],
+  ])("renders %s %s and disables the pending action", async (locale, outcome, expected) => {
+    let resolve!: (value: unknown) => void;
+    const pending = new Promise(r => { resolve = r; });
+    const calls: string[] = [];
+    const el = mountCardIn({
+      callApi: async (path: string) => { calls.push(path); return path.endsWith("/checkin") ? pending : { status: "connected", models: [] }; },
+      locale, locales: {}, disabled: false, acquireManagement: () => () => {}, onBusy: () => {}, log: console,
+    });
+    await flush();
+    const label = locale === "zh" ? "签到" : "Check in";
+    const buttons = all(el, e => e.tag === "button" && e.textContent === label);
+    // International accounts require native identity; only CN offers the action.
+    expect(buttons).toHaveLength(1);
+    expect(text(el)).toContain(locale === "zh" ? "国际站需要在 Qoder 桌面端内签到" : "International check-in requires Qoder desktop");
+    buttons[0].onclick?.();
+    await flush();
+    expect(buttonNamed(el, label)?.disabled).toBe(true);
+    expect(calls).toContain("/cn/checkin"); expect(calls).not.toContain("/checkin");
+    resolve({ outcome, credit: 12, message: "Claim: HTTP 502" });
+    await flush(); await flush();
+    expect(text(el)).toContain(expected);
+    expect(buttonNamed(el, label)?.disabled).toBe(false);
+    unmountCard(el);
+  });
+  it("shows a localized failure when the bridge rejects", async () => {
+    const el = mountCardIn({
+      callApi: async (path: string) => { if (path.endsWith("/checkin")) throw new Error("secret"); return { status: "connected", models: [] }; },
+      locale: "zh", locales: {}, disabled: false, acquireManagement: () => () => {}, log: console,
+    });
+    await flush(); buttonNamed(el, "签到")?.onclick?.(); await flush();
+    expect(text(el)).toContain("签到失败"); expect(text(el)).not.toContain("secret");
+    unmountCard(el);
+  });
+});

@@ -1,3 +1,4 @@
+import { checkinQoder, type QoderCheckinResult } from "./checkin";
 import { constants } from "node:fs";
 import { open, mkdir, chmod, rename, rm, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -354,6 +355,22 @@ export class QoderAuthService {
       await this.mutate(current => ({ ...current,
         hiddenModels: [...new Set([...current.hiddenModels.filter(m => m !== key), ...(hidden ? [key] : [])])] }));
       return { success: true };
+    });
+  }
+  /** Manual check-in is independent of chat cooldown and model selection.
+   *  CN transactions join the exclusive lane so concurrent requests cannot
+   *  double-claim (the second observes the upstream's post-claim state).
+   *  The intl gate stays outside the lane: it does no network work and must
+   *  return immediately even while a CN transaction is queued. */
+  async checkin(): Promise<QoderCheckinResult> {
+    if (this.site.id === "qoder") return { outcome: "ineligible", message: "International check-in requires Qoder desktop device identity" };
+    return this.exclusive(async () => {
+      try {
+        const credential = await this.freshCredential();
+        return await checkinQoder(credential, { site: this.site.id, host: this.options.host, fetch: this.options.fetch });
+      } catch {
+        return { outcome: "failed", message: "Check-in requires a usable connected account" };
+      }
     });
   }
   async getUsage(): Promise<QoderUsageSnapshot> {

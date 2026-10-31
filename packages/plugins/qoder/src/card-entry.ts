@@ -13,6 +13,7 @@ interface QoderCardSection {
   readonly prefix: string;
   status?: any;
   usage?: any;
+  checkin?: import("./checkin").QoderCheckinResult;
   error: boolean;
   busy: boolean;
   /** Half-typed PAT, kept across re-renders so another section cannot wipe it. */
@@ -98,11 +99,24 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       buttons.append(connectButton);
     } else if (section.status) {
       buttons.append(action(section, "sync", () => void run(section, async () => { await call(section, "/sync", {}); await reconcile(section); await refresh(section); })));
+      if (section.site.id === "qoder-cn") buttons.append(action(section, "checkin", () => void run(section, async () => {
+        section.checkin = undefined;
+        try { section.checkin = await call(section, "/checkin", {}); }
+        catch { section.checkin = { outcome: "failed" }; }
+      })));
       buttons.append(action(section, "usage", () => void run(section, async () => { section.usage = await call(section, "/usage", {}); })));
-      buttons.append(action(section, "disconnect", () => void run(section, async () => { await call(section, "/disconnect", {}); section.usage = undefined; await reconcile(section); await refresh(section); })));
+      buttons.append(action(section, "disconnect", () => void run(section, async () => { await call(section, "/disconnect", {}); section.usage = undefined; section.checkin = undefined; await reconcile(section); await refresh(section); })));
     }
     buttons.append(action(section, "refresh", () => void run(section, () => refresh(section))));
     panel.append(buttons);
+    if (section.status?.status === "connected" && section.site.id === "qoder") panel.append(node("p", words.checkinDesktop, "text-sm text-muted-foreground"));
+    if (section.checkin) {
+      const result = section.checkin;
+      const amount = result.credit;
+      const detail = result.outcome === "claimed" && typeof amount === "number" && Number.isFinite(amount) && amount > 0
+        ? lang === "zh" ? `+${amount} 积分` : `+${amount} credits` : words[`checkin_${result.outcome}`] ?? words.checkin_failed;
+      panel.append(node("p", detail + (result.outcome === "failed" && result.message ? `: ${result.message}` : ""), result.outcome === "failed" ? "text-destructive" : "text-sm"));
+    }
     // Usage windows: render defensively — shape comes from a remote payload.
     const usageLine = node("p", "", "text-sm text-muted-foreground");
     if (section.usage?.known && Array.isArray(section.usage.windows) && section.usage.windows.length) {

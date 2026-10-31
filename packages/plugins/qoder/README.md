@@ -18,7 +18,7 @@ Everything below exists once per site; the two sites are independent (own accoun
 - **Transformer** (`qoder` / `qoder-cn`): unified → chat-completions request conversion (leading system message, thinking → `reasoning_content`, stable session id → `prompt_cache_key`, reasoning effort passthrough) and strict SSE/JSON response validation (error-frame classification, `[DONE]` integrity, usage mapping). The conversion is site-independent; each managed provider locks its own transformer name.
 - **Managed runtime** (`qoder` / `qoder-cn`): pins that site's fixed chat upstream, routes through the host's subscription dispatcher, owns abort/deadline wiring and the error taxonomy (`qoder_reauth_required`, `qoder_rate_limited` with `retry_after`-derived cooldown, `qoder_upstream_error`). A runtime claims only its own managed provider.
 - **Auth service**: PAT sign-in with the job-token engine, per-site credential file (0600, atomic, size-capped), model sync/visibility, usage reads with a 60s cache, cooling circuit breaker and reconnect.
-- **Admin routes** (loopback-only, per site): status, connect, sync, usage, model visibility, disconnect.
+- **Admin routes** (loopback-only, per site): status, connect, sync, usage, checkin, model visibility, disconnect.
 - **One config protector**: re-locks BOTH managed providers in a single pass and re-adds any of them that vanish from the config.
 - **UI card + locales** (en/zh): one card with two independent sections (Qoder / Qoder CN) — PAT connect form, status, quota windows, model management.
 
@@ -38,9 +38,29 @@ Then, in the CCR settings page, open the Qoder card and use the matching section
 
 Both sections can be connected at the same time; disconnecting one never touches the other.
 
+## Manual daily check-in
+
+The Qoder CN card has a **Check in** button. It lists campaigns, claims the first
+`CLAIM_BENEFIT` marked `CLAIMABLE`, and shows the awarded credits. Already claimed
+and unavailable campaigns are ordinary results, with no automatic retry or timer.
+
+Loopback-only `POST /api/qoder/cn/checkin` returns
+`{ outcome, credit?, message? }`, where outcome is `claimed`, `done`, `inactive`,
+`ineligible`, or `failed`. Credits are a positive finite number when supplied.
+`POST /api/qoder/checkin` returns `ineligible`: international campaigns require
+Qoder's signed desktop identity, which this PAT-only plugin does not read. The
+international card directs users to claim in Qoder desktop.
+
+CN PAT requests use the exchanged job token and the upstream's supported empty
+native-identity fallback. No machine token or machine type is fabricated.
+Requests use the subscription dispatcher (direct fallback), identity encoding,
+and reject redirects. Upstream response bodies and transport errors are never
+returned in failure messages. Admin authorization failures retain HTTP 403;
+check-in outcomes return HTTP 200.
+
 ## Scope limits
 
-- Remote origins are fixed per site: `openapi.qoder.sh` / `api3.qoder.sh` for qoder.com and `openapi.qoder.com.cn` / `gateway.qoder.com.cn` for qoder.cn. No device flow, no campaigns/check-in, no VPC, no QwenWork.
+- Remote origins are fixed per site: `openapi.qoder.sh` / `api3.qoder.sh` for qoder.com and `openapi.qoder.com.cn` / `gateway.qoder.com.cn` for qoder.cn. No device flow, no VPC, no QwenWork.
 - Sign-in is PAT-only; the job token is refreshed from its refresh token when present, and a lapsed/absent refresh falls back to PAT re-exchange (a refused PAT marks that site's account expired until you reconnect). The PAT is kept in the plugin's private 0600 credential file.
 
 ## Development
