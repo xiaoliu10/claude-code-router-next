@@ -497,3 +497,29 @@ test("focus gate: initial sync delivers once, a locale-change re-sync does not r
   reloaded.offer("workbuddy-ai");
   assert.equal(reloaded.take(), "workbuddy-ai");
 });
+
+test("host actions survive plugin DOM replacement and are cleaned up with the card", async () => {
+  let cleaned = 0;
+  const fx = deterministicBridge({
+    mountHostActions: (_plugin, host) => {
+      host.appendChild(new El("button") as unknown as HTMLElement);
+      return () => { cleaned += 1; };
+    },
+  });
+  const card = fakeCard();
+  const cardUrl = "/plugins/gemini-oauth/card.js";
+  fx.sources.set(cardUrl, JSON.stringify({ staged: cardUrl }));
+  fx.modules.set(`blob:${ORIGIN}${cardUrl}`, card.mod);
+  const controller = createPluginCardAreaController(fx.bridge);
+  const host = new El("div");
+  await controller.sync([entry()], "en", host as unknown as HTMLElement);
+  const container = host.children[0];
+  assert.equal(container.children[0].children[0].tag, "button");
+  assert.equal(container.children[1], card.mounts[0].el);
+  card.mounts[0].el.children = [];
+  assert.equal(container.children[0].children[0].tag, "button");
+  controller.dispose();
+  assert.equal(cleaned, 1);
+  assert.equal(host.children.length, 0);
+  assert.equal(card.unmounts, 1);
+});
