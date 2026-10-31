@@ -478,6 +478,10 @@ describe("self-contained Codex plugin card", () => {
     await tick(); await tick();
     expect(h.bodies("/models/hide")).toEqual([{ model: "gpt-5.2-codex" }]);
     expect(h.refreshConfig).toHaveBeenCalledTimes(1); // draft reconciled from the server config
+    const reconcile = h.refreshConfig.mock.calls[0][0];
+    const draft = { Providers: [], Router: { default: "codex-subscription,gpt-5.2-codex", think: "other,draft" } };
+    const server = { Providers: [], Router: { default: "codex-subscription,gpt-5.2", think: "other,server" } };
+    expect(reconcile(draft, server).Router).toEqual({ default: "codex-subscription,gpt-5.2", think: "other,draft" });
     expect(h.statusReads()).toBe(2); // settle re-reads the filtered status
     expect(h.host.text()).toContain(en.hidden_toast.replace("{{model}}", "gpt-5.2-codex"));
     expect(h.host.text()).toContain(en.hidden_models.replace("{{count}}", "1"));

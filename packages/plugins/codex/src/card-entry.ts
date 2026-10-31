@@ -1,3 +1,4 @@
+import { clearCodexRouterRefs } from "./router";
 /** Self-contained Codex DOM card: no React, no host runtime imports, no
  * direct fetch, no Codex CLI code. Everything state/network/config related
  * flows through the host card capabilities (PluginCardMountProps, type-only).
@@ -356,14 +357,18 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   };
 
   /** Success tail shared by mutating actions: reconcile the managed provider
-   * into the host draft (unrelated providers and Router survive untouched),
+   * into the host draft; hide also cleans matching Router references,
    * re-read status, then report. A failed draft reconciliation must not
    * suppress the status refresh or the toast — the mutation already persisted
    * server-side; the failure is surfaced separately instead. */
-  const settle = async (id: number): Promise<{ fresh: CodexStatusView | null; reconcileFailed: boolean }> => {
+  const settle = async (id: number, hidden?: ReadonlySet<string>, visible: string[] = []): Promise<{ fresh: CodexStatusView | null; reconcileFailed: boolean }> => {
     let failed = false;
     try {
-      await props.refreshConfig?.((current: any, server: any) => mergeCodexProvider(current, server));
+      await props.refreshConfig?.((current: any, server: any) => {
+        const merged = mergeCodexProvider(current, server);
+        if (hidden && "Router" in merged) merged.Router = clearCodexRouterRefs(merged.Router, hidden, visible[0] ?? null);
+        return merged;
+      });
     } catch { failed = true; }
     const fresh = await readStatus().catch(() => null);
     if (!alive || generation !== id) return { fresh, reconcileFailed: failed };
@@ -503,7 +508,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         }
         // The server persists the blacklist + provider rewrite; settle()
         // reconciles the draft and re-reads the filtered status.
-        const { reconcileFailed: failed } = await settle(id);
+        const { reconcileFailed: failed } = await settle(id, new Set([...(status?.hiddenModels ?? []), model]), result.models ?? []);
         if (!alive || generation !== id) return;
         reconcileFailed = failed;
         toast = t("hidden_toast", { model });

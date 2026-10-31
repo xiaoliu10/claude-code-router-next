@@ -641,7 +641,7 @@ describe("models, usage, rate limits", () => {
 });
 
 // ---------------------------------------------------------------------------
-// hide / restore models (workbuddy §16 parity, minus the Router rewriting)
+// hide / restore models (WorkBuddy Router cleanup parity)
 // ---------------------------------------------------------------------------
 
 describe("hide / restore models", () => {
@@ -677,7 +677,7 @@ describe("hide / restore models", () => {
     const result = await h.service.hideModel("gpt-b");
     expect(result).toEqual({ success: true, model: "gpt-b", models: ["gpt-a", "gpt-c"], hiddenModels: ["gpt-b"] });
     expect(providerModels(h)).toEqual(["gpt-a", "gpt-c"]);
-    expect(h.config().Router).toEqual(CONFIG.Router); // hide never rewrites Router
+    expect(h.config().Router).toEqual(CONFIG.Router); // unrelated Router references survive
     const stored = await h.store.load();
     expect(stored!.hiddenModels).toEqual(["gpt-b"]);
     // The stored list stays COMPLETE so restores keep working.
@@ -768,6 +768,82 @@ describe("hide / restore models", () => {
     // Restoring re-registers from the union of the stored + registered lists.
     expect(await h.service.restoreModels("gpt-a")).toMatchObject({ restored: ["gpt-a"], models: ["gpt-a", "gpt-c"] });
     expect(providerModels(h)).toEqual(["gpt-a", "gpt-c"]);
+  });
+
+  it.each(["hide", "restore"] as const)("queued re-login preserves concurrent %s", async (operation) => {
+    const h = await seeded({ hiddenModels: operation === "restore" ? ["gpt-a"] : [] });
+    (h.service as any).options.fetchImpl = fakeUpstream().impl;
+    let release!: () => void;
+    let entered!: () => void;
+    const writing = new Promise<void>((resolve) => { entered = resolve; });
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const save = h.store.save.bind(h.store);
+    vi.spyOn(h.store, "save").mockImplementationOnce(async (data) => {
+      entered();
+      await barrier;
+      await save(data);
+    });
+    const mutation = operation === "hide" ? h.service.hideModel("gpt-a") : h.service.restoreModels("gpt-a");
+    await writing;
+    // Observe queue admission, rather than guessing when model discovery finishes.
+    let admitted!: () => void;
+    const queued = new Promise<void>((resolve) => { admitted = resolve; });
+    const service = h.service as any;
+    const enqueue = service.enqueueMutation.bind(service);
+    vi.spyOn(service, "enqueueMutation").mockImplementation((action: any) => {
+      const result = enqueue(action);
+      admitted();
+      return result;
+    });
+    const login = loginWith(h.service, "concurrent-login");
+    try {
+      await queued;
+    } finally {
+      release();
+    }
+    await mutation;
+    const { poll } = await login;
+    expect(poll.status).toBe("connected");
+    const expectedHidden = operation === "hide" ? ["gpt-a"] : [];
+    expect((await h.store.load())!.hiddenModels).toEqual(expectedHidden);
+    expect(providerModels(h)).toEqual(operation === "hide" ? ["gpt-c"] : ["gpt-a", "gpt-c"]);
+  });
+
+  it.each(["hide", "restore"] as const)("%s reload failure restores credentials and configuration", async (operation) => {
+    const h = await seeded();
+    if (operation === "restore") await h.service.hideModel("gpt-a");
+    const beforeConfig = structuredClone(h.config());
+    const beforeCredentials = await h.store.load();
+    h.host.reloadRuntime.mockRejectedValueOnce(new Error("reload failed"));
+    const result = operation === "hide" ? h.service.hideModel("gpt-a") : h.service.restoreModels("gpt-a");
+    await expect(result).rejects.toMatchObject({ code: "codex_config_write_failed" });
+    expect(await h.store.load()).toEqual(beforeCredentials);
+    expect(h.config()).toEqual(beforeConfig);
+    expect(h.host.reloadRuntime).toHaveBeenLastCalledWith(beforeConfig);
+  });
+
+  it("hiding Router.default migrates default and clears matching scenario references", async () => {
+    const ref = "codex-subscription,gpt-a";
+    const h = await seeded({ config: { ...CONFIG, Router: {
+      default: ref, background: ref, think: "other,model", longContext: [ref, "other,model"],
+      models: { alias: ref, keep: "other,model" }, families: { coding: { default: ref, extra: true } },
+    } } });
+    await h.service.hideModel("gpt-a");
+    expect(h.config().Router).toEqual({
+      default: "codex-subscription,gpt-b", background: "", think: "other,model", longContext: ["other,model"],
+      models: { keep: "other,model" }, families: { coding: { default: "", extra: true } },
+    });
+    expect(providerModels(h)).toContain(h.config().Router.default.split(",")[1]);
+  });
+
+  it("hiding the last model clears default and leaves no dangling Router references", async () => {
+    const h = await seeded();
+    await h.service.hideModel("gpt-b");
+    await h.service.hideModel("gpt-c");
+    await h.service.hideModel("gpt-a");
+    expect(providerModels(h)).toEqual([]);
+    expect(h.config().Router).toEqual({ default: "" });
+    expect(JSON.stringify(h.config().Router)).not.toContain("codex-subscription,");
   });
 
   it("re-login keeps the previous blacklist and registers only visible models", async () => {

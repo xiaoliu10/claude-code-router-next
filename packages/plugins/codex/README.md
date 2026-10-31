@@ -14,7 +14,7 @@ The callback binds `127.0.0.1:1455`, then registered fallback `1457`. If both ar
 
 After authorization, account-specific models are fetched dynamically. **Sync models** refreshes them. Login/model sync adds or updates only the `codex-subscription` managed provider; it never selects a Router default or changes unrelated providers (including a user-owned provider named `codex`). Choose routing explicitly in CCR. **Disconnect** removes this plugin's credential file and managed provider; Router references are intentionally not rewritten.
 
-Models can be hidden from the card (the ✕ on a model chip): the blacklist persists in `codex-credentials.json`, survives sync and re-login, and removes the model from the managed provider's registered list without touching Router. Hidden models are restorable individually or all at once from the card's hidden-models list.
+Models can be hidden from the card (the ✕ on a model chip): the blacklist persists in `codex-credentials.json`, survives sync and re-login, and removes the model from the managed provider's registered list. Matching Router default references move to the first remaining visible model (or become empty if none remain); matching scenario, model-alias and family-default references are cleared. Fallback stages and per-project routing are unchanged. Hidden models are restorable individually or all at once from the card's hidden-models list.
 
 ## Credentials and transport
 

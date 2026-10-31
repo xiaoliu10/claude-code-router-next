@@ -232,8 +232,8 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
 
   /**
    * Hide one model: blacklists it in codex-credentials.json (survives
-   * sync/re-login), removes it from the managed provider's models and never
-   * rewrites Router. Idempotent; hiding the last visible model is allowed.
+   * sync/re-login), removes it from registration and clears matching Router
+   * references, migrating default to the first visible model when available. Idempotent; hiding the last visible model is allowed.
    */
   app.post("/api/codex/models/hide", async (req: any, reply: any) => {
     try {
