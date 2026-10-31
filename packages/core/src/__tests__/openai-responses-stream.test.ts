@@ -402,3 +402,59 @@ describe("OpenAIResponsesTransformer.transformResponseOut — cancellation and e
     await expect(readAllText(out)).rejects.toThrow("upstream reset");
   });
 });
+
+describe("OpenAIResponsesTransformer.transformResponseOut — terminal usage", () => {
+  it("carries upstream usage on the closing chat chunk", async () => {
+    // Regression: the response.completed branch built its end chunk without
+    // usage, so every codex turn recorded output_tokens 0 and no cache
+    // counters while the stream itself was healthy.
+    const created = `event: response.created\ndata: ${JSON.stringify({
+      type: "response.created",
+      response: { id: "resp_1", model: "gpt-6.1-sol", output: [] },
+    })}\n\n`;
+    const delta = `event: response.output_text.delta\ndata: ${JSON.stringify({
+      type: "response.output_text.delta",
+      delta: "hi",
+      item_id: "item_1",
+      response: { model: "gpt-6.1-sol" },
+    })}\n\n`;
+    const completed = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_1",
+        model: "gpt-6.1-sol",
+        output: [{ type: "message" }],
+        usage: {
+          input_tokens: 21,
+          output_tokens: 7,
+          total_tokens: 28,
+          input_tokens_details: { cached_tokens: 5, cache_write_tokens: 3 },
+          output_tokens_details: { reasoning_tokens: 2 },
+        },
+      },
+    })}\n\n`;
+
+    const out = await transformer.transformResponseOut(
+      streamResponse([created, delta, completed]),
+      { req: { codexDetected: false, body: { model: "gpt-6.1-sol" } } } as any
+    );
+    const text = await readAllText(out);
+
+    const terminal = text
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => line.slice(6))
+      .filter((payload) => payload !== "[DONE]")
+      .map((payload) => JSON.parse(payload))
+      .find((chunk) => chunk.choices?.[0]?.finish_reason);
+
+    expect(terminal).toBeDefined();
+    expect(terminal.usage).toMatchObject({
+      prompt_tokens: 21,
+      completion_tokens: 7,
+      total_tokens: 28,
+      prompt_tokens_details: { cached_tokens: 5, cache_write_tokens: 3 },
+      completion_tokens_details: { reasoning_tokens: 2 },
+    });
+  });
+});

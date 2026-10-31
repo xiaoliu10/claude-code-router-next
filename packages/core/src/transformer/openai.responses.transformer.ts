@@ -79,6 +79,33 @@ interface ResponsesStreamEvent {
   reasoning_summary?: string; // 添加推理摘要支持
 }
 
+/** Responses usage → chat-completions usage. Cache counters are read from the
+ *  Responses detail objects so cache hits are not silently lost. */
+function toChatUsage(usage: any): Record<string, number> | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const promptTokens = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0) || 0;
+  const completionTokens = Number(usage.output_tokens ?? usage.completion_tokens ?? 0) || 0;
+  const cached = Number(
+    usage.input_tokens_details?.cached_tokens ??
+    usage.prompt_tokens_details?.cached_tokens ??
+    usage.cache_read_input_tokens ?? 0
+  ) || 0;
+  const cacheWrite = Number(
+    usage.input_tokens_details?.cache_write_tokens ??
+    usage.input_tokens_details?.cache_creation_tokens ??
+    usage.cache_creation_input_tokens ?? 0
+  ) || 0;
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: Number(usage.total_tokens ?? promptTokens + completionTokens) || 0,
+    prompt_tokens_details: { cached_tokens: cached, cache_write_tokens: cacheWrite },
+    completion_tokens_details: {
+      reasoning_tokens: Number(usage.output_tokens_details?.reasoning_tokens ?? 0) || 0,
+    },
+  };
+}
+
 export class OpenAIResponsesTransformer implements Transformer {
   name = "openai-responses";
   endPoint = "/v1/responses";
@@ -457,6 +484,12 @@ export class OpenAIResponsesTransformer implements Transformer {
 
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
+      // Stable fallback label for chunks that arrive before the upstream sends
+      // its own model field: the requested model, never a hardcoded placeholder
+      // (a literal like "gpt-5-codex-" leaked into the UI and usage rows).
+      const requestModel = String(
+        (context?.req?.body as any)?.model ?? (context?.req as any)?.originalModel ?? "unknown"
+      );
       let buffer = ""; // Buffer for incomplete lines
       let isStreamEnded = false;
 
@@ -550,7 +583,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                             "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || "gpt-5-codex-",
+                          model: data.response?.model || requestModel,
                           choices: [
                             {
                               index: getCurrentIndex(data.type),
@@ -630,7 +663,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           id: data.item_id || "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || "gpt-5-codex",
+                          model: data.response?.model || requestModel,
                           choices: [
                             {
                               index: getCurrentIndex(data.type),
@@ -668,7 +701,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           id: data.item_id || "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || "gpt-5-codex-",
+                          model: data.response?.model || requestModel,
                           choices: [
                             {
                               index: getCurrentIndex(data.type),
@@ -704,7 +737,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           id: data.response?.id || "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || "gpt-5-codex-",
+                          model: data.response?.model || requestModel,
                           choices: [
                             {
                               index: 0,
@@ -712,6 +745,12 @@ export class OpenAIResponsesTransformer implements Transformer {
                               finish_reason: finishReason,
                             },
                           ],
+                          // Carry the upstream usage on the terminal chunk, the
+                          // only place chat-completions allows it. Dropping it
+                          // here made every codex turn record output_tokens 0
+                          // (and no cache counters) even though the stream was
+                          // healthy — usage was simply never propagated.
+                          ...(data.response?.usage ? { usage: toChatUsage(data.response.usage) } : {}),
                         };
 
                         controller.enqueue(
