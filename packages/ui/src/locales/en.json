@@ -629,6 +629,9 @@
     }
   },
   "pluginCards": {
+    "upgrade": "Upgrade",
+    "upgrading": "Upgrading…",
+    "upgraded_restart": "Plugin upgraded. Restart CCR to activate the new version.",
     "area_label": "Provider plugin management cards",
     "manifest_failed": "The installed provider plugin list could not be loaded. Check that the CCR server is running, then reload this page.",
     "unavailable_title": "{{name}} is installed but unavailable",

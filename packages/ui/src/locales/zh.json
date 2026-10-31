@@ -629,6 +629,9 @@
     }
   },
   "pluginCards": {
+    "upgrade": "升级",
+    "upgrading": "升级中…",
+    "upgraded_restart": "插件已升级，请重启 CCR 以启用新版本。",
     "area_label": "供应商插件管理卡片",
     "manifest_failed": "无法加载已安装的供应商插件列表。请确认 CCR 服务正在运行，然后重新加载本页面。",
     "unavailable_title": "{{name}} 已安装但不可用",

@@ -6,6 +6,8 @@ import {
   type PluginCardAreaController, type PluginCardHostIssue, type PluginFocusGate,
 } from "../utils/plugin-card";
 import { useConfig } from "./ConfigProvider";
+import { createMarketplaceBridge, createPluginMarketController, type PluginMarketController } from "../utils/plugin-market";
+import { renderPluginCardUpgrade, upgradePluginCard } from "../utils/plugin-card-upgrade";
 import type { PluginInfo } from "../types";
 
 type ManifestState =
@@ -29,8 +31,37 @@ type ManifestState =
 export function PluginCardArea({ disabled, onBusyChange, focusKey }: { disabled: boolean; onBusyChange?: (busy: boolean) => void; focusKey?: string | null }) {
   const { i18n, t } = useTranslation();
   const { refreshConfig } = useConfig();
-  const currentProps = useRef({ disabled, refreshConfig, onBusyChange });
-  currentProps.current = { disabled, refreshConfig, onBusyChange };
+  const currentProps = useRef({ disabled, refreshConfig, onBusyChange, t });
+  currentProps.current = { disabled, refreshConfig, onBusyChange, t };
+  const actionsRef = useRef(new Map<HTMLElement, string>());
+  const cardBusy = useRef(false);
+  const upgradeBusy = useRef(false);
+  const marketRef = useRef<PluginMarketController | null>(null);
+  if (marketRef.current === null) marketRef.current = createPluginMarketController(createMarketplaceBridge(api));
+  const market = marketRef.current;
+  const renderActions = () => {
+    for (const [host, name] of actionsRef.current) {
+      renderPluginCardUpgrade(host, name, market.getState(), currentProps.current.disabled, currentProps.current.t, (packageName) => {
+        if (currentProps.current.disabled || upgradeBusy.current) return;
+        const release = api.acquireProviderManagement();
+        if (!release) return;
+        upgradeBusy.current = true;
+        currentProps.current.onBusyChange?.(true);
+        void upgradePluginCard(market, packageName, name, async () => {
+          const data = await api.getPlugins();
+          setManifest({ status: "ok", entries: data.plugins ?? [] });
+        }).catch(() => {
+          // Keep the restart notice if the manifest refresh fails after installation.
+        }).finally(() => {
+          release();
+          upgradeBusy.current = false;
+          currentProps.current.onBusyChange?.(cardBusy.current);
+        });
+      });
+    }
+  };
+  const renderActionsRef = useRef(renderActions);
+  renderActionsRef.current = renderActions;
   // F1: a deep-linked focus key is delivered exactly once per DISTINCT key.
   // location.state is persistent, so a locale switch or manifest re-sync
   // observes the same key again — the gate keeps it consumed; a NEW navigation
@@ -50,7 +81,15 @@ export function PluginCardArea({ disabled, onBusyChange, focusKey }: { disabled:
       callPluginApi: (plugin, path, init) => api.callPluginApi(plugin, path, init),
       acquireManagement: () => api.acquireProviderManagement(),
       refreshConfig: (merge) => currentProps.current.refreshConfig(merge),
-      onBusyChange: (busy) => currentProps.current.onBusyChange?.(busy),
+      onBusyChange: (busy) => {
+        cardBusy.current = busy;
+        currentProps.current.onBusyChange?.(busy || upgradeBusy.current);
+      },
+      mountHostActions: (plugin, host) => {
+        actionsRef.current.set(host, plugin.name);
+        renderActionsRef.current();
+        return () => { actionsRef.current.delete(host); };
+      },
       log: console,
       fetchCardSource: (cardUrl) => api.fetchPluginCardSource(cardUrl),
       importModule: (url) => import(/* @vite-ignore */ url),
@@ -60,6 +99,14 @@ export function PluginCardArea({ disabled, onBusyChange, focusKey }: { disabled:
   }
   const controller = controllerRef.current;
   const locale = pluginLocaleOf(i18n.language);
+
+  useEffect(() => {
+    const unsubscribe = market.subscribe(() => renderActionsRef.current());
+    void market.refresh();
+    return unsubscribe;
+  }, [market]);
+
+  useEffect(() => { renderActionsRef.current(); }, [disabled, t]);
 
   useEffect(() => {
     let cancelled = false;
