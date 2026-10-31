@@ -477,7 +477,9 @@ export class AnthropicTransformer implements Transformer {
         const encoder = new TextEncoder();
         const messageId = `msg_${Date.now()}`;
         let stopReasonMessageDelta: null | Record<string, any> = null;
-        let model = "unknown";
+        // Fallback only until the first chat chunk carries an upstream model;
+        // prefer the requested model so the UI never shows a placeholder.
+        let model = String((context?.req?.body as any)?.model ?? "unknown");
         let hasStarted = false;
         let hasTextContentStarted = false;
         let hasFinished = false;

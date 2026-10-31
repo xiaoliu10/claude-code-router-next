@@ -48,6 +48,7 @@ import {
   GEMINI_OAUTH_FALLBACK_MODELS,
   GEMINI_OAUTH_LOGIN_TTL_MS,
   GEMINI_OAUTH_PROVIDER_NAME,
+  GEMINI_OAUTH_REAUTH_COOLDOWN_MS,
   antigravityClientId,
   antigravityClientSecret,
   antigravityWireModel,
@@ -64,6 +65,7 @@ import {
   invalidateGeminiOauthAccessToken,
   isGeminiOauthConfigured,
   isManagedGeminiOauthConfigProvider,
+  isStickyGeminiOauthError,
   lockGeminiOauthProvider,
   protectGeminiOauthConfig,
   refreshAccessToken,
@@ -485,11 +487,13 @@ export class GeminiOauthAuthService {
     const account = await this.ensureLoaded();
     const modelsCount = await this.managedModelsCount();
     const now = Date.now();
-    // A parked-account error is shown only while the cooldown is live; a
-    // reauth-class error has no cooldown and stays until a fresh login.
+    // A parked-account error is shown only while its cooldown is live,
+    // EXCEPT sticky ones: a reauth failure cannot be waited out, so it stays
+    // reported after the cooldown lapses (the cooldown bounds the recovery
+    // probe's network spend; it does not mean the account recovered).
     const cooling = account?.cooldownUntil && account.cooldownUntil > now;
     const showLastError = account?.lastError
-      ? (!account.cooldownUntil || cooling)
+      ? (!account.cooldownUntil || cooling || isStickyGeminiOauthError(account.lastError.code))
       : false;
     const lastError = showLastError && account?.lastError
       ? {
@@ -746,6 +750,7 @@ export class GeminiOauthAuthService {
   }
 
   private failLogin(job: PendingLogin, error: GeminiOauthPollErrorCode): GeminiOauthPollResult {
+    this.log.error?.(`[gemini-oauth] LOGIN_FAIL ${error} loginId=${job.loginId.slice(0, 8)}`);
     this.terminalize(job, { status: "failed", error });
     return job.result!;
   }
@@ -774,7 +779,7 @@ export class GeminiOauthAuthService {
         fetchImpl: (url, init) => this.directFetch(url, init),
       });
     } catch (error: any) {
-      this.log.warn?.(`[gemini-oauth] token exchange failed: ${GEMINI_OAUTH_LAST_ERROR_CODES.has(error?.code) ? error.code : "upstream"}`);
+      this.log.error?.(`[gemini-oauth] LOGIN_STEP_FAIL exchange: code=${error?.code ?? "none"} message=${error?.message ?? ""}`);
       return this.failLogin(job, "gemini_oauth_login_account_failed");
     }
     if (!isCurrent()) return this.failLogin(job, "gemini_oauth_login_state_rejected");
@@ -782,7 +787,8 @@ export class GeminiOauthAuthService {
     let email: string;
     try {
       email = await fetchUserEmail(tokens.accessToken, (url, init) => this.directFetch(url, init));
-    } catch {
+    } catch (emailError: any) {
+      this.log.error?.(`[gemini-oauth] LOGIN_STEP_FAIL email: code=${emailError?.code ?? "none"} message=${emailError?.message ?? ""}`);
       return this.failLogin(job, "gemini_oauth_login_account_failed");
     }
 
@@ -790,7 +796,7 @@ export class GeminiOauthAuthService {
     try {
       project = await discoverAntigravityProject(tokens.accessToken, (url, init) => this.directFetch(url, init));
     } catch (error: any) {
-      this.log.warn?.(`[gemini-oauth] project discovery failed: ${GEMINI_OAUTH_LAST_ERROR_CODES.has(error?.code) ? error.code : "upstream"}`);
+      this.log.error?.(`[gemini-oauth] LOGIN_STEP_FAIL project: code=${error?.code ?? "none"} status=${error?.httpStatus ?? "none"} message=${error?.message ?? ""}`);
       return this.failLogin(job, "gemini_oauth_login_account_failed");
     }
 
@@ -1023,8 +1029,36 @@ export class GeminiOauthAuthService {
         throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
       }
       return token;
-    }).catch((error) => {
+    }).catch(async (error) => {
       if (this.refreshFlight?.key === key) this.refreshFlight = null;
+      // Same epoch guard the success branch has: a flight started before a
+      // disconnect/reconnect belongs to the OLD account. noteUpstreamError()
+      // writes onto whatever credential file exists at write time, so without
+      // this a stale failure would park a just-re-authorized account for an
+      // hour — the exact pain this fix exists to remove.
+      if (this.epoch !== epoch) throw error;
+      // A rejected refresh grant is the most common way a login expires, and it
+      // happens BEFORE any data-plane call — so no response ever reaches the
+      // classifier and noteUpstreamError. Record it here, otherwise the account
+      // keeps no state at all: the recovery probe sees a healthy account and
+      // spends a real refresh call on the dead token every interval, while the
+      // UI card reports "connected".
+      if (error?.code === "gemini_oauth_reauth_required") {
+        const cooldownMs = typeof error.cooldownMs === "number" ? error.cooldownMs : GEMINI_OAUTH_REAUTH_COOLDOWN_MS;
+        // Awaited, not fire-and-forget: the parked state must be durable before
+        // the failure reaches the caller, otherwise a probe that runs between
+        // the throw and the write would still see a healthy account.
+        try {
+          await this.noteUpstreamError({
+            code: "gemini_oauth_reauth_required",
+            message: error.message ?? "Gemini OAuth 登录态已失效，请重新授权登录。",
+            httpStatus: 401,
+            cooldownMs,
+          });
+        } catch {
+          // Bookkeeping must never mask the original failure.
+        }
+      }
       throw error;
     });
     this.refreshFlight = { key, promise };

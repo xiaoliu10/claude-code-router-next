@@ -93,6 +93,8 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2420** | <ul><li>**codex 用量统计修复**：`response.completed` 转 chat 结束帧时漏带 usage，导致 codex 回合内容正常、TTFT 正常但输出/缓存命中/速度全为 0；现在结束帧携带完整 usage（含缓存读写与推理 token）。</li><li>**不再泄漏占位模型名**：早期分块缺少上游 model 时回退到请求的模型名，不再显示 `unknown` / `gpt-5-codex-`。</li></ul> |
+| **v2.3.2419** | <ul><li>**codex 0 输出回合根因修复**：数据面此前绕过 `SUBSCRIPTION_PROXY_URL` 走直连路径，中间盒剥离响应头并破坏压缩体（插件改为走订阅代理 + identity 编码，ccr-provider-codex 1.0.7）；同时单次读取的格式探测在代理分块下漏掉格式标记，Responses 流被误送入 Chat 转换器输出「完整但空」的消息（现在累积读取判定格式，且原生 Responses 流仅对 codex 客户端放行，其他客户端走 Responses→Chat 转换）。</li><li>**gemini-oauth 数据面加 identity 编码**，登录失败记录 Google 原始错误与失败步骤（1.0.7）。</li></ul> |
 | **v2.3.2418** | <ul><li>**空回复现在会重试并降级**：上游返回 200 且 `content` 为空时不再被记成成功，改为触发同模型重试与 fallback；判据是 content 集合为空（tool_use-only 等合法回合不受影响），探测有字节与时间上限，慢速流不丢字节；Codex 侧同样拦住空 `response.completed`。</li><li>**流式回合不再记录 `output_tokens: 0`**：普通流式请求此前没有 usage 读取器，健康回复被记成全零且无 TTFT；现从 tee 分支采集并按流序合并。</li><li>**不健康 provider 从模型列表降级剔除**：熔断模型对所有 provider 类型生效隐藏，恢复后自动放回；订阅类 provider 新增两级后台探活（先查账号状态，再发真实最小请求），不再依赖真实请求反复撞死账号。</li></ul> |
 | **v2.3.2415** | <ul><li>**新增 Qoder 订阅 provider（qoder.com + qoder.cn）**: 同一插件同引擎支持国际站与国内站 PAT 订阅，双 managed provider + 卡片双区块（中英双语）；含整配置写串行化、401 单次刷新重放、每帧 1MiB 上限等健壮性修复。</li><li>**修复 WorkBuddy 6004 重置时间戳时区**: 测试改用 Asia/Shanghai 渲染，UTC CI 不再挂。</li><li>**修复 tool_result 图片按 base64 文本发送**: 图片改为视觉块发送，避免 200 万+ token 膨胀与上游拒绝。</li></ul> |
 | **v2.3.2414** | <ul><li>**CCR Desktop（可选 Tauri 客户端）与 Pi 配置生命周期修复**: 新增可选 Tauri 桌面壳（托盘快速切换全局默认模型、quota 摘要、单实例；生命周期伴侣化、退出不杀 gateway）；修复 `ccr restart` 的 disable→enable 与 legacy 项目 provider 改名迁移丢失 Pi 自定义模型字段（thinkingLevelMap/modelOverrides）。</li></ul> |
