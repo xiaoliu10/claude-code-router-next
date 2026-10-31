@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2420] - 2026-10-31
+
+### Fixed
+
+- **codex usage accounting**: the `response.completed` branch built its closing
+  chat chunk without `usage`, so every codex turn streamed real content with a
+  healthy TTFT yet recorded `output_tokens: 0`, no cache counters and no token
+  speed. The terminal chunk now carries a chat-completions usage object built
+  from the Responses usage (cached / cache-write / reasoning details included).
+- **placeholder model names**: early chunks fell back to hardcoded
+  `gpt-5-codex-` / `unknown` labels when the upstream had not sent its model
+  yet; they now fall back to the requested model.
+
+## [2.3.2420] - 2026-10-31（中文）
+
+### 修复
+
+- **codex 用量统计**：`response.completed` 分支生成 chat 结束帧时没有带上
+  `usage`，导致每个 codex 回合内容正常、TTFT 正常，但记录的
+  `output_tokens` 为 0、缓存计数与速度全空。现在结束帧携带由 Responses
+  usage 构造的 chat-completions usage（含缓存读写与推理 token）。
+- **占位模型名**：早期分块在上游尚未给出模型名时回退到硬编码的
+  `gpt-5-codex-` / `unknown`；现在回退到请求使用的模型名。
+
 ## [2.3.2419] - 2026-10-31
 
 ### Fixed
