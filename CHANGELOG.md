@@ -4,6 +4,56 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2421] - 2026-10-31
+
+### Fixed
+
+- **plugin updates were never offered**: a plugin record stores the npm
+  *specifier* it was installed with (`@wengine-ai/ccr-provider-qoder@0.2.0`),
+  while catalog rows are keyed by bare package name. A pinned install therefore
+  matched no record, its row fell back to reading the local manifest version as
+  if it were the registry version, and `updateAvailable` could never become
+  true — so a stale local plugin looked up to date and no update affordance
+  ever appeared. The specifier tail is now stripped before matching.
+- **`upstream_model: unknown`**: the Responses lifecycle carries the model on
+  every event's `response` object, but the column was only read from
+  `response.completed`. A long stream that ended without a parsed terminal event
+  (client abort, truncated tail, proxy reconnect) recorded `unknown`, which the
+  UI rendered as a third routing leg naming nothing. The first non-empty
+  `response.model` is now captured, and the row falls back to the routed model
+  instead of a placeholder.
+- **pre-routing model in converted frames**: the Responses→Chat conversion
+  labelled early chunks with the pre-routing `body.model` (for a codex leg, the
+  client's own `ccr-opus`); it now prefers the routed model.
+
+### Added
+
+- **per-card upgrade button** in the plugin marketplace: an installed card whose
+  manifest version differs from the registry version shows an Update action that
+  reinstalls with `force`, surfaces progress, and refreshes the entry when done.
+
+## [2.3.2421] - 2026-10-31（中文）
+
+### Fixed
+
+- **插件更新永远发现不了**：插件记录里保存的是安装时的 npm **specifier**
+  （如 `@wengine-ai/ccr-provider-qoder@0.2.0`），而 catalog 行是按裸包名索引的。
+  带版本号的安装因此匹配不到记录，该行退化为把本地 manifest 版本当成 registry
+  版本，`updateAvailable` 永远不可能为 true——本地插件明明是旧版却显示已是最新，
+  升级按钮从不出现。现在匹配前会剥离 specifier 尾部版本号。
+- **`upstream_model` 写成 `unknown`**：Responses 生命周期的每个事件都在
+  `response` 对象里带 model，但该列只从 `response.completed` 读取。长流若在没有
+  解析到终止事件的情况下结束（客户端中断、尾包截断、代理重连），就会记成
+  `unknown`，UI 上表现为第三段路由链什么都没写。现在会捕获首个非空的
+  `response.model`，并在完全未回显时回退到路由模型而不是占位符。
+- **转换帧里的路由前模型名**：Responses→Chat 转换给早期分块贴的是路由前的
+  `body.model`（codex 腿上就是客户端自己的 `ccr-opus`），现在优先使用路由后模型。
+
+### Added
+
+- **插件市场卡片升级按钮**：已安装且 manifest 版本与 registry 版本不一致的卡片会
+  显示更新按钮，以 `force` 重装并展示进度，完成后刷新该条目。
+
 ## [2.3.2420] - 2026-10-31
 
 ### Fixed
