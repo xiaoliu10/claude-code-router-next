@@ -157,6 +157,8 @@ export interface PluginCardAreaBridge {
   importModule(url: string): Promise<unknown>;
   makeBlobUrl(source: string): string;
   revokeBlobUrl(url: string): void;
+  /** Optional host-owned actions, isolated from plugin rendering. */
+  mountHostActions?(plugin: PluginInfo, host: HTMLElement): () => void;
 }
 
 export interface PluginCardAreaController {
@@ -192,7 +194,7 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
   let generation = 0;
   let busyCount = 0;
   let issues: PluginCardHostIssue[] = [];
-  const active: Array<{ el: HTMLElement; unmount?: (el: HTMLElement) => void; blobUrl: string | null }> = [];
+  const active: Array<{ el: HTMLElement; unmount?: (el: HTMLElement) => void; blobUrl: string | null; container: HTMLElement; cleanupActions?: () => void }> = [];
   const hostListeners = new Set<() => void>();
   const issueListeners = new Set<(next: PluginCardHostIssue[]) => void>();
 
@@ -218,7 +220,8 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
         /* plugin cleanup must not break the host */
       }
       try {
-        entry.el.remove();
+        entry.cleanupActions?.();
+        entry.container.remove();
       } catch {
         /* minimal DOM doubles may not implement remove() */
       }
@@ -259,7 +262,15 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
     const el = document.createElement("div");
     el.className = "plugin-card-host";
     el.dataset.plugin = plugin.name;
-    host.appendChild(el);
+    const container = bridge.mountHostActions ? document.createElement("div") : el;
+    const actions = bridge.mountHostActions ? document.createElement("div") : null;
+    if (actions) {
+      container.className = "plugin-card-container";
+      container.appendChild(actions);
+      container.appendChild(el);
+    }
+    host.appendChild(container);
+    const cleanupActions = actions ? bridge.mountHostActions?.(plugin, actions) : undefined;
     const props: PluginCardMountProps = {
       callApi: <T,>(path: string, init?: RequestInit & { timeoutMs?: number }) =>
         bridge.callPluginApi<T>(plugin.name, path, init),
@@ -288,7 +299,8 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
       await card.mount(el, props);
     } catch (error) {
       try {
-        el.remove();
+        cleanupActions?.();
+        container.remove();
       } catch {
         /* noop */
       }
@@ -303,14 +315,15 @@ export function createPluginCardAreaController(bridge: PluginCardAreaBridge): Pl
         /* plugin cleanup must not break the host */
       }
       try {
-        el.remove();
+        cleanupActions?.();
+        container.remove();
       } catch {
         /* noop */
       }
       bridge.revokeBlobUrl(blobUrl);
       return;
     }
-    active.push({ el, unmount: card.unmount, blobUrl });
+    active.push({ el, unmount: card.unmount, blobUrl, container, cleanupActions });
   };
 
   return {

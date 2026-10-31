@@ -1,3 +1,4 @@
+import { clearKiroRouterRefs } from "./router";
 import { constants } from "node:fs";
 import { open, mkdir, rename, unlink, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -117,8 +118,21 @@ export class KiroAuthService {
       if (at < 0) list.push(p); else list[at] = p;
     } else if (at >= 0) list.splice(at, 1);
     cfg[key] = list;
-    try { await host.writeConfig(cfg); await host.reloadRuntime(cfg); }
-    catch { await host.writeConfig(previous).then(() => host.reloadRuntime(previous)).catch(() => {}); throw kiroError("kiro_config_write_failed", 500); }
+    if ("Router" in cfg) {
+      const hidden = new Set(next.hiddenModels);
+      const firstVisible = next.models.find(model => !hidden.has(model.id))?.id ?? null;
+      cfg.Router = clearKiroRouterRefs(cfg.Router, hidden, firstVisible);
+    }
+    const expectedRouter = JSON.stringify(cfg.Router ?? null);
+    try {
+      await host.writeConfig(cfg);
+      if (JSON.stringify(cfg.Router ?? null) !== expectedRouter) throw kiroError("kiro_config_write_failed", 500);
+      await host.reloadRuntime(cfg);
+    } catch {
+      await host.writeConfig(previous).catch(() => {});
+      await host.reloadRuntime(previous).catch(() => {});
+      throw kiroError("kiro_config_write_failed", 500);
+    }
   }
   private async commit(next: Saved) {
     const old = this.saved; await this.config(next);

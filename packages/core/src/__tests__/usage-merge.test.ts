@@ -40,6 +40,27 @@ describe("normalizeUsagePayload", () => {
   });
 });
 
+describe("ordinary usage merge compatibility", () => {
+  it.each([true, false])("keeps unmarked normalized and merged objects deeply equal to baseline (reset=%s)", (resetBase) => {
+    const raw = { prompt_tokens: 50, completion_tokens: 3, cache_creation_input_tokens: 7 };
+    const normalized = normalizeUsagePayload(raw);
+    expect(normalized).toEqual({ ...raw, input_tokens: 50, output_tokens: 3, cache_read_input_tokens: 0 });
+    const base = { input_tokens: 99, output_tokens: 8, cache_read_input_tokens: 30, cache_creation_input_tokens: 4 };
+    expect(mergeUsageCapture(base, normalized, resetBase)).toEqual({
+      input_tokens: 50, output_tokens: 3, cache_read_input_tokens: resetBase ? 0 : 30, cache_creation_input_tokens: 7,
+    });
+  });
+
+  it("keeps true sticky but resets it at the next request", () => {
+    const estimated = normalizeUsagePayload({ prompt_tokens: 50, completion_tokens: 3, kiro_estimated: true });
+    const marked = mergeUsageCapture({}, estimated, true);
+    expect(mergeUsageCapture(marked, { output_tokens: 4, usage_estimated: false }, false).usage_estimated).toBe(true);
+    expect(mergeUsageCapture(marked, { input_tokens: 50, output_tokens: 3 }, true)).toEqual({
+      input_tokens: 50, output_tokens: 3, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    });
+  });
+});
+
 describe("mergeUsageCapture", () => {
   it("preserves real usage captured on message_start against a trailing all-zero frame", () => {
     // Simulates the fireworks/GLM-5.2 bug: message_start reports real input,

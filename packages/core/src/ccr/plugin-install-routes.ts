@@ -141,10 +141,21 @@ export async function buildPluginCatalog(
   // "codex"). The record's `source` field (recorded at install) bridges the
   // two; a direct name match still covers names that happen to coincide.
   const recordByName = new Map(records.map((r) => [r.name, r]));
+  // A record's `source` is the npm SPECIFIER the user installed with, which may
+  // carry a version tag ("@scope/pkg@0.2.0") or a range. Catalog entries are
+  // keyed by bare package name, so strip the specifier tail before matching —
+  // otherwise a versioned install never matches its catalog row and the row
+  // loses its `updateAvailable` affordance (the visible version would then
+  // read from the local manifest only, making an update undetectable).
+  // Scoped names keep their leading "@", so the split must ignore index 0.
+  const packageNameOf = (source: string): string => {
+    const at = source.indexOf("@", source.startsWith("@") ? 1 : 0);
+    return at > 0 ? source.slice(0, at) : source;
+  };
   const recordBySource = new Map(
     records
       .filter((r): r is typeof r & { source: string } => typeof r.source === "string" && r.source !== "")
-      .map((r) => [r.source, r])
+      .map((r) => [packageNameOf(r.source), r])
   );
   // Installed manifest version comes from the plugin payload, not npm.
   const installedVersion = (name: string): string | null => {

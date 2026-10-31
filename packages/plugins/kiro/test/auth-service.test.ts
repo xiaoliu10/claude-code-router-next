@@ -4,6 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { KiroAuthService } from "../src/auth-service";
+import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
+
+// Execute the actual core resolver in isolation from core startup dependencies.
+const coreRouter = ts.createSourceFile("router.ts", readFileSync(new URL("../../../core/src/utils/router.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+const resolver = coreRouter.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "findProviderModel")!;
+const resolverJs = ts.transpile(resolver.getText(coreRouter).replace(/^export /, ""));
+const findProviderModel = runInNewContext(`${resolverJs}; findProviderModel`) as (providers: unknown[], provider: string, model: string) => unknown;
 import { BUILDER_ID_PROFILE, CALLBACK_PORTS } from "../src/protocol";
 
 const services: KiroAuthService[] = [], dirs: string[] = [];
@@ -42,10 +51,9 @@ async function login(s: KiroAuthService, method: "portal" | "builderid" | "idc" 
 describe("Kiro browser credentials", () => {
   it.each(["portal", "builderid", "idc"] as const)("completes %s with PKCE, private persistence and fixed-origin identity encoding", async method => {
     const f = await setup(); const { started, result } = await login(f.service, method, "google", "eu-west-1");
-    expect(result.status).toBe("complete");
-    // Builder ID's fixed profile lives in us-east-1, so its Kiro region is us-east-1 whatever directory region routes the sign-in.
-    const expectedRegion = method === "builderid" ? "us-east-1" : "eu-west-1";
-    expect(result.account).toMatchObject({ email: "same@example.com", region: expectedRegion, uid: method === "portal" ? "google" : method === "builderid" ? "builderid" : "enterprise" });
+    // Builder ID is anchored to us-east-1 whatever directory region the caller
+    // typed: the fixed profile ARN lives there.
+    expect(result.status).toBe("complete"); expect(result.account).toMatchObject({ email: "same@example.com", region: method === "builderid" ? "us-east-1" : "eu-west-1", uid: method === "portal" ? "google" : method === "builderid" ? "builderid" : "enterprise" });
     const auth = new URL(started.url); expect(auth.searchParams.get("code_challenge_method")).toBe("S256"); expect(auth.searchParams.get("code_challenge")).toBeTruthy();
     const exchange = f.requests.find(r => r.url.endsWith("/token"))!;
     expect(exchange.url).toBe(method === "portal" ? "https://prod.eu-west-1.auth.desktop.kiro.dev/oauth/token" : "https://oidc.eu-west-1.amazonaws.com/token");
@@ -88,6 +96,49 @@ describe("Kiro browser credentials", () => {
     expect(f.requests.filter(r => r.url.includes("List-Available-Models")).every(r => r.url.startsWith("https://management.eu-west-1.kiro.dev/"))).toBe(true);
     expect((await f.service.getUsage()).windows[0]).toMatchObject({ amount: 5, limit: 100, used: 5 });
     await f.service.setModelHidden("claude", true); expect(f.config().Providers[1].models).toEqual(["auto"]);
+  });
+  it("cleans persisted Router references on hide and never resurrects them on restore", async () => {
+    const f = await setup(); await login(f.service); await f.service.syncModels();
+    f.config().Router = {
+      default: "kiro-subscription,auto", think: "kiro-subscription,auto",
+      background: ["other,keep", "kiro-subscription,auto"],
+      models: { alias: "kiro-subscription,auto", keep: "other,keep" },
+      families: { claude: { default: "kiro-subscription,auto" } },
+      fallback: ["kiro-subscription,auto"],
+    };
+    await f.service.setModelHidden("auto", true);
+    const expected = { default: "kiro-subscription,claude", think: "", background: ["other,keep"],
+      models: { keep: "other,keep" }, families: { claude: { default: "" } }, fallback: ["kiro-subscription,auto"] };
+    expect(f.config().Router).toEqual(expected);
+    const [provider, model] = f.config().Router.default.split(",");
+    expect(findProviderModel(f.config().Providers, provider, model)).not.toBeNull();
+    expect(f.host.reloadRuntime).toHaveBeenLastCalledWith(f.config());
+    await f.service.setModelHidden("auto", false);
+    expect(f.config().Router).toEqual(expected);
+    expect(f.config().Providers[1].models).toEqual(["auto", "claude"]);
+  });
+  it("empties the persisted default when all models are hidden and restore leaves it empty", async () => {
+    const f = await setup(); await login(f.service); await f.service.syncModels();
+    f.config().Router = { default: "kiro-subscription,auto" };
+    await f.service.setModelHidden("auto", true);
+    await f.service.setModelHidden("claude", true);
+    expect(f.config().Router.default).toBe("");
+    expect(f.config().Providers[1].models).toEqual([]);
+    await f.service.setModelHidden("auto", false);
+    expect(f.config().Router.default).toBe("");
+  });
+  it("rolls back config and runtime when a writer mutates the intended Router", async () => {
+    const f = await setup(); await login(f.service); await f.service.syncModels();
+    f.config().Router = { default: "kiro-subscription,auto" };
+    const before = structuredClone(f.config());
+    const write = f.host.writeConfig.getMockImplementation()!;
+    f.host.writeConfig.mockImplementationOnce(async (cfg: any) => {
+      cfg.Router.default = "kiro-subscription,auto"; await write(cfg);
+    });
+    await expect(f.service.setModelHidden("auto", true)).rejects.toMatchObject({ code: "kiro_config_write_failed" });
+    expect(f.config()).toEqual(before);
+    expect(f.host.reloadRuntime).toHaveBeenLastCalledWith(before);
+    expect((await f.service.getStatus()).hiddenModels).toEqual([]);
   });
   it("accepts a legacy single credential envelope and normalizes provider uid/name", async () => {
     const f = await setup(); await writeFile(f.service.file, JSON.stringify({ version: 1, credential: { access: "old", refresh: "r", expires: 1_800_000_000_000, email: "same@example.com", accountId: "same@example.com", loginProvider: "BuilderId", region: "us-east-1", method: "idc" }, models: [], hiddenModels: [] }));

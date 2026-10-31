@@ -32,6 +32,7 @@ type UsageRecordRow = {
   scenario_type: string;
   client_type: string | null;
   stream: number;
+  usage_estimated: number;
   input_tokens: number;
   output_tokens: number;
   cache_read_input_tokens: number;
@@ -61,6 +62,7 @@ export interface UsageRecord {
   scenarioType: string;
   clientType?: string; // "claude-code" | "zcode" | "codex" | "pi" | "qwen-code" | "opencode" | "api" | "unknown"
   stream: boolean;
+  usageEstimated?: boolean;
   inputTokens: number;
   outputTokens: number;
   cacheReadInputTokens: number;
@@ -74,6 +76,7 @@ export interface UsageRecord {
 }
 
 export interface UsageSummary {
+  estimatedCount: number;
   totalRequests: number;
   successCount: number;
   errorCount: number;
@@ -156,6 +159,11 @@ function getDb(): SqliteDatabase {
     }
     db.pragma("user_version = 2");
   }
+  if (currentVersion < 3) {
+    // Additive migration: historical and unmarked providers remain metered.
+    db.exec("ALTER TABLE usage_records ADD COLUMN usage_estimated INTEGER NOT NULL DEFAULT 0");
+    db.pragma("user_version = 3");
+  }
   migrateLegacyUsageJsonl(db);
   pruneExpiredRecords(db, true);
 
@@ -166,13 +174,13 @@ function getDb(): SqliteDatabase {
     INSERT INTO usage_records (
       id, timestamp, session_id, provider, original_model, model, upstream_model, model_family,
       scenario_type, client_type,
-      stream, input_tokens, output_tokens, cache_read_input_tokens,
+      stream, usage_estimated, input_tokens, output_tokens, cache_read_input_tokens,
       cache_creation_input_tokens, ttft, tokens_per_second, duration_ms,
       status, error_message, response_body
     ) VALUES (
       @id, @timestamp, @session_id, @provider, @original_model, @model, @upstream_model,
       @model_family, @scenario_type, @client_type,
-      @stream, @input_tokens, @output_tokens,
+      @stream, @usage_estimated, @input_tokens, @output_tokens,
       @cache_read_input_tokens, @cache_creation_input_tokens, @ttft,
       @tokens_per_second, @duration_ms, @status, @error_message, @response_body
     )
@@ -294,13 +302,13 @@ function getInsertStatement(db: SqliteDatabase, insertMode = "INSERT"): SqliteSt
     ${insertMode} INTO usage_records (
       id, timestamp, session_id, provider, original_model, model, upstream_model, model_family,
       scenario_type, client_type,
-      stream, input_tokens, output_tokens, cache_read_input_tokens,
+      stream, usage_estimated, input_tokens, output_tokens, cache_read_input_tokens,
       cache_creation_input_tokens, ttft, tokens_per_second, duration_ms,
       status, error_message, response_body
     ) VALUES (
       @id, @timestamp, @session_id, @provider, @original_model, @model, @upstream_model,
       @model_family, @scenario_type, @client_type,
-      @stream, @input_tokens, @output_tokens,
+      @stream, @usage_estimated, @input_tokens, @output_tokens,
       @cache_read_input_tokens, @cache_creation_input_tokens, @ttft,
       @tokens_per_second, @duration_ms, @status, @error_message, @response_body
     )
@@ -368,6 +376,7 @@ function toDbRow(record: UsageRecord): UsageRecordRow {
     scenario_type: normalizeString(normalized.scenarioType),
     client_type: normalizeOptionalString(normalized.clientType) ?? null,
     stream: normalized.stream ? 1 : 0,
+    usage_estimated: normalized.usageEstimated === true ? 1 : 0,
     input_tokens: Math.trunc(normalizeNumber(normalized.inputTokens)),
     output_tokens: Math.trunc(normalizeNumber(normalized.outputTokens)),
     cache_read_input_tokens: Math.trunc(normalizeNumber(normalized.cacheReadInputTokens)),
@@ -394,6 +403,7 @@ function toUsageRecord(row: UsageRecordRow): UsageRecord {
     scenarioType: row.scenario_type,
     clientType: row.client_type ?? undefined,
     stream: row.stream === 1,
+    ...(row.usage_estimated === 1 ? { usageEstimated: true } : {}),
     inputTokens: row.input_tokens,
     outputTokens: row.output_tokens,
     cacheReadInputTokens: row.cache_read_input_tokens,
@@ -537,6 +547,7 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
     .prepare(`
       SELECT
         COUNT(*) AS totalRequests,
+        COALESCE(SUM(usage_estimated), 0) AS estimatedCount,
         COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS successCount,
         COALESCE(SUM(CASE WHEN status = 'success' THEN input_tokens ELSE 0 END), 0) AS totalInputTokens,
         COALESCE(SUM(CASE WHEN status = 'success' THEN output_tokens ELSE 0 END), 0) AS totalOutputTokens,
@@ -547,6 +558,7 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
       FROM usage_records ${where.sql}
     `)
     .get(...where.params) as {
+    estimatedCount: number;
     totalRequests: number;
     successCount: number;
     totalInputTokens: number;
@@ -558,6 +570,7 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
   };
 
   return {
+    estimatedCount: totals.estimatedCount,
     totalRequests: totals.totalRequests,
     successCount: totals.successCount,
     errorCount: totals.totalRequests - totals.successCount,

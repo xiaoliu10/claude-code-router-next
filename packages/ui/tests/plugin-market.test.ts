@@ -531,3 +531,68 @@ test("api client: getPluginCatalog/installPlugin hit the marketplace routes with
     globalThis.fetch = original;
   }
 });
+
+// Card actions reuse the marketplace transaction while keeping plugin DOM isolated.
+const { renderPluginCardUpgrade, upgradePluginCard } = await import("../src/utils/plugin-card-upgrade.ts");
+
+test("card upgrade is absent unless the matching installed entry explicitly has an update", async () => {
+  const { bridge, catalog, catalogEntry } = fixtureBridge();
+  const controller = createPluginMarketController(bridge);
+  const host = new El("div") as unknown as HTMLElement;
+  for (const flags of [{}, { updateAvailable: false }, { localOnly: true }, { updateAvailable: true, installed: false }]) {
+    catalog.splice(0, catalog.length, catalogEntry({ name: "@wengine-ai/ccr-provider-codex", installed: true, ...flags }));
+    await controller.refresh();
+    renderPluginCardUpgrade(host, "codex", controller.getState(), false, t, () => assert.fail("unexpected action"));
+    assert.equal((host as unknown as El).byTestId("plugin-card-upgrade"), null);
+  }
+  catalog.splice(0, catalog.length, catalogEntry({ name: "other", installed: true, updateAvailable: true }));
+  await controller.refresh();
+  renderPluginCardUpgrade(host, "codex", controller.getState(), false, t, () => {});
+  assert.equal((host as unknown as El).byTestId("plugin-card-upgrade"), null);
+});
+
+test("card upgrade sends the npm name with force, displays progress, then refreshes and hides", async () => {
+  let finish!: () => void;
+  const pending = new Promise<void>((resolve) => { finish = resolve; });
+  const fixture = fixtureBridge();
+  const name = "@wengine-ai/ccr-provider-codex";
+  fixture.catalog.splice(0, fixture.catalog.length, fixture.catalogEntry({ name, installed: true, updateAvailable: true }));
+  const originalInstall = fixture.bridge.installPlugin;
+  fixture.bridge.installPlugin = async (name, force) => {
+    await pending;
+    const result = await originalInstall(name, force);
+    fixture.catalog[0].updateAvailable = false;
+    return { ...result, name: "codex" };
+  };
+  const controller = createPluginMarketController(fixture.bridge);
+  await controller.refresh();
+  const host = new El("div");
+  let cardRefreshes = 0;
+  const render = (disabled = false) => renderPluginCardUpgrade(host as unknown as HTMLElement, "codex", controller.getState(), disabled, t, (name) => { void upgradePluginCard(controller, name, "codex", async () => { cardRefreshes += 1; }); });
+  controller.subscribe(() => render());
+  render(true);
+  assert.equal(host.byTestId("plugin-card-upgrade")?.disabled, true);
+  host.byTestId("plugin-card-upgrade")!.click();
+  assert.equal(controller.getState().busyName, null);
+  render();
+  host.byTestId("plugin-card-upgrade")!.click();
+  assert.equal(host.byTestId("plugin-card-upgrade")?.textContent, "pluginCards.upgrading");
+  assert.equal(host.byTestId("plugin-card-upgrade")?.disabled, true);
+  finish();
+  await tickUntil(() => controller.getState().installedEntries[0].updateAvailable === false);
+  await tickUntil(() => cardRefreshes === 1);
+  assert.deepEqual(fixture.installCalls, [{ name, force: true }]);
+  assert.equal(host.byTestId("plugin-card-upgrade"), null);
+  assert.match(host.textContent, /pluginCards.upgraded_restart/);
+});
+
+
+test("card upgrade intentionally excludes custom npm naming without a manifest association", async () => {
+  const { bridge, catalog, catalogEntry } = fixtureBridge();
+  catalog.splice(0, catalog.length, catalogEntry({ name: "@thirdparty/codex-provider", installed: true, updateAvailable: true }));
+  const controller = createPluginMarketController(bridge);
+  await controller.refresh();
+  const host = new El("div");
+  renderPluginCardUpgrade(host as unknown as HTMLElement, "codex", controller.getState(), false, t, () => {});
+  assert.equal(host.byTestId("plugin-card-upgrade"), null);
+});

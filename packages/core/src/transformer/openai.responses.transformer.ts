@@ -485,10 +485,17 @@ export class OpenAIResponsesTransformer implements Transformer {
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
       // Stable fallback label for chunks that arrive before the upstream sends
-      // its own model field: the requested model, never a hardcoded placeholder
-      // (a literal like "gpt-5-codex-" leaked into the UI and usage rows).
+      // its own model field: the routed model, never a hardcoded placeholder.
+      // `body.model` is the routed model here (see getRequestModel in the
+      // request pipeline); `req.model` is the pre-routing name, so it must come
+      // second — putting it first made early chunks advertise the client's own
+      // "ccr-opus" and, when the routed name was absent, the "unknown"
+      // placeholder leaked back into usage rows.
       const requestModel = String(
-        (context?.req?.body as any)?.model ?? (context?.req as any)?.originalModel ?? "unknown"
+        (context?.req?.body as any)?.model ??
+          (context?.req as any)?.model ??
+          (context?.req as any)?.originalModel ??
+          "unknown"
       );
       let buffer = ""; // Buffer for incomplete lines
       let isStreamEnded = false;
