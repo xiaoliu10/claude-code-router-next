@@ -206,6 +206,7 @@ describe("Qoder card: unified model list (workbuddy/codex parity)", () => {
     expect(body).toContain("3 个模型");
     expect(body).toContain("已隐藏模型（1）");
     expect(byAriaLabel(el, "隐藏 glm-visible")).toBeTruthy();
+    expect(byAriaLabel(el, "恢复 kimi-hidden")).toBeTruthy();
     unmountCard(el);
   });
 
@@ -243,10 +244,11 @@ describe("Qoder card: unified model list (workbuddy/codex parity)", () => {
 
   it("restore and restore-all reuse the same per-model endpoint", async () => {
     const bodies: any[] = [];
+    const models = [...mixedModels, { id: "second-hidden", hidden: true }];
     const el = mountCardIn({
       callApi: async (path: string, init?: any) => {
         if (path.endsWith("/models/visibility")) bodies.push(JSON.parse(init.body));
-        return path.endsWith("/status") ? { status: "connected", models: mixedModels } : {};
+        return path.endsWith("/status") ? { status: "connected", models } : {};
       },
       locale: "en", locales: {}, plugin: { name: "qoder", version: "0.1.0" },
       disabled: false, acquireManagement: () => () => {}, onBusy: () => {},
@@ -254,7 +256,8 @@ describe("Qoder card: unified model list (workbuddy/codex parity)", () => {
     });
     await flush(); await flush();
 
-    const restore = buttonNamed(el, "Restore");
+    expect(byAriaLabel(el, "Restore second-hidden")).toBeTruthy();
+    const restore = byAriaLabel(el, "Restore kimi-hidden");
     expect(restore).toBeTruthy();
     restore!.onclick!();
     await flush(); await flush();
@@ -266,7 +269,91 @@ describe("Qoder card: unified model list (workbuddy/codex parity)", () => {
     restoreAll!.onclick!();
     await flush(); await flush();
     // Restore-all loops the per-model endpoint for every hidden model.
-    expect(bodies).toEqual([{ model: "kimi-hidden", hidden: false }]);
+    expect(bodies).toEqual([
+      { model: "kimi-hidden", hidden: false },
+      { model: "second-hidden", hidden: false },
+    ]);
+    unmountCard(el);
+  });
+});
+
+describe("Qoder card: visibility failure recovery", () => {
+  it.each([
+    ["en", "Partially completed: restored 1 of 3 models."],
+    ["zh", "部分完成：已恢复 1 个模型，共 3 个。"],
+  ])("refreshes partial restores and reports progress in %s", async (locale, message) => {
+    let models = ["first", "second", "third"].map(id => ({ id, hidden: true }));
+    const calls: string[] = [];
+    const busy: boolean[] = [];
+    const release = vi.fn();
+    const refreshConfig = vi.fn(async () => {});
+    const el = mountCardIn({
+      callApi: async (path: string, init?: { body: string }) => {
+        calls.push(path);
+        if (path === "/models/visibility") {
+          const body = JSON.parse(init!.body);
+          if (body.model === "second") throw new Error("request failed");
+          models = models.map(model => model.id === body.model ? { ...model, hidden: body.hidden } : model);
+          return {};
+        }
+        return { status: "connected", models };
+      },
+      locale, locales: {}, plugin: { name: "qoder", version: "0.1.0" },
+      disabled: false, acquireManagement: () => release,
+      onBusy: (value: boolean) => busy.push(value), refreshConfig, log: console,
+    });
+    await flush();
+    calls.length = 0;
+    buttonNamed(el, locale === "en" ? "Restore all" : "恢复全部")!.onclick!();
+    await flush();
+
+    expect(calls).toEqual(["/models/visibility", "/models/visibility", "/status"]);
+    expect(refreshConfig).toHaveBeenCalledOnce();
+    const intl = el.children[0].children[0];
+    expect(byAriaLabel(intl, locale === "en" ? "Hide first" : "隐藏 first")).toBeTruthy();
+    expect(byAriaLabel(intl, locale === "en" ? "Restore first" : "恢复 first")).toBeUndefined();
+    expect(text(intl)).toContain(locale === "en" ? "Hidden models (2)" : "已隐藏模型（2）");
+    expect(text(intl)).toContain(message);
+    expect(busy).toEqual([true, false]);
+    expect(release).toHaveBeenCalledOnce();
+
+    // A new action clears the previous error while preserving the lease gate.
+    buttonNamed(intl, locale === "en" ? "Refresh status" : "刷新状态")!.onclick!();
+    await flush();
+    expect(text(el)).not.toContain(message);
+    unmountCard(el);
+  });
+
+  it("still refreshes after the first mutation and reconciliation both fail", async () => {
+    const status = vi.fn(() => ({ status: "connected", models: [{ id: "only", hidden: true }] }));
+    const el = mountCardIn({
+      callApi: async (path: string) => {
+        if (path.endsWith("/status")) return status();
+        throw new Error("mutation failed");
+      },
+      locale: "en", locales: {}, plugin: { name: "qoder", version: "0.1.0" },
+      disabled: false, acquireManagement: () => () => {}, onBusy: () => {},
+      refreshConfig: async () => { throw new Error("reconcile failed"); }, log: console,
+    });
+    await flush();
+    status.mockClear();
+    buttonNamed(el, "Restore all")!.onclick!();
+    await flush();
+    expect(status).toHaveBeenCalledOnce();
+    expect(text(el)).toContain("Management request failed");
+    expect(text(el)).not.toContain("Partially completed");
+    unmountCard(el);
+  });
+
+  it("omits the count row for an empty disconnected section", async () => {
+    const el = mountCardIn({
+      callApi: async () => ({ status: "not_connected", models: [] }),
+      locale: "en", locales: {}, plugin: { name: "qoder", version: "0.1.0" },
+      disabled: false, acquireManagement: () => () => {}, log: console,
+    });
+    await flush();
+    expect(all(el, item => item.tag === "dl")).toHaveLength(0);
+    expect(text(el)).toContain("Refresh models after connecting");
     unmountCard(el);
   });
 });

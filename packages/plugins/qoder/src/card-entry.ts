@@ -14,6 +14,7 @@ interface QoderCardSection {
   status?: any;
   usage?: any;
   error: boolean;
+  errorMessage?: string;
   busy: boolean;
   /** Half-typed PAT, kept across re-renders so another section cannot wipe it. */
   draft: string;
@@ -83,7 +84,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   const run = async (section: QoderCardSection, fn: () => Promise<void>) => {
     if (disposed || section.busy || props.disabled || !props.acquireManagement) return;
     const lease = props.acquireManagement(); if (!lease) return;
-    section.release = lease; section.busy = true; section.error = false; props.onBusy?.(true); render();
+    section.release = lease; section.busy = true; section.error = false; section.errorMessage = undefined; props.onBusy?.(true); render();
     try { await fn(); } catch { section.error = true; }
     finally { finish(section); }
   };
@@ -115,14 +116,23 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     button.disabled = sectionBusy();
     button.onclick = fn; return button;
   };
-  // ONE visibility mutation shared by chip hide, per-model restore and
-  // restore-all: qoder's endpoint stays per-model, so restore-all simply
-  // loops it, then runs the same reconcile + status-refresh tail as every
-  // other action.
+  // Visibility changes are per-model; always re-read server state after a
+  // batch, including when only some requests succeeded.
   const setModelVisibility = (section: QoderCardSection, ids: string[], hidden: boolean) =>
     void run(section, async () => {
-      for (const id of ids) await call(section, "/models/visibility", { model: id, hidden });
-      await reconcile(section); await refresh(section);
+      let completed = 0;
+      try {
+        for (const id of ids) {
+          await call(section, "/models/visibility", { model: id, hidden });
+          completed += 1;
+        }
+      } catch (error) {
+        if (completed > 0) section.errorMessage = format(hidden ? "hide_partial" : "restore_partial", { count: completed, total: ids.length });
+        throw error;
+      } finally {
+        // A reconciliation failure must not prevent the status refresh.
+        try { await reconcile(section); } finally { await refresh(section); }
+      }
     });
   const renderSection = (section: QoderCardSection): HTMLElement => {
     const panel = node("div", "", "space-y-3 border-t border-border pt-4 first:border-t-0 first:pt-0");
@@ -131,7 +141,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     panel.append(node("p", section.status ? words[section.status.status] ?? words.error : words.loading));
     if (section.status?.expired) panel.append(node("p", words.expired, "text-destructive"));
     if (section.status?.account) panel.append(node("p", `${words.account}: ${section.status.account}`));
-    if (section.error) panel.append(node("p", words.error, "text-destructive"));
+    if (section.error) panel.append(node("p", section.errorMessage ?? words.error, "text-destructive"));
     const buttons = node("div", "", "flex flex-wrap gap-2");
     if (section.status?.status === "not_connected") {
       // PAT form: password-typed input so the token never shows on screen.
@@ -170,10 +180,12 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const models = Array.isArray(section.status?.models) ? section.status.models : [];
     const visible = models.filter((model: any) => !model.hidden);
     const hiddenModels = models.filter((model: any) => model.hidden);
-    const count = node("dl", "", "grid max-w-md grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs");
-    count.append(node("dt", words.models, "text-muted-foreground"),
-      node("dd", format("models_count", { count: section.status?.modelCount ?? models.length }), "break-all text-foreground"));
-    panel.append(count);
+    if (section.status?.status === "connected" || models.length) {
+      const count = node("dl", "", "grid max-w-md grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs");
+      count.append(node("dt", words.models, "text-muted-foreground"),
+        node("dd", format("models_count", { count: section.status?.modelCount ?? models.length }), "break-all text-foreground"));
+      panel.append(count);
+    }
     if (!models.length) panel.append(node("p", words.noModels, "text-sm text-muted-foreground"));
     if (visible.length) {
       const chips = node("div", "", "flex flex-wrap gap-2 pt-1");
@@ -202,8 +214,10 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         const id = String(model.id);
         const item = node("li", "", "flex items-center justify-between gap-2");
         item.append(node("span", id, "break-all font-mono"));
-        item.append(smallButton(words.restore, "h-6 shrink-0 px-2 text-[11px]",
-          () => { section.pendingModel = id; setModelVisibility(section, [id], false); }));
+        const restore = smallButton(words.restore, "h-6 shrink-0 px-2 text-[11px]",
+          () => { section.pendingModel = id; setModelVisibility(section, [id], false); });
+        restore.setAttribute("aria-label", format("restore_model", { model: id }));
+        item.append(restore);
         list.append(item);
       }
       details.append(list);
