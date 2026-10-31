@@ -120,7 +120,8 @@ M1 修订：授权 `api/routes.ts` 最小 Gemini OAuth 专用接缝。HTTP 错�
 | HTTP 429 + 对应 `Resource has been exhausted` 错误文本 + 请求含 Claude 身份标记（`x-anthropic-billing-header:` 或 `You are a Claude agent, built on Anthropic's Claude Agent SDK`，对**发往上游的** system 文本做检测） | `gemini_oauth_identity_blocked` | 联合启发式识别，客户端 400 语义、提示疑似身份拦截；账号 cooldown 6h；不能只凭身份标记判定 |
 | 403 + `error.details` 含 `VALIDATION_REQUIRED`（附 `validation_url`） | `gemini_oauth_validation_required` | 账号 cooldown 30min；只返回经官方 HTTPS host 校验的 validationUrl，不透传整个 details 或令牌 |
 | 429（不满足身份拦截联合条件） | `gemini_oauth_quota_exceeded` | 账号 cooldown（能解析重置时间用之，否则 15min） |
-| 401（刷新重试一次后仍 401） | `gemini_oauth_reauth_required` | 账号置 needs-relogin，不自动轮换 |
+| 401（刷新重试一次后仍 401） | `gemini_oauth_reauth_required` | 账号置 needs-relogin，不自动轮换；账号 cooldown 60min（只为限制后台探活的网络花费，不代表问题已恢复），该错误具粘性：cooldown 过期后仍持续上报，直到重新登录/同步模型/断开连接才清除 |
+| refresh grant 被拒（`invalid_grant` 等，发生在任何数据面请求之前） | `gemini_oauth_reauth_required` | 同上；此路径无上游响应可分类，由 `getAccessToken` 的 catch 直接记入账号状态，否则账号不留任何状态、后台探活会每周期对失效令牌发起真实刷新 |
 | SSE 帧 `{"error":{"message":...}}` | 按可用结构与文本分类，证据不足→`gemini_oauth_upstream_error`；使用固定安全文案，不透传任意原文、不静默成功 |
 | 网络/5xx | transient | 仅在未提交响应前有界重试一次；耗尽返回脱敏错误，不输出 raw error 或令牌 |
 

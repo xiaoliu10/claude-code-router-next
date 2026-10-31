@@ -270,7 +270,7 @@ export class OpenAIResponsesTransformer implements Transformer {
     return request;
   }
 
-  async transformResponseOut(response: Response): Promise<Response> {
+  async transformResponseOut(response: Response, context?: any): Promise<Response> {
     const contentType = response.headers.get("Content-Type") || "";
 
     // Some upstreams return SSE under an UNLABELED (or garbage) content-type —
@@ -386,12 +386,33 @@ export class OpenAIResponsesTransformer implements Transformer {
       // corrupts Anthropic events, causing Codex to receive malformed SSE.
       const [peekStream, bodyStream] = response.body.tee();
       const peekReader = peekStream.getReader();
+      const peekDecoder = new TextDecoder();
       let firstChunk = "";
+      // Accumulate before classifying: proxy exit nodes and middleboxes split
+      // the first SSE frame across several small chunks, so a single read can
+      // miss every format marker ("event: resp" alone matches nothing) and
+      // route a Responses stream into the Chat converter, which then emits a
+      // complete-but-empty Anthropic message. Read until a marker shows up,
+      // the frame is clearly unclassifiable, or a bounded budget is spent.
+      const formatMarkers = [
+        "message_start",
+        "content_block_start",
+        "response.created",
+        "response.output_text.delta",
+        "response.in_progress",
+        "response.output_item.added",
+        "chat.completion.chunk",
+      ];
       try {
-        const { value, done } = await peekReader.read();
-        if (!done && value) {
-          firstChunk = new TextDecoder().decode(value);
+        for (let i = 0; i < 8; i++) {
+          const { value, done } = await peekReader.read();
+          if (done) break;
+          if (value) firstChunk += peekDecoder.decode(value, { stream: true });
+          if (formatMarkers.some((m) => firstChunk.includes(m))) break;
+          // A leading "{" means JSON, not SSE — stop accumulating.
+          if (/^\s*[{[]/.test(firstChunk)) break;
         }
+        firstChunk += peekDecoder.decode();
       } finally {
         peekReader.releaseLock();
       }
@@ -416,7 +437,13 @@ export class OpenAIResponsesTransformer implements Transformer {
         firstChunk.includes("response.output_text.delta") ||
         firstChunk.includes("response.in_progress") ||
         firstChunk.includes("response.output_item.added");
-      if (isAlreadyResponsesAPI) {
+      // Pass through native Responses SSE ONLY for Responses-format clients
+      // (codex CLI / ZCode detected by headers). For every other client the
+      // generic Responses→Chat converter below is required: the Anthropic
+      // transformer's Chat→Anthropic converter cannot parse Responses frames
+      // (no choices[]), and feeding them through produced a complete-but-empty
+      // Anthropic message — the "codex 0-output" disease.
+      if (isAlreadyResponsesAPI && context?.req?.codexDetected) {
         return new Response(bodyStream, {
           status: response.status,
           statusText: response.statusText,
@@ -842,12 +869,28 @@ export class OpenAIResponsesTransformer implements Transformer {
       // and route to the appropriate converter.
       const [peekStream, bodyStream] = response.body.tee();
       const reader = peekStream.getReader();
+      const inDecoder = new TextDecoder();
       let firstChunk = "";
+      // Same accumulate-until-classifiable rationale as transformResponseOut:
+      // one small first chunk must not misroute the whole stream.
+      const inFormatMarkers = [
+        "message_start",
+        "content_block_start",
+        "response.created",
+        "response.output_text.delta",
+        "response.in_progress",
+        "response.output_item.added",
+        "chat.completion.chunk",
+      ];
       try {
-        const { value, done } = await reader.read();
-        if (!done && value) {
-          firstChunk = new TextDecoder().decode(value);
+        for (let i = 0; i < 8; i++) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) firstChunk += inDecoder.decode(value, { stream: true });
+          if (inFormatMarkers.some((m) => firstChunk.includes(m))) break;
+          if (/^\s*[{[]/.test(firstChunk)) break;
         }
+        firstChunk += inDecoder.decode();
       } finally {
         reader.releaseLock();
       }

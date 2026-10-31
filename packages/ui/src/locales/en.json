@@ -651,6 +651,14 @@
     "dismiss": "Dismiss",
     "retry": "Retry",
     "error_generic": "Installation failed ({{code}}). Check the code, then retry — or install from a terminal with `ccr plugin add`.",
-    "error_local_only": "Installation is only available from this machine (localhost). Open the CCR admin UI on the host machine, or install from a terminal with `ccr plugin add`."
+    "error_local_only": "Installation is only available from this machine (localhost). Open the CCR admin UI on the host machine, or install from a terminal with `ccr plugin add`.",
+    "installed_title": "Installed plugins",
+    "available_title": "Available plugins",
+    "version_ok": "v{{version}} · installed",
+    "version_outdated": "v{{installed}} → v{{latest}}",
+    "update": "Update",
+    "updating": "Updating…",
+    "local_only": "Local install",
+    "empty_available": "Every plugin in the marketplace is already installed."
   }
 }
