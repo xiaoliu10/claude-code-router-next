@@ -17,6 +17,8 @@ interface QoderCardSection {
   busy: boolean;
   /** Half-typed PAT, kept across re-renders so another section cannot wipe it. */
   draft: string;
+  /** Model id whose hide/restore is in flight; drives the chip's aria-busy. */
+  pendingModel?: string | null;
   release?: () => void;
 }
 
@@ -34,11 +36,42 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     method: body === undefined ? "GET" : "POST", ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: abort.signal, timeoutMs: 45000,
   });
   const node = (tag: string, text: string, cls = "") => { const n = document.createElement(tag); n.textContent = text; n.className = cls; return n; };
+  // Model controls use the host stylesheet vocabulary from WorkBuddy/Codex.
+  const CHIP = "inline-flex max-w-full items-center gap-1 break-all whitespace-normal rounded-lg border border-white/5 bg-white/5 px-2 py-0.5 text-[10px] font-bold text-muted-foreground";
+  const CHIP_HIDE = "rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-white/10 hover:text-foreground disabled:opacity-40";
+  const BUTTON_BASE = "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-xl text-sm font-semibold ring-offset-background transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 active:scale-95";
+  const BUTTON_OUTLINE = "border border-input bg-input/50 backdrop-blur-md shadow-sm hover:bg-input/80 hover:border-primary/50 hover:shadow-md hover:text-accent-foreground";
+  /** Inline copy of the lucide "x" svg markup (paths only; icons ship as code). */
+  const xIcon = (className: string): SVGSVGElement => {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    svg.setAttribute("width", "24");
+    svg.setAttribute("height", "24");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("class", className);
+    for (const d of ["M18 6 6 18", "m6 6 12 12"]) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", d);
+      svg.appendChild(path);
+    }
+    return svg;
+  };
+  /** Locale lookup with {{var}} interpolation; unknown keys render as-is. */
+  const format = (key: string, vars: Record<string, unknown> = {}): string =>
+    String(words[key] ?? key).replace(/\{\{(\w+)\}\}/g, (_, name) => String(vars[name] ?? ""));
+  /** One action at a time across the whole card: mirrors action()'s gate. */
+  const sectionBusy = () => disposed || props.disabled || sections.some(s => s.busy);
   const sectionWords = (section: QoderCardSection) => section.site.id === "qoder"
     ? { title: words.title, description: words.description }
     : { title: words.cnTitle, description: words.cnDescription };
   const finish = (section: QoderCardSection) => {
-    section.busy = false; section.release?.(); section.release = undefined;
+    section.busy = false; section.pendingModel = null; section.release?.(); section.release = undefined;
     // onBusy is a COUNTING semaphore on the host (increment/decrement), not a
     // boolean state, so the release must be the exact balancing `false`.
     props.onBusy?.(false);
@@ -72,9 +105,25 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     // The management lease is a strict mutex across the whole card: while ANY
     // section is busy, this section's buttons must look disabled too, or a
     // click silently no-ops instead of explaining why.
-    button.disabled = disposed || props.disabled || sections.some(s => s.busy);
+    button.disabled = sectionBusy();
     button.onclick = fn; return button;
   };
+  /** Small outline button with the unified workbuddy/codex vocabulary. */
+  const smallButton = (label: string, extra: string, fn: () => void): HTMLButtonElement => {
+    const button = node("button", label, `${BUTTON_BASE} ${BUTTON_OUTLINE} ${extra}`) as HTMLButtonElement;
+    button.type = "button";
+    button.disabled = sectionBusy();
+    button.onclick = fn; return button;
+  };
+  // ONE visibility mutation shared by chip hide, per-model restore and
+  // restore-all: qoder's endpoint stays per-model, so restore-all simply
+  // loops it, then runs the same reconcile + status-refresh tail as every
+  // other action.
+  const setModelVisibility = (section: QoderCardSection, ids: string[], hidden: boolean) =>
+    void run(section, async () => {
+      for (const id of ids) await call(section, "/models/visibility", { model: id, hidden });
+      await reconcile(section); await refresh(section);
+    });
   const renderSection = (section: QoderCardSection): HTMLElement => {
     const panel = node("div", "", "space-y-3 border-t border-border pt-4 first:border-t-0 first:pt-0");
     panel.append(node("h3", sectionWords(section).title, "font-semibold text-lg"),
@@ -116,17 +165,51 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     } else usageLine.textContent = words.unknown;
     panel.append(usageLine);
     if (section.status?.coolingUntil > Date.now()) panel.append(node("p", `${words.cooling}: ${new Date(section.status.coolingUntil).toLocaleString()}`, "text-sm text-muted-foreground"));
-    panel.append(node("h4", words.models, "font-medium"));
-    if (!section.status?.models?.length) panel.append(node("p", words.noModels, "text-sm text-muted-foreground"));
-    for (const model of section.status?.models ?? []) {
-      const row = node("div", "", "flex items-center justify-between gap-2");
-      const label = `${model.id}${model.context ? ` · ${model.context}` : ""}${model.free ? ` · ${words.free}` : ""}`;
-      row.append(node("span", label, "text-sm"));
-      row.append(action(section, model.hidden ? "restore" : "hide", () => void run(section, async () => {
-        await call(section, "/models/visibility", { model: model.id, hidden: !model.hidden });
-        await reconcile(section); await refresh(section);
-      })));
-      panel.append(row);
+    // Qoder's count includes hidden models; keep that status meaning while
+    // matching Codex's count row and WorkBuddy's visibility controls.
+    const models = Array.isArray(section.status?.models) ? section.status.models : [];
+    const visible = models.filter((model: any) => !model.hidden);
+    const hiddenModels = models.filter((model: any) => model.hidden);
+    const count = node("dl", "", "grid max-w-md grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs");
+    count.append(node("dt", words.models, "text-muted-foreground"),
+      node("dd", format("models_count", { count: section.status?.modelCount ?? models.length }), "break-all text-foreground"));
+    panel.append(count);
+    if (!models.length) panel.append(node("p", words.noModels, "text-sm text-muted-foreground"));
+    if (visible.length) {
+      const chips = node("div", "", "flex flex-wrap gap-2 pt-1");
+      for (const model of visible) {
+        const id = String(model.id);
+        const chip = node("span", id, CHIP);
+        if (model.context) chip.append(node("span", String(model.context), "font-medium text-muted-foreground/60"));
+        if (model.free) chip.append(node("span", words.free, "font-medium text-muted-foreground/60"));
+        const hide = node("button", "", CHIP_HIDE) as HTMLButtonElement;
+        hide.type = "button";
+        hide.disabled = sectionBusy();
+        hide.setAttribute("aria-label", format("hide_model", { model: id }));
+        hide.setAttribute("aria-busy", String(section.busy && section.pendingModel === id));
+        hide.append(xIcon("h-3 w-3"));
+        hide.onclick = () => { section.pendingModel = id; setModelVisibility(section, [id], true); };
+        chip.append(hide);
+        chips.append(chip);
+      }
+      panel.append(chips);
+    }
+    if (hiddenModels.length) {
+      const details = node("details", "", "max-w-md text-xs text-muted-foreground");
+      details.append(node("summary", format("hidden_models", { count: hiddenModels.length }), "cursor-pointer select-none font-medium"));
+      const list = node("ul", "", "mt-2 space-y-1");
+      for (const model of hiddenModels) {
+        const id = String(model.id);
+        const item = node("li", "", "flex items-center justify-between gap-2");
+        item.append(node("span", id, "break-all font-mono"));
+        item.append(smallButton(words.restore, "h-6 shrink-0 px-2 text-[11px]",
+          () => { section.pendingModel = id; setModelVisibility(section, [id], false); }));
+        list.append(item);
+      }
+      details.append(list);
+      details.append(smallButton(words.restore_all, "mt-2 h-7 px-2 text-[11px]",
+        () => setModelVisibility(section, hiddenModels.map((model: any) => String(model.id)), false)));
+      panel.append(details);
     }
     return panel;
   };

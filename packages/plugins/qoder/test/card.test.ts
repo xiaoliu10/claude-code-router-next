@@ -33,8 +33,12 @@ class El {
 }
 
 // The card builds elements through the global document factory; give the test
-// a double that returns the recording El above.
-(globalThis as any).document = { createElement: (tag: string) => new El(tag) };
+// a double that returns the recording El above (createElementNS backs the
+// inline lucide svg copies used by the unified model chips).
+(globalThis as any).document = {
+  createElement: (tag: string) => new El(tag),
+  createElementNS: (_ns: string, tag: string) => new El(tag),
+};
 
 const walk = (node: El, visit: (el: El) => void): void => { visit(node); for (const child of node.children) walk(child, visit); };
 const all = (root: El, predicate: (el: El) => boolean): El[] => {
@@ -43,6 +47,8 @@ const all = (root: El, predicate: (el: El) => boolean): El[] => {
 const text = (root: El): string => { let out = ""; walk(root, el => { out += el.textContent + " "; }); return out; };
 const buttonNamed = (root: El, label: string): El | undefined =>
   all(root, el => el.tag === "button" && el.textContent === label)[0];
+const byAriaLabel = (root: El, label: string): El | undefined =>
+  all(root, el => el.tag === "button" && el.attrs?.["aria-label"] === label)[0];
 const passwordInputs = (root: El): El[] => all(root, el => el.tag === "input" && el.type === "password");
 
 function mountCardIn(props: any) {
@@ -154,6 +160,113 @@ describe("Qoder card: two independent site sections", () => {
     // The draft survives its section's re-render and never leaks into CN's form.
     expect(inputs[0].value).toBe("pt-typing");
     expect(inputs[1].value).toBe("");
+    unmountCard(el);
+  });
+});
+
+describe("Qoder card: unified model list (workbuddy/codex parity)", () => {
+  const mixedModels = [
+    { id: "glm-visible", name: "GLM", context: 128000, free: false, hidden: false },
+    { id: "kimi-hidden", name: "Kimi", context: 256000, free: true, hidden: true },
+    { id: "qoder-free", name: "Free", context: 0, free: true, hidden: false },
+  ];
+
+  function mountedWithModels(models: any[], locale = "en") {
+    return mountCardIn({
+      callApi: async (path: string) => (path.endsWith("/status") ? { status: "connected", models } : {}),
+      locale, locales: {}, plugin: { name: "qoder", version: "0.1.0" },
+      disabled: false, acquireManagement: () => () => {}, onBusy: () => {},
+      log: console,
+    });
+  }
+
+  it("shows the total count in a definition row and renders visible models as chips", async () => {
+    const el = mountedWithModels(mixedModels);
+    await flush(); await flush();
+    const body = text(el);
+    // The count covers all Qoder models, including hidden ones.
+    expect(body).toContain("3 models");
+    expect(all(el, item => item.tag === "dt" && item.textContent === "Models")).toHaveLength(2);
+    // Qoder-specific metadata stays: context window + free flag as chip suffixes.
+    expect(body).toContain("glm-visible");
+    expect(body).toContain("128000");
+    expect(body).toContain("free");
+    // Only visible models get a chip hide control; the hidden one is not a chip.
+    expect(byAriaLabel(el, "Hide glm-visible")).toBeTruthy();
+    expect(byAriaLabel(el, "Hide kimi-hidden")).toBeUndefined();
+    // Hidden models collapse into a counted details list (workbuddy parity).
+    expect(body).toContain("Hidden models (1)");
+    unmountCard(el);
+  });
+
+  it("renders the unified keys from the zh bundle", async () => {
+    const el = mountedWithModels(mixedModels, "zh");
+    await flush(); await flush();
+    const body = text(el);
+    expect(body).toContain("3 个模型");
+    expect(body).toContain("已隐藏模型（1）");
+    expect(byAriaLabel(el, "隐藏 glm-visible")).toBeTruthy();
+    unmountCard(el);
+  });
+
+  it("chip hide posts the per-model visibility endpoint and settles into the hidden list", async () => {
+    const bodies: any[] = [];
+    let models = mixedModels;
+    const el = mountCardIn({
+      callApi: async (path: string, init?: any) => {
+        if (path.endsWith("/models/visibility")) {
+          const body = JSON.parse(init.body);
+          bodies.push(body);
+          models = models.map(m => (m.id === body.model ? { ...m, hidden: body.hidden } : m));
+          return {};
+        }
+        return path.endsWith("/status") ? { status: "connected", models } : {};
+      },
+      locale: "en", locales: {}, plugin: { name: "qoder", version: "0.1.0" },
+      disabled: false, acquireManagement: () => () => {}, onBusy: () => {},
+      log: console,
+    });
+    await flush(); await flush();
+
+    const hide = byAriaLabel(el, "Hide glm-visible");
+    expect(hide).toBeTruthy();
+    hide!.onclick!();
+    // The in-flight hide reports busy on exactly that chip.
+    expect(byAriaLabel(el, "Hide glm-visible")?.attrs?.["aria-busy"]).toBe("true");
+    await flush(); await flush();
+
+    expect(bodies).toEqual([{ model: "glm-visible", hidden: true }]);
+    // After the settle, the model moved into the counted hidden list.
+    expect(text(el)).toContain("Hidden models (2)");
+    unmountCard(el);
+  });
+
+  it("restore and restore-all reuse the same per-model endpoint", async () => {
+    const bodies: any[] = [];
+    const el = mountCardIn({
+      callApi: async (path: string, init?: any) => {
+        if (path.endsWith("/models/visibility")) bodies.push(JSON.parse(init.body));
+        return path.endsWith("/status") ? { status: "connected", models: mixedModels } : {};
+      },
+      locale: "en", locales: {}, plugin: { name: "qoder", version: "0.1.0" },
+      disabled: false, acquireManagement: () => () => {}, onBusy: () => {},
+      log: console,
+    });
+    await flush(); await flush();
+
+    const restore = buttonNamed(el, "Restore");
+    expect(restore).toBeTruthy();
+    restore!.onclick!();
+    await flush(); await flush();
+    expect(bodies).toEqual([{ model: "kimi-hidden", hidden: false }]);
+
+    bodies.length = 0;
+    const restoreAll = buttonNamed(el, "Restore all");
+    expect(restoreAll).toBeTruthy();
+    restoreAll!.onclick!();
+    await flush(); await flush();
+    // Restore-all loops the per-model endpoint for every hidden model.
+    expect(bodies).toEqual([{ model: "kimi-hidden", hidden: false }]);
     unmountCard(el);
   });
 });
