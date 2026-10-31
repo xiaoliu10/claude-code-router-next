@@ -207,6 +207,7 @@ export class CodexTransformer implements PluginTransformer {
   constructor(options: CodexTransformerOptions) {
     if (!options?.service) throw new Error("CodexTransformer requires { service }");
     this.service = options.service;
+    this.logger = options.logger;
   }
 
   /**

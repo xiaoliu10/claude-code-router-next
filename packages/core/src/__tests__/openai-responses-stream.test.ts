@@ -186,11 +186,30 @@ describe("OpenAIResponsesTransformer.transformResponseOut — Anthropic SSE pass
   });
 });
 
+describe("OpenAIResponsesTransformer.transformResponseOut — Responses SSE for non-codex clients", () => {
+  it("converts to Chat SSE when the client is not a codex client", async () => {
+    const chunks = nativeResponsesStreamChunks();
+    const out = await transformer.transformResponseOut(streamResponse(chunks), {
+      req: { codexDetected: false },
+    } as any);
+
+    // The Chat converter's output must be chat.completion chunks, not native
+    // Responses frames — the Anthropic transformer's Chat→Anthropic converter
+    // cannot parse Responses events (no choices[]) and would emit a
+    // complete-but-empty message.
+    const text = await readAllText(out);
+    expect(text).toContain("chat.completion.chunk");
+    expect(text).not.toContain("response.output_text.delta");
+  });
+});
+
 describe("OpenAIResponsesTransformer.transformResponseOut — native Responses SSE passthrough", () => {
   it("delivers the first event exactly once", async () => {
     const chunks = nativeResponsesStreamChunks();
     const original = chunks.join("");
-    const out = await transformer.transformResponseOut(streamResponse(chunks));
+    const out = await transformer.transformResponseOut(streamResponse(chunks), {
+      req: { codexDetected: true },
+    } as any);
 
     expect(out.headers.get("Content-Type") || "").toContain("text/event-stream");
     await expect(readAllText(out)).resolves.toBe(original);
@@ -198,7 +217,8 @@ describe("OpenAIResponsesTransformer.transformResponseOut — native Responses S
 
   it("emits each native event exactly once", async () => {
     const out = await transformer.transformResponseOut(
-      streamResponse(nativeResponsesStreamChunks())
+      streamResponse(nativeResponsesStreamChunks()),
+      { req: { codexDetected: true } } as any
     );
     const text = await readAllText(out);
     const types = text
@@ -233,7 +253,9 @@ describe("OpenAIResponsesTransformer.transformResponseOut — chunk boundaries",
     const splitAt = full.indexOf(payload) + 12;
     const chunks = [full.slice(0, splitAt), full.slice(splitAt)];
 
-    const out = await transformer.transformResponseOut(streamResponse(chunks));
+    const out = await transformer.transformResponseOut(streamResponse(chunks), {
+      req: { codexDetected: true },
+    } as any);
     const text = await readAllText(out);
 
     expect(text).toBe(full);

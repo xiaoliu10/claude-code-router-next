@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2419] - 2026-10-31
+
+### Fixed
+
+- **codex 0-output turns (root cause found)**: two stacked defects made every
+  `codex-subscription` turn return an empty answer:
+  1. The codex plugin's data plane bypassed `SUBSCRIPTION_PROXY_URL` (plain
+     direct dispatcher), sending chatgpt.com traffic through the direct route
+     whose middlebox strips response headers and mangles compressed bodies;
+     the plugin now prefers `getSubscriptionDispatcher()` and sends
+     `Accept-Encoding: identity` on the turn request (ccr-provider-codex
+     1.0.7).
+  2. The Responses→Chat converter was skipped for native Responses streams:
+     the single-read format peek missed the format markers when the proxy
+     split the first SSE frame across small chunks, so a Responses stream was
+     misrouted into the Chat converter, which cannot parse Responses events
+     (no `choices[]`) and emitted a complete-but-empty Anthropic message. The
+     peek now accumulates up to 8 reads before classifying, and native
+     Responses SSE passes through only for Responses-format clients (codex
+     CLI / ZCode); every other client goes through the existing
+     Responses→Chat conversion so the Anthropic transformer receives
+     parseable frames.
+- **gemini-oauth**: the SSE data plane now sends `Accept-Encoding: identity`
+  (the same middlebox mangled compressed bodies), and login failures log
+  Google's own `error` / `error_description` plus the failing step
+  (ccr-provider-gemini-oauth 1.0.7).
+
+## [2.3.2419] - 2026-10-31（中文）
+
+### 修复
+
+- **codex 0 输出回合（根因已定位）**：两个叠加缺陷导致 `codex-subscription`
+  的每个回合都返回空答案：
+  1. codex 插件的数据面绕过了 `SUBSCRIPTION_PROXY_URL`（使用裸直连
+     dispatcher），chatgpt.com 流量走直连路径，其上的中间盒会剥离响应头并
+     破坏压缩响应体；现在优先使用 `getSubscriptionDispatcher()`，并在回合
+     请求上发送 `Accept-Encoding: identity`（ccr-provider-codex 1.0.7）。
+  2. 原生 Responses 流被跳过 Responses→Chat 转换：单次读取的格式探测在
+     代理把首个 SSE 帧拆成多个小块时无法命中格式标记，导致 Responses 流被
+     误送入 Chat 转换器——该转换器无法解析 Responses 事件（没有
+     `choices[]`），最终输出一条完整但空的 Anthropic 消息。现在探测会累积
+     最多 8 次读取再判定格式，且原生 Responses SSE 仅对 Responses 格式客户端
+     （codex CLI / ZCode）放行；其他客户端一律走既有的 Responses→Chat 转换，
+     使 Anthropic transformer 收到可解析的帧。
+- **gemini-oauth**：SSE 数据面现在发送 `Accept-Encoding: identity`（同一个
+  中间盒也会破坏压缩响应体），登录失败时会记录 Google 返回的
+  `error` / `error_description` 以及失败步骤（ccr-provider-gemini-oauth
+  1.0.7）。
+
+## [2.3.2418] - 2026-10-29
+
 ## [2.3.2418] - 2026-10-29
 
 > 2.3.2417 shipped a bundle built before this change (the npm publish path does not

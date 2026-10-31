@@ -281,6 +281,10 @@ export interface PluginMarketCatalogEntry {
   version: string;
   installed: boolean;
   installedVersion: string | null;
+  /** Installed manifest version differs from the npm version — show Update. */
+  updateAvailable?: boolean;
+  /** Installed locally but absent from the npm search results. */
+  localOnly?: boolean;
 }
 
 /** Why the account cannot serve requests; codes are stable and localised. */
