@@ -427,9 +427,10 @@ export async function exchangeCodeForTokens(params: {
   fetchImpl?: GeminiOauthFetch;
 }): Promise<{ accessToken: string; refreshToken: string; expiresIn: number }> {
   const fetchImpl = params.fetchImpl ?? defaultGeminiOauthFetch;
+  const exchangeStartedAt = Date.now();
   const res = await fetchImpl(GOOGLE_TOKEN_URL, boundedInit({
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept-Encoding": "identity" },
     body: new URLSearchParams({
       grant_type: "authorization_code",
       code: params.code,
@@ -439,11 +440,33 @@ export async function exchangeCodeForTokens(params: {
       code_verifier: params.codeVerifier,
     }).toString(),
   }));
-  const json: any = await res.json().catch(() => ({}));
+  let bodyParseError: string | null = null;
+  const rawBody = await res.text().catch((error: any) => {
+    bodyParseError = `${error?.name ?? "Error"}: ${error?.message ?? ""}`;
+    return "";
+  });
+  let json: any = {};
+  try { json = rawBody ? JSON.parse(rawBody) : {}; } catch { /* non-JSON body */ }
   if (!res.ok || !json?.access_token || !json?.refresh_token) {
+    // Surface Google's own OAuth error fields — swallowing them made grant
+    // failures (invalid_grant / missing refresh_token / redirect mismatch)
+    // impossible to diagnose from logs. Booleans only: never log token values.
+    const detail = [
+      `googleStatus=${res.status}`,
+      `error=${json?.error ?? "none"}`,
+      `description=${json?.error_description ?? "none"}`,
+      `hasAccessToken=${Boolean(json?.access_token)}`,
+      `hasRefreshToken=${Boolean(json?.refresh_token)}`,
+      `bodyLen=${rawBody.length}`,
+      `bodyHead=${rawBody.slice(0, 140).replace(/\s+/g, " ")}`,
+      `ct=${res.headers.get("content-type") ?? "none"}`,
+      `clen=${res.headers.get("content-length") ?? "none"}`,
+      `fetchMs=${Date.now() - exchangeStartedAt}`,
+      `parseErr=${bodyParseError ?? "none"}`,
+    ].join(" ");
     throw geminiOauthError({
       code: "gemini_oauth_upstream_error",
-      message: "Google did not return a token for this sign-in.",
+      message: `Google did not return a token for this sign-in. ${detail}`,
       httpStatus: 502,
     });
   }
@@ -494,7 +517,7 @@ export async function refreshAccessToken(
       try {
         res = await fetchImpl(GOOGLE_TOKEN_URL, boundedInit({
           method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept-Encoding": "identity" },
           body: new URLSearchParams({
             grant_type: "refresh_token",
             refresh_token: refreshToken,
@@ -569,7 +592,7 @@ export async function fetchUserEmail(
   fetchImpl: GeminiOauthFetch = defaultGeminiOauthFetch
 ): Promise<string> {
   const res = await fetchImpl(GOOGLE_USERINFO_URL, boundedInit({
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: { Authorization: `Bearer ${accessToken}`, "Accept-Encoding": "identity" },
   }));
   const json: any = await res.json().catch(() => ({}));
   if (!res.ok || typeof json?.email !== "string" || !json.email) {
@@ -620,6 +643,7 @@ async function callCodeAssist(params: {
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${params.accessToken}`,
+      "Accept-Encoding": "identity",
       "User-Agent": antigravityUserAgent(),
       ...(params.headers ?? {}),
     },

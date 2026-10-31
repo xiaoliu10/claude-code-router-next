@@ -201,6 +201,10 @@ export class GeminiOauthTransformer implements PluginTransformer {
         headers: {
           Authorization: `Bearer ${token}`,
           "User-Agent": antigravityUserAgent(),
+          // The token endpoint came back as stripped-header compressed garbage
+          // through the subscription proxy tonight; ask every upstream lane for
+          // an identity response so a broken exit node has nothing to mangle.
+          "Accept-Encoding": "identity",
         },
       },
     };

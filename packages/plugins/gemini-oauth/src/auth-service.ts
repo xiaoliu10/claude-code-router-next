@@ -750,6 +750,7 @@ export class GeminiOauthAuthService {
   }
 
   private failLogin(job: PendingLogin, error: GeminiOauthPollErrorCode): GeminiOauthPollResult {
+    this.log.error?.(`[gemini-oauth] LOGIN_FAIL ${error} loginId=${job.loginId.slice(0, 8)}`);
     this.terminalize(job, { status: "failed", error });
     return job.result!;
   }
@@ -778,7 +779,7 @@ export class GeminiOauthAuthService {
         fetchImpl: (url, init) => this.directFetch(url, init),
       });
     } catch (error: any) {
-      this.log.warn?.(`[gemini-oauth] token exchange failed: ${GEMINI_OAUTH_LAST_ERROR_CODES.has(error?.code) ? error.code : "upstream"}`);
+      this.log.error?.(`[gemini-oauth] LOGIN_STEP_FAIL exchange: code=${error?.code ?? "none"} message=${error?.message ?? ""}`);
       return this.failLogin(job, "gemini_oauth_login_account_failed");
     }
     if (!isCurrent()) return this.failLogin(job, "gemini_oauth_login_state_rejected");
@@ -786,7 +787,8 @@ export class GeminiOauthAuthService {
     let email: string;
     try {
       email = await fetchUserEmail(tokens.accessToken, (url, init) => this.directFetch(url, init));
-    } catch {
+    } catch (emailError: any) {
+      this.log.error?.(`[gemini-oauth] LOGIN_STEP_FAIL email: code=${emailError?.code ?? "none"} message=${emailError?.message ?? ""}`);
       return this.failLogin(job, "gemini_oauth_login_account_failed");
     }
 
@@ -794,7 +796,7 @@ export class GeminiOauthAuthService {
     try {
       project = await discoverAntigravityProject(tokens.accessToken, (url, init) => this.directFetch(url, init));
     } catch (error: any) {
-      this.log.warn?.(`[gemini-oauth] project discovery failed: ${GEMINI_OAUTH_LAST_ERROR_CODES.has(error?.code) ? error.code : "upstream"}`);
+      this.log.error?.(`[gemini-oauth] LOGIN_STEP_FAIL project: code=${error?.code ?? "none"} status=${error?.httpStatus ?? "none"} message=${error?.message ?? ""}`);
       return this.failLogin(job, "gemini_oauth_login_account_failed");
     }
 
