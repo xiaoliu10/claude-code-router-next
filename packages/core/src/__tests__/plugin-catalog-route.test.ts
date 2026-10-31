@@ -187,6 +187,46 @@ describe("GET /api/plugins/catalog", () => {
     ]);
   });
 
+  it("flags updateAvailable when the install source carries a version tag", async () => {
+    // A pinned install ("pkg@1.0.0") records that specifier verbatim in
+    // plugins.json. Catalog rows are keyed by bare package name, so the
+    // specifier must be normalized before matching: otherwise the row matches
+    // no record, its installedVersion falls back to a directory lookup that
+    // fails for a manifest-named dir, and the update is never surfaced.
+    const root = join(scratch, "pinned");
+    const inner = join(root, "package", "dist");
+    mkdirSync(inner, { recursive: true });
+    writeFileSync(join(root, "package", "package.json"), JSON.stringify({ name: "@wengine-ai/ccr-provider-pinned", version: "1.0.0" }));
+    writeFileSync(join(inner, "plugin.json"), JSON.stringify({ name: "pinned", version: "1.0.0", coreApi: "1" }));
+    writeFileSync(join(inner, "plugin.js"), "export const activate = () => ({});\n");
+    const archive = join(scratch, "pinned.tgz");
+    execFileSync("tar", ["-czf", archive, "-C", root, "package"]);
+    const { installPluginFromArchive } = await import("@wengine-ai/claude-code-router-shared");
+    await installPluginFromArchive(archive, {
+      configDir,
+      source: "@wengine-ai/ccr-provider-pinned@1.0.0",
+    });
+
+    const registry = await startSearchStub({
+      "ccr-provider-plugin": [
+        { name: "@wengine-ai/ccr-provider-pinned", keywords: ["ccr-provider-plugin"], version: "1.1.0", description: "pinned source" },
+      ],
+    });
+    const app = buildApp(registry.url);
+    const res = await getLocal(app);
+    const body = res.json();
+    expect(body.plugins).toEqual([
+      {
+        name: "@wengine-ai/ccr-provider-pinned",
+        description: "pinned source",
+        version: "1.1.0",
+        installed: true,
+        installedVersion: "1.0.0",
+        updateAvailable: true,
+      },
+    ]);
+  });
+
   it("tolerates a broken registry: 200 with empty list + warning, no leaked details", async () => {
     // Point the route at a port where nothing listens (both searches fail).
     const app = Fastify({ logger: false });

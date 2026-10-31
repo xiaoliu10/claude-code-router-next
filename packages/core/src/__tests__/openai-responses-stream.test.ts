@@ -458,3 +458,4 @@ describe("OpenAIResponsesTransformer.transformResponseOut — terminal usage", (
     });
   });
 });
+

@@ -485,10 +485,15 @@ export class OpenAIResponsesTransformer implements Transformer {
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
       // Stable fallback label for chunks that arrive before the upstream sends
-      // its own model field: the requested model, never a hardcoded placeholder
-      // (a literal like "gpt-5-codex-" leaked into the UI and usage rows).
+      // its own model field: the routed model (what the client actually asked
+      // this leg for), never a hardcoded placeholder. The raw `body.model` is
+      // the pre-routing name — for a codex leg that is the client's "ccr-opus",
+      // which is not what this upstream is answering as.
       const requestModel = String(
-        (context?.req?.body as any)?.model ?? (context?.req as any)?.originalModel ?? "unknown"
+        (context?.req as any)?.model ??
+          (context?.req?.body as any)?.model ??
+          (context?.req as any)?.originalModel ??
+          "unknown"
       );
       let buffer = ""; // Buffer for incomplete lines
       let isStreamEnded = false;
