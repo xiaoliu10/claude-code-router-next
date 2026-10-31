@@ -4,12 +4,16 @@ import { join } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { PluginHostCapabilities, PluginClassifiedError } from "./core-types";
-import { KIRO_SITE, KIRO_PROVIDER, CALLBACK_PORTS, BUILDER_ID_START, BUILDER_ID_PROFILE, KIRO_SCOPES, DEFAULT_REGION, authURL, refreshURL, managementURL, oidcURL, validRegion, validStartUrl, kiroError, isKiroManaged, lockKiroProvider } from "./protocol";
+import { KIRO_SITE, KIRO_PROVIDER, CALLBACK_PORTS, BUILDER_ID_START, BUILDER_ID_PROFILE, KIRO_REGIONS, KIRO_SCOPES, DEFAULT_REGION, authURL, refreshURL, managementURL, oidcURL, validRegion, validStartUrl, kiroError, isKiroManaged, lockKiroProvider, regionOf, isPermanentOAuthFailure } from "./protocol";
 
 export type KiroLoginMethod = "portal" | "builderid" | "idc";
 export interface KiroCredential {
   id: string; uid: string; email: string; accountId: string; access: string; refresh: string; expires: number;
-  method: "social" | "idc"; loginProvider: string; region: string; profile: string; clientId?: string; clientSecret?: string;
+  /** Kiro service region: where the account's API is, i.e. its profile ARN's region. */
+  region: string; method: "social" | "idc"; loginProvider: string; profile: string;
+  /** Sign-in region (AWS directory or Kiro portal region); only used to reach OIDC/token endpoints. */
+  signInRegion?: string;
+  clientId?: string; clientSecret?: string;
   plan?: string; needReauth?: boolean; coolingUntil?: number;
 }
 export interface KiroModelRecord { id: string; key: string; name: string; context: number; output: number; images: boolean }
@@ -28,6 +32,8 @@ const publicAccount = (c: KiroCredential) => ({ id: c.id, uid: c.uid, email: c.e
 const secret = () => randomBytes(32).toString("base64url");
 const challenge = (s: string) => createHash("sha256").update(s).digest("base64url");
 const text = (v: unknown, max = 32768): v is string => typeof v === "string" && v.length <= max && !/[\x00-\x1f]/.test(v);
+/** Token and refresh endpoints: the only ones whose non-2xx answer can end a sign-in. */
+const AUTH_ENDPOINT = /\/(?:token|refreshToken)(?:$|\?)/;
 
 export class KiroAuthService {
   readonly site = KIRO_SITE;
@@ -40,6 +46,11 @@ export class KiroAuthService {
   private usage = new Map<string, KiroUsageSnapshot>();
   constructor(readonly options: KiroServiceOptions) { this.file = join(options.host.configDir, KIRO_SITE.credentialFile); }
   private now() { return this.options.now?.() ?? Date.now(); }
+  /**
+   * The credential-commit lane: sections run one at a time, strictly in submission order.
+   * Nothing inside a section ever waits on it again — `load()` reads through its own cached
+   * promise and `commit`'s host callbacks never enqueue — so a section cannot deadlock on itself.
+   */
   private exclusive<T>(action: () => Promise<T>): Promise<T> { const job = this.queue.then(action); this.queue = job.catch(() => {}); return job; }
   private validate(value: Json): Saved {
     if (value?.version !== 1) throw kiroError("kiro_credential_invalid");
@@ -49,14 +60,20 @@ export class KiroAuthService {
     const accounts = list.map((v: Json): KiroCredential => {
       const provider = String(v.loginProvider ?? v.uid ?? "").toLowerCase();
       const uid = provider === "awsidc" ? "enterprise" : provider;
-      const region = v.region ?? DEFAULT_REGION, access = v.access ?? v.accessToken, refresh = v.refresh ?? v.refreshToken ?? "";
+      const rawRegion = v.region ?? DEFAULT_REGION, access = v.access ?? v.accessToken, refresh = v.refresh ?? v.refreshToken ?? "";
+      const profile = v.profile ?? v.profileArn ?? (uid === "builderid" ? BUILDER_ID_PROFILE : "");
+      // Legacy files stored the sign-in (directory) region in `region`; the Kiro service region is
+      // where the profile ARN says (Kiro's nearest region when the profile carries none). Normalize
+      // at load so management calls never reach a stale directory region before the first refresh;
+      // the stored region stays the sign-in region for the token endpoints.
+      const region = regionOf(profile, rawRegion);
       const expires = v.expires ?? Date.parse(v.expiresAt ?? "");
       if ((v.id !== undefined && (!text(v.id, 128) || !v.id)) || !text(v.accountId ?? "", 2048)) throw kiroError("kiro_credential_invalid");
-      if (!text(access) || !access || !text(refresh) || !Number.isFinite(expires) || !validRegion(region) || !text(uid, 128) || !text(v.email ?? "", 1024) || !text(v.profile ?? v.profileArn ?? "", 2048) || !text(v.clientId ?? "") || !text(v.clientSecret ?? "")) throw kiroError("kiro_credential_invalid");
+      if (!text(access) || !access || !text(refresh) || !Number.isFinite(expires) || !validRegion(region) || !text(uid, 128) || !text(v.email ?? "", 1024) || !text(profile, 2048) || !text(v.clientId ?? "") || !text(v.clientSecret ?? "") || !text(v.signInRegion ?? "")) throw kiroError("kiro_credential_invalid");
       const email = v.email ?? "", accountId = email ? `${email}${names[uid] ? ` (${names[uid]})` : ""}` : v.accountId ?? "Kiro account";
       return { id: v.id ?? createHash("sha256").update(`${email}:${uid}:${email ? "" : access}`).digest("hex").slice(0, 24), uid, email, accountId,
         access, refresh, expires, method: v.method === "idc" || ["builderid", "enterprise", "internal"].includes(uid) ? "idc" : "social", loginProvider: uid,
-        region, profile: v.profile ?? v.profileArn ?? (uid === "builderid" ? BUILDER_ID_PROFILE : ""), clientId: v.clientId, clientSecret: v.clientSecret,
+        region, profile, signInRegion: v.signInRegion ?? rawRegion, clientId: v.clientId, clientSecret: v.clientSecret,
         plan: text(v.plan, 256) ? v.plan : undefined, needReauth: v.needReauth === true, coolingUntil: Number.isFinite(v.coolingUntil) ? v.coolingUntil : 0 };
     });
     const models = (value.models ?? []).map((m: Json) => {
@@ -72,13 +89,15 @@ export class KiroAuthService {
       let handle;
       try { handle = await open(this.file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         const stat = await handle.stat(); if (!stat.isFile() || stat.size > 1_048_576) throw kiroError("kiro_credential_invalid");
-        this.saved = this.validate(JSON.parse(await handle.readFile("utf8"))); await handle.chmod(0o600);
+        this.saved = this.validate(JSON.parse(await handle.readFile("utf8")));
+        try { await handle.chmod(0o600); } catch { /* a read-only mount keeps its own mode */ }
       } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw kiroError("kiro_credential_unreadable", 500); }
       finally { await handle?.close(); }
     })().catch(e => { this.loaded = undefined; throw e; });
     return this.loaded;
   }
   private async persist(next: Saved) {
+    await this.load();
     const serialized = JSON.stringify(this.validate(next));
     if (Buffer.byteLength(serialized) > 1_048_576) throw kiroError("kiro_persist_failed", 500);
     await mkdir(this.options.host.configDir, { recursive: true, mode: 0o700 });
@@ -112,16 +131,48 @@ export class KiroAuthService {
       body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(30_000),
       dispatcher: this.options.host.getSubscriptionDispatcher?.() ?? this.options.host.getDirectDispatcher() } as RequestInit); }
     catch { throw kiroError("kiro_upstream_error", 502); }
-    if (!res.ok) { await res.body?.cancel(); throw kiroError([401, 403].includes(res.status) ? "kiro_reauth_required" : "kiro_upstream_error", [401, 403].includes(res.status) ? 401 : 502); }
+    if (!res.ok) {
+      // A token/refresh answer that ends the sign-in is read at a bounded size and by code only:
+      // the vendor's error_description is never surfaced or persisted.
+      const permanent = AUTH_ENDPOINT.test(url) && isPermanentOAuthFailure(res.status, await this.oauthError(res));
+      await res.body?.cancel().catch(() => {});
+      throw kiroError(permanent ? "kiro_reauth_required" : "kiro_upstream_error", permanent ? 401 : 502);
+    }
     try { return await res.json() as Json; } catch { throw kiroError("kiro_upstream_error", 502); }
+  }
+  /** Reads at most 8 KiB of an OAuth error body, and only its code. */
+  private async oauthError(res: Response): Promise<{ error?: unknown }> {
+    if (!res.body || res.status !== 400) return {};
+    const reader = res.body.getReader(), decoder = new TextDecoder(); let raw = "", size = 0;
+    try {
+      for (;;) { const { done, value } = await reader.read(); if (done) break; size += value?.length ?? 0;
+        if (size > 8192) return {}; raw += decoder.decode(value, { stream: true }); }
+      raw += decoder.decode();
+      const parsed = JSON.parse(raw) as Json;
+      return { error: parsed?.error };
+    } catch { return {}; } finally { await reader.cancel().catch(() => {}); }
   }
   private management(c: KiroCredential, operation: string, query: Record<string, string> = {}, body?: Json) {
     const q = new URLSearchParams({ origin: "KIRO_CLI", profileArn: c.profile, ...query });
     return this.request(`${managementURL(c.region)}/${operation}${body ? "" : `?${q}`}`, body, c.access);
   }
+  /** A profile without a region-bearing ARN needs a Kiro region; ask Kiro's own regions in order. */
+  private async discoverProfile(c: KiroCredential): Promise<string> {
+    for (const region of KIRO_REGIONS) {
+      try {
+        const probe: KiroCredential = { ...c, region };
+        const p = await this.management(probe, "List-Available-Profiles", {}, {});
+        const arn = p.profiles?.find((v: Json) => typeof v.arn === "string" && v.arn)?.arn;
+        if (typeof arn === "string" && arn) return arn;
+      } catch { /* try Kiro's next region */ }
+    }
+    return "";
+  }
   private async identify(c: KiroCredential) {
     if (c.uid === "builderid") c.profile = BUILDER_ID_PROFILE;
-    else if (!c.profile) { const p = await this.management(c, "List-Available-Profiles", {}, {}); c.profile = p.profiles?.find((v: Json) => typeof v.arn === "string")?.arn ?? ""; }
+    else if (!c.profile) c.profile = await this.discoverProfile(c);
+    // The account's API lives where its profile ARN says, not where the directory login happened.
+    c.region = regionOf(c.profile, c.signInRegion ?? c.region);
     const l = await this.management(c, "Get-Usage-Limits", { resourceType: "CREDIT", isEmailRequired: "true" });
     c.email = typeof l.userInfo?.email === "string" ? l.userInfo.email : "";
     if (!c.email) throw kiroError("kiro_login_failed", 502);
@@ -146,6 +197,8 @@ export class KiroAuthService {
     } throw kiroError("kiro_callback_ports_busy", 409);
   }
   private end(l: Login, status: Login["status"]) { l.status = status; clearTimeout(l.timer); l.server.close(); }
+  /** Token and refresh endpoints follow the sign-in region, never the profile region. */
+  private signInRegion(c: KiroCredential) { return validRegion(c.signInRegion) ? c.signInRegion : c.region; }
   private async startAWS(l: Login, provider: string, issuer: string, region: string) {
     if (!validRegion(region) || !validStartUrl(issuer)) throw kiroError("kiro_login_invalid");
     const reg = await this.request(`${oidcURL(region)}/client/register`, { clientName: "Kiro IDE", clientType: "public", scopes: KIRO_SCOPES,
@@ -159,24 +212,32 @@ export class KiroAuthService {
   async startLogin(input: { method: KiroLoginMethod; startUrl?: string; region?: string }) {
     await this.load();
     if (!["portal", "builderid", "idc"].includes(input?.method) || !validRegion(input.region ?? DEFAULT_REGION) || (input.method === "idc" && !validStartUrl(input.startUrl))) throw kiroError("kiro_login_invalid");
-    // Bound pending listeners and retained terminal sessions.
-    for (const l of this.logins.values()) if (l.status === "pending") this.end(l, "cancelled");
-    while (this.logins.size >= 32) this.logins.delete(this.logins.keys().next().value!);
-    const { server, port } = await this.listen();
-    const l: Login = { id: randomUUID(), server, port, timer: undefined as unknown as ReturnType<typeof setTimeout>, state: secret(), verifier: secret(), stage: "portal", region: input.region ?? DEFAULT_REGION, status: "pending", url: "" };
-    l.timer = setTimeout(() => this.end(l, "expired"), 600_000); l.timer.unref(); this.logins.set(l.id, l);
-    server.on("request", async (req, res) => {
-      res.setHeader("Connection", "close");
-      try { const result = await this.completeLogin(l.id, `http://127.0.0.1:${port}${req.url}`);
-        if (result.status === "pending") { res.writeHead(302, { Location: l.url }); res.end(); }
-        else { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end("<!doctype html><title>Kiro</title>Signed in. You can close this tab."); }
-      } catch { res.writeHead(400, { "Content-Type": "text/plain" }); res.end("Kiro callback rejected. Return to CCR to continue."); }
+    // Bound pending listeners and retained terminal sessions. No await before the listener is
+    // registered: `listen()` is awaited inside the critical section so two racing starts cannot
+    // both see the same old session list and each open a listener of their own.
+    const l = await this.exclusive(async () => {
+      for (const old of this.logins.values()) if (old.status === "pending") this.end(old, "cancelled");
+      while (this.logins.size >= 32) this.logins.delete(this.logins.keys().next().value!);
+      const { server, port } = await this.listen();
+      const login: Login = { id: randomUUID(), server, port, timer: undefined as unknown as ReturnType<typeof setTimeout>, state: secret(), verifier: secret(), stage: "portal", region: input.region ?? DEFAULT_REGION, status: "pending", url: "" };
+      login.timer = setTimeout(() => this.end(login, "expired"), 600_000); login.timer.unref(); this.logins.set(login.id, login);
+      server.on("request", async (req, res) => {
+        res.setHeader("Connection", "close");
+        try { const result = await this.completeLogin(login.id, `http://127.0.0.1:${port}${req.url}`);
+          if (result.status === "pending") { res.writeHead(302, { Location: login.url }); res.end(); }
+          else { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end("<!doctype html><title>Kiro</title>Signed in. You can close this tab."); }
+        } catch { res.writeHead(400, { "Content-Type": "text/plain" }); res.end("Kiro callback rejected. Return to CCR to continue."); }
+      });
+      return login;
     });
+    // AWS registration is a remote call and stays outside the critical section; a competing
+    // start cancels this session here, and `startAWS` refuses to go on for a cancelled login.
     try {
-      if (input.method === "portal") l.url = `${KIRO_SITE.web}/signin?${new URLSearchParams({ state: l.state, code_challenge: challenge(l.verifier), code_challenge_method: "S256", redirect_uri: `http://localhost:${port}`, redirect_from: "KiroIDE" })}`;
+      if (input.method === "portal") l.url = `${KIRO_SITE.web}/signin?${new URLSearchParams({ state: l.state, code_challenge: challenge(l.verifier), code_challenge_method: "S256", redirect_uri: `http://localhost:${l.port}`, redirect_from: "KiroIDE" })}`;
       else await this.startAWS(l, input.method === "idc" ? "enterprise" : "builderid", input.method === "idc" ? input.startUrl! : BUILDER_ID_START, l.region);
+      if (l.status !== "pending") throw kiroError("kiro_login_cancelled", 409);
       return { loginId: l.id, url: l.url };
-    } catch (e) { this.end(l, "failed"); throw e; }
+    } catch (e) { if (l.status === "pending") this.end(l, "failed"); throw e; }
   }
   private login(id: unknown): Login { const l = typeof id === "string" ? this.logins.get(id) : undefined; if (!l) throw kiroError("kiro_login_unknown", 404); return l; }
   async pollLogin(id: string, callbackUrl?: string) { if (callbackUrl !== undefined) return this.completeLogin(id, callbackUrl); const l = this.login(id); return { status: l.status, ...(l.account ? { account: l.account } : {}), ...(l.status === "pending" ? { url: l.url } : {}) }; }
@@ -188,6 +249,11 @@ export class KiroAuthService {
     if (u.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(u.hostname) || Number(u.port) !== l.port || u.username || u.password || !["/oauth/callback", "/signin/callback"].includes(u.pathname) || u.searchParams.get("state") !== l.state || (l.stage === "aws" && u.pathname !== "/oauth/callback")) throw kiroError("kiro_callback_invalid");
     if (l.busy) throw kiroError("kiro_login_busy", 409);
     l.busy = true;
+    // From the moment an authorized callback starts trading its code, a terminal failure ends the
+    // session: the authorization code is single-use, so leaving the session pending would strand
+    // the listener and offer no retry. A callback that fails before this point (state, host, path)
+    // is not this session's and must not cancel it.
+    let redeeming = false;
     try {
       const q = u.searchParams; if (q.has("error")) { this.end(l, "failed"); throw kiroError("kiro_login_failed"); }
       if (l.stage === "portal" && ["builderid", "awsidc", "internal"].includes(q.get("login_option") ?? "")) {
@@ -196,17 +262,27 @@ export class KiroAuthService {
       }
       const provider = l.stage === "aws" ? l.provider! : q.get("login_option")!;
       if (!q.get("code") || (l.stage === "portal" && !["google", "github"].includes(provider))) throw kiroError("kiro_callback_invalid");
-      const t = l.stage === "aws" ? await this.request(`${oidcURL(l.region)}/token`, { clientId: l.clientId, clientSecret: l.clientSecret, grantType: "authorization_code", redirectUri: `http://127.0.0.1:${l.port}/oauth/callback`, code: q.get("code"), codeVerifier: l.verifier }) :
-        await this.request(`${authURL(l.region)}/oauth/token`, { code: q.get("code"), code_verifier: l.verifier, redirect_uri: `http://localhost:${l.port}${u.pathname}?login_option=${provider}` });
+      redeeming = true;
+      const signInRegion = l.region;
+      const t = l.stage === "aws" ? await this.request(`${oidcURL(signInRegion)}/token`, { clientId: l.clientId, clientSecret: l.clientSecret, grantType: "authorization_code", redirectUri: `http://127.0.0.1:${l.port}/oauth/callback`, code: q.get("code"), codeVerifier: l.verifier }) :
+        await this.request(`${authURL(signInRegion)}/oauth/token`, { code: q.get("code"), code_verifier: l.verifier, redirect_uri: `http://localhost:${l.port}${u.pathname}?login_option=${provider}` });
       if (!text(t.accessToken) || !t.accessToken) throw kiroError("kiro_login_failed", 502);
-      const c: KiroCredential = { id: randomUUID(), uid: provider, email: "", accountId: "Kiro account", access: t.accessToken, refresh: t.refreshToken ?? "", expires: this.now() + (Number(t.expiresIn) > 0 ? Number(t.expiresIn) : 3600) * 1000,
-        method: l.stage === "aws" ? "idc" : "social", loginProvider: provider, region: l.region, profile: t.profileArn ?? "", clientId: l.clientId, clientSecret: l.clientSecret };
+      const profile = text(t.profileArn, 2048) ? t.profileArn : "";
+      // The sign-in region reaches the token endpoints; the profile region is where the API is.
+      const c: KiroCredential = { id: randomUUID(), uid: provider, email: "", accountId: "Kiro account", access: t.accessToken, refresh: text(t.refreshToken) ? t.refreshToken : "", expires: this.now() + (Number(t.expiresIn) > 0 ? Number(t.expiresIn) : 3600) * 1000,
+        method: l.stage === "aws" ? "idc" : "social", loginProvider: provider, region: regionOf(profile, signInRegion), profile, signInRegion, clientId: l.clientId, clientSecret: l.clientSecret };
       await this.identify(c);
-      await this.exclusive(async () => { if (l.status !== "pending") throw kiroError("kiro_login_cancelled", 409);
+      await this.exclusive(async () => {
+        if (l.status !== "pending") throw kiroError("kiro_login_cancelled", 409);
         const old = this.saved.accounts.find(a => a.uid === c.uid && a.email === c.email && !!c.email); if (old) c.id = old.id;
         await this.commit({ ...this.saved, accounts: [...this.saved.accounts.filter(a => a.id !== c.id), c] });
-        l.account = publicAccount(c); this.end(l, "complete"); });
+      });
+      l.account = publicAccount(c); this.end(l, "complete");
       return { status: "complete", account: l.account };
+    } catch (e) {
+      // A concurrent cancel/expiry already ended the session; keep its status and its error.
+      if (redeeming && l.status === "pending" && (e as { code?: string }).code !== "kiro_login_cancelled") this.end(l, "failed");
+      throw e;
     } finally { l.busy = false; }
   }
   private select(id?: string) { const c = id ? this.saved.accounts.find(a => a.id === id || a.accountId === id) : this.saved.accounts.find(a => !a.needReauth && (a.coolingUntil ?? 0) <= this.now()) ?? this.saved.accounts[0]; if (!c) throw kiroError("kiro_not_connected", 409); return c; }
@@ -217,16 +293,38 @@ export class KiroAuthService {
     const job = (async () => {
       try {
         if (!c.refresh) throw kiroError("kiro_reauth_required", 401);
-        const t = await this.request(c.method === "idc" ? `${oidcURL(c.region)}/token` : refreshURL(c.region), c.method === "idc" ? { clientId: c.clientId, clientSecret: c.clientSecret, refreshToken: c.refresh, grantType: "refresh_token" } : { refreshToken: c.refresh });
+        const signInRegion = this.signInRegion(c);
+        const t = await this.request(c.method === "idc" ? `${oidcURL(signInRegion)}/token` : refreshURL(signInRegion), c.method === "idc" ? { clientId: c.clientId, clientSecret: c.clientSecret, refreshToken: c.refresh, grantType: "refresh_token" } : { refreshToken: c.refresh });
         if (!text(t.accessToken) || !t.accessToken) throw kiroError("kiro_reauth_required", 401);
-        const next = { ...c, access: t.accessToken, refresh: t.refreshToken || c.refresh, expires: this.now() + (Number(t.expiresIn) > 0 ? Number(t.expiresIn) : 3600) * 1000, profile: t.profileArn ?? c.profile };
-        await this.exclusive(async () => { if (!this.saved.accounts.includes(c)) throw kiroError("kiro_not_connected", 409); await this.persist({ ...this.saved, accounts: this.saved.accounts.map(a => a === c ? next : a) }); }); return { ...next };
+        const profile = text(t.profileArn, 2048) && t.profileArn ? t.profileArn : c.profile;
+        const next = { ...c, access: t.accessToken, refresh: text(t.refreshToken) && t.refreshToken ? t.refreshToken : c.refresh, expires: this.now() + (Number(t.expiresIn) > 0 ? Number(t.expiresIn) : 3600) * 1000, profile, region: regionOf(profile, c.region) };
+        await this.exclusive(() => this.upsert(c, next));
+        return { ...next };
       } catch (e) { if ((e as { code?: string }).code === "kiro_reauth_required") await this.markError(c, { code: "kiro_reauth_required", cooldownMs: 3_600_000 }); throw e; }
       finally { this.refreshes.delete(c.id); }
     })(); this.refreshes.set(c.id, job); return job;
   }
-  private markError(c: KiroCredential, info: { code: string; cooldownMs?: number }) { return this.exclusive(async () => { if (!this.saved.accounts.includes(c)) return;
-    await this.persist({ ...this.saved, accounts: this.saved.accounts.map(a => a === c ? { ...a, needReauth: info.code === "kiro_reauth_required" || a.needReauth, coolingUntil: this.now() + Math.min(info.cooldownMs ?? 300_000, 3_600_000) } : a) }); }); }
+  /**
+   * Merges freshly rotated tokens into the account as it is stored *now*, not into the snapshot
+   * the refresh started from: a concurrent cooldown/reauth update replaces the account object, and
+   * discarding the rotated tokens there would spend a refresh token the server may already have
+   * retired. Only a real disconnect (account gone) or a new sign-in (credentials changed) refuses.
+   * Callers hold the exclusive credential-commit lane.
+   */
+  private async upsert(previous: KiroCredential, next: KiroCredential) {
+    const at = this.saved.accounts.findIndex(a => a.id === previous.id);
+    if (at < 0) throw kiroError("kiro_not_connected", 409);
+    const current = this.saved.accounts[at];
+    if (current.access !== previous.access || current.refresh !== previous.refresh) throw kiroError("kiro_not_connected", 409);
+    const merged: KiroCredential = { ...current, access: next.access, refresh: next.refresh, expires: next.expires, profile: next.profile, region: next.region };
+    const accounts = [...this.saved.accounts]; accounts[at] = merged;
+    await this.persist({ ...this.saved, accounts });
+  }
+  private markError(c: KiroCredential, info: { code: string; cooldownMs?: number }) { return this.exclusive(async () => {
+    const at = this.saved.accounts.findIndex(a => a.id === c.id); if (at < 0) return;
+    const current = this.saved.accounts[at], accounts = [...this.saved.accounts];
+    accounts[at] = { ...current, needReauth: info.code === "kiro_reauth_required" || current.needReauth, coolingUntil: this.now() + Math.min(info.cooldownMs ?? 300_000, 3_600_000) };
+    await this.persist({ ...this.saved, accounts }); }); }
   async noteUpstreamError(info: PluginClassifiedError, account?: string) { await this.load(); try { await this.markError(this.select(account), info); } catch { /* Telemetry never breaks the response path. */ } }
   async getStatus() { await this.load(); return { connected: !!this.saved.accounts.length, status: this.saved.accounts.length ? "connected" : "disconnected", providerName: KIRO_PROVIDER,
     accounts: this.saved.accounts.map(publicAccount), models: this.saved.models, hiddenModels: this.saved.hiddenModels, plan: this.saved.accounts[0]?.plan ?? null,

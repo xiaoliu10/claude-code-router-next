@@ -42,7 +42,10 @@ async function login(s: KiroAuthService, method: "portal" | "builderid" | "idc" 
 describe("Kiro browser credentials", () => {
   it.each(["portal", "builderid", "idc"] as const)("completes %s with PKCE, private persistence and fixed-origin identity encoding", async method => {
     const f = await setup(); const { started, result } = await login(f.service, method, "google", "eu-west-1");
-    expect(result.status).toBe("complete"); expect(result.account).toMatchObject({ email: "same@example.com", region: "eu-west-1", uid: method === "portal" ? "google" : method === "builderid" ? "builderid" : "enterprise" });
+    expect(result.status).toBe("complete");
+    // Builder ID's fixed profile lives in us-east-1, so its Kiro region is us-east-1 whatever directory region routes the sign-in.
+    const expectedRegion = method === "builderid" ? "us-east-1" : "eu-west-1";
+    expect(result.account).toMatchObject({ email: "same@example.com", region: expectedRegion, uid: method === "portal" ? "google" : method === "builderid" ? "builderid" : "enterprise" });
     const auth = new URL(started.url); expect(auth.searchParams.get("code_challenge_method")).toBe("S256"); expect(auth.searchParams.get("code_challenge")).toBeTruthy();
     const exchange = f.requests.find(r => r.url.endsWith("/token"))!;
     expect(exchange.url).toBe(method === "portal" ? "https://prod.eu-west-1.auth.desktop.kiro.dev/oauth/token" : "https://oidc.eu-west-1.amazonaws.com/token");
@@ -76,11 +79,13 @@ describe("Kiro browser credentials", () => {
     await expect(f.service.getCredential(accounts[0].id)).rejects.toMatchObject({ code: "kiro_reauth_required" }); expect(f.refreshCount()).toBe(1);
   });
   it("does not mark a transient refresh failure as reauthentication", async () => { const f = await setup(); await login(f.service); f.expire(); f.setRefreshStatus(503); await expect(f.service.getCredential()).rejects.toMatchObject({ code: "kiro_upstream_error" }); expect((await f.service.getStatus()).accounts[0].needReauth).toBe(false); });
-  it("uses regional OIDC for AWS refresh and regional management for pagination and usage", async () => {
+  it("uses the directory region for AWS OIDC and the profile ARN region for management", async () => {
     const f = await setup(); await login(f.service, "idc", "", "ap-southeast-2"); f.expire(); await f.service.getCredential();
+    // Token endpoints follow the sign-in (directory) region supplied by the user.
     expect(f.requests.find(r => r.body?.grantType === "refresh_token")!.url).toBe("https://oidc.ap-southeast-2.amazonaws.com/token");
     const synced = await f.service.syncModels(); expect(synced.models.map(m => m.id)).toEqual(["auto", "claude"]);
-    expect(f.requests.filter(r => r.url.includes("List-Available-Models")).every(r => r.url.startsWith("https://management.ap-southeast-2.kiro.dev/"))).toBe(true);
+    // Kiro's API is where the profile ARN says (the fixture's eu-west-1 profile), not the directory region.
+    expect(f.requests.filter(r => r.url.includes("List-Available-Models")).every(r => r.url.startsWith("https://management.eu-west-1.kiro.dev/"))).toBe(true);
     expect((await f.service.getUsage()).windows[0]).toMatchObject({ amount: 5, limit: 100, used: 5 });
     await f.service.setModelHidden("claude", true); expect(f.config().Providers[1].models).toEqual(["auto"]);
   });
