@@ -23,8 +23,11 @@ export interface CodexStatusView {
   accountId?: string;
   email?: string;
   plan?: string;
+  /** Registered, user-visible models (hiddenModels already excluded). */
   models: string[];
   modelCount: number;
+  /** User-hidden models; absent in older payloads → the card renders none. */
+  hiddenModels?: string[];
   coolingUntil?: number;
   lastError?: string | null;
 }
@@ -109,6 +112,8 @@ export function parseCodexStatus(value: unknown): CodexStatusView | null {
   if (typeof value.accountId === "string" && value.accountId) next.accountId = value.accountId;
   if (typeof value.email === "string" && value.email) next.email = value.email;
   if (typeof value.plan === "string" && value.plan) next.plan = value.plan;
+  const hiddenModels = stringArray(value.hiddenModels);
+  if (hiddenModels) next.hiddenModels = hiddenModels;
   const coolingUntil = finiteNumber(value.coolingUntil);
   if (coolingUntil !== null) next.coolingUntil = coolingUntil;
   if (typeof value.lastError === "string") next.lastError = value.lastError;

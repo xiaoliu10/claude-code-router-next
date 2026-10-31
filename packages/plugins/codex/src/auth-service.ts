@@ -42,6 +42,7 @@ import {
   fetchCodexModels,
   fetchCodexUsage,
   isCodexManagedConfigProvider,
+  isCodexModelId,
   lockCodexProvider,
   protectCodexConfig,
   randomToken,
@@ -101,8 +102,28 @@ export interface CodexCredentialData {
   version: 1;
   kind: "codex-subscription";
   account: CodexAccountRecord;
+  /** Full discovered model list (including hidden ones — restore needs it). */
   models: CodexStoredModel[];
+  /** User-hidden model slugs (workbuddy-style blacklist: survives sync/re-login). */
+  hiddenModels: string[];
   rateLimits: CodexRateLimits | null;
+}
+
+/** Result of POST /api/codex/models/hide (route adds the ok/success envelope). */
+export interface CodexModelHideResult {
+  success: true;
+  model: string;
+  /** Registered, visible models after the hide. */
+  models: string[];
+  hiddenModels: string[];
+}
+
+/** Result of POST /api/codex/models/restore; `restored` is empty for no-ops. */
+export interface CodexModelRestoreResult {
+  success: true;
+  restored: string[];
+  models: string[];
+  hiddenModels: string[];
 }
 
 const LAST_ERROR_CODES: ReadonlySet<string> = new Set<CodexErrorCode>([
@@ -185,6 +206,17 @@ export function normalizeCodexCredentialData(raw: any): CodexCredentialData {
     }
   }
   const rateLimits = normalizeRateLimits(raw.rateLimits);
+  // Blacklist normalization mirrors `models`: wrong-shaped entries are skipped
+  // (a polluted entry may at worst make a model visible again — never crash
+  // the whole credential), duplicates collapse, and the count is capped.
+  const hiddenModels: string[] = [];
+  if (Array.isArray(raw.hiddenModels)) {
+    if (raw.hiddenModels.length > 256) throw invalid();
+    for (const m of raw.hiddenModels) {
+      if (!isCodexModelId(m) || hiddenModels.includes(m)) continue;
+      hiddenModels.push(m);
+    }
+  }
   return {
     version: 1,
     kind: "codex-subscription",
@@ -202,6 +234,7 @@ export function normalizeCodexCredentialData(raw: any): CodexCredentialData {
       rateLimitCooldownUntil: cooldown(a.rateLimitCooldownUntil),
     },
     models,
+    hiddenModels,
     rateLimits,
   };
 }
@@ -380,11 +413,14 @@ export class CodexAuthService {
 
   async getStatus(): Promise<CodexStatus> {
     const data = await this.ensureLoaded();
-    const models = await this.configManagedModels();
+    // Read-time hidden filter (workbuddy auth-service parity): even if a stale
+    // config still registers a hidden model, it must not surface as visible.
+    const hidden = new Set(data?.hiddenModels ?? []);
+    const models = (await this.configManagedModels()).filter((m) => !hidden.has(m));
     const account = data?.account;
     const now = this.now;
     if (!account) {
-      return { status: "not_connected", providerName: CODEX_PROVIDER_NAME, models, modelCount: models.length };
+      return { status: "not_connected", providerName: CODEX_PROVIDER_NAME, models, modelCount: models.length, hiddenModels: [] };
     }
     const coolingUntil = this.latestCooldown(data);
     let status: CodexStatus["status"] = "connected";
@@ -398,6 +434,7 @@ export class CodexAuthService {
       ...(account.plan ? { plan: account.plan } : {}),
       models,
       modelCount: models.length,
+      hiddenModels: [...(data?.hiddenModels ?? [])],
       ...(coolingUntil ? { coolingUntil } : {}),
       lastError: account.lastError ? CODEX_SAFE_MESSAGES[account.lastError.code] ?? null : null,
     };
@@ -445,19 +482,24 @@ export class CodexAuthService {
   /**
    * Raw read → upsert only the managed entry (Router untouched) → write →
    * reload. `protectCodexConfig` is defence in depth; unrelated providers are
-   * never rewritten.
+   * never rewritten. With `create: false` (hide/restore path) a missing
+   * managed entry is left alone — hiding a model must never resurrect a
+   * provider the user removed; the store-only change still stands (workbuddy
+   * parity: `if (providerIndex >= 0)`).
    */
-  private async upsertManagedProvider(models: string[]): Promise<void> {
+  private async upsertManagedProvider(models: string[], opts: { create?: boolean } = {}): Promise<boolean> {
     const config = await this.options.host.readRawConfig?.().catch(() => null) ??
       await this.options.host.readConfig().catch(() => ({}));
     const previousConfig = structuredClone(config ?? {});
     const routerBefore = JSON.stringify((config ?? {}).Router ?? null);
     let list: any[] = [];
     let usedKey: (typeof PROVIDER_KEYS)[number] = "Providers";
+    let found = false;
     for (const key of PROVIDER_KEYS) {
-      if (Array.isArray(config?.[key])) { usedKey = key; list = config[key]; break; }
+      if (Array.isArray(config?.[key])) { usedKey = key; list = config[key]; found = true; break; }
     }
-    if (!Array.isArray(config?.[usedKey])) {
+    if (!found) {
+      if (opts.create === false) return false;
       if (!config || typeof config !== "object") throw codexAdminError("codex_config_write_failed", 500);
       config[usedKey] = list = [];
     }
@@ -467,6 +509,7 @@ export class CodexAuthService {
       const enabled = existing.enabled !== false;
       list[index] = lockCodexProvider({ ...existing, models, enabled });
     } else {
+      if (opts.create === false) return false;
       list.push(lockCodexProvider({ name: CODEX_PROVIDER_NAME, models, enabled: true }));
     }
     config[usedKey] = list;
@@ -487,6 +530,86 @@ export class CodexAuthService {
       throw codexAdminError("codex_config_write_failed", 500);
     }
     await this.options.host.reloadRuntime?.(config);
+    return true;
+  }
+
+  // ------------------------------------------------------- hide / restore ---
+
+  /**
+   * Workbuddy-style hide (§16 semantics without the Router rewriting): the
+   * blacklist is persisted in codex-credentials.json (survives sync/re-login),
+   * the model leaves the managed provider's registered models immediately, and
+   * Router is NEVER touched — re-wiring remains the user's explicit action.
+   * Store+config rollback on write failure. Idempotent: hiding twice keeps one
+   * blacklist entry. Hiding the LAST visible model is allowed (the provider
+   * then registers an empty list) — workbuddy behaves the same way.
+   */
+  async hideModel(model: string): Promise<CodexModelHideResult> {
+    if (!isCodexModelId(model)) throw codexAdminError("codex_model_invalid", 422);
+    return this.enqueueMutation(async () => {
+      const data = await this.store.load().catch((): CodexCredentialData | null => null);
+      if (!data?.account) throw codexAdminError("codex_not_connected", 409);
+      const hidden = new Set<string>([...data.hiddenModels, model]);
+      const visible = await this.computeVisibleModels(data.models.map((m) => m.slug), hidden);
+      try {
+        await this.saveData({ ...data, hiddenModels: [...hidden] });
+        await this.upsertManagedProvider(visible, { create: false });
+      } catch (error: any) {
+        // Config write failed (upsertManagedProvider already restored the
+        // previous config): roll the credential back so the store never shows
+        // a hidden state whose provider-side effect did not land.
+        await this.saveData(data).catch(() => this.log.error("[codex] hide rollback failed"));
+        if (error?.code === "codex_config_write_failed") throw error;
+        throw codexAdminError("codex_config_write_failed", 500);
+      }
+      return { success: true, model, models: visible, hiddenModels: [...hidden] };
+    });
+  }
+
+  /**
+   * Workbuddy-style restore: `model` omitted = restore ALL hidden models.
+   * Updates the blacklist + registered provider models ONLY — never Router.
+   * An unknown name is a successful no-op (idempotent), never an error.
+   */
+  async restoreModels(model?: string): Promise<CodexModelRestoreResult> {
+    if (model !== undefined && !isCodexModelId(model)) throw codexAdminError("codex_model_invalid", 422);
+    return this.enqueueMutation(async () => {
+      const data = await this.store.load().catch((): CodexCredentialData | null => null);
+      if (!data?.account) throw codexAdminError("codex_not_connected", 409);
+      const hidden = new Set(data.hiddenModels);
+      const restored: string[] = [];
+      if (model === undefined) {
+        restored.push(...hidden);
+        hidden.clear();
+      } else if (hidden.has(model)) {
+        hidden.delete(model);
+        restored.push(model);
+      }
+      const visible = await this.computeVisibleModels(data.models.map((m) => m.slug), hidden);
+      try {
+        await this.saveData({ ...data, hiddenModels: [...hidden] });
+        await this.upsertManagedProvider(visible, { create: false });
+      } catch (error: any) {
+        await this.saveData(data).catch(() => this.log.error("[codex] restore rollback failed"));
+        if (error?.code === "codex_config_write_failed") throw error;
+        throw codexAdminError("codex_config_write_failed", 500);
+      }
+      return { success: true, restored, models: visible, hiddenModels: [...hidden] };
+    });
+  }
+
+  /**
+   * Union of the stored credential models and whatever the managed provider
+   * currently registers, minus the hidden set. The union is what makes a
+   * restored model reappear even when the provider list was hand-edited.
+   */
+  private async computeVisibleModels(storedSlugs: string[], hidden: ReadonlySet<string>): Promise<string[]> {
+    const config = await this.readRawConfig();
+    const provider = this.findManaged(config);
+    const registered: string[] = Array.isArray(provider?.models)
+      ? provider.models.filter((m: any) => typeof m === "string") : [];
+    const union = new Set<string>([...storedSlugs, ...registered]);
+    return [...union].filter((m) => !hidden.has(m));
   }
 
   // ---------------------------------------------------------- browser login --
@@ -819,6 +942,10 @@ export class CodexAuthService {
     }
 
     const previous = await this.store.load().catch((): CodexCredentialData | null => null);
+    // A re-login keeps the previous blacklist: hidden models stay hidden
+    // across re-authorization (workbuddy parity), while the stored model list
+    // is rebuilt from the fresh discovery so restores keep working.
+    const hidden = new Set(previous?.hiddenModels ?? []);
     const data: CodexCredentialData = {
       version: 1,
       kind: "codex-subscription",
@@ -840,16 +967,18 @@ export class CodexAuthService {
         displayName: m.displayName,
         ...(m.instructions ? { instructions: m.instructions } : {}),
       })),
+      hiddenModels: [...hidden],
       rateLimits: null,
     };
     const slugs = models.map((m) => m.slug);
+    const registered = slugs.filter((s) => !hidden.has(s));
     try {
       await this.enqueueMutation(async () => {
         if (this.epoch !== epoch) throw codexAdminError("codex_login_cancelled", 409);
         await this.saveData(data);
         if (this.epoch !== epoch) throw codexAdminError("codex_login_cancelled", 409);
         try {
-          await this.upsertManagedProvider(slugs);
+          await this.upsertManagedProvider(registered);
         } catch (error) {
           // Half-connected account is impossible: roll the credential back.
           if (previous) await this.store.save(previous).catch(() => {});
@@ -867,7 +996,7 @@ export class CodexAuthService {
     this.refreshFlight = null;
     this.forceRefreshRequested = false;
     this.usageCache = null;
-    const result: CodexLoginPoll = { status: "connected", models: slugs, modelCount: slugs.length };
+    const result: CodexLoginPoll = { status: "connected", models: registered, modelCount: registered.length };
     job.result = result;
     this.lastResult.set(job.loginId, result);
     if (this.pending === job) this.pending = null;
@@ -995,9 +1124,14 @@ export class CodexAuthService {
     const visible = selectCodexModels(models);
     const slugs = visible.map((m) => m.slug);
     if (!slugs.length) throw codexAdminError("codex_models_fetch_failed", 502);
+    let registered: string[] = slugs;
     await this.enqueueMutation(async () => {
       const current = await this.store.load().catch((): CodexCredentialData | null => null);
       if (!current) throw codexAdminError("codex_not_connected", 409);
+      // The blacklist survives sync and is applied BEFORE registration:
+      // sync never resurrects hidden models and never rewrites Router.
+      const hidden = new Set(current.hiddenModels);
+      registered = slugs.filter((s) => !hidden.has(s));
       await this.saveData({
         ...current,
         account: { ...current.account, lastError: null },
@@ -1007,9 +1141,9 @@ export class CodexAuthService {
           ...(m.instructions ? { instructions: m.instructions } : {}),
         })),
       });
-      await this.upsertManagedProvider(slugs);
+      await this.upsertManagedProvider(registered);
     });
-    return { success: true, models: slugs, modelCount: slugs.length };
+    return { success: true, models: registered, modelCount: registered.length };
   }
 
   /** Stable synchronous getter over the in-memory per-model instruction cache. */

@@ -451,6 +451,107 @@ describe("self-contained Codex plugin card", () => {
     expect(h.release).toHaveBeenCalledTimes(1);
   });
 
+  it("model chips carry an inline hide (X) action: per-model aria-label, aria-busy while pending, post + toast", async () => {
+    let hidden = false;
+    let resolveHide!: (value: unknown) => void;
+    const xLabel = en.hide_model.replace("{{model}}", "gpt-5.2-codex");
+    const findX = () => h.host.all().find(n => n.tag === "button" && n.attrs["aria-label"] === xLabel)!;
+    const h = harness({
+      "/status": () => (hidden
+        ? { ...CONNECTED, models: ["gpt-5.2"], modelCount: 1, hiddenModels: ["gpt-5.2-codex"] }
+        : CONNECTED),
+      "/models/hide": () => new Promise(resolve => { resolveHide = (value) => { hidden = true; resolve(value); }; }),
+    });
+    await tick();
+    expect(findX(), "X button per visible model").toBeTruthy();
+    const other = h.host.all().find(n => n.tag === "button" && n.attrs["aria-label"] === en.hide_model.replace("{{model}}", "gpt-5.2"))!;
+    expect(other, "one X per chip").toBeTruthy();
+    expect(findX().attrs["aria-busy"]).toBe("false");
+    expect(findX().className).toContain("hover:text-foreground");
+    findX().onclick?.();
+    await tick();
+    // Pending: the exact chip shows aria-busy and every action is disabled.
+    expect(findX().attrs["aria-busy"]).toBe("true");
+    expect(findX().disabled).toBe(true);
+    expect(h.host.button(en.sync).disabled).toBe(true);
+    resolveHide({ ok: true, success: true, model: "gpt-5.2-codex", models: ["gpt-5.2"], hiddenModels: ["gpt-5.2-codex"] });
+    await tick(); await tick();
+    expect(h.bodies("/models/hide")).toEqual([{ model: "gpt-5.2-codex" }]);
+    expect(h.refreshConfig).toHaveBeenCalledTimes(1); // draft reconciled from the server config
+    expect(h.statusReads()).toBe(2); // settle re-reads the filtered status
+    expect(h.host.text()).toContain(en.hidden_toast.replace("{{model}}", "gpt-5.2-codex"));
+    expect(h.host.text()).toContain(en.hidden_models.replace("{{count}}", "1"));
+    expect(h.host.text()).toContain("gpt-5.2-codex"); // listed as hidden
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("hidden models render as a collapsible list with per-item restore and restore-all", async () => {
+    const summary = en.hidden_models.replace("{{count}}", "1");
+    const h = harness({
+      "/status": () => ({ ...CONNECTED, models: ["gpt-5.2"], modelCount: 1, hiddenModels: ["gpt-5.2-codex"] }),
+      "/models/restore": (_init: any) => ({ ok: true, success: true, restored: ["gpt-5.2-codex"], models: CONNECTED.models, hiddenModels: [] }),
+    });
+    await tick();
+    expect(h.host.all().some(n => n.tag === "details"));
+    expect(h.host.all().some(n => n.tag === "summary" && n.textContent === summary)).toBe(true);
+    expect(h.host.text()).toContain(en.hidden_note);
+    // Per-item restore posts exactly that model.
+    h.host.click(en.restore); await tick();
+    expect(h.bodies("/models/restore")).toEqual([{ model: "gpt-5.2-codex" }]);
+    expect(h.host.text()).toContain(en.restored_toast.replace("{{model}}", "gpt-5.2-codex"));
+    expect(h.statusReads()).toBe(2);
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("restore-all posts without a model field and reports how many models came back", async () => {
+    const h = harness({
+      "/status": () => ({ ...CONNECTED, models: [], modelCount: 0, hiddenModels: ["gpt-5.2", "gpt-5.2-codex"] }),
+      "/models/restore": () => ({ ok: true, success: true, restored: ["gpt-5.2", "gpt-5.2-codex"], models: CONNECTED.models, hiddenModels: [] }),
+    });
+    await tick();
+    expect(h.host.text()).toContain(en.hidden_models.replace("{{count}}", "2"));
+    h.host.click(en.restore_all); await tick();
+    expect(h.bodies("/models/restore")).toEqual([{}]);
+    expect(h.host.text()).toContain(en.restored_all_toast.replace("{{count}}", "2"));
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed hide surfaces a stable error note, no toast, and releases the lease", async () => {
+    const h = harness({
+      "/models/hide": () => ({ ok: false, success: false, error: "codex_config_write_failed" }),
+    });
+    await tick();
+    const xLabel = en.hide_model.replace("{{model}}", "gpt-5.2-codex");
+    const x = () => h.host.all().find(n => n.tag === "button" && n.attrs["aria-label"] === xLabel)!;
+    x().onclick?.(); await tick();
+    expect(h.bodies("/models/hide")).toEqual([{ model: "gpt-5.2-codex" }]);
+    expect(h.host.text()).toContain(en.errors.request_failed); // server code → generic copy
+    expect(h.host.text()).not.toContain(en.hidden_toast.replace("{{model}}", "gpt-5.2-codex"));
+    expect(h.release).toHaveBeenCalledTimes(1);
+    // The card is usable again: a retry reaches the endpoint.
+    x().onclick?.(); await tick();
+    expect(h.bodies("/models/hide")).toHaveLength(2);
+  });
+
+  it("hide/restore render localized in zh and absent when not connected", async () => {
+    const zh = codexLocales.zh.codex as any;
+    const h = harness({
+      "/status": () => ({ ...CONNECTED, hiddenModels: ["gpt-5.2-codex"] }),
+    }, false, "zh");
+    await tick();
+    expect(h.host.text()).toContain(zh.hidden_models.replace("{{count}}", "1"));
+    expect(h.host.all().some(n => n.tag === "button" && n.attrs["aria-label"] === zh.hide_model.replace("{{model}}", "gpt-5.2"))).toBe(true);
+    expect(h.host.button(zh.restore_all)).toBeTruthy();
+    unmount(h.host as any);
+    cleanups.pop();
+    // Not connected: neither chips nor a hidden list render (the About <details>
+    // is always there, so key on the hidden-models summary instead).
+    const nc = harness({ "/status": () => NOT_CONNECTED });
+    await tick();
+    expect(nc.host.all().some(n => n.tag === "button" && String(n.attrs["aria-label"] ?? "").startsWith("Hide "))).toBe(false);
+    expect(nc.host.all().some(n => n.tag === "summary" && n.textContent === en.hidden_models.replace("{{count}}", "0"))).toBe(false);
+  });
+
   it("expired status shows the re-login help; a connected cooldown shows the localized reset line", async () => {
     const h = harness({
       "/status": () => ({ ...CONNECTED, status: "expired" }),
@@ -539,6 +640,8 @@ describe("self-contained Codex plugin card", () => {
     expect(parseCodexStatus({ status: "bogus", models: [] })).toBeNull();
     expect(parseCodexStatus({ status: "connected" })).toBeNull(); // models required
     expect(parseCodexStatus({ ...CONNECTED })!.email).toBe("user@example.test");
+    expect(parseCodexStatus({ ...CONNECTED, hiddenModels: ["m1"] })!.hiddenModels).toEqual(["m1"]);
+    expect(parseCodexStatus({ ...CONNECTED, hiddenModels: ["", 42] })).toEqual(parseCodexStatus({ ...CONNECTED })); // malformed → dropped
     expect(parseCodexLoginStart({ ...LOGIN_START, url: "http://auth.openai.com/x" })).toBeNull();
     expect(parseCodexLoginStart({ ...LOGIN_START, mode: "magic" })).toBeNull();
     expect(parseCodexLoginStart(LOGIN_START)?.loginId).toBe(LOGIN_START.loginId);

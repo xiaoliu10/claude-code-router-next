@@ -8,9 +8,9 @@
  *   - registerManagedRuntime:   fixed chatgpt.com origin, token/account
  *                               injection, final-body session headers, error
  *                               taxonomy, 401-once refresh, cooling breaker;
- *   - registerAdminRoutes:      eight local-only management routes under
+ *   - registerAdminRoutes:      ten local-only management routes under
  *                               /api/codex (status, login x4, sync, usage,
- *                               disconnect);
+ *                               disconnect, models/hide, models/restore);
  *   - registerConfigProtector:  the managed entry can neither be redirected
  *                               nor dropped by a generic config save;
  *   - registerUiCard:           the prebuilt card chunk (dist/card.js);
@@ -33,7 +33,7 @@ import type { PluginContext } from "./core-types";
 
 export const manifest = {
   name: "codex",
-  version: "1.0.7",
+  version: "1.0.8",
   coreApi: "1",
   description:
     "Codex subscription managed provider: chatgpt.com backend-api/codex data plane, browser OAuth login (PKCE, loopback 1455/1457 + paste), model sync, usage and admin routes.",

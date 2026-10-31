@@ -639,3 +639,145 @@ describe("models, usage, rate limits", () => {
     expect((await service.pollLogin(start.loginId)).status).toBe("cancelled");
   });
 });
+
+// ---------------------------------------------------------------------------
+// hide / restore models (workbuddy §16 parity, minus the Router rewriting)
+// ---------------------------------------------------------------------------
+
+describe("hide / restore models", () => {
+  const CONFIG = {
+    Providers: [{ name: CODEX_PROVIDER_NAME, api_key: CODEX_API_KEY, models: ["gpt-a", "gpt-b", "gpt-c"] }],
+    Router: { default: "codex-subscription,gpt-a" },
+  };
+  const credential = (hiddenModels: string[] = []): CodexCredentialData => ({
+    version: 1, kind: "codex-subscription",
+    account: {
+      accessToken: accessTokenFor(), refreshToken: "rt", idToken: freshIdToken(),
+      accountId: "acct_1", email: "codex@example.invalid", plan: "pro",
+      connectedAt: "2026-01-01T00:00:00.000Z", accessExp: nowSec() * 1000 + 3_600_000,
+      lastError: null, cooldownUntil: null, rateLimitCooldownUntil: null,
+    } satisfies CodexAccountRecord,
+    models: ["gpt-a", "gpt-b", "gpt-c"].map((slug) => ({ slug, displayName: slug.toUpperCase() })),
+    hiddenModels,
+    rateLimits: null,
+  });
+
+  /** Connected service without a login round-trip: a directly saved credential. */
+  async function seeded(opts: { hiddenModels?: string[]; config?: any } = {}) {
+    const h = await harness({ config: opts.config ?? CONFIG });
+    await h.store.save(credential(opts.hiddenModels));
+    return h;
+  }
+
+  const providerModels = (h: Awaited<ReturnType<typeof seeded>>): string[] =>
+    (h.config().Providers as any[]).find((p: any) => p.name === CODEX_PROVIDER_NAME)?.models ?? [];
+
+  it("hide removes the model from the provider, persists the blacklist and shows both in status", async () => {
+    const h = await seeded();
+    const result = await h.service.hideModel("gpt-b");
+    expect(result).toEqual({ success: true, model: "gpt-b", models: ["gpt-a", "gpt-c"], hiddenModels: ["gpt-b"] });
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-c"]);
+    expect(h.config().Router).toEqual(CONFIG.Router); // hide never rewrites Router
+    const stored = await h.store.load();
+    expect(stored!.hiddenModels).toEqual(["gpt-b"]);
+    // The stored list stays COMPLETE so restores keep working.
+    expect(stored!.models.map((m) => m.slug)).toEqual(["gpt-a", "gpt-b", "gpt-c"]);
+    expect(await h.service.getStatus()).toMatchObject({ models: ["gpt-a", "gpt-c"], modelCount: 2, hiddenModels: ["gpt-b"] });
+  });
+
+  it("status filters hidden models at read time even when a stale config still registers them", async () => {
+    const h = await seeded({ hiddenModels: ["gpt-a"] });
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-b", "gpt-c"]); // stale registration
+    expect(await h.service.getStatus()).toMatchObject({ models: ["gpt-b", "gpt-c"], modelCount: 2, hiddenModels: ["gpt-a"] });
+  });
+
+  it("duplicate hide is idempotent; hiding every visible model is allowed (empty registered list)", async () => {
+    const h = await seeded();
+    await h.service.hideModel("gpt-b");
+    const again = await h.service.hideModel("gpt-b");
+    expect(again.hiddenModels).toEqual(["gpt-b"]);
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-c"]);
+    for (const m of ["gpt-a", "gpt-c"]) await h.service.hideModel(m);
+    expect(await h.service.hideModel("gpt-c")).toMatchObject({ success: true, models: [], hiddenModels: ["gpt-b", "gpt-a", "gpt-c"] });
+    expect(providerModels(h)).toEqual([]);
+  });
+
+  it("restore puts one model back; restore-all clears the blacklist; unknown names are no-ops", async () => {
+    const h = await seeded({ hiddenModels: ["gpt-b", "gpt-c"] });
+    const one = await h.service.restoreModels("gpt-c");
+    expect(one).toEqual({ success: true, restored: ["gpt-c"], models: ["gpt-a", "gpt-c"], hiddenModels: ["gpt-b"] });
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-c"]);
+
+    const all = await h.service.restoreModels();
+    expect(all).toEqual({ success: true, restored: ["gpt-b"], models: ["gpt-a", "gpt-b", "gpt-c"], hiddenModels: [] });
+    expect((await h.store.load())!.hiddenModels).toEqual([]);
+
+    const unknown = await h.service.restoreModels("never-hidden");
+    expect(unknown).toEqual({ success: true, restored: [], models: ["gpt-a", "gpt-b", "gpt-c"], hiddenModels: [] });
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-b", "gpt-c"]);
+  });
+
+  it("hiding an unknown name still blacklists it (list semantics); restoring it is harmless", async () => {
+    const h = await seeded();
+    const result = await h.service.hideModel("brand-new");
+    expect(result).toMatchObject({ success: true, hiddenModels: ["brand-new"], models: ["gpt-a", "gpt-b", "gpt-c"] });
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-b", "gpt-c"]); // was never registered
+    const back = await h.service.restoreModels("brand-new");
+    expect(back).toMatchObject({ success: true, restored: ["brand-new"], models: ["gpt-a", "gpt-b", "gpt-c"] });
+  });
+
+  it("invalid model ids are rejected with codex_model_invalid and change nothing", async () => {
+    const h = await seeded();
+    for (const bad of ["", "a,b", "bad\x00", "x".repeat(257), 42]) {
+      await expect(h.service.hideModel(bad as any)).rejects.toMatchObject({ code: "codex_model_invalid" });
+      // NOTE: restoreModels(undefined) is the legitimate restore-ALL form and
+      // must never reject — only wrong-shaped ids do.
+      await expect(h.service.restoreModels(bad as any)).rejects.toMatchObject({ code: "codex_model_invalid" });
+    }
+    expect((await h.store.load())!.hiddenModels).toEqual([]);
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-b", "gpt-c"]);
+  });
+
+  it("hiding without a connection is a stable 409", async () => {
+    const { service } = await harness();
+    await expect(service.hideModel("gpt-a")).rejects.toMatchObject({ code: "codex_not_connected" });
+    await expect(service.restoreModels()).rejects.toMatchObject({ code: "codex_not_connected" });
+  });
+
+  it("a failed config write rolls the credential back and maps to codex_config_write_failed", async () => {
+    const h = await seeded();
+    h.host.writeConfig.mockImplementationOnce(async () => { throw new Error("disk gone"); });
+    await expect(h.service.hideModel("gpt-a")).rejects.toMatchObject({ code: "codex_config_write_failed" });
+    expect((await h.store.load())!.hiddenModels).toEqual([]); // rolled back
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-b", "gpt-c"]); // write never committed
+    // With the failure gone the same hide succeeds.
+    const result = await h.service.hideModel("gpt-a");
+    expect(result).toMatchObject({ success: true, models: ["gpt-b", "gpt-c"] });
+    expect(providerModels(h)).toEqual(["gpt-b", "gpt-c"]);
+  });
+
+  it("the blacklist survives sync: registration filters it, the stored list keeps everything", async () => {
+    const h = await seeded({ hiddenModels: ["gpt-a"] });
+    (h.service as any).options.fetchImpl = fakeUpstream().impl;
+    const result = await h.service.syncModels();
+    expect(result).toEqual({ success: true, models: ["gpt-c"], modelCount: 1 }); // gpt-b hidden upstream, gpt-a user-hidden
+    expect(providerModels(h)).toEqual(["gpt-c"]);
+    const stored = await h.store.load();
+    expect(stored!.hiddenModels).toEqual(["gpt-a"]);
+    expect(stored!.models.map((m) => m.slug)).toEqual(["gpt-a", "gpt-c"]);
+    // Restoring re-registers from the union of the stored + registered lists.
+    expect(await h.service.restoreModels("gpt-a")).toMatchObject({ restored: ["gpt-a"], models: ["gpt-a", "gpt-c"] });
+    expect(providerModels(h)).toEqual(["gpt-a", "gpt-c"]);
+  });
+
+  it("re-login keeps the previous blacklist and registers only visible models", async () => {
+    const h = await harness({ config: CONFIG });
+    await h.store.save(credential(["gpt-a"]));
+    (h.service as any).options.fetchImpl = fakeUpstream().impl;
+    const { poll } = await loginWith(h.service, "the-code");
+    expect(poll.status).toBe("connected");
+    expect(poll.models).toEqual(["gpt-c"]);
+    expect(providerModels(h)).toEqual(["gpt-c"]);
+    expect((await h.store.load())!.hiddenModels).toEqual(["gpt-a"]);
+  });
+});

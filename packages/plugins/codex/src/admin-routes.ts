@@ -1,5 +1,5 @@
 /**
- * Codex subscription — eight local-only, explicit user-action admin routes
+ * Codex subscription — ten local-only, explicit user-action admin routes
  * under the `/api/codex` namespace (the manifest name is `codex`, and the UI
  * bridge builds `/api` + `/codex${path}`).
  *
@@ -11,6 +11,8 @@
  *  POST /sync            {}
  *  POST /usage           {}
  *  POST /disconnect      {}
+ *  POST /models/hide     {model}            (blacklist one model)
+ *  POST /models/restore  {model?}           (no model = restore ALL)
  *
  * Guard shape is identical to the gemini-oauth / workbuddy plugins: the loopback
  * socket address is the only trustworthy identity, plus a Host/Origin allowlist
@@ -24,6 +26,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import type { CodexAuthService } from "./auth-service";
+import { isCodexModelId } from "./protocol";
 
 export interface CodexAdminRouteDeps {
   /** Resolved per request so tests and late wiring stay race-free. */
@@ -90,6 +93,7 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
     codex_config_write_failed: 500,
     codex_models_fetch_failed: 422,
     codex_reauth_required: 422,
+    codex_model_invalid: 422,
   };
 
   const isCodexErrorCode = (value: unknown): value is string =>
@@ -223,6 +227,61 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
       return await service.syncModels();
     } catch (error: any) {
       return codexRouteError(error, reply, "sync", "codex_request_failed");
+    }
+  });
+
+  /**
+   * Hide one model: blacklists it in codex-credentials.json (survives
+   * sync/re-login), removes it from the managed provider's models and never
+   * rewrites Router. Idempotent; hiding the last visible model is allowed.
+   */
+  app.post("/api/codex/models/hide", async (req: any, reply: any) => {
+    try {
+      assertLocalCodexRequest(req);
+      const service = deps.getService();
+      if (!service) {
+        reply.status(503);
+        return { ok: false, success: false, error: "codex_request_failed" };
+      }
+      // Format gate here (the service re-checks): stable 422 code, no echo.
+      const model = (req.body as any)?.model;
+      if (!isCodexModelId(model)) {
+        reply.status(422);
+        return { ok: false, success: false, error: "codex_model_invalid" };
+      }
+      const result = await service.hideModel(model);
+      // `ok`+`success` mirror the workbuddy mutating-route contract: the card
+      // keys off `success`, `ok` keeps the error-envelope shape symmetric.
+      return { ok: true, ...result };
+    } catch (error: any) {
+      return codexRouteError(error, reply, "models/hide", "codex_model_hide_failed");
+    }
+  });
+
+  /** Restore one hidden model, or ALL of them when `model` is omitted/empty. */
+  app.post("/api/codex/models/restore", async (req: any, reply: any) => {
+    try {
+      assertLocalCodexRequest(req);
+      const service = deps.getService();
+      if (!service) {
+        reply.status(503);
+        return { ok: false, success: false, error: "codex_request_failed" };
+      }
+      // Absent, null or empty-string model means restore-ALL (workbuddy parity);
+      // anything else must be a well-formed model id.
+      const raw = (req.body as any)?.model;
+      let model: string | undefined;
+      if (raw !== undefined && raw !== null && raw !== "") {
+        if (!isCodexModelId(raw)) {
+          reply.status(422);
+          return { ok: false, success: false, error: "codex_model_invalid" };
+        }
+        model = raw;
+      }
+      const result = await service.restoreModels(model);
+      return { ok: true, ...result };
+    } catch (error: any) {
+      return codexRouteError(error, reply, "models/restore", "codex_model_restore_failed");
     }
   });
 
