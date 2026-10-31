@@ -1,4 +1,5 @@
 {
+  "private": true,
   "name": "claude-code-router-workspace",
   "version": "2.3.2420",
   "description": "Use Claude Code and Codex with any LLM provider, allowing flexible request/response routing and client configuration management",
