@@ -173,18 +173,27 @@ describe("Qoder card check-in", () => {
       locale, locales: {}, disabled: false, acquireManagement: () => () => {}, onBusy: () => {}, log: console,
     });
     await flush();
+    // Workbuddy-style full-width labelled row, not an icon-style action.
     const label = locale === "zh" ? "签到" : "Check in";
+    const pendingLabel = locale === "zh" ? "签到中…" : "Checking in…";
     const buttons = all(el, e => e.tag === "button" && e.textContent === label);
     // International accounts require native identity; only CN offers the action.
     expect(buttons).toHaveLength(1);
+    expect(buttons[0].className).toContain("w-full");
     expect(text(el)).toContain(locale === "zh" ? "国际站需要在 Qoder 桌面端内签到" : "International check-in requires Qoder desktop");
     buttons[0].onclick?.();
     await flush();
-    expect(buttonNamed(el, label)?.disabled).toBe(true);
+    // While in flight the button swaps to the pending label and reads busy.
+    expect(buttonNamed(el, label)).toBeUndefined();
+    const inFlight = buttonNamed(el, pendingLabel);
+    expect(inFlight?.disabled).toBe(true);
+      expect(inFlight?.attrs["aria-busy"]).toBe("true");
     expect(calls).toContain("/cn/checkin"); expect(calls).not.toContain("/checkin");
     resolve({ outcome, credit: 12, message: "Claim: HTTP 502" });
     await flush(); await flush();
     expect(text(el)).toContain(expected);
+    const note = all(el, e => e.tag === "p" && e.attrs?.role === "status" && text(el).includes(expected));
+    expect(note.length).toBeGreaterThan(0);
     expect(buttonNamed(el, label)?.disabled).toBe(false);
     unmountCard(el);
   });

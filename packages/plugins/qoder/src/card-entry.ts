@@ -14,6 +14,8 @@ interface QoderCardSection {
   status?: any;
   usage?: any;
   checkin?: import("./checkin").QoderCheckinResult;
+  /** True while this section's check-in request is the one in flight. */
+  checkinPending?: boolean;
   error: boolean;
   busy: boolean;
   /** Half-typed PAT, kept across re-renders so another section cannot wipe it. */
@@ -76,6 +78,27 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     button.disabled = disposed || props.disabled || sections.some(s => s.busy);
     button.onclick = fn; return button;
   };
+  // The daily check-in gets the same full-width labelled button as workbuddy's
+  // (h-8 w-full outline row between sign-in and sync), not a small icon-style
+  // action: it is a money-adjacent manual gesture and must read as one.
+  const checkinButton = (section: QoderCardSection) => {
+    const pending = !!section.checkinPending;
+    const button = node("button", pending ? words.checkin_pending : words.checkin_action, "inline-flex h-8 w-full items-center justify-center gap-2 whitespace-nowrap rounded-xl border border-input bg-input/50 text-xs font-semibold shadow-sm hover:bg-input/80 disabled:pointer-events-none disabled:opacity-50") as HTMLButtonElement;
+    button.type = "button";
+    button.disabled = disposed || props.disabled || sections.some(s => s.busy) || section.status?.status !== "connected";
+    button.setAttribute("aria-busy", String(pending));
+    button.onclick = () => {
+      section.checkinPending = true;
+      void run(section, async () => {
+        try {
+          section.checkin = undefined;
+          try { section.checkin = await call(section, "/checkin", {}); }
+          catch { section.checkin = { outcome: "failed" }; }
+        } finally { section.checkinPending = false; }
+      });
+    };
+    return button;
+  };
   const renderSection = (section: QoderCardSection): HTMLElement => {
     const panel = node("div", "", "space-y-3 border-t border-border pt-4 first:border-t-0 first:pt-0");
     panel.append(node("h3", sectionWords(section).title, "font-semibold text-lg"),
@@ -99,11 +122,18 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       buttons.append(connectButton);
     } else if (section.status) {
       buttons.append(action(section, "sync", () => void run(section, async () => { await call(section, "/sync", {}); await reconcile(section); await refresh(section); })));
-      if (section.site.id === "qoder-cn") buttons.append(action(section, "checkin", () => void run(section, async () => {
-        section.checkin = undefined;
-        try { section.checkin = await call(section, "/checkin", {}); }
-        catch { section.checkin = { outcome: "failed" }; }
-      })));
+      if (section.site.id === "qoder-cn") {
+        panel.append(checkinButton(section));
+        if (section.checkin) {
+          const result = section.checkin;
+          const amount = result.credit;
+          const detail = result.outcome === "claimed" && typeof amount === "number" && Number.isFinite(amount) && amount > 0
+            ? lang === "zh" ? `+${amount} 积分` : `+${amount} credits` : words[`checkin_${result.outcome}`] ?? words.checkin_failed;
+          const note = node("p", detail + (result.outcome === "failed" && result.message ? `: ${result.message}` : ""), result.outcome === "failed" ? "text-destructive" : "text-xs text-muted-foreground");
+          note.setAttribute("role", "status");
+          panel.append(note);
+        }
+      }
       buttons.append(action(section, "usage", () => void run(section, async () => { section.usage = await call(section, "/usage", {}); })));
       buttons.append(action(section, "disconnect", () => void run(section, async () => { await call(section, "/disconnect", {}); section.usage = undefined; section.checkin = undefined; await reconcile(section); await refresh(section); })));
     }
