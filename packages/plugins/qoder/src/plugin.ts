@@ -6,7 +6,7 @@ import { registerQoderAdminRoutes } from "./admin-routes";
 import { QODER_SITES, protectQoderConfig, type QoderSiteId } from "./protocol";
 import { qoderLocales } from "./locales";
 
-export const manifest = { name: "qoder", version: "0.3.1", coreApi: "1", description: "Qoder (qoder.com / qoder.cn) subscription provider with PAT sign-in, model management and usage." };
+export const manifest = { name: "qoder", version: "0.3.2", coreApi: "1", description: "Qoder (qoder.com / qoder.cn) subscription provider with PAT sign-in, model management and usage." };
 
 /**
  * The transformer is site-independent (same request/response protocol); only
