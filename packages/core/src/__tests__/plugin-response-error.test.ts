@@ -63,6 +63,28 @@ describe("describeTransportFailure", () => {
     expect(describeTransportFailure("boom")).toEqual({});
     expect(describeTransportFailure(undefined)).toEqual({});
   });
+
+  it("never lets a throwing getter escape — name, cause link and chain links", () => {
+    const boom = () => { throw new Error("hostile getter"); };
+    // Getter on `name`.
+    const hostileName: any = {};
+    Object.defineProperty(hostileName, "name", { get: boom, enumerable: true });
+    expect(() => describeTransportFailure(hostileName)).not.toThrow();
+    expect(describeTransportFailure(hostileName)).toEqual({});
+    // Getter on the top-level `cause`.
+    const hostileCause: any = new TypeError("fetch failed");
+    Object.defineProperty(hostileCause, "cause", { get: boom, enumerable: true });
+    expect(() => describeTransportFailure(hostileCause)).not.toThrow();
+    // Getter on a chain node's own `cause` — the loop-update read.
+    const link: any = { code: "ECONNRESET", address: "1.2.3.4", port: 443 };
+    Object.defineProperty(link, "cause", { get: boom, enumerable: true });
+    const nested = Object.assign(new TypeError("fetch failed"), { cause: link });
+    expect(() => describeTransportFailure(nested)).not.toThrow();
+    // The readable fields from the earlier link still surface.
+    expect(describeTransportFailure(nested)).toEqual({
+      errorName: "TypeError", causeCode: "ECONNRESET", causeDetail: "1.2.3.4:443",
+    });
+  });
 });
 
 describe("pluginResponseError status-0 network classification", () => {

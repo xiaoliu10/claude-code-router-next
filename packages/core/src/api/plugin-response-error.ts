@@ -23,14 +23,17 @@ export interface PluginTransportFailure {
 export function describeTransportFailure(error: unknown): PluginTransportFailure {
   if (!error || typeof error !== "object") return {};
   const out: PluginTransportFailure = {};
-  const name = (error as any)?.name;
+  // Every property read below is wrapped: a hostile error with a throwing
+  // getter (name, cause, or any chain node's fields) must not replace the
+  // classified plugin error with a raw throw at the routes.ts call site.
+  let name: unknown;
+  try { name = (error as any)?.name; } catch { /* unreadable */ }
   if (typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name)) out.errorName = name;
   // The errno-shaped fields may sit on `cause` itself or one level deeper
-  // (undici wraps connect failures in its own error objects). Property reads
-  // are wrapped: a hostile error with a throwing getter must not replace the
-  // classified plugin error with a raw throw at the routes.ts call site.
-  let node: any = (error as any)?.cause;
-  for (let depth = 0; node && typeof node === "object" && depth < 3; depth++, node = node?.cause) {
+  // (undici wraps connect failures in its own error objects).
+  let node: any;
+  try { node = (error as any)?.cause; } catch { node = undefined; }
+  for (let depth = 0; node && typeof node === "object" && depth < 3; depth++) {
     try {
       const code = node.code;
       if (!out.causeCode && typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code)) {
@@ -47,6 +50,7 @@ export function describeTransportFailure(error: unknown): PluginTransportFailure
       }
     } catch { /* unreadable cause node — skip to the next link */ }
     if (out.causeCode && out.causeDetail) break;
+    try { node = node?.cause; } catch { break; }
   }
   return out;
 }
