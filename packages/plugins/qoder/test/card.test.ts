@@ -122,6 +122,25 @@ describe("Qoder card: two independent site sections", () => {
     unmountCard(el);
   });
 
+  it("puts the divider only between the two site sections (no unscanned first: variant)", async () => {
+    const el = mountCardIn({
+      callApi: async () => ({ status: "connected", models: [{ id: "m1", context: 1000, hidden: false }] }),
+      locale: "en", locales: {}, plugin: { name: "qoder", version: "0.3.2" },
+      disabled: false, acquireManagement: () => () => {}, onBusy: () => {}, log: console,
+    });
+    await flush(); await flush();
+
+    const panels = all(el, e => e.tag === "div" && e.className.includes("sm:justify-between"));
+    expect(panels).toHaveLength(2);
+    // First (intl) section: no top rule flush against the card's rounded edge.
+    expect(panels[0].className).not.toContain("border-t");
+    expect(panels[0].className).not.toContain("first:");
+    // Second (CN) section: divider above it.
+    expect(panels[1].className).toContain("border-t");
+    expect(panels[1].className).toContain("border-border");
+    unmountCard(el);
+  });
+
   it("renders connected management actions with the unified outline vocabulary", async () => {
     const el = mountCardIn({
       callApi: async () => ({ status: "connected", models: [{ id: "m1", context: 1000, hidden: false }] }),
