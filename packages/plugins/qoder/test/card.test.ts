@@ -122,6 +122,49 @@ describe("Qoder card: two independent site sections", () => {
     unmountCard(el);
   });
 
+  it("renders connected management actions with the unified outline vocabulary", async () => {
+    const el = mountCardIn({
+      callApi: async () => ({ status: "connected", models: [{ id: "m1", context: 1000, hidden: false }] }),
+      locale: "en", locales: {}, plugin: { name: "qoder", version: "0.3.2" },
+      disabled: false, acquireManagement: () => () => {}, onBusy: () => {}, log: console,
+    });
+    await flush(); await flush();
+
+    // sync/usage/disconnect/refresh render on BOTH connected sections.
+    for (const label of ["Refresh models", "Refresh quota", "Disconnect", "Refresh status"]) {
+      const found = all(el, e => e.tag === "button" && e.textContent === label);
+      expect(found.length).toBeGreaterThan(0);
+      for (const b of found) {
+        expect(b.className).toContain("rounded-xl");
+        expect(b.className).toContain("backdrop-blur-md");
+        expect(b.className).toContain("active:scale-95");
+        // The old filled secondary style must be gone (that was the visual mismatch).
+        expect(b.className).not.toContain("bg-secondary");
+        expect(b.className).not.toContain("rounded-md");
+      }
+    }
+    unmountCard(el);
+  });
+
+  it("renders the PAT connect action as the unified primary variant on both sites", async () => {
+    const el = mountCardIn({
+      callApi: async () => ({ status: "not_connected", models: [] }),
+      locale: "en", locales: {}, plugin: { name: "qoder", version: "0.3.2" },
+      disabled: false, acquireManagement: () => () => {}, onBusy: () => {}, log: console,
+    });
+    await flush(); await flush();
+
+    // One Connect per site (intl + CN). Login/connect is the card's primary CTA.
+    const connect = all(el, e => e.tag === "button" && e.textContent === "Connect");
+    expect(connect).toHaveLength(2);
+    for (const b of connect) {
+      expect(b.className).toContain("bg-primary");
+      expect(b.className).toContain("rounded-xl");
+      expect(b.className).not.toContain("bg-secondary");
+    }
+    unmountCard(el);
+  });
+
   it("does not wipe a half-typed PAT when the other section re-renders", async () => {
     // Both statuses resolve normally; the CN section is held back on its SECOND
     // read so its landing lands mid-typing.
@@ -186,6 +229,10 @@ describe("Qoder card check-in", () => {
     // International accounts require native identity; only CN offers the action.
     expect(buttons).toHaveLength(1);
     expect(buttons[0].className).toContain("w-full");
+    // Unified workbuddy/codex vocabulary (outline row), not a bespoke style.
+    expect(buttons[0].className).toContain("rounded-xl");
+    expect(buttons[0].className).toContain("backdrop-blur-md");
+    expect(buttons[0].className).toContain("active:scale-95");
     expect(text(el)).toContain(locale === "zh" ? "国际站需要在 Qoder 桌面端内签到" : "International check-in requires Qoder desktop");
     buttons[0].onclick?.();
     await flush();

@@ -44,6 +44,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   const CHIP = "inline-flex max-w-full items-center gap-1 break-all whitespace-normal rounded-lg border border-white/5 bg-white/5 px-2 py-0.5 text-[10px] font-bold text-muted-foreground";
   const CHIP_HIDE = "rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-white/10 hover:text-foreground disabled:opacity-40";
   const BUTTON_BASE = "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-xl text-sm font-semibold ring-offset-background transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 active:scale-95";
+  const BUTTON_PRIMARY = "bg-primary text-primary-foreground shadow-lg shadow-primary/20 hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/30";
   const BUTTON_OUTLINE = "border border-input bg-input/50 backdrop-blur-md shadow-sm hover:bg-input/80 hover:border-primary/50 hover:shadow-md hover:text-accent-foreground";
   /** Inline copy of the lucide "x" svg markup (paths only; icons ship as code). */
   const xIcon = (className: string): SVGSVGElement => {
@@ -104,8 +105,15 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       throw e;
     }
   });
-  const action = (section: QoderCardSection, label: string, fn: () => void) => {
-    const button = node("button", words[label], "px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50") as HTMLButtonElement;
+  const action = (
+    section: QoderCardSection,
+    label: string,
+    fn: () => void,
+    variant: "primary" | "outline" = "outline",
+    extra = "h-9 px-4",
+  ) => {
+    const button = node("button", words[label], `${BUTTON_BASE} ${variant === "primary" ? BUTTON_PRIMARY : BUTTON_OUTLINE} ${extra}`) as HTMLButtonElement;
+    button.type = "button";
     // The management lease is a strict mutex across the whole card: while ANY
     // section is busy, this section's buttons must look disabled too, or a
     // click silently no-ops instead of explaining why.
@@ -117,7 +125,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   // money-adjacent manual gesture and must read as one.
   const checkinButton = (section: QoderCardSection) => {
     const pending = !!section.checkinPending;
-    const button = node("button", pending ? words.checkin_pending : words.checkin_action, "inline-flex h-8 w-full items-center justify-center gap-2 whitespace-nowrap rounded-xl border border-input bg-input/50 text-xs font-semibold shadow-sm hover:bg-input/80 disabled:pointer-events-none disabled:opacity-50") as HTMLButtonElement;
+    const button = node("button", pending ? words.checkin_pending : words.checkin_action, `${BUTTON_BASE} ${BUTTON_OUTLINE} h-8 w-full text-xs`) as HTMLButtonElement;
     button.type = "button";
     button.disabled = disposed || props.disabled || sections.some(s => s.busy) || section.status?.status !== "connected";
     button.setAttribute("aria-busy", String(pending));
@@ -185,7 +193,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       // A render triggered by the OTHER section must not wipe a half-typed PAT.
       input.value = section.draft;
       input.oninput = () => { section.draft = input.value; };
-      const connectButton = action(section, "connect", () => connect(section, input));
+      const connectButton = action(section, "connect", () => connect(section, input), "primary");
       input.onkeydown = e => { if (e.key === "Enter") connect(section, input); };
       panel.append(node("p", words.pat, "text-sm font-medium"), input);
       buttons.append(connectButton);
