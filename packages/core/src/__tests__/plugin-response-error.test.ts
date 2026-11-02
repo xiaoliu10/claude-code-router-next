@@ -75,14 +75,17 @@ describe("describeTransportFailure", () => {
     const hostileCause: any = new TypeError("fetch failed");
     Object.defineProperty(hostileCause, "cause", { get: boom, enumerable: true });
     expect(() => describeTransportFailure(hostileCause)).not.toThrow();
-    // Getter on a chain node's own `cause` — the loop-update read.
-    const link: any = { code: "ECONNRESET", address: "1.2.3.4", port: 443 };
+    // Getter on a chain node's own `cause` — the loop-update read. The link
+    // carries only ONE atom, so the early-break (both atoms found) does not
+    // fire and the iteration actually advances into the throwing getter;
+    // deleting the loop-update guard makes this test red.
+    const link: any = { code: "ECONNRESET" };
     Object.defineProperty(link, "cause", { get: boom, enumerable: true });
     const nested = Object.assign(new TypeError("fetch failed"), { cause: link });
     expect(() => describeTransportFailure(nested)).not.toThrow();
-    // The readable fields from the earlier link still surface.
+    // The readable atom from the earlier link still surfaces.
     expect(describeTransportFailure(nested)).toEqual({
-      errorName: "TypeError", causeCode: "ECONNRESET", causeDetail: "1.2.3.4:443",
+      errorName: "TypeError", causeCode: "ECONNRESET",
     });
   });
 });
