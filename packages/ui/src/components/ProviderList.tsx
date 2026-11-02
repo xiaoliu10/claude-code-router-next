@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Provider, ProviderHealthState, ProviderProbeTelemetry, ProviderQuotaUsage } from "@/types";
+import { formatFailureTime } from "@/utils/provider-health-display";
 
 interface ProviderListProps {
   providers: Provider[];
@@ -32,6 +33,8 @@ function getProviderHealth(providerName: string, healthStates?: ProviderHealthSt
   status: 'closed' | 'open' | 'half-open' | 'unknown';
   hasFailure: boolean;
   lastError?: string;
+  /** Epoch ms of the newest failure across the worst-state models; undefined when healthy. */
+  lastFailureTime?: number;
 } {
   if (!healthStates || healthStates.length === 0) {
     return { status: 'closed', hasFailure: false }; // No failures recorded = healthy
@@ -53,6 +56,7 @@ function getProviderHealth(providerName: string, healthStates?: ProviderHealthSt
       status: 'open',
       hasFailure: true,
       lastError: openStates[0].lastError,
+      lastFailureTime: openStates[0].lastFailureTime,
     };
   }
 
@@ -61,6 +65,7 @@ function getProviderHealth(providerName: string, healthStates?: ProviderHealthSt
       status: 'half-open',
       hasFailure: true,
       lastError: halfOpenStates[0].lastError,
+      lastFailureTime: halfOpenStates[0].lastFailureTime,
     };
   }
 
@@ -333,8 +338,13 @@ export function ProviderList({ providers, healthStates, quotaUsages, probeTeleme
                 </div>
               
               {health.lastError && (
-                <div className="p-2 px-3 bg-red-500/10 border border-red-500/20 rounded-lg text-[11px] text-red-500 font-medium truncate max-w-md">
-                  {health.lastError}
+                <div className="p-2 px-3 bg-red-500/10 border border-red-500/20 rounded-lg text-[11px] text-red-500 font-medium max-w-md">
+                  {health.lastFailureTime ? (
+                    <div className="opacity-80 mb-0.5">
+                      {t("providers.last_failure_at", { time: formatFailureTime(health.lastFailureTime) })}
+                    </div>
+                  ) : null}
+                  <div className="truncate">{health.lastError}</div>
                 </div>
               )}
 

@@ -167,6 +167,7 @@
     "health_probe_tooltip": "Based on the latest provider connectivity probe. This reflects network reachability, not model generation latency.",
     "slow_network_warning": "Network response is slow ({{latency}} ms). Requests to this provider may be delayed.",
     "unreachable_warning": "Could not reach the provider: {{error}}",
+    "last_failure_at": "Last failure: {{time}}",
     "enabled": "Active",
     "disabled": "Disabled",
     "proxy": "Proxy",
