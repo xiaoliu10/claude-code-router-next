@@ -253,6 +253,31 @@ describe("codexFinalizeBody — prompt_cache_key and session key", () => {
     const b = codexFinalizeBody(base({ input: [] }));
     expect(a.prompt_cache_key).toBe(b.prompt_cache_key);
   });
+
+  it("does not let an unsynced client instructions drift the key", () => {
+    // Model sync has not run: finalizeInstructions leaves the CLIENT's own
+    // instructions in place (both are non-empty and differ from each other),
+    // and those instructions must not be hashed — the official Codex
+    // instructions are the only stable anchor, and their absence degrades the
+    // key to the first-user-turn anchor alone.
+    const turn1 = codexFinalizeBody(base({
+      instructions: "client prompt turn 1",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }] }],
+    }), { modelInstructions: "   " });
+    const turn2 = codexFinalizeBody(base({
+      instructions: "client prompt turn 2",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }] }],
+    }), { modelInstructions: "   " });
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+  });
+
+  it("keeps the two anchoring paths disjoint: synced instructions change the key", () => {
+    // With official instructions present they ARE part of the anchor, so a
+    // different model family (different instructions) must not share a key.
+    const a = codexFinalizeBody(base({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }] }] }), { modelInstructions: "codex-a" });
+    const b = codexFinalizeBody(base({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }] }] }), { modelInstructions: "codex-b" });
+    expect(a.prompt_cache_key).not.toBe(b.prompt_cache_key);
+  });
 });
 
 describe("codexFinalizeBody — purity", () => {

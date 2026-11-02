@@ -280,18 +280,30 @@ export function codexFinalizeBody(body: any, options: CodexFinalizeOptions = {})
   let { input } = finalizeInput(out.input);
   input = finalizeInstructions(out, input, options.modelInstructions);
   out.input = input;
+  // Only the Codex instructions the model sync installed are a STABLE anchor:
+  // the shared ~3968-token official block every request starts with. When the
+  // sync has not run, out.instructions is still the client's own prompt — the
+  // very field that drifts per turn — so it must not be hashed into the key
+  // (research: opencodex/CLIProxyAPI both anchor on content, never on a
+  // preamble they cannot vouch for).
+  const stableInstructions = typeof options.modelInstructions === "string" &&
+    options.modelInstructions.trim() !== "" &&
+    out.instructions === options.modelInstructions
+    ? out.instructions
+    : "";
 
   if (typeof out.prompt_cache_key !== "string" || out.prompt_cache_key.trim() === "") {
     // With a real session id it is the whole seed. Without one, the seed stays
-    // empty: conversationKey() already anchors on instructions + the first
-    // user turn, which are stable across a conversation. The old seed folded
-    // in input[0] (the client's volatile developer/system preamble), which
-    // reset the derived key — and the upstream cache — on every turn.
+    // empty: conversationKey() already anchors on the stable instructions +
+    // the first user turn, which are stable across a conversation. The old
+    // seed folded in input[0] (the client's volatile developer/system
+    // preamble), which reset the derived key — and the upstream cache — on
+    // every turn.
     const seed = typeof options.sessionId === "string" && options.sessionId
       ? options.sessionId
       : "";
     out.prompt_cache_key = conversationKey(
-      typeof out.instructions === "string" ? out.instructions : "",
+      stableInstructions,
       input,
       seed,
     );
