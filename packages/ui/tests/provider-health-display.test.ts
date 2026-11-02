@@ -27,12 +27,14 @@ test("midnight boundaries stay on the same-day side correctly", () => {
 test("non-finite and NaN input render as empty so callers can skip the line", () => {
   assert.equal(formatFailureTime(Number.NaN, NOW), "");
   assert.equal(formatFailureTime(Infinity, NOW), "");
-  assert.equal(formatFailureTime(0, NOW), "1970-01-01 08:00");
+  // Epoch 0's wall-clock rendering is timezone-dependent — assert the shape,
+  // not the value (repo lesson from the v2.3.2415 workbuddy TZ incident).
+  assert.match(formatFailureTime(0, NOW), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
 });
 
 test("timestamps are formatted in local time (deterministic pads)", () => {
-  // 1970-01-01T00:00:00Z is 08:00 local in Asia/Shanghai; the padded shape is
-  // what matters, not the timezone value itself.
+  // Epoch 0 against a far-future "now" must render the full local date shape;
+  // the timezone-dependent value itself is never asserted.
   const stamp = formatFailureTime(0, new Date("2026-06-01T00:00:00"));
   assert.match(stamp, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
 });

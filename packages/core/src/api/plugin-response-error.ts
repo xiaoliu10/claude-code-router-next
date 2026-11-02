@@ -14,9 +14,11 @@ export interface PluginTransportFailure {
  * Extract bounded transport diagnostics from a thrown send-level error. Node's
  * fetch failures are `TypeError("fetch failed")` with a `cause` chain that
  * carries errno-style fields (code/address/port/hostname). Only enum-like codes
- * and own-config endpoint atoms survive sanitization — never error messages,
- * URLs or anything upstream-controlled, so the result is safe to embed in a
- * client-visible message.
+ * and endpoint atoms the core actually dialed survive sanitization — never
+ * error messages or URLs. The dialed endpoint normally comes from provider
+ * config, but a redirect-following dispatcher may have been pointed there by
+ * an upstream 3xx; the strict charset/length caps keep the result safe to
+ * embed in a client-visible message regardless.
  */
 export function describeTransportFailure(error: unknown): PluginTransportFailure {
   if (!error || typeof error !== "object") return {};
@@ -24,22 +26,26 @@ export function describeTransportFailure(error: unknown): PluginTransportFailure
   const name = (error as any)?.name;
   if (typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name)) out.errorName = name;
   // The errno-shaped fields may sit on `cause` itself or one level deeper
-  // (undici wraps connect failures in its own error objects).
+  // (undici wraps connect failures in its own error objects). Property reads
+  // are wrapped: a hostile error with a throwing getter must not replace the
+  // classified plugin error with a raw throw at the routes.ts call site.
   let node: any = (error as any)?.cause;
   for (let depth = 0; node && typeof node === "object" && depth < 3; depth++, node = node?.cause) {
-    const code = node.code;
-    if (!out.causeCode && typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code)) {
-      out.causeCode = code;
-    }
-    if (!out.causeDetail) {
-      const address = typeof node.address === "string" ? node.address : "";
-      const port = typeof node.port === "number" && Number.isInteger(node.port) && node.port > 0 && node.port <= 65535 ? node.port : undefined;
-      if (address && /^[0-9A-Za-z.:%\[\]-]{1,60}$/.test(address)) {
-        out.causeDetail = port !== undefined ? `${address}:${port}` : address;
-      } else if (typeof node.hostname === "string" && /^[0-9A-Za-z.-]{1,120}$/.test(node.hostname)) {
-        out.causeDetail = node.hostname;
+    try {
+      const code = node.code;
+      if (!out.causeCode && typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code)) {
+        out.causeCode = code;
       }
-    }
+      if (!out.causeDetail) {
+        const address = typeof node.address === "string" ? node.address : "";
+        const port = typeof node.port === "number" && Number.isInteger(node.port) && node.port > 0 && node.port <= 65535 ? node.port : undefined;
+        if (address && /^[0-9A-Za-z.:%\[\]-]{1,60}$/.test(address)) {
+          out.causeDetail = port !== undefined ? `${address}:${port}` : address;
+        } else if (typeof node.hostname === "string" && /^[0-9A-Za-z.-]{1,120}$/.test(node.hostname)) {
+          out.causeDetail = node.hostname;
+        }
+      }
+    } catch { /* unreadable cause node — skip to the next link */ }
     if (out.causeCode && out.causeDetail) break;
   }
   return out;

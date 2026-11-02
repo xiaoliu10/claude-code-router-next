@@ -39,7 +39,6 @@ function getProviderHealth(providerName: string, healthStates?: ProviderHealthSt
   if (!healthStates || healthStates.length === 0) {
     return { status: 'closed', hasFailure: false }; // No failures recorded = healthy
   }
-
   // Find all health states for this provider
   const providerStates = healthStates.filter(s => s.provider === providerName);
 
@@ -56,7 +55,9 @@ function getProviderHealth(providerName: string, healthStates?: ProviderHealthSt
       status: 'open',
       hasFailure: true,
       lastError: openStates[0].lastError,
-      lastFailureTime: openStates[0].lastFailureTime,
+      // Newest stamp across the circuit-open models — the banner answers
+      // "when did this provider last fail", not "which model failed first".
+      lastFailureTime: Math.max(...openStates.map(s => s.lastFailureTime ?? 0)) || undefined,
     };
   }
 
@@ -65,7 +66,7 @@ function getProviderHealth(providerName: string, healthStates?: ProviderHealthSt
       status: 'half-open',
       hasFailure: true,
       lastError: halfOpenStates[0].lastError,
-      lastFailureTime: halfOpenStates[0].lastFailureTime,
+      lastFailureTime: Math.max(...halfOpenStates.map(s => s.lastFailureTime ?? 0)) || undefined,
     };
   }
 

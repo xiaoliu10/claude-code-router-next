@@ -71,7 +71,6 @@ describe("pluginResponseError status-0 network classification", () => {
     const error = await pluginResponseError(rt, 0, undefined, "", describeTransportFailure(fetchFailedRefused()));
     expect(error.code).toBe("plugin_network_error");
     expect(error.message).toBe("Provider plugin network failure (ECONNREFUSED 127.0.0.1:7897).");
-    expect(error.retryable === true || error.nonRetryable === false);
     expect(error.nonRetryable).toBe(false);
     expect(error.upstreamStatus).toBe(0);
     expect(error.upstreamErrorName).toBe("TypeError");
