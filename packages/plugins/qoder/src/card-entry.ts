@@ -47,7 +47,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   const BUTTON_PRIMARY = "bg-primary text-primary-foreground shadow-lg shadow-primary/20 hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/30";
   const BUTTON_OUTLINE = "border border-input bg-input/50 backdrop-blur-md shadow-sm hover:bg-input/80 hover:border-primary/50 hover:shadow-md hover:text-accent-foreground";
   /** Inline copy of the lucide "x" svg markup (paths only; icons ship as code). */
-  const xIcon = (className: string): SVGSVGElement => {
+  /** Inline copy of the lucide svg markup (paths only; icons ship as code). */
+  const icon = (paths: string[], className: string): SVGSVGElement => {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
     svg.setAttribute("width", "24");
@@ -60,13 +61,21 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     svg.setAttribute("stroke-linejoin", "round");
     svg.setAttribute("aria-hidden", "true");
     svg.setAttribute("class", className);
-    for (const d of ["M18 6 6 18", "m6 6 12 12"]) {
+    for (const d of paths) {
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute("d", d);
       svg.appendChild(path);
     }
     return svg;
   };
+  const xIcon = (className: string) => icon(["M18 6 6 18", "m6 6 12 12"], className);
+  const refreshCwIcon = (className: string) => icon([
+    "M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8",
+    "M21 3v5h-5",
+    "M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16",
+    "M8 16H3v5",
+  ], className);
+  const plugIcon = (className: string) => icon(["M12 22v-5", "M9 8V2", "M15 8V2", "M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"], className);
   /** Locale lookup with {{var}} interpolation; unknown keys render as-is. */
   const format = (key: string, vars: Record<string, unknown> = {}): string =>
     String(words[key] ?? key).replace(/\{\{(\w+)\}\}/g, (_, name) => String(vars[name] ?? ""));
@@ -110,7 +119,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     label: string,
     fn: () => void,
     variant: "primary" | "outline" = "outline",
-    extra = "h-9 px-4",
+    extra = "h-8 w-full text-xs",
   ) => {
     const button = node("button", words[label], `${BUTTON_BASE} ${variant === "primary" ? BUTTON_PRIMARY : BUTTON_OUTLINE} ${extra}`) as HTMLButtonElement;
     button.type = "button";
@@ -177,14 +186,23 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       }
     });
   const renderSection = (section: QoderCardSection): HTMLElement => {
-    const panel = node("div", "", "space-y-3 border-t border-border pt-4 first:border-t-0 first:pt-0");
-    panel.append(node("h3", sectionWords(section).title, "font-semibold text-lg"),
+    // Two-column skeleton shared with workbuddy/codex: status + model chips on
+    // the left, a fixed-width vertical action column on the right.
+    const panel = node("div", "",
+      "flex flex-col gap-4 p-5 sm:flex-row sm:items-start sm:justify-between border-t border-border first:border-t-0");
+    const body = node("div", "", "min-w-0 flex-1 space-y-3");
+    const actions = node("div", "", "flex shrink-0 flex-col gap-2 sm:w-[210px]");
+    body.append(node("h3", sectionWords(section).title, "font-semibold text-lg"),
       node("p", sectionWords(section).description, "text-sm text-muted-foreground"));
-    panel.append(node("p", section.status ? words[section.status.status] ?? words.error : words.loading));
-    if (section.status?.expired) panel.append(node("p", words.expired, "text-destructive"));
-    if (section.status?.account) panel.append(node("p", `${words.account}: ${section.status.account}`));
-    if (section.error) panel.append(node("p", section.errorMessage ?? words.error, "text-destructive"));
-    const buttons = node("div", "", "flex flex-wrap gap-2");
+    body.append(node("p", section.status ? words[section.status.status] ?? words.error : words.loading));
+    if (section.status?.expired) body.append(node("p", words.expired, "text-destructive"));
+    if (section.status?.account) body.append(node("p", `${words.account}: ${section.status.account}`));
+    if (section.error) body.append(node("p", section.errorMessage ?? words.error, "text-destructive"));
+    const columnButton = (label: string, fn: () => void, variant: "primary" | "outline" = "outline", iconNode?: SVGSVGElement) => {
+      const button = action(section, label, fn, variant, "h-8 w-full text-xs");
+      if (iconNode) button.prepend(iconNode);
+      return button;
+    };
     if (section.status?.status === "not_connected") {
       // PAT form: password-typed input so the token never shows on screen.
       const input = node("input", "", "w-full rounded-md border border-input bg-background px-3 py-2 text-sm") as HTMLInputElement;
@@ -193,24 +211,23 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       // A render triggered by the OTHER section must not wipe a half-typed PAT.
       input.value = section.draft;
       input.oninput = () => { section.draft = input.value; };
-      const connectButton = action(section, "connect", () => connect(section, input), "primary");
       input.onkeydown = e => { if (e.key === "Enter") connect(section, input); };
-      panel.append(node("p", words.pat, "text-sm font-medium"), input);
-      buttons.append(connectButton);
+      body.append(node("p", words.pat, "text-sm font-medium"), input);
+      actions.append(columnButton("connect", () => connect(section, input), "primary", plugIcon("mr-1 h-3.5 w-3.5")));
     } else if (section.status) {
       if (section.site.id === "qoder-cn") {
-        panel.append(checkinButton(section));
+        actions.append(checkinButton(section));
         const note = checkinNote(section);
-        if (note) panel.append(note);
-      } else if (section.status) {
-        panel.append(node("p", words.checkinDesktop, "text-sm text-muted-foreground"));
+        if (note) actions.append(note);
+      } else {
+        actions.append(node("p", words.checkinDesktop, "text-xs text-muted-foreground"));
       }
-      buttons.append(action(section, "sync", () => void run(section, async () => { await call(section, "/sync", {}); await reconcile(section); await refresh(section); })));
-      buttons.append(action(section, "usage", () => void run(section, async () => { section.usage = await call(section, "/usage", {}); })));
-      buttons.append(action(section, "disconnect", () => void run(section, async () => { await call(section, "/disconnect", {}); section.usage = undefined; await reconcile(section); await refresh(section); })));
+      actions.append(columnButton("sync", () => void run(section, async () => { await call(section, "/sync", {}); await reconcile(section); await refresh(section); }),
+        "outline", refreshCwIcon("mr-1 h-3.5 w-3.5")));
+      actions.append(columnButton("usage", () => void run(section, async () => { section.usage = await call(section, "/usage", {}); })));
+      actions.append(columnButton("disconnect", () => void run(section, async () => { await call(section, "/disconnect", {}); section.usage = undefined; await reconcile(section); await refresh(section); })));
     }
-    buttons.append(action(section, "refresh", () => void run(section, () => refresh(section))));
-    panel.append(buttons);
+    actions.append(columnButton("refresh", () => void run(section, () => refresh(section))));
     // Usage windows: render defensively — shape comes from a remote payload.
     const usageLine = node("p", "", "text-sm text-muted-foreground");
     if (section.usage?.known && Array.isArray(section.usage.windows) && section.usage.windows.length) {
@@ -222,8 +239,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
           return `${name}: ${detail}`;
         }).join(" · ");
     } else usageLine.textContent = words.unknown;
-    panel.append(usageLine);
-    if (section.status?.coolingUntil > Date.now()) panel.append(node("p", `${words.cooling}: ${new Date(section.status.coolingUntil).toLocaleString()}`, "text-sm text-muted-foreground"));
+    body.append(usageLine);
+    if (section.status?.coolingUntil > Date.now()) body.append(node("p", `${words.cooling}: ${new Date(section.status.coolingUntil).toLocaleString()}`, "text-sm text-muted-foreground"));
     // Qoder's count includes hidden models; keep that status meaning while
     // matching Codex's count row and WorkBuddy's visibility controls.
     const models = Array.isArray(section.status?.models) ? section.status.models : [];
@@ -233,9 +250,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       const count = node("dl", "", "grid max-w-md grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs");
       count.append(node("dt", words.models, "text-muted-foreground"),
         node("dd", format("models_count", { count: section.status?.modelCount ?? models.length }), "break-all text-foreground"));
-      panel.append(count);
+      body.append(count);
     }
-    if (!models.length) panel.append(node("p", words.noModels, "text-sm text-muted-foreground"));
+    if (!models.length) body.append(node("p", words.noModels, "text-sm text-muted-foreground"));
     if (visible.length) {
       const chips = node("div", "", "flex flex-wrap gap-2 pt-1");
       for (const model of visible) {
@@ -253,7 +270,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         chip.append(hide);
         chips.append(chip);
       }
-      panel.append(chips);
+      body.append(chips);
     }
     if (hiddenModels.length) {
       const details = node("details", "", "max-w-md text-xs text-muted-foreground");
@@ -272,15 +289,16 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       details.append(list);
       details.append(smallButton(words.restore_all, "mt-2 h-7 px-2 text-[11px]",
         () => setModelVisibility(section, hiddenModels.map((model: any) => String(model.id)), false)));
-      panel.append(details);
+      body.append(details);
     }
+    panel.append(body, actions);
     return panel;
   };
   const render = () => {
     if (disposed) return;
     el.replaceChildren();
     panels.clear();
-    const card = node("section", "", "glass-card rounded-xl p-5 space-y-4");
+    const card = node("section", "", "glass-card rounded-2xl overflow-hidden mb-4");
     for (const section of sections) {
       const panel = renderSection(section);
       panels.set(section.site.id, panel);

@@ -138,6 +138,10 @@ describe("Qoder card: two independent site sections", () => {
         expect(b.className).toContain("rounded-xl");
         expect(b.className).toContain("backdrop-blur-md");
         expect(b.className).toContain("active:scale-95");
+        // Outline skin + full-width column row sizing.
+        expect(b.className).toContain("border-input");
+        expect(b.className).toContain("h-8");
+        expect(b.className).toContain("w-full");
         // The old filled secondary style must be gone (that was the visual mismatch).
         expect(b.className).not.toContain("bg-secondary");
         expect(b.className).not.toContain("rounded-md");
@@ -159,7 +163,11 @@ describe("Qoder card: two independent site sections", () => {
     expect(connect).toHaveLength(2);
     for (const b of connect) {
       expect(b.className).toContain("bg-primary");
+      expect(b.className).toContain("text-primary-foreground");
       expect(b.className).toContain("rounded-xl");
+      // Primary must NOT carry the outline skin — that mix is the drift this
+      // contract exists to catch.
+      expect(b.className).not.toContain("backdrop-blur-md");
       expect(b.className).not.toContain("bg-secondary");
     }
     unmountCard(el);
@@ -233,6 +241,7 @@ describe("Qoder card check-in", () => {
     expect(buttons[0].className).toContain("rounded-xl");
     expect(buttons[0].className).toContain("backdrop-blur-md");
     expect(buttons[0].className).toContain("active:scale-95");
+    expect(buttons[0].className).toContain("h-8");
     expect(text(el)).toContain(locale === "zh" ? "国际站需要在 Qoder 桌面端内签到" : "International check-in requires Qoder desktop");
     buttons[0].onclick?.();
     await flush();
