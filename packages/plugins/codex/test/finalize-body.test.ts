@@ -248,10 +248,42 @@ describe("codexFinalizeBody — prompt_cache_key and session key", () => {
     expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
   });
 
-  it("derives the degenerate key from instructions alone when there is no user turn", () => {
+  it("derives a deterministic degenerate key when there is no user turn (constant, not random)", () => {
+    // Unsynced + sessionless + no user turn collapses to one shared key:
+    // deterministic (never a per-turn random id, which would kill caching).
     const a = codexFinalizeBody(base({ input: [] }));
     const b = codexFinalizeBody(base({ input: [] }));
     expect(a.prompt_cache_key).toBe(b.prompt_cache_key);
+  });
+
+  it("keeps the session-keyed key stable across a volatile developer preamble too", () => {
+    // MINOR-2 regression: 1.0.9 folded the preamble into the hashed parts
+    // even when seeded with a session id, so session-keyed drifting clients
+    // churned keys too. The session id is now the whole seed.
+    const turn1 = codexFinalizeBody(base(dynamicPreamble("turn-1")), { sessionId: "s1" });
+    const turn2 = codexFinalizeBody(base(dynamicPreamble("turn-2")), { sessionId: "s1" });
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+  });
+
+  it("keeps the sessionless key stable when synced instructions are fixed but the client preamble drifts", () => {
+    // MINOR-3 regression: model sync has run (official instructions applied),
+    // yet the client prepends a different developer message every turn. The
+    // anchor must skip that preamble while keeping the official block.
+    const turn1 = codexFinalizeBody(base({
+      instructions: "client prompt turn 1",
+      input: [
+        { type: "message", role: "developer", content: [{ type: "input_text", text: "volatile 1" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "a" }] },
+      ],
+    }), { modelInstructions: "CODEX" });
+    const turn2 = codexFinalizeBody(base({
+      instructions: "client prompt turn 2",
+      input: [
+        { type: "message", role: "developer", content: [{ type: "input_text", text: "volatile 2" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "a" }] },
+      ],
+    }), { modelInstructions: "CODEX" });
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
   });
 
   it("does not let an unsynced client instructions drift the key", () => {

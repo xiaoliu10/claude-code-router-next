@@ -69,9 +69,11 @@ export interface CodexFinalizeOptions {
    */
   modelInstructions?: string;
   /**
-   * Stable per-conversation identity (thread/session id). When the body has no
-   * prompt_cache_key, this hashes together with the conversation prefix so
-   * every turn of one conversation resolves to the same key.
+   * Stable per-conversation identity (thread/session id). When the body has
+   * no prompt_cache_key, this is the whole hash seed: with it present, the
+   * key cannot collide across sessions regardless of content. Without it,
+   * the key degrades to the content anchor (applied Codex instructions +
+   * first user turn) below.
    */
   sessionId?: string;
 }
@@ -105,16 +107,30 @@ function sha256Hex(text: string): string {
 /**
  * magpie conversationKey shape: 8-4-4-4-12 hex groups from a sha256.
  *
- * The anchor is instructions + the first USER turn. Everything before that
- * user turn is deliberately skipped: Claude-Code-style clients put their own
- * system prompt (a developer message) in front, and regenerate it on every
- * turn — date, environment summary, todo state. Hashing that preamble made
- * the derived key change every turn, so the backend treated each request as a
- * brand-new conversation and only the fixed Codex instructions survived in
- * cache (2026-11-02 incident: 10% cache hit on sessionless pi requests vs
- * 94.7% on session-keyed ones; a repro with a dynamic first block hit 0%).
- * With a real session id the same recipe applies — the id is mixed in below,
- * so distinct sessions never share a key.
+ * The anchor is the APPLIED Codex instructions (only when the model sync
+ * installed them; never an unsynced client instructions) + the first USER
+ * turn. Everything before that user turn is deliberately skipped:
+ * Claude-Code-style clients put their own system prompt (a developer
+ * message) in front and regenerate it on every turn — date, environment
+ * summary, todo state. Hashing that preamble made the derived key change
+ * every turn, so the backend treated each request as a brand-new
+ * conversation and only the fixed Codex instructions survived in cache
+ * (2026-11-02 incident: 10% cache hit on sessionless pi requests vs 94.7%
+ * on session-keyed ones; a repro with a dynamic first block hit 0%). With a
+ * real session id it is the whole seed — distinct sessions never share a
+ * key regardless of content.
+ *
+ * Two deliberate exclusions, both cache-routing-only (the stateless backend
+ * always generates from the request body, and its prefix match is
+ * token-exact, so a shared key can only share a routing bucket, never an
+ * answer):
+ *  - tools, stable developer items, and everything before the first user
+ *    turn are not hashed, so conversations differing only there share a
+ *    key;
+ *  - with no user turn, no session id and no synced instructions the key
+ *    collapses to one shared constant. That is pathological for a stateless
+ *    chat request and stays deterministic rather than randomised, since a
+ *    per-turn random id would defeat cross-turn caching entirely.
  */
 function conversationKey(instructions: string, input: any[], sessionId: string): string {
   const parts: string[] = [];
