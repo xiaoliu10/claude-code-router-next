@@ -102,15 +102,28 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-/** magpie conversationKey shape: 8-4-4-4-12 hex groups from a sha256. */
+/**
+ * magpie conversationKey shape: 8-4-4-4-12 hex groups from a sha256.
+ *
+ * The anchor is instructions + the first USER turn. Everything before that
+ * user turn is deliberately skipped: Claude-Code-style clients put their own
+ * system prompt (a developer message) in front, and regenerate it on every
+ * turn — date, environment summary, todo state. Hashing that preamble made
+ * the derived key change every turn, so the backend treated each request as a
+ * brand-new conversation and only the fixed Codex instructions survived in
+ * cache (2026-11-02 incident: 10% cache hit on sessionless pi requests vs
+ * 94.7% on session-keyed ones; a repro with a dynamic first block hit 0%).
+ * With a real session id the same recipe applies — the id is mixed in below,
+ * so distinct sessions never share a key.
+ */
 function conversationKey(instructions: string, input: any[], sessionId: string): string {
   const parts: string[] = [];
   if (instructions) parts.push(instructions);
   for (const item of input) {
-    parts.push(JSON.stringify(item));
-    // The prefix through the first user turn identifies the thread; later turns
-    // must not change it (magpie: "up to the first user message").
-    if (item?.role === "user") break;
+    if (item?.role === "user") {
+      parts.push(JSON.stringify(item));
+      break;
+    }
   }
   const digest = sha256Hex(sessionId + "\u0000" + parts.join("\u0000"));
   return [
@@ -269,9 +282,14 @@ export function codexFinalizeBody(body: any, options: CodexFinalizeOptions = {})
   out.input = input;
 
   if (typeof out.prompt_cache_key !== "string" || out.prompt_cache_key.trim() === "") {
+    // With a real session id it is the whole seed. Without one, the seed stays
+    // empty: conversationKey() already anchors on instructions + the first
+    // user turn, which are stable across a conversation. The old seed folded
+    // in input[0] (the client's volatile developer/system preamble), which
+    // reset the derived key — and the upstream cache — on every turn.
     const seed = typeof options.sessionId === "string" && options.sessionId
       ? options.sessionId
-      : JSON.stringify([out.instructions ?? "", input[0] ?? null]);
+      : "";
     out.prompt_cache_key = conversationKey(
       typeof out.instructions === "string" ? out.instructions : "",
       input,

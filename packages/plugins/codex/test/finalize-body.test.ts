@@ -205,6 +205,54 @@ describe("codexFinalizeBody — prompt_cache_key and session key", () => {
     expect(typeof out.prompt_cache_key).toBe("string");
     expect(out.prompt_cache_key.length).toBeGreaterThan(0);
   });
+
+  // 2026-11-02 production incident: pi sessions that did NOT carry
+  // x-session-affinity fell into the degenerate key path, which hashed
+  // input[0] — the client's own system prompt prepended as a developer
+  // message. Claude-Code-style clients re-generate that first block every
+  // turn (date/env/todos), so the key changed every turn, the backend saw a
+  // new conversation each time, and only the fixed Codex instructions
+  // (~3968 tokens) hit cache. Measured: 177 requests at 10% hit vs 2518
+  // session-keyed requests at 94.7%; a repro with a dynamic first block hit 0%.
+  const dynamicPreamble = (marker: string) => ({
+    input: [
+      { type: "message", role: "developer", content: [{ type: "input_text", text: `volatile ${marker}` }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "a" }] },
+    ],
+  });
+
+  it("ignores a per-turn volatile developer preamble when no session id is given", () => {
+    const turn1 = codexFinalizeBody(base(dynamicPreamble("turn-1")));
+    const turn2 = codexFinalizeBody(base(dynamicPreamble("turn-2")));
+    // The conversation's first user turn and instructions are identical, so
+    // the cache key MUST be identical — otherwise the prefix cache resets.
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+    expect(turn1.prompt_cache_key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it("still separates different first user turns in the degenerate path", () => {
+    const a = codexFinalizeBody(base({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "first" }] }] }));
+    const b = codexFinalizeBody(base({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "second" }] }] }));
+    expect(a.prompt_cache_key).not.toBe(b.prompt_cache_key);
+  });
+
+  it("keeps the degenerate key stable across turns of the same conversation", () => {
+    const turn1 = codexFinalizeBody(base(dynamicPreamble("x")));
+    const turn2 = codexFinalizeBody(base({
+      input: [
+        ...dynamicPreamble("later").input,
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "b" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "c" }] },
+      ],
+    }));
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+  });
+
+  it("derives the degenerate key from instructions alone when there is no user turn", () => {
+    const a = codexFinalizeBody(base({ input: [] }));
+    const b = codexFinalizeBody(base({ input: [] }));
+    expect(a.prompt_cache_key).toBe(b.prompt_cache_key);
+  });
 });
 
 describe("codexFinalizeBody — purity", () => {
