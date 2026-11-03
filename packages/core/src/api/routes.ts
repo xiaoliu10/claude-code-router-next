@@ -190,6 +190,13 @@ async function handleTransformerEndpoint(
   // Initialize on the original request before any fallback spreads it.
   ensurePluginRequestState(req);
 
+  // Stamp codex detection BEFORE any throwing validation: handleFallback reads
+  // the stamp off the spread request, and a request that dies at normalize /
+  // family-router / provider lookup must still fall back with the correct
+  // client response format.
+  const codexDetected = isCodexClient(req);
+  (req as any).codexDetected = codexDetected;
+
   // Normalize Responses API (Codex) format into a unified chat request BEFORE
   // provider resolution. This must happen first so that a CCR family alias can be
   // routed through the shared family router below, which needs messages/system/tools
@@ -279,7 +286,7 @@ async function handleTransformerEndpoint(
   // the Anthropic transformer runs (endpoint = /v1/messages), but the response
   // needs to be converted to Responses API format for codex to parse it.
   // We flag the request so processResponseTransformers can apply the conversion.
-  const codexDetected = isCodexClient(req);
+
   const isCodexOnMessagesEndpoint =
     transformer.endPoint === "/v1/messages" &&
     codexDetected;
@@ -294,7 +301,6 @@ async function handleTransformerEndpoint(
 
   // Store codex flags on the request so handleFallback can propagate them
   (req as any).isCodexOnMessagesEndpoint = isCodexOnMessagesEndpoint;
-  (req as any).codexDetected = codexDetected;
 
   try {
     // Safety net: convert any Responses API (Codex) body that was not already
@@ -795,7 +801,7 @@ async function handleFallback(
             responseTargetFormat: resolveClientResponseFormat(
               newReq,
               transformer,
-              (newReq as any).codexDetected ?? codexDetected
+              (newReq as any).codexDetected === true
             ),
           };
 

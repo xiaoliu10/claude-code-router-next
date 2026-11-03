@@ -395,3 +395,73 @@ describe("OpenAIResponsesTransformer.transformResponseOut — cancellation and e
     await expect(readAllText(out)).rejects.toThrow("upstream reset");
   });
 });
+
+describe("OpenAIResponsesTransformer — review-finding regressions", () => {
+  it("transformResponseIn classifies a Responses stream whose first frame is split across chunks (accumulate peek)", async () => {
+    // Proxy chunk splitting: the first read ends mid-token ("event: response.cr").
+    // A single-read peek misroutes this to the Anthropic→Responses converter and
+    // synthesizes an empty turn; the accumulate peek must recognize it and pass
+    // the native frames through verbatim.
+    const full = `event: response.created\ndata: {"type":"response.created","response":{"id":"r1","model":"g"}}\n\n` +
+      `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello world","item_id":"m1"}\n\n` +
+      `event: response.completed\ndata: {"type":"response.completed","response":{"id":"r1","model":"g","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n`;
+    const splitAt = full.indexOf("response.cr") + "response.cr".length;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(full.slice(0, splitAt)));
+        controller.enqueue(encoder.encode(full.slice(splitAt)));
+        controller.close();
+      },
+    });
+    const out = await transformer.transformResponseIn(
+      new Response(body, { headers: { "Content-Type": "text/event-stream" } })
+    );
+    const text = await readAllText(out);
+    expect(text).toContain("response.output_text.delta");
+    expect(text).toContain("hello world");
+    expect(text).toContain("response.completed");
+  });
+
+  it("terminal completed frame with an INLINE message and tool call emits both (non-streamed upstream)", async () => {
+    const completed =
+      `event: response.created\ndata: {"type":"response.created","response":{"id":"r2","model":"g"}}\n\n` +
+      `data: {"type":"response.completed","response":{"id":"r2","model":"g","output":[{"type":"function_call","id":"fc1","call_id":"call_1","name":"read","arguments":"{}"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"let me check"}]}],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}\n\n`;
+    const out = await transformer.transformResponseOut(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) { c.enqueue(encoder.encode(completed)); c.close(); },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } }
+      ),
+      { responseTargetFormat: "chat" }
+    );
+    const text = await readAllText(out);
+    // Inline tool call survives with its own index and call id…
+    expect(text).toContain('"tool_calls"');
+    expect(text).toContain('"call_1"');
+    expect(text).toContain('"read"');
+    // …and the inline message text is not dropped either.
+    expect(text).toContain("let me check");
+    expect(text).toContain('"finish_reason":"tool_calls"');
+  });
+
+  it("a whitespace-only inline message is NOT content: the turn still ends as an error for the guard", async () => {
+    const completed =
+      `event: response.created\ndata: {"type":"response.created","response":{"id":"r3","model":"g"}}\n\n` +
+      `data: {"type":"response.completed","response":{"id":"r3","model":"g","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"   "}]}],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}\n\n`;
+    const out = await transformer.transformResponseOut(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) { c.enqueue(encoder.encode(completed)); c.close(); },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } }
+      ),
+      { responseTargetFormat: "chat" }
+    );
+    const text = await readAllText(out);
+    // No clean finish_reason:"stop" and no whitespace content chunk — the
+    // emitted error chunk is what lets the empty-answer guard 400 the turn.
+    expect(text).not.toContain('"finish_reason":"stop"');
+    expect(text).toContain('"error"');
+  });
+});

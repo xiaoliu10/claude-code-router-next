@@ -450,7 +450,9 @@ export class OpenAIResponsesTransformer implements Transformer {
           if (
             looksLikeResponsesSSE(firstChunk) ||
             firstChunk.includes("message_start") ||
-            firstChunk.includes("content_block_start")
+            firstChunk.includes("content_block_start") ||
+            firstChunk.includes("chat.completion.chunk") ||
+            /^\s*[{[]/.test(firstChunk)
           ) break;
         }
       } finally {
@@ -687,6 +689,49 @@ export class OpenAIResponsesTransformer implements Transformer {
           return index;
         };
 
+        /**
+         * Terminal frames may carry the WHOLE turn inline (non-streamed
+         * upstreams): function_call items and message text with no prior delta
+         * events. Emit them in upstream order — dropping them produced
+         * tool-use finishes with no tool block, or zero-content turns the
+         * empty-answer guard then 400s. Returns whether anything was emitted.
+         */
+        const emitInlineOutput = (output: any[]): boolean => {
+          let emitted = false;
+          for (const item of Array.isArray(output) ? output : []) {
+            if (item?.type === "function_call") {
+              lastActivity = "tool";
+              const index = toolIndexFor(item, undefined);
+              const id = item.call_id || item.id;
+              if (id) callIdByToolIndex.set(index, id);
+              emitChunk({
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index,
+                    id,
+                    type: "function",
+                    function: {
+                      name: item.name || "",
+                      arguments: typeof item.arguments === "string" ? item.arguments : "",
+                    },
+                  },
+                ],
+              });
+              emitted = true;
+            } else if (item?.type === "message") {
+              for (const part of Array.isArray(item.content) ? item.content : []) {
+                if (part?.type === "output_text" && typeof part.text === "string" && part.text.trim().length > 0) {
+                  lastActivity = "text";
+                  emitChunk({ role: "assistant", content: part.text });
+                  emitted = true;
+                }
+              }
+            }
+          }
+          return emitted;
+        };
+
         const handleEvent = (data: ResponsesStreamEvent) => {
           if (data?.response?.model) responseModel = data.response.model;
           if (data?.response?.id) responseId = data.response.id;
@@ -781,17 +826,7 @@ export class OpenAIResponsesTransformer implements Transformer {
               // or summary-style upstreams): no text delta ever fired, yet the
               // answer is right there in output[]. Dropping it produced a clean
               // turn with zero content — emit it here, once, before finishing.
-              if (lastActivity === "" && !hasToolCall) {
-                for (const item of output) {
-                  if (item?.type !== "message") continue;
-                  for (const part of Array.isArray(item.content) ? item.content : []) {
-                    if (part?.type === "output_text" && typeof part.text === "string" && part.text.length > 0) {
-                      lastActivity = "text";
-                      emitChunk({ role: "assistant", content: part.text });
-                    }
-                  }
-                }
-              }
+              if (lastActivity === "") emitInlineOutput(output);
               // A "completed" turn that never delivered text, thinking or a tool
               // call is NOT a success: reporting it as a clean finish is exactly
               // the silent empty turn this converter exists to prevent.
@@ -815,16 +850,7 @@ export class OpenAIResponsesTransformer implements Transformer {
               // Same inline-message case as response.completed: a truncated
               // non-delta stream still carries what it did produce.
               if (lastActivity === "") {
-                const output: any[] = Array.isArray(data.response?.output) ? data.response.output : [];
-                for (const item of output) {
-                  if (item?.type !== "message") continue;
-                  for (const part of Array.isArray(item.content) ? item.content : []) {
-                    if (part?.type === "output_text" && typeof part.text === "string" && part.text.length > 0) {
-                      lastActivity = "text";
-                      emitChunk({ role: "assistant", content: part.text });
-                    }
-                  }
-                }
+                emitInlineOutput(Array.isArray(data.response?.output) ? data.response.output : []);
               }
               const truncated =
                 reason === "max_output_tokens" || reason === "max_tokens";
@@ -963,10 +989,23 @@ export class OpenAIResponsesTransformer implements Transformer {
       const reader = peekStream.getReader();
       let firstChunk = "";
       try {
-        const { value, done } = await reader.read();
-        if (!done && value) {
-          firstChunk = new TextDecoder().decode(value);
+        // Same accumulate-until-classifiable rationale as transformResponseOut:
+        // proxy exit nodes split the first SSE frame across small chunks, and a
+        // single read missed every marker — routing a native Responses stream
+        // into the wrong converter (the codex 0-output disease, 2463008).
+        for (let reads = 0; reads < 8 && firstChunk.length < 65536; reads++) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) firstChunk += new TextDecoder().decode(value, { stream: true });
+          if (
+            looksLikeResponsesSSE(firstChunk) ||
+            firstChunk.includes("message_start") ||
+            firstChunk.includes("content_block_start") ||
+            firstChunk.includes("chat.completion.chunk") ||
+            /^\s*[{[]/.test(firstChunk)
+          ) break;
         }
+        firstChunk += new TextDecoder().decode();
       } finally {
         reader.releaseLock();
       }
@@ -978,11 +1017,16 @@ export class OpenAIResponsesTransformer implements Transformer {
       // Detect OpenAI Chat SSE by looking for "object":"chat.completion.chunk"
       const isOpenAIChat = firstChunk.includes("chat.completion.chunk");
       // Detect native Responses API SSE — upstream already speaks the Responses API format.
-      // Pass it through unchanged so Codex can parse it directly.
+      // Pass it through unchanged so Codex can parse it directly. The generic
+      // detector (any response.* event name, even a split-frame partial that
+      // truncated a specific marker like "response.created") is authoritative:
+      // the accumulate loop can break on that partial, and the four point
+      // checks alone would then misroute the stream to the wrong converter.
       const isResponsesAPI = firstChunk.includes("response.created") ||
         firstChunk.includes("response.output_text.delta") ||
         firstChunk.includes("response.in_progress") ||
-        firstChunk.includes("response.output_item.added");
+        firstChunk.includes("response.output_item.added") ||
+        looksLikeResponsesSSE(firstChunk);
 
       if (isResponsesAPI) {
         return new Response(bodyStream, {
