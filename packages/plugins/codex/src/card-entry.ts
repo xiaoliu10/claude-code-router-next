@@ -625,7 +625,12 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       t("managed_provider", { name: status?.providerName || CODEX_PROVIDER_NAME })));
     body.append(styled("p", "max-w-md text-xs text-muted-foreground", t("description")));
 
-    if (connected && status) {
+    // Read-only account + usage surface: shown when connected AND while a
+    // quota cooldown is parked — during a cooldown the user most needs the
+    // burn percentages and the reset time, and the read-only usage endpoint
+    // keeps working (the data-plane cooldown does not gate it).
+    const showAccountSurface = !loading && !!status && (connected || state === "cooldown");
+    if (showAccountSurface && status) {
       const rows = styled("dl", "grid max-w-md grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs");
       const account = maskCodexAccountId(status.accountId) ?? t("unknown");
       for (const [label, value, mono] of [
@@ -800,13 +805,31 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   unsubscribeHost = props.onHostChange?.(() => { if (alive) render(); }) ?? null;
   render();
   // Only local status on mount. Never start a login, sync models or poll here.
-  readStatus().then(value => {
-    if (alive) { status = value; loadFailed = false; }
-  }).catch(() => {
-    if (alive) { loadFailed = true; errorKey = "request_failed"; }
-  }).finally(() => {
-    if (alive) { loading = false; render(); if (codexConnected(status)) void autoReadUsage(); }
-  });
+  const mountRead = (retried: boolean): void => {
+    readStatus().then(value => {
+      if (alive) { status = value; loadFailed = false; }
+    }).catch(() => {
+      if (!alive) return;
+      if (!retried) {
+        // A host restart (deploy) can blank the API for a few seconds; one
+        // bounded retry keeps a page open across that window from latching
+        // the failure banner until the next manual remount.
+        setTimeout(() => { if (alive) mountRead(true); }, 2500);
+        return;
+      }
+      loadFailed = true; errorKey = "request_failed";
+    }).finally(() => {
+      if (!alive) return;
+      loading = false; render();
+      // A cooled-down account is exactly when the usage windows matter most
+      // (how much of each window burned, when it resets). The usage endpoint
+      // is a read that works during cooldown, so read it there too — not
+      // only in the connected state.
+      const mountState = codexStateKey(status);
+      if (mountState === "connected" || mountState === "cooldown") void autoReadUsage();
+    });
+  };
+  mountRead(false);
 }
 
 export function unmount(el: HTMLElement): void {
