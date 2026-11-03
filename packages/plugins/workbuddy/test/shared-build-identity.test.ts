@@ -48,7 +48,7 @@ describe("shared build identity", () => {
 it("pins npm, install and runtime manifest versions and keeps the build drift guard", async () => {
   const { manifest } = await import("../src/plugin");
   const pkg = JSON.parse(read("package.json"));
-  expect(pkg.version).toBe("1.0.1");
+  expect(pkg.version).toBe("1.0.2");
   expect(manifest.version).toBe(pkg.version);
   expect(JSON.parse(read("plugin.json")).version).toBe(pkg.version);
   const build = read("scripts/build.ts");

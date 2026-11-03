@@ -2,7 +2,7 @@
  * packages/workbuddy/index.mjs (MIT); see ../THIRD_PARTY_NOTICES.md.
  * No browser login, no prompt rewriting, no static model fallback, no source-file writes.
  * Daily check-in (D11, superseded on 2026-11-01 by an explicit user requirement):
- * CN only, user-triggered, per ACTIVE pool account — never a background task, and
+ * CN only, automatic daily with a manual override, per ACTIVE pool account, and
  * never for the AI site, whose build has no check-in activity.
  * Browser authorization (§15) does not require a desktop installation.
  *
@@ -15,6 +15,7 @@
  *     were deleted: every activation owns its service/store (Node may reuse the
  *     plugin module, so module state must never carry per-activation state).
  */
+import { normalizeAutoCheckin, type WorkBuddyAutoCheckinState } from "./auto-checkin";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, fstatSync, openSync, readFileSync, constants } from "node:fs";
 import fs from "node:fs/promises";
@@ -147,6 +148,7 @@ export interface WorkBuddySiteState {
 }
 export interface WorkBuddyCredentialData {
   version: 2;
+  autoCheckin?: WorkBuddyAutoCheckinState;
   sites: Partial<Record<WorkBuddySiteId, WorkBuddySiteState>>;
 }
 /**
@@ -404,8 +406,9 @@ export class WorkBuddyCredentialStore {
         lastError: typeof s.lastError === "string" && s.lastError.length <= 512 ? s.lastError : null,
       };
     }
-    if (!Object.keys(sites).length) throw new Error();
-    return { version: 2, sites };
+    const autoCheckin = normalizeAutoCheckin(c.autoCheckin);
+    if (!Object.keys(sites).length && !autoCheckin) throw new Error();
+    return { version: 2, sites, ...(autoCheckin ? { autoCheckin } : {}) };
   }
 
   private migrateV1Data(c: WorkBuddyCredential): WorkBuddyCredentialData {

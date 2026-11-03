@@ -1,3 +1,4 @@
+import { localCheckinDate, normalizeAutoCheckin } from "./auto-checkin";
 /** Self-contained WorkBuddy DOM card: no React, host imports or direct fetch.
  * All state/network/config interactions flow through the host card capabilities
  * (PluginCardMountProps). Framework-free port of the former React
@@ -654,6 +655,21 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       const claim = button(actions, t(pending ? "checkin.pending" : "checkin.action"),
         () => void run("checkin", site), disabled || !connected, "outline", "h-8 w-full text-xs");
       claim.setAttribute("aria-busy", String(pending));
+      const auto = normalizeAutoCheckin(status?.autoCheckin);
+      if (auto) {
+        const today = auto.lastAttemptDate === localCheckinDate();
+        const time = new Date(auto.lastResult.at);
+        const clock = `${String(time.getHours()).padStart(2, "0")}:${String(time.getMinutes()).padStart(2, "0")}`;
+        const outcome = auto.lastResult.outcome;
+        const key = !today ? "previous" : outcome === "failed"
+          ? (auto.retryCount < 5 ? "retrying" : "failed") : outcome;
+        const note = styled("p", "text-xs text-muted-foreground", t(`checkin.auto.${key}`, {
+          time: clock, date: auto.lastAttemptDate,
+        }));
+        note.dataset.testid = "workbuddy-auto-checkin";
+        note.setAttribute("role", "status");
+        actions.append(note);
+      }
       if (checkinRequestFailed) {
         const note = styled("p", "text-xs text-muted-foreground", t("checkin.failed"));
         note.setAttribute("role", "status");

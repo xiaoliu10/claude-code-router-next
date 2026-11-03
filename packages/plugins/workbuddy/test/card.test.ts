@@ -1,3 +1,4 @@
+import { localCheckinDate } from "../src/auto-checkin";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mount, unmount } from "../src/card-entry";
 import { workbuddyLocales } from "../src/locales";
@@ -529,4 +530,43 @@ it("MAJOR-1: conflict refreshes status without attaching a claim result to eithe
   expect(h.statusReads()).toBe(2);
   expect(h.host.text()).not.toContain(en.checkin.claimed);
   expect(h.host.text()).toContain(en.checkin.failed);
+});
+
+
+it.each(["en", "zh"] as const)("renders compact automatic outcomes in %s, with the manual override intact", async locale => {
+  const words = workbuddyLocales[locale].workbuddy.checkin;
+  for (const outcome of ["claimed", "done", "inactive", "ineligible", "failed"] as const) {
+    const now = new Date(); now.setHours(9, 12, 0, 0);
+    const at = now.toISOString();
+    const h = harness({ "/status": { ...status, autoCheckin: {
+      lastAttemptDate: localCheckinDate(now), lastAttemptAt: at, lastResult: { outcome, at }, retryCount: 0,
+    } } }, false, false, locale);
+    await tick();
+    const text = h.host.querySelector('[data-testid="workbuddy-auto-checkin"]')?.textContent;
+    const key = outcome === "failed" ? "retrying" : outcome;
+    expect(text).toBe(words.auto[key].replace("{{time}}", "09:12"));
+    expect(h.host.card("workbuddy").button(words.action).disabled).toBe(false);
+    expect(h.host.card("workbuddy-ai").querySelector('[data-testid="workbuddy-auto-checkin"]')).toBeNull();
+  }
+});
+it("hides absent or malformed automatic state and keeps state-only users disconnected", async () => {
+  const absent = harness(); await tick();
+  expect(absent.host.querySelector('[data-testid="workbuddy-auto-checkin"]')).toBeNull();
+  const malformed = harness({ "/status": { ...status, autoCheckin: { lastResult: { outcome: "secret" } } } }); await tick();
+  expect(malformed.host.querySelector('[data-testid="workbuddy-auto-checkin"]')).toBeNull();
+  const at = new Date().toISOString();
+  const signedOut = harness({ "/status": { sites: {}, connectedSites: [], autoCheckin: {
+    lastAttemptDate: localCheckinDate(), lastAttemptAt: at, lastResult: { outcome: "failed", at }, retryCount: 5,
+  } } }); await tick();
+  expect(signedOut.host.card("workbuddy").button(workbuddyLocales.en.workbuddy.checkin.action).disabled).toBe(true);
+  expect(signedOut.host.text()).toContain(workbuddyLocales.en.workbuddy.status.not_connected);
+  expect(signedOut.host.querySelector('[data-testid="workbuddy-auto-checkin"]')?.textContent).toMatch(/^Auto: failed \d{2}:\d{2}$/);
+});
+it("does not label yesterday's automatic claim as today's", async () => {
+  const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+  const at = yesterday.toISOString();
+  const h = harness({ "/status": { ...status, autoCheckin: {
+    lastAttemptDate: localCheckinDate(yesterday), lastAttemptAt: at, lastResult: { outcome: "claimed", at }, retryCount: 0,
+  } } }); await tick();
+  expect(h.host.querySelector('[data-testid="workbuddy-auto-checkin"]')?.textContent).toContain(`Auto: last attempt ${localCheckinDate(yesterday)}`);
 });
