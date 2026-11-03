@@ -49,7 +49,7 @@ export function registerCursorAdminRoutes(app: FastifyInstance, service: CursorA
       const code = unauthorized ? "cursor_unauthorized" : CURSOR_SAFE_CODES.has(e?.code) ? e.code : "cursor_request_failed";
       const status = unauthorized ? 403 : Number.isInteger(e?.statusCode) && e.statusCode !== 401 && e.statusCode >= 400 && e.statusCode <= 599 ? e.statusCode : 500;
       reply.status(status);
-      return { success: false, error: code, ...(e?.detail ? { detail: String(e.detail).slice(0, 300) } : {}) };
+      return { success: false, error: code };
     }
   } });
 }

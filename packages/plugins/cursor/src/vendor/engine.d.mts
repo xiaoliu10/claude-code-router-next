@@ -93,8 +93,8 @@ export interface CursorEngineOptions {
 export interface CursorEngineInternal {
   answer(auth: CursorAuth, chat: any, signal?: AbortSignal, session?: string): Promise<Response>;
   answerOf(auth: CursorAuth, chat: any, signal?: AbortSignal, session?: string): Promise<Response>;
-  browserSignIn(signal?: AbortSignal): CursorSignInMethod;
-  cliSignIn(): CursorSignInMethod;
+  browserSignIn(signal?: AbortSignal): Promise<CursorSignInMethod>;
+  cliSignIn(): Promise<CursorSignInMethod>;
   keyToken(key: string): Promise<string>;
   tokenOf(auth: CursorAuth | undefined): Promise<string>;
   usable(tok: string): Promise<CursorModelInfo[]>;

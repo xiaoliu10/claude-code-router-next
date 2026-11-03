@@ -126,7 +126,7 @@ export function classifyCursorError(status: number, body: unknown): PluginClassi
     code = String(e?.code ?? "");
   }
   const numeric = Number(code);
-  if (Number.isFinite(numeric) && numeric >= 400 && numeric <= 599 && !status) status = numeric;
+  if (Number.isFinite(numeric) && numeric >= 400 && numeric <= 599 && (!status || (status >= 200 && status < 300))) status = numeric;
   const low = `${message} ${raw}`.toLowerCase();
   const out = (info: Partial<PluginClassifiedError> & { code: string; httpStatus: number }): PluginClassifiedError => ({
     retryable: false, ...info, message: info.code,

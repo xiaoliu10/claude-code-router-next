@@ -1,4 +1,5 @@
 import type { ManagedRuntime, PluginClassifiedError, PluginDispatchInput, PluginHostCapabilities, ManagedProbeInput } from "./core-types";
+import { cursorTransportSignal } from "./transport-scope";
 import type { CursorAuthService } from "./auth-service";
 import { classifyCursorError, cursorError, isCursorManaged, CURSOR_MARKER, CURSOR_PROVIDER } from "./protocol";
 
@@ -32,7 +33,7 @@ function classifiedInfo(error: any): PluginClassifiedError | null {
 
 /** Preserve the real AbortError identity; sanitize every other stream failure. */
 function streamError(error: unknown, aborted: boolean): Error {
-  if (aborted || (error instanceof Error && error.name === "AbortError")) {
+  if (aborted || (error instanceof Error && (error.name === "AbortError" || (error.cause as any)?.name === "AbortError"))) {
     return Object.assign(new Error(error instanceof Error ? error.message : "aborted"), { name: "AbortError" });
   }
   return cursorError("cursor_upstream_error", 502);
@@ -60,23 +61,85 @@ export function dispatcherIsProxy(dispatcher: unknown): boolean {
 export function resolveCursorTransport(host: PluginHostCapabilities, override?: unknown): { fetch: typeof fetch; h2: boolean } {
   const dispatcher = override ?? host.getSubscriptionDispatcher?.() ?? host.getDirectDispatcher();
   const proxied = dispatcherIsProxy(dispatcher);
-  const fetchImpl: typeof fetch = (input: any, init?: any) => fetch(input, {
-    ...init, redirect: "error", dispatcher,
-  } as RequestInit);
+  const fetchImpl: typeof fetch = (input: any, init?: any) => {
+    const budget = cursorTransportSignal.getStore();
+    const upstreamSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    return fetch(input, {
+      ...init, redirect: "error", dispatcher,
+      ...(budget ? { signal: AbortSignal.any([budget, ...(upstreamSignal ? [upstreamSignal] : [])]) } : {}),
+    } as RequestInit);
+  };
   return { fetch: fetchImpl, h2: !proxied };
 }
 
+/** An undici dispatcher with no sockets: the host fetch executes one virtual engine request. */
+function virtualCursorDispatcher(send: (signal: AbortSignal) => Promise<Response>) {
+  return {
+    dispatch(_options: unknown, handler: any): boolean {
+      const controller = new AbortController();
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      let resume: (() => void) | undefined;
+      let ended = false;
+      let paused = false;
+      // Node 20/22 use the original dispatcher handler, Node 24+ the controller API.
+      const modern = typeof handler.onRequestStart === "function";
+      const dispatchController = {
+        abort: (reason?: Error) => fail(reason ?? new DOMException("aborted", "AbortError")),
+        pause: () => { paused = true; },
+        resume: () => { paused = false; resume?.(); resume = undefined; },
+      };
+      const fail = (error: unknown) => {
+        if (ended) return;
+        ended = true;
+        controller.abort();
+        resume?.(); resume = undefined;
+        void reader?.cancel(error).catch(() => {});
+        if (modern) handler.onResponseError(dispatchController, error);
+        else handler.onError(error);
+      };
+      if (modern) handler.onRequestStart(dispatchController);
+      else handler.onConnect(dispatchController.abort);
+      void (async () => {
+        try {
+          if (controller.signal.aborted) return;
+          const response = await send(controller.signal);
+          if (ended) { await response.body?.cancel(); return; }
+          const headers = [...response.headers].flatMap(([key, value]) => [key, value]);
+          if (modern) handler.onResponseStart(dispatchController, response.status, Object.fromEntries(response.headers), response.statusText);
+          else handler.onHeaders(response.status, headers, dispatchController.resume, response.statusText);
+          reader = response.body?.getReader();
+          while (reader && !ended) {
+            const next = await reader.read();
+            if (next.done) break;
+            // Undici's response reader supplies backpressure, just as a socket dispatcher does.
+            if (modern) handler.onResponseData(dispatchController, next.value);
+            else if (handler.onData(next.value) === false) paused = true;
+            if (paused && !ended) await new Promise<void>(resolve => { resume = resolve; });
+          }
+          if (!ended) {
+            ended = true;
+            if (modern) handler.onResponseEnd(dispatchController, {});
+            else handler.onComplete([]);
+          }
+        } catch (error) { fail(error); }
+      })();
+      return true;
+    },
+  };
+}
+
 export function createCursorManagedRuntime(service: CursorAuthService, host: PluginHostCapabilities, timeoutMs = 600_000): ManagedRuntime {
+  const attempts = new WeakMap<object, ReturnType<typeof virtualCursorDispatcher>>();
   return {
     // Name = provider family: the core keys runtimes (and 401 bookkeeping) by it.
     name: "cursor", isManaged: (provider: any) => isCursorManaged(provider), suppressDebugLog: true,
     ensureUsable: () => service.ensureUsable(),
     lockUpstream: async config => {
-      // dispatchRequest NEVER calls attempt(): the marker credential is not a
-      // Cursor credential and Cursor's data plane is the engine's Connect
-      // transaction, not a chat-completions POST. Pin config.url to a dead
-      // local address so a stray attempt could never send the marker upstream.
-      config.url = "http://127.0.0.1:9/ccr-managed-cursor";
+      // No socket is opened: only dispatchRequest can supply the virtual bridge.
+      config.url = "http://127.0.0.1:65534/ccr-managed-cursor";
+      config.dispatcher = attempts.get(config) ?? virtualCursorDispatcher(async () => {
+        throw cursorError("cursor_request_failed", 500);
+      });
       config.redirect = "error";
     },
     // Signing happens inside the vendored engine's answer() (headersFor +
@@ -94,7 +157,7 @@ export function createCursorManagedRuntime(service: CursorAuthService, host: Plu
     // The engine owns exactly one bounded chat transaction (queue wait and
     // region/max-mode retries are its own, upstream-bounded); this wrapper
     // owns abort/deadline wiring and the classified-error fold.
-    async dispatchRequest({ requestBody, config, req }: PluginDispatchInput) {
+    async dispatchRequest({ attempt, requestBody, config, req }: PluginDispatchInput) {
       const controller = new AbortController();
       const abort = () => controller.abort();
       const socket = req?.raw?.socket;
@@ -107,7 +170,14 @@ export function createCursorManagedRuntime(service: CursorAuthService, host: Plu
         ...(req?.signal instanceof AbortSignal ? [req.signal] : []),
       ]);
       const cleanup = () => { req?.raw?.off?.("aborted", abort); socket?.off?.("close", abort); };
-      const send = async (): Promise<Response> => service.dispatch(requestBody, signal);
+      const dispatcher = virtualCursorDispatcher(hostSignal => service.dispatch(requestBody, AbortSignal.any([
+        signal, hostSignal,
+        // The host initializes TIMEOUT inside attempt(), before invoking this dispatcher.
+        AbortSignal.timeout(Number(config.TIMEOUT) > 0 ? Math.min(Number(config.TIMEOUT), 3_600_000) : timeoutMs),
+      ])));
+      attempts.set(config, dispatcher);
+      config.dispatcher = dispatcher;
+      config.signal = signal;
       const wrap = (response: Response): Response => {
         if (!response.body) { cleanup(); return response; }
         const reader = response.body.getReader();
@@ -125,7 +195,7 @@ export function createCursorManagedRuntime(service: CursorAuthService, host: Plu
         }), { status: response.status, statusText: response.statusText, headers: response.headers });
       };
       try {
-        const response = await send();
+        const response = await attempt();
         if (!response.ok) {
           // The engine answered an errorResponse: classify, note, throw. The
           // core's shared seam turns this into the safe client error; a 401
@@ -138,13 +208,16 @@ export function createCursorManagedRuntime(service: CursorAuthService, host: Plu
         }
         return wrap(response);
       } catch (error: any) {
+        controller.abort();
         cleanup();
-        if (signal.aborted || error?.name === "AbortError") {
+        if (signal.aborted && error?.name === "AbortError") {
           throw Object.assign(new Error(error?.message ?? "aborted"), { name: "AbortError" });
         }
         const info = classifiedInfo(error);
         if (info) await service.noteUpstreamError(info).catch(() => {});
-        throw error?.pluginClassified ? error : Object.assign(cursorError("cursor_upstream_error", 502), { pluginClassified: true });
+        throw error;
+      } finally {
+        attempts.delete(config);
       }
     },
     // Level 1: account state without a network call (the Gemini lesson — a
@@ -155,7 +228,10 @@ export function createCursorManagedRuntime(service: CursorAuthService, host: Plu
     async probeLiveness({ config }: ManagedProbeInput): Promise<Response> {
       const deadline = Number(config?.TIMEOUT ?? timeoutMs);
       try {
-        return await service.probeLiveness(deadline > 0 ? AbortSignal.timeout(Math.min(deadline, 60_000)) : undefined);
+        return await service.probeLiveness(AbortSignal.any([
+          AbortSignal.timeout(Number.isFinite(deadline) && deadline > 0 ? Math.min(deadline, 60_000) : 60_000),
+          ...(config?.signal instanceof AbortSignal ? [config.signal] : []),
+        ]));
       } catch (e: any) {
         if (e?.name === "AbortError") throw e;
         const status = Number(e?.status) >= 400 && Number(e?.status) <= 599 ? Number(e.status) : 502;

@@ -1,3 +1,4 @@
+import { cursorTransportSignal } from "./transport-scope";
 import { constants } from "node:fs";
 import { open, mkdir, chmod, rename, rm, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -314,13 +315,38 @@ export class CursorAuthService {
     signal?.addEventListener("abort", stop, { once: true });
     if (signal?.aborted) controller.abort();
     this.active.add(controller);
+    const cleanup = () => {
+      this.active.delete(controller);
+      signal?.removeEventListener("abort", stop);
+    };
     try {
       const auth = toEngineAuth(this.saved.credential);
       const session = typeof chatBody?.prompt_cache_key === "string" ? chatBody.prompt_cache_key : "";
-      return await this.waitWithSignal(this.engine.answer(auth, chatBody, controller.signal, session), signal);
-    } finally {
-      this.active.delete(controller);
-      signal?.removeEventListener("abort", stop);
+      const response = await this.waitWithSignal(this.engine.answer(auth, chatBody, controller.signal, session), controller.signal);
+      if (!response.body) { cleanup(); return response; }
+      const reader = response.body.getReader();
+      return new Response(new ReadableStream<Uint8Array>({
+        pull: async ctl => {
+          try {
+            const next = await this.waitWithSignal(reader.read(), controller.signal);
+            if (next.done) {
+              // Native tool continuations retain their Run, but delivered() detaches
+              // this segment's signal. Disconnect separately cancels retained owners.
+              cleanup(); ctl.close();
+            } else ctl.enqueue(next.value);
+          } catch (error) {
+            controller.abort(); cleanup();
+            void reader.cancel(error).catch(() => {});
+            ctl.error(error);
+          }
+        },
+        cancel: async reason => {
+          controller.abort(); cleanup();
+          await reader.cancel(reason).catch(() => {});
+        },
+      }), { status: response.status, statusText: response.statusText, headers: response.headers });
+    } catch (error) {
+      controller.abort(); cleanup(); throw error;
     }
   }
 
@@ -335,11 +361,13 @@ export class CursorAuthService {
         throw cursorError("cursor_login_busy", 409);
       }
       const controller = new AbortController();
-      const method: CursorSignInMethod = this.engine.browserSignIn(controller.signal);
-      const generation = this.generation;
+      const method: CursorSignInMethod = await this.engine.browserSignIn(controller.signal);
+      const generation = ++this.generation;
       const startedAt = Date.now();
-      const job = method.callback().then(async (result): Promise<CursorSignInResult> => {
-        if (generation !== this.generation || this.disconnecting) {
+      const current = () => generation === this.generation && !this.disconnecting &&
+        !controller.signal.aborted && this.login?.controller === controller && this.login.outcome === null;
+      const job = method.callback().then(result => this.exclusive(async (): Promise<CursorSignInResult> => {
+        if (!current()) {
           // A disconnect (or a newer login) landed meanwhile: never resurrect
           // the older job's outcome.
           return { type: "failed", error: "superseded" };
@@ -350,17 +378,19 @@ export class CursorAuthService {
           ...(result.accountId ? { accountId: result.accountId } : {}),
           ...(result.plan ? { plan: result.plan } : {}),
         };
-        await this.persistNewCredential(credential);
-        return result;
-      });
+        await this.persistNewCredential(credential, () => {
+          if (!current()) throw cursorError("cursor_login_cancelled", 409);
+        });
+        return current() ? result : { type: "failed", error: "cursor_login_cancelled" };
+      }));
       this.login = { controller, job, url: method.url, startedAt, outcome: null };
       void job.then(result => {
-        if (!this.login || this.login.job !== job) return; // superseded by a newer job or disconnect
-        this.login.outcome = result.type === "success" ? { state: "success" }
+        if (!current()) return; // superseded by a newer job or disconnect
+        this.login!.outcome = result.type === "success" ? { state: "success" }
           : result.error === "the sign-in was cancelled" ? { state: "cancelled", error: result.error }
-          : { state: "failed", error: result.error };
+          : { state: "failed", error: "cursor_login_failed" };
       }).catch((error: any) => {
-        if (this.login?.job === job) this.login.outcome = { state: "failed", error: String(error?.message ?? error) };
+        if (current()) this.login!.outcome = { state: "failed", error: "cursor_login_failed" };
       });
       return { url: method.url };
     });
@@ -372,15 +402,17 @@ export class CursorAuthService {
       return { state: this.login.outcome.state, ...(this.login.outcome.error ? { error: this.login.outcome.error } : {}) };
     }
     if (Date.now() - this.login.startedAt > MAX_LOGIN_POLLS_MS) {
+      this.generation++;
       this.login.controller.abort();
-      this.login.outcome = { state: "failed", error: "the sign-in timed out" };
-      return { state: "failed", error: "the sign-in timed out" };
+      this.login.outcome = { state: "failed", error: "cursor_login_failed" };
+      return { state: "failed", error: "cursor_login_failed" };
     }
     return { state: "pending", url: this.login.url };
   }
 
   cancelLogin(): { success: true } {
     if (this.login && this.login.outcome === null) {
+      this.generation++;
       this.login.controller.abort();
       this.login.outcome = { state: "cancelled", error: "the sign-in was cancelled" };
     }
@@ -392,7 +424,8 @@ export class CursorAuthService {
     return this.exclusive(async () => {
       await this.load();
       if (this.saved) throw cursorError("cursor_already_connected", 409);
-      const result = await this.engine.cliSignIn().callback();
+      const method = await this.engine.cliSignIn();
+      const result = await method.callback();
       if (result.type !== "success") throw Object.assign(cursorError("cursor_login_failed", 422), { detail: result.error });
       const credential: CursorCredential = { type: "cli",
         ...(result.accountId ? { accountId: result.accountId } : {}), ...(result.plan ? { plan: result.plan } : {}) };
@@ -429,11 +462,18 @@ export class CursorAuthService {
   }
 
   /** Persist FIRST, then config; a config failure rolls the file back. */
-  private async persistNewCredential(credential: CursorCredential): Promise<void> {
+  private async persistNewCredential(credential: CursorCredential, check = () => {}): Promise<void> {
     const next: Saved = { version: 1, credential, models: [] };
-    await this.persist(next);
-    try { await this.updateConfig(next); }
-    catch (e) { await rm(this.file, { force: true }); this.saved = undefined; throw e; }
+    check();
+    try {
+      await this.persist(next);
+      check();
+      await this.updateConfig(next);
+      check();
+    } catch (e) {
+      await this.updateConfig(undefined).catch(() => {});
+      await rm(this.file, { force: true }); this.saved = undefined; throw e;
+    }
     this.expired = false;
     this.lastError = undefined;
     this.coolingUntil = 0;
@@ -597,14 +637,19 @@ export class CursorAuthService {
 
   /** Level-2 liveness: the cheapest call that proves Cursor answers for THIS account. */
   async probeLiveness(signal?: AbortSignal): Promise<Response> {
-    const tok = await this.engineToken();
-    try {
-      const plan = await this.engine.unary(_internal.API, "aiserver.v1.DashboardService/GetPlanInfo", tok, {}, 15_000);
-      return Response.json({ ok: true, ...(plan ? { plan } : {}) }, { status: 200, signal } as ResponseInit);
-    } catch (e: any) {
-      const status = Number(e?.status) >= 400 && Number(e?.status) <= 599 ? Number(e.status) : 502;
-      return Response.json({ ok: false }, { status, signal } as ResponseInit);
-    }
+    const probe = async () => {
+      const tok = await this.waitWithSignal(this.engineToken(), signal);
+      try {
+        const plan = await this.waitWithSignal(this.engine.unary(_internal.API, "aiserver.v1.DashboardService/GetPlanInfo", tok, {}), signal);
+        if (signal?.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        return Response.json({ ok: true, ...(plan ? { plan } : {}) });
+      } catch (e: any) {
+        if (signal?.aborted || e?.name === "AbortError") throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        const status = Number(e?.status) >= 400 && Number(e?.status) <= 599 ? Number(e.status) : 502;
+        return Response.json({ ok: false }, { status });
+      }
+    };
+    return signal ? cursorTransportSignal.run(signal, probe) : probe();
   }
 
   /** Marker identity, for tests and the runtime's isManaged. */

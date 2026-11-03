@@ -187,7 +187,7 @@ export async function cursorResponse(response: Response, note?: CursorStreamNote
               throw error;
             }
             for (const c of event.choices ?? []) {
-              const reasoningVisible = typeof c.delta?.reasoning_content === "string" && c.delta.reasoning_content.length > 0;
+              const reasoningVisible = typeof c.delta?.thinking?.content === "string" && c.delta.thinking.content.length > 0;
               if (reasoningVisible || c.delta?.content || c.delta?.tool_calls?.length) visible = true;
               if (c.finish_reason) finished = true;
             }

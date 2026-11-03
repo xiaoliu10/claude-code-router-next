@@ -33,6 +33,8 @@ Then press **Refresh models** to sync the model list (Cursor's picker, one entry
 
 ## Data plane
 
+Each CCR host attempt invokes a request-local virtual dispatcher, which runs exactly one engine dispatch without opening a socket or forwarding the marker credential. The host still runs its policy, signing, timeout initialization and error classification. A retained native tool Run can span attempts; every tool continuation still enters a fresh host attempt and attaches that attempt's signal until its response body finishes. Disconnect separately cancels retained owners.
+
 Requests go to Cursor's agent API (`AgentService/Run`, a Connect stream both ways over **HTTP/2** by default). Where HTTP/2 can't open a Run, the engine falls back to its own HTTP/1.1 lane (`RunSSE` + `BidiAppend` on api2) exactly as upstream does.
 
 **Caveat under a subscription proxy:** when `SUBSCRIPTION_PROXY_URL` is set, Node's `http2` cannot traverse the host's proxy dispatcher. The plugin then pins the **entire** data plane to HTTP/1.1 through the proxy — including the engine's own region retry — so no request bypasses the proxy. Without the proxy setting, HTTP/2 is used (fastest lane), with upstream's automatic H1 fallback on transport failures.
@@ -48,7 +50,7 @@ The engine counts usage from Cursor's dashboard events per conversation; `prompt
 - **H1 under proxy**: see above; HTTP/2 and the subscription proxy are mutually exclusive by platform constraint.
 - **Upstream checkpoint test known-failing**: the vendored engine's own suite has one known-failing test (background checkpoint reference closure while a Run is parked). It is ported **skipped-with-comment**, not deleted and not fake-passed; see `test/native-e2e.test.mjs`.
 - **Real account UNVERIFIED**: this build was validated against the upstream offline test suite and adapter tests only. No live Cursor account was used; sign-in flows, the H2/H1 lanes and quota windows against the real API are UNVERIFIED.
-- **No host disposal hook (coreApi=1)**: disconnect aborts the plugin's own in-flight requests and cancels this account's retained native owners, and the host has no provider-disposal hook a plugin could use for process-shutdown cleanup. In-flight core attempts that already hold a response continue to their own ends; nothing in this plugin can reach them beyond the request signal.
+- **No host disposal hook (coreApi=1)**: disconnect aborts the plugin's own in-flight requests and cancels this account's retained native owners, and the host has no provider-disposal hook a plugin could use for process-shutdown cleanup. Request aborts and deadlines remain linked through the response body; retained tool Runs are bounded by the engine lifetime and cancelled on disconnect.
 - **One account per process**: the engine keeps per-token caches process-wide, matching upstream's single-account design.
 
 ## Third-party

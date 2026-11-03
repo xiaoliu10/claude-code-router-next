@@ -1,6 +1,10 @@
 import "./nonet.mjs"
 import { afterEach, beforeEach, expect, test, vi } from "vitest"
 import http2 from "node:http2"
+import { mkdtemp, writeFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { CursorAuthService } from "../src/auth-service.ts"
 import { randomUUID } from "node:crypto"
 import { getEventListeners } from "node:events"
 import { CursorAuthPlugin, _internal } from "../src/vendor/engine.mjs"
@@ -272,6 +276,28 @@ const rebuilt = (response, marker) => {
   expect(choice(response).message.content).toContain("rebuilt:" + marker)
   expect(response.diagnostic).toMatch(/^stateless;/)
 }
+
+test("adapter: delivered tool body releases request signal while disconnect cancels retained Run", async () => {
+  const a = await agent(), account = auth(), chat = initial({ stream: true })
+  const dir = await mkdtemp(join(tmpdir(), "cursor-retained-"))
+  await writeFile(join(dir, "cursor-credentials.json"), JSON.stringify({ version: 1,
+    credential: { type: "browser", access: account.access, refresh: "none", expires: Date.now() + 60_000 }, models: [] }))
+  const host = { configDir: dir, readRawConfig: async () => ({ providers: [] }), writeConfig: async () => {}, reloadRuntime: async () => {} }
+  const service = new CursorAuthService({ host, engine: _internal })
+  try {
+    const client = new AbortController()
+    const response = await service.dispatch(chat, client.signal)
+    expect(await sseOf(response)).toContain("[DONE]")
+    expect(a.runs).toHaveLength(1)
+    const owner = [...nativeSessions.entries][0]
+    expect(owner.state).toBe("awaiting-results")
+    client.abort()
+    expect(owner.error).toBeUndefined()
+    await service.disconnect()
+    expect(owner.state).toBe("cancelled")
+    await until(() => a.closedStreams === 1)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
 
 test("native retention: healthy two external roundtrips use one Run", async () => {
   const a = await agent(), account = auth(), chat = initial()
@@ -1544,23 +1570,28 @@ for (const path of ["native", "stateless"]) {
   })
 
   test(`${path}: Cursor's heartbeats alone don't keep a silent Run open past quiet (#2672)`, async () => {
-    // Port note: upstream fixtures (idle 150 / quiet 400 / heartbeat 40) rely
-    // on bun's timer sharpness. This test's invariant is the QUIET branch
-    // (heartbeats counted > 0), so idle must be impossible to reach while the
-    // harness heartbeats: idle is set far above any realistic loaded-worker
-    // heartbeat slip (was ×2.5, which still flaked ~1-in-6 under load), and
-    // quiet scales with it. The Run still must END past quiet — that is the
-    // #2672 regression, unchanged.
+    // Port note: under load Node can hit idle before a heartbeat is delivered.
+    // Retry the entire scenario once ONLY on that idle branch, with the SAME
+    // limits. Both runs missing quiet fails: #2672 still requires heartbeats
+    // alone to end the Run via quiet with a positive heartbeat count.
     Object.assign(NATIVE_LIMITS, { idle: 1500, quiet: 3000 })
     if (path === "stateless") NATIVE_LIMITS.perProcess = 0
-    const a = await agent({ thinkingOnly: true, serverHeartbeat: 60 })
-    const response = await a.ask(auth(), initial({ stream: true }))
-    // the heartbeats branch names the wait as past quiet: that it ended so,
-    // and not on idle, is the check, not how long a loaded machine took
-    const sse = await sseOf(response)
-    const [, beats] = sse.match(/Cursor went quiet: (\d+) heartbeats and nothing else for \d+ s, its last message thinking/) ?? []
-    expect(Number(beats)).toBeGreaterThan(0)
-    await until(() => a.closedStreams === 1)
+    for (let run = 0; run < 2; run++) {
+      const a = await agent({ thinkingOnly: true, serverHeartbeat: 60 })
+      const response = await a.ask(auth(), initial({ stream: true }))
+      const sse = await sseOf(response)
+      await until(() => a.closedStreams === 1)
+      expect(sse).toContain("native planning one")
+      expect(sse).not.toContain("[DONE]")
+      if (run === 0 && /Cursor went quiet: no message for/.test(sse)) {
+        await nativeSessions.clear()
+        _internal.resetH1()
+        continue
+      }
+      const [, beats] = sse.match(/Cursor went quiet: (\d+) heartbeats and nothing else for \d+ s, its last message thinking/) ?? []
+      expect(Number(beats)).toBeGreaterThan(0)
+      break
+    }
   })
 }
 

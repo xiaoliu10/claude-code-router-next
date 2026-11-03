@@ -2,6 +2,9 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { configureCursorEngine, _internal } from "../src/vendor/engine.mjs";
+import { nativeSessions } from "../src/vendor/native-session.mjs";
+import { registerCursorAdminRoutes } from "../src/admin-routes";
 import { CursorAuthService, type CursorCredential } from "../src/auth-service";
 import { CursorTransformer } from "../src/transformer";
 import { createCursorManagedRuntime, dispatcherIsProxy, resolveCursorTransport } from "../src/managed-runtime";
@@ -38,8 +41,8 @@ function fakeEngine(overrides: Partial<Record<string, any>> = {}) {
     async tokenOf() { engine.calls.tokenOf++; return "tok"; },
     async usable() { engine.calls.usable++; return [{ id: "grok-4.7@256k", name: "Grok 4.7 @ 256k", context: 256000, run: "grok-4.7", title: "Grok 4.7" }]; },
     async answer() { engine.calls.answer++; return new Response("{}"); },
-    browserSignIn() { engine.calls.browserSignIn++; return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "failed", error: "unused" }) }; },
-    cliSignIn() { engine.calls.cliSignIn++; return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "failed", error: "unused" }) }; },
+    async browserSignIn() { engine.calls.browserSignIn++; return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "failed", error: "unused" }) }; },
+    async cliSignIn() { engine.calls.cliSignIn++; return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "failed", error: "unused" }) }; },
     async keyToken() { engine.calls.keyToken++; return "tok"; },
     async whoIs() { return { email: "", plan: "" }; },
     async planOf() { return ""; },
@@ -72,6 +75,23 @@ function serviceIn(engine = fakeEngine(), config: any = { providers: [] }) {
 
 function writeCreds(dir: string, credential: CursorCredential, models: any[] = []) {
   writeFileSync(join(dir, "cursor-credentials.json"), JSON.stringify({ version: 1, credential, models }));
+}
+
+/** The real host invokes global fetch through config.dispatcher after its policy seams. */
+function hostAttempt(runtime: any, config: any, requestBody: any = {}) {
+  return async () => {
+    await runtime.ensureUsable();
+    await runtime.lockUpstream(config, {});
+    const headers = await runtime.signRequest({ headers: { Authorization: `Bearer ${CURSOR_MARKER}` }, config, requestBody, provider: {} });
+    return fetch(config.url, { method: "POST", body: JSON.stringify(requestBody), headers, signal: config.signal,
+      dispatcher: config.dispatcher } as RequestInit);
+  };
+}
+
+function deferred<T = any>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
 }
 
 const BROWSER_CREDS: CursorCredential = {
@@ -123,6 +143,9 @@ describe("error taxonomy: region mapping and 401 narrowing", () => {
     // [httpStatus, body, expected code, expected httpStatus]
     [403, { error: { message: "Your team is only served in some regions and this request was turned away", type: "cursor_error", code: 403 } }, "cursor_region_restricted", 403],
     [200, { error: { message: "region not supported", type: "cursor_error", code: 403 } }, "cursor_region_restricted", 403],
+    [200, { error: { code: 401, message: "Unauthorized" } }, "cursor_reauth_required", 401],
+    [200, { error: { code: 429, message: "Error" } }, "cursor_rate_limited", 429],
+    [502, { error: { code: 401, message: "Error" } }, "cursor_upstream_error", 502],
     [401, { error: { message: "Unauthorized", type: "cursor_error", code: 401 } }, "cursor_reauth_required", 401],
     [200, { error: { code: "unauthenticated", message: "Error" } }, "cursor_reauth_required", 401],
     [400, { error: { code: "failed_precondition", message: "Your free trial has expired" } }, "cursor_reauth_required", 401],
@@ -155,7 +178,8 @@ describe("error taxonomy: region mapping and 401 narrowing", () => {
     writeCreds((service as any).options.host.configDir, BROWSER_CREDS);
     const runtime = createCursorManagedRuntime(service, (service as any).options.host);
     let thrown: any;
-    try { await runtime.dispatchRequest!({ requestBody: { model: "auto", messages: [] }, config: {}, provider: {} as any }); }
+    const config = {};
+    try { await runtime.dispatchRequest!({ attempt: hostAttempt(runtime, config), requestBody: { model: "auto", messages: [] }, config, provider: {} as any }); }
     catch (e) { thrown = e; }
     expect(thrown?.pluginClassified).toBe(true);
     expect(thrown?.code).toBe("cursor_reauth_required");
@@ -268,7 +292,8 @@ describe("dispatch plumbing: abort propagation and dead-local lock", () => {
     const runtime = createCursorManagedRuntime(service, (service as any).options.host);
     const config: any = {};
     await runtime.lockUpstream!(config, {} as any);
-    expect(config.url).toBe("http://127.0.0.1:9/ccr-managed-cursor");
+    expect(config.url).toBe("http://127.0.0.1:65534/ccr-managed-cursor");
+    expect(typeof config.dispatcher.dispatch).toBe("function");
     expect(await runtime.signRequest!({ headers: {}, requestBody: {}, provider: {} as any })).toEqual({});
     expect(runtime.isManaged({ name: CURSOR_PROVIDER, api_key: CURSOR_MARKER })).toBe(true);
     expect(runtime.isManaged({ name: "other", api_key: "sk-real" })).toBe(false);
@@ -289,8 +314,9 @@ describe("dispatch plumbing: abort propagation and dead-local lock", () => {
     writeCreds((service as any).options.host.configDir, BROWSER_CREDS);
     const runtime = createCursorManagedRuntime(service, (service as any).options.host);
     const controller = new AbortController();
+    const config = {};
     const pending = runtime.dispatchRequest!({
-      requestBody: { model: "auto", messages: [] }, config: {}, provider: {} as any,
+      attempt: hostAttempt(runtime, config), requestBody: { model: "auto", messages: [] }, config, provider: {} as any,
       req: { signal: controller.signal },
     });
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -374,7 +400,8 @@ describe("disconnect fault tolerance", () => {
 describe("login flows through the engine seams", () => {
   it("browser sign-in exposes the PKCE url and persists on success", async () => {
     const { service, dir, config } = serviceIn(fakeEngine({
-      browserSignIn() {
+      async browserSignIn() {
+        await Promise.resolve();
         return {
           url: "https://cursor.com/loginDeepControl?challenge=abc", instructions: "", method: "auto",
           callback: async () => ({ type: "success", access: "tok-browser", refresh: "r1", expires: Date.now() + 60_000, accountId: "me@example.com", plan: "pro" }),
@@ -407,7 +434,8 @@ describe("login flows through the engine seams", () => {
 
   it("CLI import stores the cursor-agent mark, never a fabricated token", async () => {
     const { service, dir } = serviceIn(fakeEngine({
-      cliSignIn() {
+      async cliSignIn() {
+        await Promise.resolve();
         return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "success", access: "", refresh: "cursor-agent", expires: 0, accountId: "cli@example.com" }) };
       },
     }));
@@ -450,6 +478,236 @@ describe("login flows through the engine seams", () => {
     expect(verdict.available).toBe(false);
     expect(verdict.parkedUntil).toBeGreaterThan(Date.now());
     expect(engine.calls.tokenOf).toBe(0);
+  });
+});
+
+// ---- review regressions -------------------------------------------------------------
+
+describe("managed runtime host attempt bridge", () => {
+  it("a rejecting host policy runs once and prevents any engine transaction", async () => {
+    const { service, host, engine, dir } = serviceIn();
+    writeCreds(dir, BROWSER_CREDS);
+    const runtime = createCursorManagedRuntime(service, host);
+    const failure = Object.assign(new Error("budget denied"), { code: "host_budget_denied", nonRetryable: true });
+    const attempt = vi.fn(async () => { throw failure; });
+    await expect(runtime.dispatchRequest!({ attempt, config: {}, provider: {} as any, requestBody: {} })).rejects.toBe(failure);
+    expect(attempt).toHaveBeenCalledTimes(1);
+    expect(engine.calls.answer).toBe(0);
+  });
+
+  it("a policy rejection after starting virtual fetch aborts that transaction", async () => {
+    const began = deferred<AbortSignal>();
+    const { service, host, dir } = serviceIn(fakeEngine({
+      answer: async (_auth: any, _chat: any, signal: AbortSignal) => {
+        began.resolve(signal);
+        return new Response(new ReadableStream());
+      },
+    }));
+    writeCreds(dir, BROWSER_CREDS);
+    const runtime = createCursorManagedRuntime(service, host), config = {};
+    const failure = new Error("host rejected execution");
+    let response!: Response;
+    await expect(runtime.dispatchRequest!({ config, provider: {} as any, requestBody: {}, attempt: async () => {
+      response = await hostAttempt(runtime, config)();
+      throw failure;
+    } })).rejects.toBe(failure);
+    expect((await began.promise).aborted).toBe(true);
+    await response.body?.cancel().catch(() => {});
+  });
+
+  it("one host attempt wraps each dispatch and no marker/auth header reaches engine fetch", async () => {
+    const bodies: any[] = [];
+    const { service, host, dir } = serviceIn(fakeEngine({
+      answer: async (_auth: any, body: any) => { bodies.push(body); return Response.json({ choices: [{ message: { content: "ok" } }] }); },
+    }));
+    writeCreds(dir, BROWSER_CREDS);
+    const runtime = createCursorManagedRuntime(service, host);
+    let hostAttempts = 0;
+    for (const model of ["one", "two"]) {
+      const config: any = {};
+      const result = await runtime.dispatchRequest!({ config, provider: {} as any, requestBody: { model }, attempt: async () => {
+        hostAttempts++;
+        config.TIMEOUT = 200;
+        return hostAttempt(runtime, config, { model })();
+      } });
+      expect(await result.json()).toHaveProperty("choices");
+    }
+    expect(hostAttempts).toBe(2);
+    expect(bodies).toEqual([{ model: "one" }, { model: "two" }]);
+    expect(JSON.stringify(bodies)).not.toContain(CURSOR_MARKER);
+  });
+});
+
+describe("stream body owns the active request lifetime", () => {
+  it.each(["client", "deadline", "disconnect", "cancel"])("%s after headers still aborts the engine", async cause => {
+    const began = deferred<AbortSignal>();
+    const cancelled = vi.fn();
+    const { service, host, dir } = serviceIn(fakeEngine({ answer: async (_auth: any, _chat: any, signal: AbortSignal) => {
+      began.resolve(signal);
+      return new Response(new ReadableStream<Uint8Array>({
+        start(ctl) { ctl.enqueue(new TextEncoder().encode("open")); }, cancel: cancelled,
+      }));
+    } }));
+    writeCreds(dir, BROWSER_CREDS);
+    const runtime = createCursorManagedRuntime(service, host);
+    const client = new AbortController();
+    const config: any = { ...(cause === "deadline" ? { TIMEOUT: 25 } : {}) };
+    const response = await runtime.dispatchRequest!({ attempt: hostAttempt(runtime, config), config, requestBody: {}, provider: {} as any, req: { signal: client.signal } });
+    const engineSignal = await began.promise;
+    expect(engineSignal.aborted).toBe(false);
+    if (cause === "cancel") await response.body!.cancel();
+    else {
+      const reader = response.body!.getReader();
+      expect((await reader.read()).done).toBe(false);
+      const pending = reader.read();
+      const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      if (cause === "client") client.abort();
+      if (cause === "disconnect") await service.disconnect();
+      await rejected;
+    }
+    expect(engineSignal.aborted).toBe(true);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect((service as any).active.size).toBe(0);
+  });
+
+  it.each(["finish", "error"])("body %s releases the abort linkage and active tracking", async ending => {
+    let body!: ReadableStreamDefaultController<Uint8Array>;
+    let engineSignal!: AbortSignal;
+    const { service, dir } = serviceIn(fakeEngine({ answer: async (_a: any, _b: any, signal: AbortSignal) => {
+      engineSignal = signal;
+      return new Response(new ReadableStream<Uint8Array>({ start(ctl) { body = ctl; } }));
+    } }));
+    writeCreds(dir, BROWSER_CREDS);
+    const client = new AbortController();
+    const response = await service.dispatch({}, client.signal);
+    expect((service as any).active.size).toBe(1);
+    const read = response.text();
+    if (ending === "finish") { body.close(); expect(await read).toBe(""); }
+    else { body.error(new Error("wire failed")); await expect(read).rejects.toThrow("wire failed"); }
+    expect((service as any).active.size).toBe(0);
+    client.abort();
+    expect(engineSignal.aborted).toBe(ending === "error");
+  });
+});
+
+describe("cancelled login cannot commit success", () => {
+  it.each(["callback", "persist", "config"])("cancellation during %s rolls back file and config and keeps cancelled state", async phase => {
+    const callback = deferred();
+    const entered = deferred<void>(), release = deferred<void>();
+    const { service, dir, config, host } = serviceIn(fakeEngine({ browserSignIn: () => ({
+      url: "https://cursor.com/loginDeepControl", callback: () => callback.promise,
+    }) }));
+    if (phase === "persist") {
+      const persist = (service as any).persist.bind(service);
+      vi.spyOn(service as any, "persist").mockImplementation(async (next: any) => {
+        await persist(next); entered.resolve(); await release.promise;
+      });
+    }
+    if (phase === "config") {
+      const write = host.writeConfig;
+      vi.spyOn(host, "writeConfig").mockImplementation(async next => {
+        await write(next);
+        if (next.providers.some((p: any) => isCursorManaged(p))) { entered.resolve(); await release.promise; }
+      });
+    }
+    await service.startBrowserLogin();
+    const job = (service as any).login.job;
+    if (phase === "callback") service.cancelLogin();
+    callback.resolve({ type: "success", access: "late-secret", refresh: "none", expires: Date.now() + 60_000 });
+    if (phase !== "callback") { await entered.promise; service.cancelLogin(); release.resolve(); }
+    await job.catch(() => {});
+    expect(await service.getStatus()).toMatchObject({ status: "not_connected", login: { state: "cancelled" } });
+    expect(existsSync(join(dir, "cursor-credentials.json"))).toBe(false);
+    expect(config.providers.some((p: any) => isCursorManaged(p))).toBe(false);
+  });
+
+  it("a late cancelled callback cannot replace a newer login", async () => {
+    const old = deferred(), newer = deferred();
+    const signin = vi.fn().mockReturnValueOnce({ url: "https://cursor.com/old", callback: () => old.promise })
+      .mockReturnValueOnce({ url: "https://cursor.com/new", callback: () => newer.promise });
+    const { service, dir } = serviceIn(fakeEngine({ browserSignIn: signin }));
+    await service.startBrowserLogin();
+    const oldJob = (service as any).login.job;
+    service.cancelLogin();
+    await service.startBrowserLogin();
+    old.resolve({ type: "success", access: "old-secret", refresh: "none", expires: Date.now() + 60_000 });
+    await oldJob;
+    expect(service.loginState()).toMatchObject({ state: "pending", url: "https://cursor.com/new" });
+    expect(existsSync(join(dir, "cursor-credentials.json"))).toBe(false);
+    service.cancelLogin(); newer.resolve({ type: "failed", error: "cancelled" });
+  });
+});
+
+describe("reasoning-only completion", () => {
+  it("mapped thinking plus finish and DONE is visible and heals the stream", async () => {
+    const heal = vi.fn();
+    const transformer = new CursorTransformer(undefined, undefined, heal);
+    const frames = [{ choices: [{ delta: { reasoning_content: "thinking only" }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] }];
+    const response = await transformer.transformResponseOut(new Response(frames.map(f => `data: ${JSON.stringify(f)}\n\n`).join("") + "data: [DONE]\n\n", {
+      headers: { "content-type": "text/event-stream" },
+    }));
+    const result = await response.text();
+    expect(result).toContain('"thinking":{"content":"thinking only"}');
+    expect(result).toContain("[DONE]"); expect(heal).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("liveness host deadline", () => {
+  it.each(["token", "unary"])("a pending %s cannot report success past the deadline", async phase => {
+    const blocked = deferred();
+    const { service, host, dir } = serviceIn(fakeEngine({
+      ...(phase === "token" ? { tokenOf: () => blocked.promise } : { unary: () => blocked.promise }),
+    }));
+    writeCreds(dir, BROWSER_CREDS);
+    const runtime = createCursorManagedRuntime(service, host);
+    await expect(runtime.probeLiveness!({ config: { TIMEOUT: 10 } } as any)).rejects.toMatchObject({ name: "AbortError" });
+    blocked.resolve({});
+  });
+
+  it.each(["token", "unary"])("the supplied signal reaches the real %s transport through engine injection", async phase => {
+    const client = new AbortController();
+    const started = deferred<AbortSignal>();
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const signal = init!.signal!;
+      started.resolve(signal);
+      return new Promise<Response>((_resolve, reject) => signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true }));
+    });
+    configureCursorEngine(resolveCursorTransport(fakeHost("/tmp/unused")));
+    const { service, host, dir } = serviceIn(fakeEngine({
+      tokenOf: phase === "token" ? () => _internal.keyToken(`probe-${Date.now()}`) : async () => "tok",
+      unary: _internal.unary,
+    }));
+    writeCreds(dir, BROWSER_CREDS);
+    const runtime = createCursorManagedRuntime(service, host);
+    try {
+      const pending = runtime.probeLiveness!({ config: { TIMEOUT: 1000, signal: client.signal } } as any);
+      const assertion = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      const upstreamSignal = await started.promise;
+      client.abort(); await assertion;
+      expect(upstreamSignal.aborted).toBe(true);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally { configureCursorEngine({ fetch: null as any }); }
+  });
+});
+
+describe("admin confidentiality", () => {
+  it.each(["cursor_login_failed", "cursor_reauth_required", "cursor_credential_invalid", "cursor_persist_failed", "upstream-secret-code"])("%s never reflects arbitrary detail", async code => {
+    const routes: any[] = [];
+    registerCursorAdminRoutes({ server: { address: () => ({ port: 3456 }) }, route: (r: any) => routes.push(r) } as any, {
+      connectApiKey: async () => { throw Object.assign(new Error("Bearer secret-token"), { code, statusCode: 422, detail: "Authorization: Bearer secret-token" }); },
+    } as any);
+    const route = routes.find(r => r.url.endsWith("/connect"));
+    const response = await route.handler({ body: { apiKey: "secret-token" }, raw: { socket: { remoteAddress: "127.0.0.1" } }, headers: { host: "localhost:3456" } }, { status: vi.fn() });
+    expect(response).toEqual({ success: false, error: code === "upstream-secret-code" ? "cursor_request_failed" : code });
+    expect(JSON.stringify(response)).not.toContain("secret-token");
+  });
+
+  it("browser callback errors become safe codes on both status and login state", async () => {
+    const { service } = serviceIn(fakeEngine({ browserSignIn: () => ({ url: "https://cursor.com/login", callback: async () => ({ type: "failed", error: "Authorization: Bearer secret-token" }) }) }));
+    await service.startBrowserLogin(); await (service as any).login.job; await Promise.resolve();
+    expect(service.loginState()).toEqual({ state: "failed", error: "cursor_login_failed" });
+    expect(JSON.stringify(await service.getStatus())).not.toContain("secret-token");
   });
 });
 
