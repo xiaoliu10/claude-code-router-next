@@ -399,6 +399,16 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
               if (event === 'message_start' && data?.message?.model) {
                 req.upstreamModel = data.message.model;
               }
+              // Responses API carries the model on every lifecycle event's
+              // `response` object, not only on the terminal one. Record it as
+              // soon as it appears: a long stream can end without a parsed
+              // `response.completed` (aborted client, truncated tail, proxy
+              // reconnect), and waiting for the terminal event is what left
+              // `unknown` in the usage rows. First non-empty value wins so a
+              // later event cannot overwrite the real upstream model.
+              if (!req.upstreamModel && data?.response?.model) {
+                req.upstreamModel = data.response.model;
+              }
               if (event === 'response.completed' && data?.response?.model) {
                 req.upstreamModel = data.response.model;
               }
@@ -699,7 +709,11 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         provider: req.provider || "",
         originalModel: req.originalModel || req.body?.model || "",
         model: getRequestModel(req),
-        upstreamModel: req.upstreamModel,
+        // Never persist a bare placeholder: when no upstream lifecycle event
+        // carried a model, the routed model is the truthful best answer and
+        // matches what the client was told. `unknown` in the UI looked like a
+        // routing bug rather than a missing upstream echo.
+        upstreamModel: req.upstreamModel || getRequestModel(req) || undefined,
         modelFamily: req.modelFamily || "",
         scenarioType: req.scenarioType || "default",
         clientType: req.clientType || detectClientType(req),

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import {
-  createPluginMarketController, renderPluginMarketState,
+  createMarketplaceBridge, createPluginMarketController, renderPluginMarketState,
   type PluginMarketController, type PluginMarketState,
 } from "../utils/plugin-market";
 
@@ -42,11 +42,7 @@ export function PluginMarketArea({ disabled, onBusyChange }: { disabled: boolean
   currentProps.current = { disabled, onBusyChange };
   const controllerRef = useRef<PluginMarketController | null>(null);
   if (controllerRef.current === null) {
-    controllerRef.current = createPluginMarketController({
-      getCatalog: () => api.getPluginCatalog(),
-      installPlugin: (name) => api.installPlugin(name),
-      log: console,
-    });
+    controllerRef.current = createPluginMarketController(createMarketplaceBridge(api));
   }
   const controller = controllerRef.current;
 
@@ -65,6 +61,7 @@ export function PluginMarketArea({ disabled, onBusyChange }: { disabled: boolean
     if (!host || !state) return;
     renderPluginMarketState(host, state, t, {
       onInstall: (name) => { void controller.install(name); },
+      onUpdate: (name) => { void controller.update(name); },
       onRetry: () => { void controller.refresh(); },
       onRestart: () => {
         // Explicit user click only — never automatic.

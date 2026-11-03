@@ -184,7 +184,8 @@ export type CodexAdminCode =
   | "codex_models_fetch_failed"
   | "codex_credential_invalid"
   | "codex_credential_unreadable"
-  | "codex_config_write_failed";
+  | "codex_config_write_failed"
+  | "codex_model_invalid";
 
 /** The managed runtime throws this before any network touch when the account is cooling. */
 export type CodexThrownCode = CodexErrorCode | "codex_account_cooling";
@@ -642,6 +643,17 @@ export function rateLimitsSaturated(limits: QuotaCodexRateLimits, now: number): 
 }
 
 // ---------------------------------------------------------------------------
+/**
+ * Codex model ids are short slugs without separators or control characters.
+ * Commas are banned because Router references are "provider,model" strings —
+ * a comma inside an id could never be referenced unambiguously.
+ */
+export function isCodexModelId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256
+    && !/[\x00-\x1f\x7f,]/.test(value);
+}
+
+// ---------------------------------------------------------------------------
 // Config protection trio
 // ---------------------------------------------------------------------------
 
@@ -722,8 +734,11 @@ export interface CodexStatus {
   accountId?: string;
   email?: string;
   plan?: string;
+  /** Registered, user-visible models (hiddenModels already excluded). */
   models: string[];
   modelCount: number;
+  /** User-hidden model ids — persisted across sync/re-login, restored on demand. */
+  hiddenModels: string[];
   coolingUntil?: number;
   lastError?: string | null;
 }

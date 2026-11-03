@@ -137,6 +137,30 @@ describe("empty answer triggers fallback (end-to-end)", () => {
     expect(hits.some((h) => h.includes("backup.example"))).toBe(true);
   });
 
+  it("falls back when a NON-streaming request comes back as an empty SSE answer", async () => {
+    // The transport emits event:/data: frames even when the client asked for
+    // stream:false, so gating the empty-answer guard on body.stream let a
+    // zero-output non-streaming turn through as a 200 success. This is the
+    // "output 0 but status green" shape seen in the usage list.
+    globalThis.fetch = vi.fn(async (url: any) => {
+      const target = String(url);
+      hits.push(target);
+      return streamOf(target.includes("primary.example") ? EMPTY_ANSWER : TEXT_ANSWER);
+    }) as any;
+
+    const { server } = await buildRuntime();
+    const res = await server.app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { "x-anthropic-billing-header": "cc_version=9.9" },
+      payload: { model: "ccr-opus", max_tokens: 64, stream: false, messages: [{ role: "user", content: "hi" }] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.payload).toContain("recovered");
+    expect(hits.some((h) => h.includes("backup.example"))).toBe(true);
+  });
+
   it("retries the dead model and then falls back (empty answer is not a success)", async () => {
     const callsByHost: Record<string, number> = {};
     globalThis.fetch = vi.fn(async (url: any) => {

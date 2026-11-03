@@ -31,6 +31,7 @@ import {
   geminiOauthError,
   isGeminiOauthRuntime,
   protectGeminiOauthConfig,
+  isStickyGeminiOauthError,
   type GeminiOauthAuthServiceLike,
   type GeminiOauthErrorInfo,
 } from "./protocol";
@@ -42,7 +43,7 @@ import type {
 
 export const manifest = {
   name: "gemini-oauth",
-  version: "1.0.6",
+  version: "1.0.8",
   coreApi: "1",
   description: "Gemini OAuth (Antigravity) managed subscription provider: Code Assist data plane, browser OAuth login, model sync and admin routes.",
 };
@@ -88,10 +89,19 @@ async function activate(ctx: PluginContext): Promise<void> {
     ensureUsable: async () => {
       const svc = requireService();
       if (await svc.isAccountCooling?.()) {
+        // This breaker runs BEFORE every real request, so its copy is what the
+        // user actually sees. "Cooling" covers very different causes: quota,
+        // verification and risk-control all clear on their own, an expired login
+        // never does. Reporting the generic diagnosis for a dead token tells the
+        // user to wait for something that cannot recover.
+        const status: any = await svc.getStatus?.().catch(() => null);
+        const reauth = isStickyGeminiOauthError(status?.lastError?.code);
         throw geminiOauthError({
           code: "gemini_oauth_account_cooling",
-          message: "Gemini OAuth 账号处于冷却期（配额/验证/风控拦截），请稍后再试或重新授权。",
-          httpStatus: 429,
+          message: reauth
+            ? "Gemini OAuth 登录态已失效，请重新授权登录（等待无法恢复）。"
+            : "Gemini OAuth 账号处于冷却期（配额/验证/风控拦截），请稍后再试或重新授权。",
+          httpStatus: reauth ? 401 : 429,
           retryable: false,
         });
       }
@@ -105,7 +115,18 @@ async function activate(ctx: PluginContext): Promise<void> {
      */
     probeAccountState: async () => {
       const svc = requireService();
-      if (!(await svc.isAccountCooling?.())) return { available: true };
+      if (!(await svc.isAccountCooling?.())) {
+        // Not cooling, but a login-class error is sticky: it survives its
+        // cooldown on purpose (waiting cannot fix it, only re-auth can). Without
+        // this check the probe treated an expired-token account as available
+        // and spent a real request on it every interval.
+        const status: any = await svc.getStatus?.().catch(() => null);
+        const code = status?.lastError?.code;
+        if (isStickyGeminiOauthError(code)) {
+          return { available: false, reason: "reauth_required" };
+        }
+        return { available: true };
+      }
       let parkedUntil: number | undefined;
       try {
         const status: any = await svc.getStatus?.();

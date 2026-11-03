@@ -10,7 +10,7 @@ import { createApiError } from "./middleware";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
 import { type PluginRegistry, pluginErrorFrom } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "./plugin-request-state";
-import { pluginResponseError } from "./plugin-response-error";
+import { pluginResponseError, describeTransportFailure } from "./plugin-response-error";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -438,7 +438,17 @@ async function validateStreamingResponse(
   finalResponse: any,
   providerName?: string
 ): Promise<any> {
-  if (!body?.stream || !finalResponse?.body) {
+  if (!finalResponse?.body) {
+    return finalResponse;
+  }
+  // Judge by what the response actually IS, not by what the client asked for:
+  // a non-streaming request still comes back as an SSE body (the Anthropic
+  // transport emits event:/data: frames either way), so gating on body.stream
+  // let an empty non-streaming answer through as a 200 success — the exact
+  // "output 0 but status green" shape.
+  const contentType = finalResponse.headers?.get?.("content-type") ?? "";
+  const isEventStream = contentType.includes("text/event-stream");
+  if (!isEventStream && !body?.stream) {
     return finalResponse;
   }
 
@@ -1256,7 +1266,7 @@ async function sendProviderAttempt(
   try {
     response = await dispatchUpstream();
   } catch (sendError: any) {
-    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), { errorName: sendError?.name });
+    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), describeTransportFailure(sendError));
     throw sendError;
   }
 

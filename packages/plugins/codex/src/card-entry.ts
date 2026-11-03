@@ -1,3 +1,4 @@
+import { clearCodexRouterRefs } from "./router";
 /** Self-contained Codex DOM card: no React, no host runtime imports, no
  * direct fetch, no Codex CLI code. Everything state/network/config related
  * flows through the host card capabilities (PluginCardMountProps, type-only).
@@ -10,10 +11,11 @@
  * every error is a stable, sanitized code.
  *
  * Lifecycle: one explicit user action at a time under the shared management
- * lease (login/sync/disconnect), quota auto-reads once per mount behind a
- * valid-only TTL cache with a manual refresh, host disabled flips re-render
- * in place (never a remount), and unmount cancels the login session and all
- * loops while a deferred mutation keeps the lease until it settles.
+ * lease (login/sync/disconnect/model hide/restore), quota auto-reads once per
+ * mount behind a valid-only TTL cache with a manual refresh, host disabled
+ * flips re-render in place (never a remount), and unmount cancels the login
+ * session and all loops while a deferred mutation keeps the lease until it
+ * settles.
  */
 import type { PluginCardMountProps } from "../../../ui/src/utils/plugin-card";
 import type {
@@ -211,7 +213,9 @@ function wait(ms: number, signal: AbortSignal, wakeListeners?: Set<() => void>):
 const mounted = new WeakMap<HTMLElement, () => void>();
 
 type UsagePhase = "idle" | "reading" | "ready" | "unavailable";
-type ActionKind = "login" | "sync" | "disconnect" | "usage";
+type ActionKind = "login" | "sync" | "disconnect" | "usage" | "hide" | "restore";
+/** The one explicit action in flight; `model` scopes hide/restore per chip. */
+interface ActiveAction { kind: ActionKind; model?: string }
 
 export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   unmount(el);
@@ -236,7 +240,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   let status: CodexStatusView | null = null;
   let locked = false;            // one action at a time (incl. read-only usage)
   let generation = 0;
-  let action: ActionKind | null = null;
+  let action: ActiveAction | null = null;
   let errorKey: string | null = null;
   let toast: string | null = null;
   let reconcileFailed = false;
@@ -353,14 +357,18 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   };
 
   /** Success tail shared by mutating actions: reconcile the managed provider
-   * into the host draft (unrelated providers and Router survive untouched),
+   * into the host draft; hide also cleans matching Router references,
    * re-read status, then report. A failed draft reconciliation must not
    * suppress the status refresh or the toast — the mutation already persisted
    * server-side; the failure is surfaced separately instead. */
-  const settle = async (id: number): Promise<{ fresh: CodexStatusView | null; reconcileFailed: boolean }> => {
+  const settle = async (id: number, hidden?: ReadonlySet<string>, visible: string[] = []): Promise<{ fresh: CodexStatusView | null; reconcileFailed: boolean }> => {
     let failed = false;
     try {
-      await props.refreshConfig?.((current: any, server: any) => mergeCodexProvider(current, server));
+      await props.refreshConfig?.((current: any, server: any) => {
+        const merged = mergeCodexProvider(current, server);
+        if (hidden && "Router" in merged) merged.Router = clearCodexRouterRefs(merged.Router, hidden, visible[0] ?? null);
+        return merged;
+      });
     } catch { failed = true; }
     const fresh = await readStatus().catch(() => null);
     if (!alive || generation !== id) return { fresh, reconcileFailed: failed };
@@ -393,7 +401,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       if (!background) props.onBusy?.(false);
       if (alive && generation === id) {
         locked = false;
-        if (action === "usage") action = null;
+        if (action?.kind === "usage") action = null;
       }
       if (alive) render();
     }
@@ -413,11 +421,11 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     await readUsage(id, true);
   };
 
-  const run = async (kind: ActionKind) => {
+  const run = async (kind: ActionKind, argument?: string) => {
     if (!alive || locked || loading || props.disabled) return;
     if (kind === "usage") {
       locked = true;
-      action = "usage";
+      action = { kind };
       usagePhase = "reading";
       errorKey = null;
       render();
@@ -430,7 +438,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     locked = true;
     const id = ++generation;
     props.onBusy?.(true);
-    action = kind;
+    action = { kind, model: argument };
     errorKey = null;
     toast = null;
     reconcileFailed = false;
@@ -490,6 +498,33 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         reconcileFailed = failed;
         toast = t("synced", { count: result.modelCount ?? result.models?.length ?? 0 });
         if (fresh) usagePhase = "idle"; // plan may have changed; next visit re-reads
+      } else if (kind === "hide") {
+        const model = argument ?? "";
+        if (!model) return;
+        const result = parseCodexMutation(await post<unknown>("/models/hide", { model }));
+        if (!result.success) {
+          if (alive && generation === id) errorKey = result.error ?? "hide_failed";
+          return;
+        }
+        // The server persists the blacklist + provider rewrite; settle()
+        // reconciles the draft and re-reads the filtered status.
+        const { reconcileFailed: failed } = await settle(id, new Set([...(status?.hiddenModels ?? []), model]), result.models ?? []);
+        if (!alive || generation !== id) return;
+        reconcileFailed = failed;
+        toast = t("hidden_toast", { model });
+      } else if (kind === "restore") {
+        // Captured BEFORE the call: status is refreshed by settle() below.
+        const hiddenCount = status?.hiddenModels?.length ?? 0;
+        // No model = restore ALL hidden models (workbuddy parity).
+        const result = parseCodexMutation(await post<unknown>("/models/restore", argument ? { model: argument } : {}));
+        if (!result.success) {
+          if (alive && generation === id) errorKey = result.error ?? "restore_failed";
+          return;
+        }
+        const { reconcileFailed: failed } = await settle(id);
+        if (!alive || generation !== id) return;
+        reconcileFailed = failed;
+        toast = argument ? t("restored_toast", { model: argument }) : t("restored_all_toast", { count: hiddenCount });
       } else {
         const result = parseCodexMutation(await post<unknown>("/disconnect", {}));
         if (!result.success) {
@@ -507,7 +542,11 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       if (alive && generation === id) {
         const reason = (error as { reason?: unknown } | null)?.reason;
         errorKey = sanitizeCodexErrorCode(typeof reason === "string" ? reason : null)
-          ?? (kind === "login" ? "login_failed" : kind === "sync" ? "sync_failed" : "disconnect_failed");
+          ?? (kind === "login" ? "login_failed"
+            : kind === "sync" ? "sync_failed"
+            : kind === "hide" ? "hide_failed"
+            : kind === "restore" ? "restore_failed"
+            : "disconnect_failed");
       }
     } finally {
       endBusy();
@@ -558,6 +597,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const canDisconnect = !!status && (status.status !== "not_connected" || status.models.length > 0);
     const busy = loading || action !== null;
     const disabled = busy || props.disabled;
+    // Per-model busy flag for the chip X buttons (workbuddy parity).
+    const pendingHide = (model: string) => action?.kind === "hide" && action.model === model;
 
     const card = styled("div", "glass-card rounded-2xl overflow-hidden mb-4");
     card.setAttribute("role", "group");
@@ -599,12 +640,38 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         );
       }
       body.append(rows);
+      const hiddenModels = status.hiddenModels ?? [];
       if (status.models.length > 0) {
         const chips = styled("div", "flex flex-wrap gap-2 pt-1");
         for (const model of status.models) {
-          chips.append(styled("span", "inline-flex max-w-full items-center gap-1 break-all whitespace-normal rounded-lg border border-white/5 bg-white/5 px-2 py-0.5 text-[10px] font-bold text-muted-foreground", model));
+          const chip = styled("span", "inline-flex max-w-full items-center gap-1 break-all whitespace-normal rounded-lg border border-white/5 bg-white/5 px-2 py-0.5 text-[10px] font-bold text-muted-foreground", model);
+          // Inline hide (X) action per chip: per-model aria-label + aria-busy.
+          const hide = styled("button", "rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-white/10 hover:text-foreground disabled:opacity-40") as HTMLButtonElement;
+          hide.type = "button";
+          hide.disabled = disabled;
+          hide.setAttribute("aria-label", t("hide_model", { model }));
+          hide.setAttribute("aria-busy", String(pendingHide(model)));
+          hide.append(xIcon("h-3 w-3"));
+          hide.onclick = () => void run("hide", model);
+          chip.append(hide);
+          chips.append(chip);
         }
         body.append(chips);
+      }
+      if (hiddenModels.length > 0) {
+        // Collapsed hidden-model list with per-item restore + restore-all.
+        const details = styled("details", "max-w-md text-xs text-muted-foreground");
+        details.append(styled("summary", "cursor-pointer select-none font-medium", t("hidden_models", { count: hiddenModels.length })));
+        const list = styled("ul", "mt-2 space-y-1");
+        for (const model of hiddenModels) {
+          const item = styled("li", "flex items-center justify-between gap-2");
+          item.append(styled("span", "break-all font-mono", model));
+          button(item, t("restore"), () => void run("restore", model), disabled, "outline", "h-6 shrink-0 px-2 text-[11px]");
+          list.append(item);
+        }
+        details.append(list);
+        button(details, t("restore_all"), () => void run("restore"), disabled, "outline", "mt-2 h-7 px-2 text-[11px]");
+        body.append(details);
       }
       const usageBox = styled("div", "max-w-md space-y-1 rounded-lg border border-white/5 bg-white/5 px-3 py-2 text-xs");
       const usageHeader = styled("div", "flex flex-wrap items-center justify-between gap-2");
@@ -677,16 +744,17 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     about.append(styled("summary", "cursor-pointer select-none font-medium", t("about")));
     const aboutBody = styled("div", "mt-2 space-y-1 leading-relaxed");
     aboutBody.append(styled("p", "", t("about_body")));
+    aboutBody.append(styled("p", "", t("hidden_note")));
     aboutBody.append(styled("p", "", t("disclaimer")));
     about.append(aboutBody);
     body.append(about);
     if (props.disabled) body.append(styled("p", "text-xs text-muted-foreground", t("other_edit")));
 
     const actions = styled("div", "flex shrink-0 flex-col gap-2 sm:w-[210px]");
-    button(actions, action === "login" ? t("working") : connected || state === "needs_relogin" ? t("reconnect") : t("browser_login"),
+    button(actions, action?.kind === "login" ? t("working") : connected || state === "needs_relogin" ? t("reconnect") : t("browser_login"),
       () => void run("login"), disabled, "primary", "h-8 w-full text-xs", plugIcon("mr-1 h-3.5 w-3.5"));
     button(actions, t("sync"), () => void run("sync"), disabled || !connected, "outline", "h-8 w-full text-xs",
-      refreshCwIcon(`mr-1 h-3.5 w-3.5 ${action === "sync" ? "animate-spin" : ""}`));
+      refreshCwIcon(`mr-1 h-3.5 w-3.5 ${action?.kind === "sync" ? "animate-spin" : ""}`));
     button(actions, t("disconnect"), () => { confirmDisconnect = true; render(); }, disabled || !canDisconnect, "outline", "h-8 w-full text-xs");
 
     layout.append(body, actions);
