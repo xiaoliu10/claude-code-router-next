@@ -234,6 +234,65 @@ describe("Qoder card: two independent site sections", () => {
   });
 });
 
+describe("Qoder card auto check-in", () => {
+  it.each([
+    ["en", "claimed", "Auto: claimed today"], ["en", "done", "Auto: already claimed"],
+    ["en", "inactive", "Auto: no campaign"], ["en", "ineligible", "Auto: unavailable"],
+    ["en", "failed", "Auto: failed"], ["zh", "claimed", "自动签到：今天已领"],
+    ["zh", "done", "自动签到：今日已签"], ["zh", "inactive", "自动签到：今日无活动"],
+    ["zh", "ineligible", "自动签到：不可用"], ["zh", "failed", "自动签到："],
+  ])("renders %s automatic %s in the CN action column", async (locale, outcome, expected) => {
+    const at = new Date().toISOString();
+    const el = mountCardIn({
+      callApi: async () => ({ status: "connected", models: [], autoCheckin: { lastAttemptAt: at,
+        lastAttemptDate: at.slice(0, 10), retryCount: 0, lastResult: { outcome, at } } }),
+      locale, locales: {}, disabled: false, acquireManagement: () => () => {}, log: console,
+    });
+    await flush();
+    const panels = all(el, e => e.tag === "div" && e.className.includes("sm:justify-between"));
+    expect(text(panels[0])).not.toContain(locale === "en" ? "Auto:" : "自动签到：");
+    const actions = panels[1].children[1];
+    expect(text(actions)).toContain(expected);
+    if (outcome === "failed") expect(text(actions)).toContain(locale === "en" ? ", retrying" : "失败，将重试");
+    expect(buttonNamed(actions, locale === "en" ? "Check in" : "签到")).toBeTruthy();
+    unmountCard(el);
+  });
+
+  it("hides the auto line before the first attempt and refreshes it after manual check-in", async () => {
+    let autoCheckin: any;
+    const el = mountCardIn({
+      callApi: async (path: string) => {
+        if (path.endsWith("/checkin")) {
+          const at = new Date().toISOString();
+          autoCheckin = { lastAttemptAt: at, lastAttemptDate: at.slice(0, 10), retryCount: 0, lastResult: { outcome: "done", at } };
+          return { outcome: "done" };
+        }
+        return { status: "connected", models: [], autoCheckin };
+      },
+      locale: "en", locales: {}, disabled: false, acquireManagement: () => () => {}, log: console,
+    });
+    await flush();
+    expect(text(el)).not.toContain("Auto:");
+    buttonNamed(el, "Check in")!.onclick!();
+    await flush();
+    expect(text(el)).toContain("Auto: already claimed");
+    unmountCard(el);
+  });
+
+  it("stops advertising retries when the daily budget is exhausted", async () => {
+    const at = new Date().toISOString();
+    const el = mountCardIn({
+      callApi: async () => ({ status: "connected", models: [], autoCheckin: { lastAttemptAt: at,
+        lastAttemptDate: at.slice(0, 10), retryCount: 5, lastResult: { outcome: "failed", at } } }),
+      locale: "en", locales: {}, disabled: false, acquireManagement: () => () => {}, log: console,
+    });
+    await flush();
+    expect(text(el)).toContain("Auto: failed");
+    expect(text(el)).not.toContain("retrying");
+    unmountCard(el);
+  });
+});
+
 describe("Qoder card check-in", () => {
   it.each([
     ["en", "claimed", "+12 credits"], ["en", "done", "Already claimed today"],

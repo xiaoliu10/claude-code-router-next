@@ -144,6 +144,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
           section.checkin = undefined;
           try { section.checkin = await call(section, "/checkin", {}); }
           catch { section.checkin = { outcome: "failed" }; }
+          await refresh(section);
         } finally { section.checkinPending = false; }
       });
     };
@@ -156,6 +157,21 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const detail = result.outcome === "claimed" && typeof amount === "number" && Number.isFinite(amount) && amount > 0
       ? lang === "zh" ? `+${amount} 积分` : `+${amount} credits` : words[`checkin_${result.outcome}`] ?? words.checkin_failed;
     const note = node("p", detail + (result.outcome === "failed" && result.message ? `: ${result.message}` : ""), result.outcome === "failed" ? "text-xs text-destructive" : "text-xs text-muted-foreground");
+    note.setAttribute("role", "status");
+    return note;
+  };
+  const autoCheckinNote = (section: QoderCardSection) => {
+    const state = section.status?.autoCheckin as import("./auto-checkin").AutoCheckinState | undefined;
+    if (!state?.lastResult) return null;
+    const date = new Date(state.lastResult.at);
+    if (!Number.isFinite(date.getTime())) return null;
+    const today = date.toDateString() === new Date().toDateString();
+    const outcome = state.lastResult.outcome;
+    const key = outcome === "failed" && today && state.retryCount < 5 ? "autoCheckin_retrying" : `autoCheckin_${outcome}`;
+    const note = node("p", format(key, {
+      time: date.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit", hour12: false }),
+      day: today ? words.autoCheckin_today : date.toLocaleDateString(lang),
+    }), "text-xs text-muted-foreground");
     note.setAttribute("role", "status");
     return note;
   };
@@ -218,6 +234,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       actions.append(columnButton("connect", () => connect(section, input), "primary", plugIcon("mr-1 h-3.5 w-3.5")));
     } else if (section.status) {
       if (section.site.id === "qoder-cn") {
+        const autoNote = autoCheckinNote(section);
+        if (autoNote) actions.append(autoNote);
         actions.append(checkinButton(section));
         const note = checkinNote(section);
         if (note) actions.append(note);
