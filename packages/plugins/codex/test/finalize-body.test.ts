@@ -205,6 +205,111 @@ describe("codexFinalizeBody — prompt_cache_key and session key", () => {
     expect(typeof out.prompt_cache_key).toBe("string");
     expect(out.prompt_cache_key.length).toBeGreaterThan(0);
   });
+
+  // 2026-11-02 production incident: pi sessions that did NOT carry
+  // x-session-affinity fell into the degenerate key path, which hashed
+  // input[0] — the client's own system prompt prepended as a developer
+  // message. Claude-Code-style clients re-generate that first block every
+  // turn (date/env/todos), so the key changed every turn, the backend saw a
+  // new conversation each time, and only the fixed Codex instructions
+  // (~3968 tokens) hit cache. Measured: 177 requests at 10% hit vs 2518
+  // session-keyed requests at 94.7%; a repro with a dynamic first block hit 0%.
+  const dynamicPreamble = (marker: string) => ({
+    input: [
+      { type: "message", role: "developer", content: [{ type: "input_text", text: `volatile ${marker}` }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "a" }] },
+    ],
+  });
+
+  it("ignores a per-turn volatile developer preamble when no session id is given", () => {
+    const turn1 = codexFinalizeBody(base(dynamicPreamble("turn-1")));
+    const turn2 = codexFinalizeBody(base(dynamicPreamble("turn-2")));
+    // The conversation's first user turn and instructions are identical, so
+    // the cache key MUST be identical — otherwise the prefix cache resets.
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+    expect(turn1.prompt_cache_key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it("still separates different first user turns in the degenerate path", () => {
+    const a = codexFinalizeBody(base({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "first" }] }] }));
+    const b = codexFinalizeBody(base({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "second" }] }] }));
+    expect(a.prompt_cache_key).not.toBe(b.prompt_cache_key);
+  });
+
+  it("keeps the degenerate key stable across turns of the same conversation", () => {
+    const turn1 = codexFinalizeBody(base(dynamicPreamble("x")));
+    const turn2 = codexFinalizeBody(base({
+      input: [
+        ...dynamicPreamble("later").input,
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "b" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "c" }] },
+      ],
+    }));
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+  });
+
+  it("derives a deterministic degenerate key when there is no user turn (constant, not random)", () => {
+    // Unsynced + sessionless + no user turn collapses to one shared key:
+    // deterministic (never a per-turn random id, which would kill caching).
+    const a = codexFinalizeBody(base({ input: [] }));
+    const b = codexFinalizeBody(base({ input: [] }));
+    expect(a.prompt_cache_key).toBe(b.prompt_cache_key);
+  });
+
+  it("keeps the session-keyed key stable across a volatile developer preamble too", () => {
+    // MINOR-2 regression: 1.0.9 folded the preamble into the hashed parts
+    // even when seeded with a session id, so session-keyed drifting clients
+    // churned keys too. The session id is now the whole seed.
+    const turn1 = codexFinalizeBody(base(dynamicPreamble("turn-1")), { sessionId: "s1" });
+    const turn2 = codexFinalizeBody(base(dynamicPreamble("turn-2")), { sessionId: "s1" });
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+  });
+
+  it("keeps the sessionless key stable when synced instructions are fixed but the client preamble drifts", () => {
+    // MINOR-3 regression: model sync has run (official instructions applied),
+    // yet the client prepends a different developer message every turn. The
+    // anchor must skip that preamble while keeping the official block.
+    const turn1 = codexFinalizeBody(base({
+      instructions: "client prompt turn 1",
+      input: [
+        { type: "message", role: "developer", content: [{ type: "input_text", text: "volatile 1" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "a" }] },
+      ],
+    }), { modelInstructions: "CODEX" });
+    const turn2 = codexFinalizeBody(base({
+      instructions: "client prompt turn 2",
+      input: [
+        { type: "message", role: "developer", content: [{ type: "input_text", text: "volatile 2" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "a" }] },
+      ],
+    }), { modelInstructions: "CODEX" });
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+  });
+
+  it("does not let an unsynced client instructions drift the key", () => {
+    // Model sync has not run: finalizeInstructions leaves the CLIENT's own
+    // instructions in place (both are non-empty and differ from each other),
+    // and those instructions must not be hashed — the official Codex
+    // instructions are the only stable anchor, and their absence degrades the
+    // key to the first-user-turn anchor alone.
+    const turn1 = codexFinalizeBody(base({
+      instructions: "client prompt turn 1",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }] }],
+    }), { modelInstructions: "   " });
+    const turn2 = codexFinalizeBody(base({
+      instructions: "client prompt turn 2",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }] }],
+    }), { modelInstructions: "   " });
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+  });
+
+  it("keeps the two anchoring paths disjoint: synced instructions change the key", () => {
+    // With official instructions present they ARE part of the anchor, so a
+    // different model family (different instructions) must not share a key.
+    const a = codexFinalizeBody(base({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }] }] }), { modelInstructions: "codex-a" });
+    const b = codexFinalizeBody(base({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }] }] }), { modelInstructions: "codex-b" });
+    expect(a.prompt_cache_key).not.toBe(b.prompt_cache_key);
+  });
 });
 
 describe("codexFinalizeBody — purity", () => {
