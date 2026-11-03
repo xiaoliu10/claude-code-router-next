@@ -7,7 +7,7 @@ import { protectCursorConfig } from "./protocol";
 import { configureCursorEngine } from "./vendor/engine.mjs";
 import { cursorLocales } from "./locales";
 
-export const manifest = { name: "cursor", version: "0.1.0", coreApi: "1", description: "Cursor (cursor.com) subscription provider: browser/CLI/API-key sign-in, agent-API data plane, model management and usage." };
+export const manifest = { name: "cursor", version: "0.1.1", coreApi: "1", description: "Cursor (cursor.com) subscription provider: browser/CLI/API-key sign-in, agent-API data plane, model management and usage." };
 
 /**
  * Activation wires the vendored engine's transport ONCE (process-wide, see

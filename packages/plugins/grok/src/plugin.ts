@@ -5,7 +5,7 @@ import { createGrokManagedRuntime } from "./managed-runtime";
 import { registerGrokAdminRoutes } from "./admin-routes";
 import { protectGrokConfig } from "./protocol";
 import { grokLocales } from "./locales";
-export const manifest = { name: "grok", version: "0.1.1", coreApi: "1", description: "Grok Build subscription provider with explicit CLI sign-in, model management and quota." };
+export const manifest = { name: "grok", version: "0.1.2", coreApi: "1", description: "Grok Build subscription provider with explicit CLI sign-in, model management and quota." };
 export async function activate(ctx: PluginContext): Promise<void> {
   const service = new GrokAuthService({ host: ctx.host });
   class ActivatedGrokTransformer extends GrokTransformer {

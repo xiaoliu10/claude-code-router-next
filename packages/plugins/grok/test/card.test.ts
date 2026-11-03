@@ -3,8 +3,11 @@ import { mount, unmount } from "../src/card-entry";
 import { grokLocales } from "../src/locales";
 class Element {
   children: Element[] = []; textContent = ""; className = ""; disabled = false; onclick?: () => void; href = ""; rel = ""; target = "";
+  setAttribute(_: string, _v: string) {}
   constructor(readonly tag: string) {}
   append(...children: Element[]) { this.children.push(...children); }
+  appendChild(child: Element) { this.children.push(child); return child; }
+  prepend(child: Element) { this.children.unshift(child); return child; }
   replaceChildren(...children: Element[]) { this.children = children; }
   all(): Element[] { return [this, ...this.children.flatMap(c => c.all())]; }
   button(text: string) { const b = this.all().find(c => c.tag === "button" && c.textContent === text); if (!b) throw new Error(`Missing ${text}`); return b; }
@@ -13,7 +16,7 @@ const tick = async () => { for (let n = 0; n < 8; n++) await Promise.resolve(); 
 const roots: Element[] = [];
 afterEach(() => { for (const root of roots.splice(0)) unmount(root as any); });
 function setup(state = "not_connected") {
-  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag) });
+  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any });
   const root = new Element("div"); roots.push(root);
   const release = vi.fn(); let listener: (() => void) | undefined;
   const props: any = {

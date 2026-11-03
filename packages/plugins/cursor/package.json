@@ -1,6 +1,6 @@
 {
   "name": "@wengine-ai/ccr-provider-cursor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cursor subscription provider: browser/CLI/API-key sign-in, Cursor agent-API data plane (HTTP/2 with an HTTP/1.1 fallback lane), model list, usage and admin routes.",
   "type": "module",
   "main": "dist/plugin.js",
