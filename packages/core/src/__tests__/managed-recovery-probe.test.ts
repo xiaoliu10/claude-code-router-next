@@ -33,14 +33,14 @@ function buildService(dispatchRequest: any) {
 }
 
 /** Put the model in the fail pool as if real requests had exhausted it. */
-function openCircuit(model: string) {
+function openCircuit(model: string, opts: { freshFailure?: boolean } = {}) {
   const health = getHealthStore();
   health.forceOpen("sub", model, "quota exhausted");
-  // forceOpen stamps lastFailureTime = now, which the interval gate would treat as
-  // "just failed". Age it so the probe is allowed to run (this is what happens in
-  // production once the interval elapses).
   const state: any = health.getState("sub", model);
-  state.lastFailureTime = Date.now() - 60 * 60 * 1000;
+  // A fresh lastFailureTime (half-open real requests keep stamping it) must NOT
+  // postpone the recovery probe: the gate only looks at lastProbeTime. Age the
+  // stamp anyway except in the regression test that pins the new semantics.
+  if (!opts.freshFailure) state.lastFailureTime = Date.now() - 60 * 60 * 1000;
   state.lastProbeTime = 0;
   return state;
 }
@@ -61,6 +61,21 @@ describe("managed recovery probe", () => {
     expect(health.isAvailable("sub", "s2")).toBe(true);
     // One probe per provider: a shared account limit must not be spent per model.
     expect(dispatchRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("probes immediately despite a fresh failure — the gate ignores lastFailureTime", async () => {
+    // 2026-11-02 codex outage: the old gate (max(lastFailureTime, lastProbeTime))
+    // let every half-open real-request failure push the recovery probe out, so a
+    // model the proxy had already healed stayed circuit-open all day. A fresh
+    // failure with a stale lastProbeTime must probe on this very tick.
+    openCircuit("s1", { freshFailure: true });
+    const dispatchRequest = vi.fn(async () => new Response("{}", { status: 200 }));
+    const service = buildService(dispatchRequest);
+
+    await service.runManagedRecoveryProbe();
+
+    expect(dispatchRequest).toHaveBeenCalledTimes(1);
+    expect(getHealthStore().isAvailable("sub", "s1")).toBe(true);
   });
 
   it("keeps the circuit open and spaces out retries when the probe fails", async () => {

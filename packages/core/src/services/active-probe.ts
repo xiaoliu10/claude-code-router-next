@@ -835,10 +835,14 @@ export class ActiveProbeService {
       // An active quota lock belongs to the plugin's cooldown machinery;
       // probing it would defeat the lock.
       if (state.rateLimitUntil && Date.now() < state.rateLimitUntil) continue;
-      // Same interval gate as every other probe, so a permanently dead account
-      // is never hammered.
-      const lastSeen = Math.max(state.lastFailureTime ?? 0, state.lastProbeTime ?? 0);
-      if (Date.now() - lastSeen < this.config.quotaProbeIntervalMinutes * 60_000) continue;
+      // Gate on the last probe ATTEMPT only. The old gate also included
+      // lastFailureTime, but half-open real requests keep refreshing it while
+      // the circuit is open — so with any traffic cadence shorter than the
+      // interval the recovery probe was postponed indefinitely and a model the
+      // network had already healed stayed circuit-open all day (2026-11-02
+      // codex outage). recordProbeAttempt stamps lastProbeTime on every actual
+      // attempt, so this still spaces retries by the full interval.
+      if (Date.now() - (state.lastProbeTime ?? 0) < this.config.quotaProbeIntervalMinutes * 60_000) continue;
 
       // Level 1 — account state. A parked or over-quota account must not spend a
       // network call, and network health says nothing about a parked account, so
