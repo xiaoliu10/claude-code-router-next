@@ -119,9 +119,10 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   });
   // Family button builders: action-column rows (h-8 full width) — matching
   // codex/qoder/workbuddy exactly.
-  const action = (label: string, fn: () => void, opts: { variant?: "primary" | "destructive"; icon?: SVGSVGElement } = {}) => {
-    const button = node("button", words[label], `${BUTTON_BASE} ${opts.variant === "primary" ? BUTTON_PRIMARY : opts.variant === "destructive" ? BUTTON_DESTRUCTIVE : BUTTON_OUTLINE} h-8 w-full text-xs`) as HTMLButtonElement;
+  const action = (label: string, fn: () => void, opts: { variant?: "primary" | "destructive"; icon?: SVGSVGElement; extra?: string } = {}) => {
+    const button = node("button", words[label], `${BUTTON_BASE} ${opts.variant === "primary" ? BUTTON_PRIMARY : opts.variant === "destructive" ? BUTTON_DESTRUCTIVE : BUTTON_OUTLINE} h-8 w-full text-xs${opts.extra ? ` ${opts.extra}` : ""}`) as HTMLButtonElement;
     if (opts.icon) button.prepend(opts.icon);
+    button.type = "button";
     button.disabled = disposed || props.disabled || busy;
     button.onclick = fn; return button;
   };
@@ -148,10 +149,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     input.setAttribute("aria-label", words.apiKey);
     input.value = draft;
     input.oninput = () => { draft = input.value; };
-    const connectButton = node("button", words.connect, `${BUTTON_BASE} ${BUTTON_OUTLINE} h-8 shrink-0 px-3 text-xs`) as HTMLButtonElement;
-    connectButton.disabled = disposed || props.disabled || busy;
     const connect = () => connectApiKey(input);
-    connectButton.onclick = connect;
+    const connectButton = action("connect", connect, { extra: "w-auto shrink-0 px-3" });
     input.onkeydown = e => { if (e.key === "Enter") connect(); };
     const keyRow = node("div", "", "flex gap-2 items-center");
     keyRow.append(input, connectButton);
@@ -194,10 +193,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const pending = status ? renderLoginPending(body) : false;
     if (status?.status === "connected") renderConnected(body);
     else if (status && !pending) renderNotConnected(body);
-    const isConnected = status?.status === "connected";
     if (pending) {
       actions.append(action("cancelLogin", cancelLogin, { icon: plugIcon("h-3.5 w-3.5 shrink-0") }));
-    } else if (isConnected) {
+    } else if (status?.status === "connected") {
       actions.append(action("sync", () => void run(async () => { await call("/sync", {}); await reconcile(); await refresh(); }), { icon: refreshCwIcon("h-3.5 w-3.5 shrink-0") }));
       actions.append(action("usage", () => void run(async () => { usage = await call("/usage", {}); }), { icon: coinsIcon("h-3.5 w-3.5 shrink-0") }));
       actions.append(action("disconnect", () => void run(async () => {

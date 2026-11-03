@@ -3,7 +3,8 @@ import { mount, unmount } from "../src/card-entry";
 import { grokLocales } from "../src/locales";
 class Element {
   children: Element[] = []; textContent = ""; className = ""; disabled = false; onclick?: () => void; href = ""; rel = ""; target = "";
-  setAttribute(_: string, _v: string) {}
+  attrs: Record<string, string> = {};
+  setAttribute(key: string, value: string) { this.attrs[key] = value; }
   constructor(readonly tag: string) {}
   append(...children: Element[]) { this.children.push(...children); }
   appendChild(child: Element) { this.children.push(child); return child; }
@@ -79,4 +80,18 @@ describe("Grok card host bridge", () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
   it("locale keys have parity", () => { expect(Object.keys(grokLocales.en.grok).sort()).toEqual(Object.keys(grokLocales.zh.grok).sort()); });
+  it("renders family-style buttons with hidden lucide icons", async () => {
+    const connected = setup("connected"); await tick();
+    // Every icon-bearing action button carries a leading svg that is hidden from
+    // a11y and sized by the family class, so a broken icon() would fail here.
+    for (const label of ["Refresh models", "Refresh quota", "Refresh status"]) {
+      const icon = connected.root.button(label).children[0] as any;
+      expect(icon.tag).toBe("svg");
+      expect(icon.attrs["aria-hidden"]).toBe("true");
+      expect(icon.attrs.class).toBe("h-3.5 w-3.5 shrink-0");
+    }
+    // The primary action uses the primary vocabulary, not the outline default.
+    const idle = setup(); await tick();
+    expect(idle.root.button("Device sign-in").className).toContain("bg-primary");
+  });
 });

@@ -88,14 +88,16 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   };
   // Family button builders: action-column rows (h-8 full width) and small list
   // row buttons (h-6), matching codex/qoder/workbuddy exactly.
-  const action = (label: string, fn: () => void, opts: { variant?: "primary" | "destructive"; icon?: SVGSVGElement; canCancel?: boolean } = {}) => {
-    const button = node("button", words[label], `${BUTTON_BASE} ${opts.variant === "primary" ? BUTTON_PRIMARY : opts.variant === "destructive" ? BUTTON_DESTRUCTIVE : BUTTON_OUTLINE} h-8 w-full text-xs`) as HTMLButtonElement;
+  const action = (label: string, fn: () => void, opts: { variant?: "primary" | "destructive"; icon?: SVGSVGElement; extra?: string; canCancel?: boolean } = {}) => {
+    const button = node("button", words[label], `${BUTTON_BASE} ${opts.variant === "primary" ? BUTTON_PRIMARY : opts.variant === "destructive" ? BUTTON_DESTRUCTIVE : BUTTON_OUTLINE} h-8 w-full text-xs${opts.extra ? ` ${opts.extra}` : ""}`) as HTMLButtonElement;
     if (opts.icon) button.prepend(opts.icon);
+    button.type = "button";
     button.disabled = disposed || props.disabled || (busy && !opts.canCancel);
     button.onclick = fn; return button;
   };
   const rowButton = (label: string, fn: () => void) => {
     const button = node("button", words[label], `${BUTTON_BASE} ${BUTTON_OUTLINE} h-6 shrink-0 px-2 text-[11px]`) as HTMLButtonElement;
+    button.type = "button";
     button.disabled = disposed || props.disabled || busy;
     button.onclick = fn; return button;
   };
