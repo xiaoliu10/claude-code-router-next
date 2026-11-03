@@ -711,6 +711,104 @@ describe("admin confidentiality", () => {
   });
 });
 
+describe("virtual dispatcher backpressure", () => {
+  const tick = (ms = 20) => new Promise(resolve => setTimeout(resolve, ms));
+  // Reproduces reviewer probe /tmp/cursor-review2-bridge.ts for both undici
+  // handler generations: pause requested at the HEADER stage must stop the
+  // bridge from reading or delivering ANY body data until resume; abort while
+  // paused must still cancel the engine body exactly once and error once.
+  const check = async (modern: boolean, atHeaders: boolean) => {
+    const observed = { reads: 0, data: 0, cancels: 0, errors: 0 };
+    const service: any = { dispatch: async () => new Response(new ReadableStream<Uint8Array>({
+      pull(ctl) { observed.reads++; ctl.enqueue(new Uint8Array([1])); },
+      cancel() { observed.cancels++; },
+    }, { highWaterMark: 0 })) };
+    const runtime = createCursorManagedRuntime(service, fakeHost("/tmp/unused") as any);
+    const config: any = {};
+    let control: any, resumeFn: (() => void) | undefined;
+    await runtime.dispatchRequest!({
+      config, requestBody: {}, provider: {} as any,
+      attempt: async () => {
+        const handler = modern ? {
+          onRequestStart(c: any) { control = c; },
+          onResponseStart(c: any) { if (atHeaders) c.pause(); },
+          onResponseData() { observed.data++; control.pause(); },
+          onResponseEnd() {},
+          onResponseError() { observed.errors++; },
+        } : {
+          onConnect(abort: any) { control = { abort }; },
+          onHeaders(_s: any, _h: any, resume: () => void) { resumeFn = resume; return !atHeaders; },
+          onData() { observed.data++; return false; },
+          onComplete() {},
+          onError() { observed.errors++; },
+        };
+        config.dispatcher.dispatch({}, handler);
+        await tick();
+        if (atHeaders) {
+          // Paused at headers: zero upstream reads and zero delivered data.
+          expect(observed.reads).toBe(0);
+          expect(observed.data).toBe(0);
+        } else {
+          // Data-stage pause: exactly one chunk was read/delivered before it.
+          expect(observed.data).toBe(1);
+        }
+        expect(observed.errors).toBe(0);
+        (modern ? control.resume : resumeFn!)(); // unblock the first body chunk
+        await tick();
+        expect(observed.data).toBeGreaterThan(0);
+        return new Response(null);
+      },
+    });
+    // Drain a few more chunks: every resume must deliver one more chunk
+    // (the handler pauses after each onData/onResponseData).
+    for (let i = 0; i < 3; i++) { (modern ? control.resume : resumeFn!)(); await tick(); }
+    expect(observed.reads).toBeGreaterThan(1);
+    control.abort(new DOMException("aborted", "AbortError"));
+    await tick();
+    expect(observed.cancels).toBe(1);
+    expect(observed.errors).toBe(1);
+  };
+
+  it.each([["legacy", false], ["modern", false], ["legacy", true], ["modern", true]])("%s handler honors %s pause then drains and aborts cleanly", async (style, atHeaders) => {
+    await check(style === "modern", atHeaders);
+  });
+
+  it("abort while header-paused cancels the engine before any read (both styles)", async () => {
+    for (const modern of [false, true]) {
+      const observed = { reads: 0, cancels: 0, errors: 0 };
+      const service: any = { dispatch: async () => new Response(new ReadableStream<Uint8Array>({
+        pull(ctl) { observed.reads++; ctl.enqueue(new Uint8Array([1])); },
+        cancel() { observed.cancels++; },
+      }, { highWaterMark: 0 })) };
+      const runtime = createCursorManagedRuntime(service, fakeHost("/tmp/unused") as any);
+      const config: any = {};
+      let control: any;
+      await runtime.dispatchRequest!({
+        config, requestBody: {}, provider: {} as any,
+        attempt: async () => {
+          const handler = modern ? {
+            onRequestStart(c: any) { control = c; },
+            onResponseStart(c: any) { c.pause(); },
+            onResponseData() {}, onResponseEnd() {}, onResponseError() { observed.errors++; },
+          } : {
+            onConnect(abort: any) { control = { abort }; },
+            onHeaders() { return false; },
+            onData() {}, onComplete() {}, onError() { observed.errors++; },
+          };
+          config.dispatcher.dispatch({}, handler);
+          await tick();
+          expect(observed.reads).toBe(0);
+          control.abort(new DOMException("aborted", "AbortError"));
+          await tick();
+          expect(observed.cancels).toBe(1);
+          expect(observed.errors).toBe(1);
+          return new Response(null);
+        },
+      });
+    }
+  });
+});
+
 // ---- card mount smoke ---------------------------------------------------------------
 
 class El {

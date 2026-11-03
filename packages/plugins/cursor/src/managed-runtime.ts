@@ -78,6 +78,7 @@ function virtualCursorDispatcher(send: (signal: AbortSignal) => Promise<Response
     dispatch(_options: unknown, handler: any): boolean {
       const controller = new AbortController();
       let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      let engineBody: ReadableStream<Uint8Array> | null | undefined;
       let resume: (() => void) | undefined;
       let ended = false;
       let paused = false;
@@ -88,12 +89,19 @@ function virtualCursorDispatcher(send: (signal: AbortSignal) => Promise<Response
         pause: () => { paused = true; },
         resume: () => { paused = false; resume?.(); resume = undefined; },
       };
+      const waitWhilePaused = async () => {
+        if (paused && !ended) await new Promise<void>(resolve => { resume = resolve; });
+      };
       const fail = (error: unknown) => {
         if (ended) return;
         ended = true;
         controller.abort();
+        paused = false;
         resume?.(); resume = undefined;
+        // Cancellation must reach the engine even when it lands while the
+        // bridge is paused at the header stage (no reader taken yet).
         void reader?.cancel(error).catch(() => {});
+        if (!reader) void engineBody?.cancel(error).catch(() => {});
         if (modern) handler.onResponseError(dispatchController, error);
         else handler.onError(error);
       };
@@ -104,9 +112,15 @@ function virtualCursorDispatcher(send: (signal: AbortSignal) => Promise<Response
           if (controller.signal.aborted) return;
           const response = await send(controller.signal);
           if (ended) { await response.body?.cancel(); return; }
+          engineBody = response.body;
           const headers = [...response.headers].flatMap(([key, value]) => [key, value]);
           if (modern) handler.onResponseStart(dispatchController, response.status, Object.fromEntries(response.headers), response.statusText);
-          else handler.onHeaders(response.status, headers, dispatchController.resume, response.statusText);
+          // Legacy undici: onHeaders returning false pauses BEFORE any body data.
+          else if (handler.onHeaders(response.status, headers, dispatchController.resume, response.statusText) === false) paused = true;
+          // Header-stage backpressure: no read (and therefore no onData) until
+          // the consumer resumes or the transaction aborts.
+          await waitWhilePaused();
+          if (ended) { await response.body?.cancel().catch(() => {}); return; }
           reader = response.body?.getReader();
           while (reader && !ended) {
             const next = await reader.read();
@@ -114,7 +128,7 @@ function virtualCursorDispatcher(send: (signal: AbortSignal) => Promise<Response
             // Undici's response reader supplies backpressure, just as a socket dispatcher does.
             if (modern) handler.onResponseData(dispatchController, next.value);
             else if (handler.onData(next.value) === false) paused = true;
-            if (paused && !ended) await new Promise<void>(resolve => { resume = resolve; });
+            await waitWhilePaused();
           }
           if (!ended) {
             ended = true;

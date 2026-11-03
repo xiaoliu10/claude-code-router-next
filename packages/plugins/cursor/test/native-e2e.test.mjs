@@ -8,7 +8,7 @@ import { CursorAuthService } from "../src/auth-service.ts"
 import { randomUUID } from "node:crypto"
 import { getEventListeners } from "node:events"
 import { CursorAuthPlugin, _internal } from "../src/vendor/engine.mjs"
-import { NATIVE_LIMITS, nativeSessions } from "../src/vendor/native-session.mjs"
+import { NATIVE_LIMITS, nativeSessions, Quiet } from "../src/vendor/native-session.mjs"
 import { message, bin, text, uint, readWire, nest, number, string, envelope, update, end, tool, setBlob, getBlob, checkpoint, abortExec, readResult } from "./native-test-wire.mjs"
 
 const savedFetch = globalThis.fetch
@@ -1569,28 +1569,55 @@ for (const path of ["native", "stateless"]) {
     await until(() => a.closedStreams === 1)
   })
 
-  test(`${path}: Cursor's heartbeats alone don't keep a silent Run open past quiet (#2672)`, async () => {
-    // Port note: under load Node can hit idle before a heartbeat is delivered.
-    // Retry the entire scenario once ONLY on that idle branch, with the SAME
-    // limits. Both runs missing quiet fails: #2672 still requires heartbeats
-    // alone to end the Run via quiet with a positive heartbeat count.
-    Object.assign(NATIVE_LIMITS, { idle: 1500, quiet: 3000 })
-    if (path === "stateless") NATIVE_LIMITS.perProcess = 0
-    for (let run = 0; run < 2; run++) {
-      const a = await agent({ thinkingOnly: true, serverHeartbeat: 60 })
-      const response = await a.ask(auth(), initial({ stream: true }))
-      const sse = await sseOf(response)
-      await until(() => a.closedStreams === 1)
-      expect(sse).toContain("native planning one")
-      expect(sse).not.toContain("[DONE]")
-      if (run === 0 && /Cursor went quiet: no message for/.test(sse)) {
-        await nativeSessions.clear()
-        _internal.resetH1()
-        continue
+  test(`${path}: Cursor's heartbeats alone don't keep a silent Run open past quiet (#2672) [deterministic clock]`, async () => {
+    // Port note: the wall-clock version (real HTTP/2 server, idle 1500 /
+    // quiet 3000 / heartbeat 60) still raced a saturated event loop: a
+    // heartbeat landing one timer tick late ended the Run on the idle branch
+    // and the beat regex produced NaN. The wire itself cannot run under fake
+    // timers (real http2 sockets), but BOTH lanes' quiet/idle decision is the
+    // same vendored Quiet — native owners construct it in NativeSession
+    // (native-session.mjs:590) and the stateless H1 Run in runOnce
+    // (engine.mjs:2525), each with these NATIVE_LIMITS. Drive THAT decision
+    // on a virtual clock so ~46 heartbeats always reset the idle deadline and
+    // the accumulated wait deterministically reaches quiet. Interval 64 is
+    // coprime to the 1500 idle cap, so no heartbeat ever shares a timer tick
+    // with the idle deadline.
+    vi.useFakeTimers()
+    try {
+      const limits = { ...NATIVE_LIMITS, idle: 1500, quiet: 3000 }
+      const stopped = []
+      const quiet = new Quiet(limits, e => stopped.push(e))
+      async function* wire() {
+        // One thinking frame (the "last message" the diagnostic names),
+        // then only InteractionUpdate heartbeats forever. Values are the
+        // payloads AFTER engine frames() strips its 5-byte envelope — exactly
+        // what Quiet.frames receives and what kindOf reads.
+        yield { data: bin(1, bin(4, text(1, "native planning one"))) }
+        for (;;) {
+          await new Promise(resolve => setTimeout(resolve, 64))
+          yield { data: bin(1, bin(13, Buffer.alloc(0))) }
+        }
       }
-      const [, beats] = sse.match(/Cursor went quiet: (\d+) heartbeats and nothing else for \d+ s, its last message thinking/) ?? []
-      expect(Number(beats)).toBeGreaterThan(0)
-      break
+      let failure
+      const consume = (async () => {
+        try { for await (const _frame of quiet.frames(wire())) { /* drain */ } }
+        catch (e) { failure = e }
+      })()
+      await vi.advanceTimersByTimeAsync(0) // deliver the thinking frame at t=0
+      // 48 beats of 64 virtual ms carry the accumulated wait past 3000 ms
+      // while every individual 64 ms gap stays far inside the 1500 idle cap.
+      for (let beat = 0; beat < 48 && !failure; beat++) await vi.advanceTimersByTimeAsync(64)
+      await consume
+      expect(failure?.quiet).toBe(true)
+      expect(failure).toMatchObject({ status: 502 })
+      expect(failure.message).toMatch(/^Cursor went quiet: \d+ heartbeats and nothing else for \d+ s, its last message thinking \(try again\)$/)
+      const beats = Number(failure.message.match(/(\d+) heartbeats/)?.[1])
+      expect(beats).toBeGreaterThan(0)
+      // The stop callback (an owner's fail) fires with the same evidence.
+      expect(stopped).toHaveLength(1)
+      expect(stopped[0]).toMatchObject({ status: 502, message: failure.message })
+    } finally {
+      vi.useRealTimers()
     }
   })
 }
