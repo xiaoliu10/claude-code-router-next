@@ -1,6 +1,6 @@
 {
   "name": "@wengine-ai/ccr-provider-qoder",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Qoder subscription provider (qoder.com and qoder.cn): Personal Access Token sign-in, fixed agent_chat_generation upstream, model management and usage.",
   "type": "module",
   "main": "dist/plugin.js",
