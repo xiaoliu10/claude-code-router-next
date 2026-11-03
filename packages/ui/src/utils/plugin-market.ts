@@ -12,19 +12,18 @@
  * stable codes only.
  */
 
-export interface PluginMarketCatalogEntry {
-  name: string;
-  description: string;
-  version: string;
-  installed: boolean;
-  installedVersion: string | null;
-}
+// Single source of truth for the catalog DTO is the shared UI types module.
+// A second declaration here previously let the two copies drift apart (a field
+// the route emits but typed consumers cannot see), so it is re-exported.
+export type { PluginMarketCatalogEntry } from "../types";
+import type { PluginMarketCatalogEntry } from "../types";
 
 export interface PluginMarketBridge {
   /** GET /api/plugins/catalog (already authenticated via the API client). */
   getCatalog(): Promise<{ ok: true; plugins: PluginMarketCatalogEntry[]; warning?: string }>;
-  /** POST /api/plugins/install — resolves only on ok:true. */
-  installPlugin(name: string): Promise<{ ok: true; name: string; version: string; restartRequired: boolean }>;
+  /** POST /api/plugins/install — resolves only on ok:true. With `force` the
+   *  same staged atomic swap replaces an existing installation (update path). */
+  installPlugin(name: string, force?: boolean): Promise<{ ok: true; name: string; version: string; restartRequired: boolean }>;
   log: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -32,6 +31,9 @@ export interface PluginMarketState {
   status: "loading" | "ready" | "unavailable";
   /** Catalog entries that are NOT installed yet — the installable list. */
   entries: PluginMarketCatalogEntry[];
+  /** Installed catalog entries. Shown with an update affordance when the
+   *  npm version differs from the installed manifest version. */
+  installedEntries: PluginMarketCatalogEntry[];
   /** Total catalog size (installed entries exist but are not listed). */
   hiddenInstalled: number;
   /** Stable warning code from the route ("registry_unavailable"). */
@@ -79,6 +81,7 @@ export function sanitizeMarketErrorCode(value: unknown): PluginMarketErrorCode {
 
 export interface PluginMarketHandlers {
   onInstall(name: string): void;
+  onUpdate(name: string): void;
   onRetry(): void;
   onRestart(): void;
   onDismissNotice(): void;
@@ -163,13 +166,104 @@ export function renderPluginMarketState(
     return;
   }
 
-  if (state.entries.length === 0) {
+  if (state.entries.length === 0 && state.installedEntries.length === 0) {
     const empty = document.createElement("div");
     empty.className = "mt-3 text-sm text-muted-foreground";
     empty.dataset.testid = "plugin-market-empty";
-    empty.textContent = state.hiddenInstalled > 0
-      ? t("pluginMarket.empty_all_installed", { count: state.hiddenInstalled })
-      : t("pluginMarket.empty");
+    empty.textContent = t("pluginMarket.empty");
+    section.appendChild(empty);
+    host.appendChild(section);
+    return;
+  }
+
+  // Installed plugins — so a marketplace user can see their version state and
+  // update without reaching for the CLI. Rows with `updateAvailable` get the
+  // prominent affordance; up-to-date and local-only rows render read-only.
+  if (state.installedEntries.length > 0) {
+    const installedTitle = document.createElement("h4");
+    installedTitle.className = "mt-4 text-xs font-semibold tracking-wide text-muted-foreground uppercase";
+    installedTitle.dataset.testid = "plugin-market-installed-title";
+    installedTitle.textContent = t("pluginMarket.installed_title");
+    section.appendChild(installedTitle);
+
+    const installedList = document.createElement("ul");
+    installedList.className = "mt-2 space-y-2";
+    installedList.dataset.testid = "plugin-market-installed-list";
+    for (const entry of state.installedEntries) {
+      const row = document.createElement("li");
+      row.className = "flex items-start justify-between gap-4 rounded-lg border border-white/10 bg-white/5 p-3";
+      row.dataset.testid = "plugin-market-installed-entry";
+      row.dataset.name = entry.name;
+
+      const info = document.createElement("div");
+      info.className = "min-w-0";
+      const nameLine = document.createElement("div");
+      nameLine.className = "text-sm font-medium";
+      nameLine.textContent = entry.name;
+      info.appendChild(nameLine);
+      const meta = document.createElement("div");
+      meta.className = "mt-0.5 text-xs text-muted-foreground";
+      meta.textContent = entry.updateAvailable
+        ? t("pluginMarket.version_outdated", {
+            installed: entry.installedVersion ?? "?",
+            latest: entry.version,
+          })
+        : t("pluginMarket.version_ok", { version: entry.installedVersion ?? entry.version });
+      info.appendChild(meta);
+      if (entry.description) {
+        const description = document.createElement("div");
+        description.className = "mt-1 text-xs text-muted-foreground";
+        description.textContent = entry.description;
+        info.appendChild(description);
+      }
+      row.appendChild(info);
+
+      if (entry.updateAvailable) {
+        const update = document.createElement("button");
+        update.type = "button";
+        update.dataset.testid = "plugin-market-update";
+        update.dataset.name = entry.name;
+        update.className = "shrink-0 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white shadow hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50";
+        const busy = state.busyName !== null;
+        update.disabled = busy;
+        update.textContent = state.busyName === entry.name ? t("pluginMarket.updating") : t("pluginMarket.update");
+        update.addEventListener("click", () => handlers.onUpdate(entry.name));
+        row.appendChild(update);
+      } else if (entry.localOnly) {
+        const tag = document.createElement("span");
+        tag.className = "shrink-0 rounded-md border border-white/10 px-2 py-1 text-xs text-muted-foreground";
+        tag.dataset.testid = "plugin-market-local-only";
+        tag.textContent = t("pluginMarket.local_only");
+        row.appendChild(tag);
+      }
+
+      if (state.error && state.error.name === entry.name) {
+        const errorLine = document.createElement("div");
+        errorLine.className = "basis-full text-xs text-red-400";
+        errorLine.dataset.testid = "plugin-market-installed-error";
+        errorLine.setAttribute("role", "note");
+        errorLine.textContent = t("pluginMarket.error_generic", { code: state.error.code });
+        row.appendChild(errorLine);
+      }
+
+      installedList.appendChild(row);
+    }
+    section.appendChild(installedList);
+  }
+
+  if (state.entries.length > 0) {
+    const availableTitle = document.createElement("h4");
+    availableTitle.className = "mt-4 text-xs font-semibold tracking-wide text-muted-foreground uppercase";
+    availableTitle.dataset.testid = "plugin-market-available-title";
+    availableTitle.textContent = t("pluginMarket.available_title");
+    section.appendChild(availableTitle);
+  }
+
+  if (state.entries.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "mt-3 text-sm text-muted-foreground";
+    empty.dataset.testid = "plugin-market-empty-available";
+    empty.textContent = t("pluginMarket.empty_available");
     section.appendChild(empty);
     host.appendChild(section);
     return;
@@ -239,8 +333,11 @@ export function renderPluginMarketState(
 export interface PluginMarketController {
   /** Load the catalog. Safe to call repeatedly (retry / post-install refresh). */
   refresh(): Promise<void>;
-  /** Install one catalog entry; refreshes the catalog on success. */
-  install(name: string): Promise<void>;
+  /** Install one catalog entry; refreshes the catalog on success. With force
+   *  (update path) an existing installation is replaced in place. */
+  install(name: string, force?: boolean): Promise<void>;
+  /** Update an installed entry (same install seam with force semantics). */
+  update(name: string): Promise<void>;
   /** Clear the restart notice (dismiss button). */
   dismissNotice(): void;
   getState(): PluginMarketState;
@@ -254,6 +351,7 @@ export function createPluginMarketController(bridge: PluginMarketBridge): Plugin
   let state: PluginMarketState = {
     status: "loading",
     entries: [],
+    installedEntries: [],
     hiddenInstalled: 0,
     warning: null,
     busyName: null,
@@ -281,16 +379,17 @@ export function createPluginMarketController(bridge: PluginMarketBridge): Plugin
         const catalog = await bridge.getCatalog();
         if (disposed) return;
         const warning = typeof catalog.warning === "string" ? catalog.warning : null;
-        const installed = catalog.plugins.filter((entry) => entry.installed);
-        // The section lists installable entries only; installed ones are
-        // visible through their plugin cards / recovery notices above.
-        const entries = catalog.plugins
-          .filter((entry) => !entry.installed)
-          .sort((a, b) => a.name.localeCompare(b.name));
+        const byName = [...catalog.plugins].sort((a, b) => a.name.localeCompare(b.name));
+        const entries = byName.filter((entry) => !entry.installed);
+        // Installed rows are listed alongside the installable ones so the
+        // marketplace is also where an update is discovered and triggered;
+        // updateAvailable is computed by the route from the manifest version.
+        const installedEntries = byName.filter((entry) => entry.installed);
         publish({
           status: warning ? "unavailable" : "ready",
           entries,
-          hiddenInstalled: installed.length,
+          installedEntries,
+          hiddenInstalled: installedEntries.length,
           warning,
           busyName: null,
           error: null,
@@ -304,6 +403,7 @@ export function createPluginMarketController(bridge: PluginMarketBridge): Plugin
         publish({
           status: "unavailable",
           entries: [],
+          installedEntries: [],
           hiddenInstalled: 0,
           warning: "registry_unavailable",
           busyName: null,
@@ -312,11 +412,11 @@ export function createPluginMarketController(bridge: PluginMarketBridge): Plugin
         });
       }
     },
-    async install(name) {
+    async install(name, force = false) {
       if (disposed || state.busyName !== null) return;
       publish({ ...state, busyName: name, error: null });
       try {
-        const result = await bridge.installPlugin(name);
+        const result = await bridge.installPlugin(name, force);
         if (disposed) return;
         bridge.log.info(`plugin installed via marketplace: ${result.name}@${result.version}`);
         publish({
@@ -331,6 +431,11 @@ export function createPluginMarketController(bridge: PluginMarketBridge): Plugin
         bridge.log.warn(`plugin install failed: ${code}`);
         publish({ ...state, busyName: null, error: { name, code } });
       }
+    },
+    // An update is the same install call with force semantics, so credentials
+    // survive and the swap is the same staged atomic rename.
+    async update(name) {
+      await this.install(name, true);
     },
     dismissNotice() {
       if (disposed) return;
@@ -347,5 +452,34 @@ export function createPluginMarketController(bridge: PluginMarketBridge): Plugin
       disposed = true;
       listeners.clear();
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Production bridge factory
+// ---------------------------------------------------------------------------
+
+/** The subset of the API client the bridge needs (keeps the factory testable
+ *  with a plain double instead of the whole client). */
+export interface MarketplaceApiLike {
+  getPluginCatalog(): Promise<{ ok: true; plugins: PluginMarketCatalogEntry[]; warning?: string }>;
+  installPlugin(name: string, force?: boolean): Promise<{ ok: true; name: string; version: string; restartRequired: boolean }>;
+}
+
+/**
+ * Build the marketplace bridge over the real API client.
+ *
+ * Exported so a test can assert argument forwarding: the update path depends
+ * on `force` reaching POST /api/plugins/install. A wrapper that drops it (TS
+ * allows a fewer-params function where a two-param signature is expected)
+ * silently sends every update down the plain install lane, where an existing
+ * directory is rejected with already_installed — the button would appear to
+ * work while never replacing the plugin.
+ */
+export function createMarketplaceBridge(apiClient: MarketplaceApiLike): PluginMarketBridge {
+  return {
+    getCatalog: () => apiClient.getPluginCatalog(),
+    installPlugin: (name, force) => apiClient.installPlugin(name, force),
+    log: console,
   };
 }

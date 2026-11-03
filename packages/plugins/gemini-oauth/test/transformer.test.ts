@@ -445,10 +445,14 @@ describe("gemini-oauth error taxonomy (contract §1.6, line by line)", () => {
     expect(extractValidationUrl({ error: { details: [{ reason: "VALIDATION_REQUIRED", metadata: { validation_url: "http://evil.example" } }] } }).validationUrl).toBeUndefined();
   });
 
-  it("classifies a 401 (after one refresh retry) as reauth required", () => {
+  it("classifies a 401 (after one refresh retry) as reauth required and parks the account", () => {
     const info = classifyGeminiOauthError({ status: 401, message: "Unauthorized" });
     expect(info.code).toBe("gemini_oauth_reauth_required");
-    expect(info.cooldownMs).toBeUndefined();
+    // Waiting cannot fix an expired login, but the cooldown is what stops the
+    // background recovery probe from spending a real request on this account
+    // every probe interval. Previously undefined, which left isAccountCooling()
+    // false and the probe looping against a dead token.
+    expect(info.cooldownMs).toBe(60 * 60 * 1000);
   });
 
   it("classifies SSE error-frame text that matches no other row as upstream_error, message passed through", () => {

@@ -272,6 +272,85 @@ describe("Gemini OAuth error bookkeeping and disconnect", () => {
     expect(await h.service.isAccountCooling()).toBe(false);
     expect(await h.service.getStatus()).toMatchObject({ lastError: null, cooldownUntil: null });
   });
+  it("a 401 parks the account, so the recovery probe stops spending real requests on it", async () => {
+    // Regression: the reauth classification carried no cooldownMs, so
+    // noteUpstreamError() wrote cooldownUntil = null and isAccountCooling()
+    // answered false forever. The background probe therefore treated a dead
+    // token as a usable account and re-requested it every probe interval.
+    const h = await harness(); await h.store.save(credential());
+    const before = Date.now();
+    await h.service.noteUpstreamError(classifyGeminiOauthError({ status: 401, message: "Unauthorized" }));
+    const account = (await h.store.load())!.account;
+    expect(account.lastError).toEqual({ code: "gemini_oauth_reauth_required" });
+    expect(account.cooldownUntil).toBeGreaterThanOrEqual(before + 60 * 60_000);
+    expect(await h.service.isAccountCooling()).toBe(true);
+  });
+
+  it("a rejected refresh grant records the reauth state (no data-plane call happens to classify it)", async () => {
+    // The most common way a login expires. It fails inside getAccessToken,
+    // BEFORE any chat request, so no upstream response ever reaches the error
+    // classifier — without this recording the account keeps no state, the
+    // recovery probe sees a healthy account, and it spends a real refresh call
+    // on the dead token every interval while the UI card says "connected".
+    const h = await harness(); await h.store.save(credential());
+    // The refresh exchange goes through the injected fetch seam; model Google
+    // rejecting the stored grant.
+    h.options.fetch = vi.fn(async () => new Response(JSON.stringify({ error: "invalid_grant" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    })) as any;
+    const service = new GeminiOauthAuthService(h.options);
+
+    await expect(service.getAccessToken()).rejects.toMatchObject({ code: "gemini_oauth_reauth_required" });
+
+    const account = (await h.store.load())!.account;
+    expect(account.lastError).toEqual({ code: "gemini_oauth_reauth_required" });
+    expect(account.cooldownUntil).toBeGreaterThan(Date.now() + 30 * 60_000);
+    expect(await service.isAccountCooling()).toBe(true);
+  });
+
+  it("a refresh flight that fails AFTER a disconnect does not park the new account", async () => {
+    // The catch records onto whatever credential file exists at write time. A
+    // flight started before a disconnect belongs to the old account, so without
+    // the epoch guard its failure would park a just-re-authorized account for an
+    // hour — the exact symptom this fix removes.
+    const h = await harness(); await h.store.save(credential());
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    // Hold the refresh in flight so the disconnect lands mid-call.
+    h.options.fetch = (async () => {
+      await gate;
+      return new Response(JSON.stringify({ error: "invalid_grant" }), {
+        status: 400, headers: { "content-type": "application/json" },
+      });
+    }) as any;
+    const service = new GeminiOauthAuthService(h.options);
+
+    const flight = service.getAccessToken().catch((error) => error);
+    await new Promise((resolve) => setTimeout(resolve, 5)); // let the call reach the network seam
+    await service.disconnect();
+    await h.store.save(credential()); // a fresh account is authorized meanwhile
+    release!();
+    expect((await flight)?.code).toBe("gemini_oauth_reauth_required");
+
+    // The stale failure must not be written onto the new account.
+    const account = (await h.store.load())!.account;
+    expect(account.lastError).toBeNull();
+    expect(account.cooldownUntil).toBeNull();
+    expect(await service.isAccountCooling()).toBe(false);
+  });
+
+  it("getStatus keeps reporting a reauth error after its cooldown expires (only a fresh login clears it)", async () => {
+    // The cooldown bounds the probe's network spend; the ERROR is sticky,
+    // because waiting cannot fix an expired login. This is what lets the
+    // probe park an account whose cooldown has already lapsed.
+    const h = await harness(); await h.store.save(credential());
+    await h.service.noteUpstreamError(classifyGeminiOauthError({ status: 401, message: "Unauthorized" }));
+    const until = (await h.store.load())!.account.cooldownUntil!;
+    vi.spyOn(Date, "now").mockReturnValue(until + 1);
+    expect(await h.service.isAccountCooling()).toBe(false);
+    expect((await h.service.getStatus()).lastError).toMatchObject({ code: "gemini_oauth_reauth_required" });
+  });
+
   it("disconnect removes the provider, all Router reference shapes, credential and token cache", async () => {
     const provider = lockGeminiOauthProvider({ models: ["m"] });
     const other = { name: "other", api_base_url: "https://other.invalid/v1", api_key: "dummy", models: ["x"] };

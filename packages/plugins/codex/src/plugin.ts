@@ -33,7 +33,7 @@ import type { PluginContext } from "./core-types";
 
 export const manifest = {
   name: "codex",
-  version: "1.0.6",
+  version: "1.0.7",
   coreApi: "1",
   description:
     "Codex subscription managed provider: chatgpt.com backend-api/codex data plane, browser OAuth login (PKCE, loopback 1455/1457 + paste), model sync, usage and admin routes.",
@@ -65,7 +65,7 @@ async function activate(ctx: PluginContext): Promise<void> {
   // instance when the core constructs it.
   class ActivatedCodexTransformer extends CodexTransformer {
     constructor() {
-      super({ service });
+      super({ service, logger: ctx.log });
     }
   }
 

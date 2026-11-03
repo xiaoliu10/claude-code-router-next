@@ -438,7 +438,17 @@ async function validateStreamingResponse(
   finalResponse: any,
   providerName?: string
 ): Promise<any> {
-  if (!body?.stream || !finalResponse?.body) {
+  if (!finalResponse?.body) {
+    return finalResponse;
+  }
+  // Judge by what the response actually IS, not by what the client asked for:
+  // a non-streaming request still comes back as an SSE body (the Anthropic
+  // transport emits event:/data: frames either way), so gating on body.stream
+  // let an empty non-streaming answer through as a 200 success — the exact
+  // "output 0 but status green" shape.
+  const contentType = finalResponse.headers?.get?.("content-type") ?? "";
+  const isEventStream = contentType.includes("text/event-stream");
+  if (!isEventStream && !body?.stream) {
     return finalResponse;
   }
 

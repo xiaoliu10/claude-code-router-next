@@ -76,6 +76,11 @@ export function codexAccountHeaders(input: {
     version,
     "User-Agent": codexUserAgent(version),
     Accept: "text/event-stream",
+    // Same middlebox rationale as the OAuth/management calls: the direct
+    // route's middlebox strips content-encoding while handing through the
+    // compressed bytes, which undici cannot decode. identity = plain SSE,
+    // parseable under any exit node.
+    "Accept-Encoding": "identity",
   };
   if (input.accountId) headers["chatgpt-account-id"] = input.accountId;
   const sessionKey = input.requestBody?.prompt_cache_key;
@@ -150,11 +155,16 @@ export function createCodexManagedRuntime(options: CodexRuntimeOptions): Managed
 
     // Pin the upstream: a config-supplied base_url can never win, a redirect
     // away from the fixed origin is an error, and the fixed origin ignores
-    // CCR/proxy environment routing.
+    // CCR/proxy environment routing. Fixed subscription origins honor the
+    // explicit SUBSCRIPTION_PROXY_URL opt-in: chatgpt.com answers through the
+    // subscription dispatcher when one is configured. The plain direct agent
+    // stays the fallback for hosts that predate the opt-in seam — and it is
+    // also why tonight's direct-route middlebox could strip response headers
+    // and hand the SSE parser undecodable bodies (every turn judged empty).
     lockUpstream: async (config: any) => {
       config.url = CODEX_UPSTREAM_URL;
       config.redirect = "error";
-      config.dispatcher = options.host.getDirectDispatcher();
+      config.dispatcher = options.host.getSubscriptionDispatcher?.() ?? options.host.getDirectDispatcher();
     },
 
     // Called AFTER the body is final: session headers derive from it.

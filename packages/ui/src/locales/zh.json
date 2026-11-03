@@ -629,6 +629,9 @@
     }
   },
   "pluginCards": {
+    "upgrade": "升级",
+    "upgrading": "升级中…",
+    "upgraded_restart": "插件已升级，请重启 CCR 以启用新版本。",
     "area_label": "供应商插件管理卡片",
     "manifest_failed": "无法加载已安装的供应商插件列表。请确认 CCR 服务正在运行，然后重新加载本页面。",
     "unavailable_title": "{{name}} 已安装但不可用",
@@ -651,6 +654,14 @@
     "dismiss": "知道了",
     "retry": "重试",
     "error_generic": "安装失败（{{code}}）。请稍后重试，或在终端使用 `ccr plugin add` 安装。",
-    "error_local_only": "安装只能在运行 CCR 的本机（localhost）上进行。请在本机的管理界面操作，或在终端执行 `ccr plugin add`。"
+    "error_local_only": "安装只能在运行 CCR 的本机（localhost）上进行。请在本机的管理界面操作，或在终端执行 `ccr plugin add`。",
+    "installed_title": "已安装插件",
+    "available_title": "可安装插件",
+    "version_ok": "v{{version}} · 已安装",
+    "version_outdated": "v{{installed}} → v{{latest}}",
+    "update": "升级",
+    "updating": "升级中…",
+    "local_only": "本地安装",
+    "empty_available": "市场中的插件均已安装。"
   }
 }
