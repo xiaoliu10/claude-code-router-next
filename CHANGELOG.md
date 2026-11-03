@@ -4,6 +4,62 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2422] - 2026-11-03
+
+### Fixed
+
+- **send-level plugin failures were mislabelled as bad upstream responses**: when a
+  provider plugin's fetch failed before any HTTP status existed (local proxy down,
+  DNS, TLS, timeout), the pipeline reported a generic "invalid upstream response".
+  Status-0 send failures are now classified as `plugin_network_error` with bounded,
+  sanitized transport diagnostics taken from the cause chain (error code plus
+  host:port), so a flapping local proxy no longer reads like a plugin bug.
+- **the recovery probe could be starved by its own failure timestamp**: the managed
+  recovery gate waited on `max(lastFailureTime, lastProbeTime)`, so a provider whose
+  failures kept refreshing `lastFailureTime` — half-open traffic on a flapping proxy —
+  never became due for a probe and the circuit never self-healed. The gate now uses
+  `lastProbeTime` only.
+
+### Added
+
+- **last failure time on the home failure banner**: provider rows now show when the
+  recorded failure last occurred (locale-aware `providers.last_failure_at`), so a
+  stale red banner is distinguishable from an ongoing outage.
+
+### Housekeeping
+
+- reconciled `main` with shipped reality: merged the stacked release lanes
+  (#95-#100), including the workspace-root `private` guard, the codex 1.0.10
+  prompt-cache-key anchor (repairs sessionless clients whose cache-hit rate
+  collapsed to ~10%), the qoder 0.3.x check-in + card-family line, and plugin
+  version alignment (codex 1.0.10, qoder 0.3.3).
+
+## [2.3.2422] - 2026-11-03（中文）
+
+### 修复
+
+- **send 级插件失败被误报为上游响应异常**：provider 插件的 fetch 在拿到任何
+  HTTP 状态之前就失败（本地代理拒连、DNS、TLS、超时）时，链路只报笼统的
+  "invalid upstream response"。status 0 的发送失败现在归类为
+  `plugin_network_error`，并附带上界受控、严格消毒的传输诊断（cause 链中的
+  错误码 + host:port）——本地代理抖动不再看起来像插件坏了。
+- **恢复探活会被自己的失败时间饿死**：受托恢复门控等待
+  `max(lastFailureTime, lastProbeTime)`，而失败会不断刷新 `lastFailureTime`
+  （抖动代理上的半开流量正是如此），导致探活永远不到期、熔断永不自愈。
+  现在门控只看 `lastProbeTime`。
+
+### 新增
+
+- **首页失败横幅显示最后失败时间**：provider 行现在展示最近一次记录失败的
+  时间（locale 化的 `providers.last_failure_at`），过期红条与持续故障一眼可分。
+
+### 整理
+
+- `main` 与已发运状态对齐：合并堆积的 release lane（#95-#100），包括
+  workspace 根 `private` 守卫、codex 1.0.10 prompt-cache-key 锚定（修复无会话
+  客户端缓存命中跌至约 10% 的问题）、qoder 0.3.x 签到与卡片家族线，以及插件
+  版本对齐（codex 1.0.10、qoder 0.3.3）。
+
 ## [2.3.2421] - 2026-10-31
 
 ### Fixed
