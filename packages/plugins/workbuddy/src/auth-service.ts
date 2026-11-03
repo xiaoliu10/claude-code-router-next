@@ -1,3 +1,4 @@
+import { WorkBuddyAutoCheckin, type WorkBuddyAutoCheckinState } from "./auto-checkin";
 /**
  * WorkBuddy (CN + international) managed-provider authorization service.
  *
@@ -171,6 +172,7 @@ export interface WorkBuddySiteStatus {
   renewalMode: "desktop" | "browser";
 }
 export interface WorkBuddyPoolStatus {
+  autoCheckin?: WorkBuddyAutoCheckinState;
   sites: Partial<Record<WorkBuddySiteId, WorkBuddySiteStatus>>;
   connectedSites: WorkBuddySiteId[];
 }
@@ -229,6 +231,7 @@ export interface WorkBuddyServiceOptions {
   host: WorkBuddyServiceHost;
   logger?: any;
   fetch?: WorkBuddyFetch;
+  autoCheckinRandom?: () => number;
   /** Credential store + source reader injection (tests only; production uses
    *  the fixed CCR-private path built by plugin.ts and the fixed desktop login
    *  path). The store is REQUIRED: a plugin never guesses the config dir. */
@@ -403,7 +406,24 @@ export class WorkBuddyAuthService {
   /** Memory-only renewed desktop credentials, keyed by snapshot generation. Never persisted. */
   private desktopRenewals = new Map<string, WorkBuddyCredential>();
 
-  constructor(private readonly options: WorkBuddyServiceOptions) {}
+  private readonly autoCheckin: WorkBuddyAutoCheckin;
+  constructor(private readonly options: WorkBuddyServiceOptions) {
+    this.autoCheckin = new WorkBuddyAutoCheckin({
+      load: async () => (await this.store.loadData())?.autoCheckin,
+      update: transform => this.enqueueMutation(async () => {
+        const data = (await this.store.ensureV2OnDisk())?.data ?? { version: 2 as const, sites: {} };
+        data.autoCheckin = transform(data.autoCheckin);
+        await this.store.saveData(data);
+        return data.autoCheckin;
+      }),
+      attempt: () => this.checkin(),
+      logger: { warn: message => this.log.warn(message) },
+      random: options.autoCheckinRandom,
+    });
+  }
+
+  scheduleAutoCheckin(): Promise<void> { return this.autoCheckin.scheduleAutoCheckin(); }
+  stopAutoCheckin(): void { this.autoCheckin.stop(); }
 
   private get log(): any {
     return this.options.logger ?? console;
@@ -525,7 +545,8 @@ export class WorkBuddyAuthService {
         renewalMode: active.source === "browser" ? "browser" : "desktop",
       };
     }
-    return { sites, connectedSites: (await this.connectedSites()) as WorkBuddySiteId[] };
+    return { sites, connectedSites: (await this.connectedSites()) as WorkBuddySiteId[],
+      ...(data.autoCheckin ? { autoCheckin: data.autoCheckin } : {}) };
   }
 
   /**
@@ -1283,11 +1304,13 @@ export class WorkBuddyAuthService {
     if (options.expectedActiveUid !== undefined && options.expectedActiveUid !== uid) {
       throw new WorkBuddyActiveAccountChangedError();
     }
-    if (!account) return { uid, outcome: "failed", message: "Not signed in" };
-    // Snapshot the active identity once. Never let inference selection rotate
-    // this explicit account operation to a backup account.
-    return { ...await checkinOf(this.withSite("workbuddy", account), this.fetchImpl,
-      this.options.host.getSubscriptionDispatcher?.() ?? this.options.host.getDirectDispatcher(), options), uid };
+    return this.autoCheckin.execute(async () => {
+      if (!account) return { uid, outcome: "failed" as const, message: "Not signed in" };
+      // Snapshot the active identity once. Never let inference selection rotate
+      // this explicit account operation to a backup account.
+      return { ...await checkinOf(this.withSite("workbuddy", account), this.fetchImpl,
+        this.options.host.getSubscriptionDispatcher?.() ?? this.options.host.getDirectDispatcher(), options), uid };
+    });
   }
 
   // -------------------------------------------------------------- credits ---

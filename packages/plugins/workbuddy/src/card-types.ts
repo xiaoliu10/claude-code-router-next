@@ -1,3 +1,4 @@
+import type { WorkBuddyAutoCheckinState } from "./auto-checkin";
 /**
  * WorkBuddy UI API payload types, SELF-CONTAINED copies of the former
  * `packages/ui/src/types.ts` WorkBuddy declarations (the UI deletes them at
@@ -47,6 +48,7 @@ export interface WorkBuddySiteStatus {
 }
 
 export interface WorkBuddyStatusResponse {
+  autoCheckin?: WorkBuddyAutoCheckinState;
   // §16 source of truth: one independent entry per site.
   sites: Partial<Record<WorkBuddyKind, WorkBuddySiteStatus>>;
   // Legacy flat mirror of the only connected site. Kept one version for
