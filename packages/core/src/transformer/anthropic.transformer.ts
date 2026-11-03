@@ -1,4 +1,3 @@
-import { getUsageCacheCreationInputTokens, mergeUsageCapture } from "../ccr/usage-merge";
 import { ChatCompletion } from "openai/resources";
 import {
   LLMProvider,
@@ -22,6 +21,7 @@ import {
 import { formatBase64 } from "@/utils/image";
 import { convertToAnthropic } from "@/utils/converter";
 import { modelSupportsImages } from "@/utils/router";
+import { getUsageCacheCreationInputTokens, mergeUsageCapture } from "../ccr/usage-merge";
 
 /**
  * Read a client's thinking switch. "adaptive" and boolean true both mean the
@@ -693,13 +693,8 @@ export class AnthropicTransformer implements Transformer {
                   continue;
                 }
 
-                // A chunk may echo a placeholder instead of a real model (some
-                // gateways send "unknown" or an empty string). Accepting it would
-                // overwrite the good routed name this stream already carries, so
-                // only a real, non-placeholder value wins.
-                if (chunk.model && chunk.model !== "unknown") {
-                  model = chunk.model;
-                }
+                // Never downgrade to the "unknown" placeholder if a chunk omits/empties the model.
+                model = (chunk.model && chunk.model !== "unknown") ? chunk.model : model;
 
                 if (!hasStarted && !isClosed && !hasFinished) {
                   hasStarted = true;
@@ -794,7 +789,8 @@ export class AnthropicTransformer implements Transformer {
                       stopReasonMessageDelta.usage = {
                         input_tokens: incomingUsage.input_tokens || prev.input_tokens || 0,
                         output_tokens: incomingUsage.output_tokens || prev.output_tokens || 0,
-                        cache_read_input_tokens: incomingUsage.cache_read_input_tokens || prev.cache_read_input_tokens || 0,
+                        cache_read_input_tokens:
+                          incomingUsage.cache_read_input_tokens || prev.cache_read_input_tokens || 0,
                       };
                     }
                   }

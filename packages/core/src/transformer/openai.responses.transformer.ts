@@ -49,6 +49,13 @@ interface ResponsesStreamEvent {
   type: string;
   item_id?: string;
   output_index?: number;
+  summary_index?: number;
+  annotation?: {
+    url?: string;
+    title?: string;
+    start_index?: number;
+    end_index?: number;
+  };
   delta?:
     | string
     | {
@@ -72,38 +79,51 @@ interface ResponsesStreamEvent {
   response?: {
     id?: string;
     model?: string;
+    status?: string;
     output?: Array<{
       type: string;
     }>;
+    usage?: ResponsesAPIPayload["usage"];
+    error?: { code?: string; message?: string } | null;
+    incomplete_details?: { reason?: string } | null;
   };
+  message?: string;
+  error?: { code?: string; message?: string } | null;
   reasoning_summary?: string; // 添加推理摘要支持
 }
 
-/** Responses usage → chat-completions usage. Cache counters are read from the
- *  Responses detail objects so cache hits are not silently lost. */
-function toChatUsage(usage: any): Record<string, number> | undefined {
-  if (!usage || typeof usage !== "object") return undefined;
-  const promptTokens = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0) || 0;
-  const completionTokens = Number(usage.output_tokens ?? usage.completion_tokens ?? 0) || 0;
-  const cached = Number(
-    usage.input_tokens_details?.cached_tokens ??
-    usage.prompt_tokens_details?.cached_tokens ??
-    usage.cache_read_input_tokens ?? 0
-  ) || 0;
-  const cacheWrite = Number(
-    usage.input_tokens_details?.cache_write_tokens ??
-    usage.input_tokens_details?.cache_creation_tokens ??
-    usage.cache_creation_input_tokens ?? 0
-  ) || 0;
-  return {
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    total_tokens: Number(usage.total_tokens ?? promptTokens + completionTokens) || 0,
-    prompt_tokens_details: { cached_tokens: cached, cache_write_tokens: cacheWrite },
-    completion_tokens_details: {
-      reasoning_tokens: Number(usage.output_tokens_details?.reasoning_tokens ?? 0) || 0,
-    },
-  };
+/**
+ * Response protocol the CLIENT expects for this attempt. Routes derive it from
+ * the client (endpoint + user agent) so the transformer chain knows which wire
+ * format to hand back instead of guessing from the upstream payload alone.
+ */
+export type ResponsesClientFormat = "responses" | "chat" | "anthropic";
+
+/**
+ * Detect which native Responses SSE event types are present in a (possibly
+ * incomplete) peeked prefix. Point-name matching alone misclassifies streams
+ * whose first meaningful frame is a reasoning / function-call event.
+ */
+function peekedResponsesEventTypes(prefix: string): Set<string> {
+  const types = new Set<string>();
+  for (const line of prefix.split(/\r?\n/)) {
+    // Fold both a literal `"type":"x"` and a JSON-escaped `\"type\":\"x\"`
+    // occurrence down to one spelling before matching.
+    const normalized = line.replace(/\\"/g, '"');
+    for (const match of normalized.matchAll(/"type"\s*:\s*"(response\.[A-Za-z0-9_.]+)"/g)) {
+      types.add(match[1]);
+    }
+    const named = line.match(/^event:\s*(response\.[A-Za-z0-9_.]+)/);
+    if (named) types.add(named[1]);
+  }
+  return types;
+}
+
+function looksLikeResponsesSSE(prefix: string): boolean {
+  for (const type of peekedResponsesEventTypes(prefix)) {
+    if (type.startsWith("response.")) return true;
+  }
+  return false;
 }
 
 export class OpenAIResponsesTransformer implements Transformer {
@@ -297,7 +317,10 @@ export class OpenAIResponsesTransformer implements Transformer {
     return request;
   }
 
-  async transformResponseOut(response: Response, context?: any): Promise<Response> {
+  async transformResponseOut(
+    response: Response,
+    context?: any
+  ): Promise<Response> {
     const contentType = response.headers.get("Content-Type") || "";
 
     // Some upstreams return SSE under an UNLABELED (or garbage) content-type —
@@ -316,7 +339,7 @@ export class OpenAIResponsesTransformer implements Transformer {
             "content-type": "text/event-stream",
           }),
         });
-        return this.transformResponseOut(rebuilt);
+        return this.transformResponseOut(rebuilt, context);
       }
       if (peeked?.body) {
         response = new Response(peeked.body, {
@@ -347,7 +370,7 @@ export class OpenAIResponsesTransformer implements Transformer {
             "content-type": "text/event-stream",
           }),
         });
-        return this.transformResponseOut(rebuilt);
+        return this.transformResponseOut(rebuilt, context);
       }
       if (peeked?.body) {
         // Genuine JSON (or at least not SSE) — put the unread body back.
@@ -361,7 +384,7 @@ export class OpenAIResponsesTransformer implements Transformer {
         // reclassify; a locked-body SSE mislabel still needs the SSE path.
         const drained = await readBodyForSSE(response);
         if (drained.isSSE) {
-          return this.transformResponseOut(drained.response);
+          return this.transformResponseOut(drained.response, context);
         }
         response = drained.response;
       }
@@ -413,33 +436,25 @@ export class OpenAIResponsesTransformer implements Transformer {
       // corrupts Anthropic events, causing Codex to receive malformed SSE.
       const [peekStream, bodyStream] = response.body.tee();
       const peekReader = peekStream.getReader();
-      const peekDecoder = new TextDecoder();
       let firstChunk = "";
-      // Accumulate before classifying: proxy exit nodes and middleboxes split
-      // the first SSE frame across several small chunks, so a single read can
-      // miss every format marker ("event: resp" alone matches nothing) and
-      // route a Responses stream into the Chat converter, which then emits a
-      // complete-but-empty Anthropic message. Read until a marker shows up,
-      // the frame is clearly unclassifiable, or a bounded budget is spent.
-      const formatMarkers = [
-        "message_start",
-        "content_block_start",
-        "response.created",
-        "response.output_text.delta",
-        "response.in_progress",
-        "response.output_item.added",
-        "chat.completion.chunk",
-      ];
+      const peekDecoder = new TextDecoder();
       try {
-        for (let i = 0; i < 8; i++) {
+        // A single read is not enough: a heartbeat or a frame split before the
+        // `response.*` token would misclassify a native Responses stream and
+        // hand it raw to an Anthropic client. Accumulate a bounded prefix,
+        // stopping as soon as the protocol is identifiable.
+        for (let reads = 0; reads < 8 && firstChunk.length < 65536; reads++) {
           const { value, done } = await peekReader.read();
           if (done) break;
           if (value) firstChunk += peekDecoder.decode(value, { stream: true });
-          if (formatMarkers.some((m) => firstChunk.includes(m))) break;
-          // A leading "{" means JSON, not SSE — stop accumulating.
-          if (/^\s*[{[]/.test(firstChunk)) break;
+          if (
+            looksLikeResponsesSSE(firstChunk) ||
+            firstChunk.includes("message_start") ||
+            firstChunk.includes("content_block_start") ||
+            firstChunk.includes("chat.completion.chunk") ||
+            /^\s*[{[]/.test(firstChunk)
+          ) break;
         }
-        firstChunk += peekDecoder.decode();
       } finally {
         peekReader.releaseLock();
       }
@@ -458,19 +473,21 @@ export class OpenAIResponsesTransformer implements Transformer {
         });
       }
 
-      // Also pass through if the upstream already speaks Responses API natively.
-      // The downstream transformResponseIn will detect and handle it.
-      const isAlreadyResponsesAPI = firstChunk.includes("response.created") ||
-        firstChunk.includes("response.output_text.delta") ||
-        firstChunk.includes("response.in_progress") ||
-        firstChunk.includes("response.output_item.added");
-      // Pass through native Responses SSE ONLY for Responses-format clients
-      // (codex CLI / ZCode detected by headers). For every other client the
-      // generic Responses→Chat converter below is required: the Anthropic
-      // transformer's Chat→Anthropic converter cannot parse Responses frames
-      // (no choices[]), and feeding them through produced a complete-but-empty
-      // Anthropic message — the "codex 0-output" disease.
-      if (isAlreadyResponsesAPI && context?.req?.codexDetected) {
+      // Also handle upstream payloads that already speak the Responses API
+      // natively. When the client expects the Responses protocol (or the caller
+      // gave no hint at all) pass it through untouched. When the client needs the
+      // unified Chat/Anthropic shape, hand it to the converter below — leaving it
+      // untouched made the Anthropic transformer parse Responses events as Chat
+      // chunks (no model, no choices): model "unknown", zero content, and a
+      // synthesized empty success at EOF.
+      if (looksLikeResponsesSSE(firstChunk)) {
+        // EVERY non-Responses client needs the unified Chat shape: `chat` for
+        // Chat clients, `anthropic` for /v1/messages (pi, Claude Code). Gating on
+        // "chat" alone left the anthropic target on the pass-through path, so a
+        // real pi request still received an empty "unknown" turn.
+        if (this.getClientFormat(context) !== "responses") {
+          return this.buildResponsesToChatStream(bodyStream, context);
+        }
         return new Response(bodyStream, {
           status: response.status,
           statusText: response.statusText,
@@ -478,398 +495,13 @@ export class OpenAIResponsesTransformer implements Transformer {
         });
       }
 
-      // OpenAI Chat SSE — proceed with Responses API → Chat conversion below.
-      // bodyStream still contains the peeked first chunk, so feed it straight
-      // into the converter without re-prepending anything.
-
-      const decoder = new TextDecoder();
-      const encoder = new TextEncoder();
-      // Stable fallback label for chunks that arrive before the upstream sends
-      // its own model field: the routed model, never a hardcoded placeholder.
-      // `body.model` is the routed model here (see getRequestModel in the
-      // request pipeline); `req.model` is the pre-routing name, so it must come
-      // second — putting it first made early chunks advertise the client's own
-      // "ccr-opus" and, when the routed name was absent, the "unknown"
-      // placeholder leaked back into usage rows.
-      const requestModel = String(
-        (context?.req?.body as any)?.model ??
-          (context?.req as any)?.model ??
-          (context?.req as any)?.originalModel ??
-          "unknown"
-      );
-      let buffer = ""; // Buffer for incomplete lines
-      let isStreamEnded = false;
-
-      const transformer = this;
-      const stream = new ReadableStream({
-        async start(controller) {
-          const reader = bodyStream.getReader();
-
-          // Index tracking — only increments when event type changes
-          let currentIndex = -1;
-          let lastEventType = "";
-
-          const getCurrentIndex = (eventType: string) => {
-            if (eventType !== lastEventType) {
-              currentIndex++;
-              lastEventType = eventType;
-            }
-            return currentIndex;
-          };
-
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) {
-                if (!isStreamEnded) {
-                  // 发送结束标记
-                  const doneChunk = `data: [DONE]\n\n`;
-                  controller.enqueue(encoder.encode(doneChunk));
-                }
-                break;
-              }
-
-              const chunk = decoder.decode(value, { stream: true });
-              buffer += chunk;
-
-              // 处理缓冲区中完整的数据行
-              let lines = buffer.split(/\r?\n/);
-              buffer = lines.pop() || ""; // 最后一行可能不完整，保留在缓冲区
-
-              for (const line of lines) {
-                if (!line.trim()) continue;
-
-                try {
-                  if (line.startsWith("event: ")) {
-                    // 处理事件行，暂存以便与下一行数据配对
-                    continue;
-                  } else if (line.startsWith("data: ")) {
-                    const dataStr = line.slice(5).trim(); // 移除 "data: " 前缀
-                    if (dataStr === "[DONE]") {
-                      isStreamEnded = true;
-                      controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
-                      continue;
-                    }
-
-                    try {
-                      const data: ResponsesStreamEvent = JSON.parse(dataStr);
-
-                      // 根据不同的事件类型转换为chat格式
-                      if (data.type === "response.output_text.delta") {
-                        // 将output_text.delta转换为chat格式
-                        const chatChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model,
-                          choices: [
-                            {
-                              index: getCurrentIndex(data.type),
-                              delta: {
-                                content: data.delta || "",
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(chatChunk)}\n\n`
-                          )
-                        );
-                      } else if (
-                        data.type === "response.output_item.added" &&
-                        data.item?.type === "function_call"
-                      ) {
-                        // 处理function call开始 - 创建初始的tool call chunk
-                        const functionCallChunk = {
-                          id:
-                            data.item.call_id ||
-                            data.item.id ||
-                            "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || requestModel,
-                          choices: [
-                            {
-                              index: getCurrentIndex(data.type),
-                              delta: {
-                                role: "assistant",
-                                tool_calls: [
-                                  {
-                                    index: 0,
-                                    id: data.item.call_id || data.item.id,
-                                    function: {
-                                      name: data.item.name || "",
-                                      arguments: "",
-                                    },
-                                    type: "function",
-                                  },
-                                ],
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(functionCallChunk)}\n\n`
-                          )
-                        );
-                      } else if (
-                        data.type === "response.output_item.added" &&
-                        data.item?.type === "message"
-                      ) {
-                        // 处理message item added事件
-                        const contentItems: MessageContent[] = [];
-                        (data.item.content || []).forEach((item: any) => {
-                          if (item.type === "output_text") {
-                            contentItems.push({
-                              type: "text",
-                              text: item.text || "",
-                            });
-                          }
-                        });
-
-                        const delta: any = { role: "assistant" };
-                        if (
-                          contentItems.length === 1 &&
-                          contentItems[0].type === "text"
-                        ) {
-                          delta.content = contentItems[0].text;
-                        } else if (contentItems.length > 0) {
-                          delta.content = contentItems;
-                        }
-                        if (delta.content) {
-                          const messageChunk = {
-                            id: data.item.id || "chatcmpl-" + Date.now(),
-                            object: "chat.completion.chunk",
-                            created: Math.floor(Date.now() / 1000),
-                            model: data.response?.model,
-                            choices: [
-                              {
-                                index: getCurrentIndex(data.type),
-                                delta,
-                                finish_reason: null,
-                              },
-                            ],
-                          };
-
-                          controller.enqueue(
-                            encoder.encode(
-                              `data: ${JSON.stringify(messageChunk)}\n\n`
-                            )
-                          );
-                        }
-                      } else if (
-                        data.type === "response.output_text.annotation.added"
-                      ) {
-                        const annotationChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || requestModel,
-                          choices: [
-                            {
-                              index: getCurrentIndex(data.type),
-                              delta: {
-                                annotations: [
-                                  {
-                                    type: "url_citation",
-                                    url_citation: {
-                                      url: data.annotation?.url || "",
-                                      title: data.annotation?.title || "",
-                                      content: "",
-                                      start_index:
-                                        data.annotation?.start_index || 0,
-                                      end_index:
-                                        data.annotation?.end_index || 0,
-                                    },
-                                  },
-                                ],
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(annotationChunk)}\n\n`
-                          )
-                        );
-                      } else if (
-                        data.type === "response.function_call_arguments.delta"
-                      ) {
-                        // 处理function call参数增量
-                        const functionCallChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || requestModel,
-                          choices: [
-                            {
-                              index: getCurrentIndex(data.type),
-                              delta: {
-                                tool_calls: [
-                                  {
-                                    index: 0,
-                                    function: {
-                                      arguments: data.delta || "",
-                                    },
-                                  },
-                                ],
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(functionCallChunk)}\n\n`
-                          )
-                        );
-                      } else if (data.type === "response.completed") {
-                        // 发送结束标记 - 检查是否是tool_calls完成
-                        const finishReason = data.response?.output?.some(
-                          (item: any) => item.type === "function_call"
-                        )
-                          ? "tool_calls"
-                          : "stop";
-
-                        const endChunk = {
-                          id: data.response?.id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || requestModel,
-                          choices: [
-                            {
-                              index: 0,
-                              delta: {},
-                              finish_reason: finishReason,
-                            },
-                          ],
-                          // Carry the upstream usage on the terminal chunk, the
-                          // only place chat-completions allows it. Dropping it
-                          // here made every codex turn record output_tokens 0
-                          // (and no cache counters) even though the stream was
-                          // healthy — usage was simply never propagated.
-                          ...(data.response?.usage ? { usage: toChatUsage(data.response.usage) } : {}),
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(endChunk)}\n\n`
-                          )
-                        );
-                        isStreamEnded = true;
-                      } else if (
-                        data.type === "response.reasoning_summary_text.delta"
-                      ) {
-                        // 处理推理文本，将其转换为 thinking delta 格式
-                        const thinkingChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model,
-                          choices: [
-                            {
-                              index: getCurrentIndex(data.type),
-                              delta: {
-                                thinking: {
-                                  content: data.delta || "",
-                                },
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(thinkingChunk)}\n\n`
-                          )
-                        );
-                      } else if (
-                        data.type === "response.reasoning_summary_part.done" &&
-                        data.part
-                      ) {
-                        const thinkingChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model,
-                          choices: [
-                            {
-                              index: currentIndex,
-                              delta: {
-                                thinking: {
-                                  signature: data.item_id,
-                                },
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(thinkingChunk)}\n\n`
-                          )
-                        );
-                      }
-                    } catch (e) {
-                      // 如果JSON解析失败，传递原始行
-                      controller.enqueue(encoder.encode(line + "\n"));
-                    }
-                  } else {
-                    // 传递其他行
-                    controller.enqueue(encoder.encode(line + "\n"));
-                  }
-                } catch (error) {
-                  console.error("Error processing line:", line, error);
-                  // 如果解析失败，直接传递原始行
-                  controller.enqueue(encoder.encode(line + "\n"));
-                }
-              }
-            }
-
-            // 处理缓冲区中剩余的数据
-            if (buffer.trim()) {
-              controller.enqueue(encoder.encode(buffer + "\n"));
-            }
-
-            // 确保流结束时发送结束标记
-            if (!isStreamEnded) {
-              const doneChunk = `data: [DONE]\n\n`;
-              controller.enqueue(encoder.encode(doneChunk));
-            }
-          } catch (error) {
-            console.error("Stream error:", error);
-            controller.error(error);
-          } finally {
-            try {
-              reader.releaseLock();
-            } catch (e) {
-              console.error("Error releasing reader lock:", e);
-            }
-            controller.close();
-          }
-        },
-      });
-
-      return new Response(stream, {
+      // Neither Anthropic nor native Responses SSE: an upstream that already
+      // emits Chat chunks, or a payload of unknown shape, passes through
+      // untouched. bodyStream still contains the peeked first chunk.
+      return new Response(bodyStream, {
         status: response.status,
         statusText: response.statusText,
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-          "Access-Control-Allow-Origin": "*",
-        },
+        headers: response.headers,
       });
     }
 
@@ -903,6 +535,446 @@ export class OpenAIResponsesTransformer implements Transformer {
     return null;
   }
 
+  /**
+   * Resolve which protocol the client of THIS attempt expects. Routes set
+   * `responseTargetFormat` per attempt (client, not upstream). An unset format
+   * is backward compatible with the historical behavior: native Responses
+   * streams pass through untouched.
+   */
+  private getClientFormat(context?: any): ResponsesClientFormat {
+    const format = context?.responseTargetFormat;
+    if (format === "responses" || format === "chat" || format === "anthropic") {
+      return format;
+    }
+    return "responses";
+  }
+
+  /**
+   * Convert a native Responses API SSE stream into Chat-completion chunks so a
+   * Chat/Anthropic client can consume it. Model identity comes from the
+   * `response` envelope of created/in_progress/completed events, terminal usage
+   * from `response.completed`, and each function call keeps its own tool_call
+   * index. A terminal failure is surfaced as an `error` event instead of an
+   * empty successful completion, and a stream that ends before any terminal
+   * event only reports `finish_reason` when it actually delivered content.
+   */
+  private buildResponsesToChatStream(
+    bodyStream: ReadableStream<Uint8Array>,
+    context?: any
+  ): Response {
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    const messageId = "chatcmpl-" + Date.now();
+    const model = context?.provider?.models?.[0];
+
+    let buffer = "";
+    let responseModel: string | undefined;
+    let responseId: string | undefined;
+    let terminalUsage: any;
+    let currentTextItemId: string | undefined;
+    let lastActivity = "";
+    const toolIndexByCallKey = new Map<string, number>();
+    const callIdByToolIndex = new Map<number, string>();
+    let nextToolIndex = 0;
+    let emittedError = false;
+    let finished = false;
+    let emittedDone = false;
+    const self = this;
+
+    const stream = new ReadableStream({
+      start(controller) {
+        const emitChunk = (delta: Record<string, any>, finishReason: string | null = null) => {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                id: responseId || messageId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: responseModel || model,
+                choices: [{ index: 0, delta, finish_reason: finishReason }],
+              })}\n\n`
+            )
+          );
+        };
+
+        const emitUsageChunk = (usage: any) => {
+          if (!usage) return;
+          const cacheRead = self.getCacheReadInputTokens(usage);
+          const rawInput =
+            typeof usage.input_tokens === "number" ? usage.input_tokens : undefined;
+          const cacheCreation = self.getCacheCreationInputTokens(usage);
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                id: responseId || messageId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: responseModel || model,
+                // Same key a Chat upstream uses, so downstream usage mapping
+                // (prompt_tokens_to_input_tokens minus cached) stays exact.
+                choices: [],
+                usage: {
+                  prompt_tokens: rawInput,
+                  completion_tokens:
+                    typeof usage.output_tokens === "number" ? usage.output_tokens : undefined,
+                  total_tokens: usage.total_tokens,
+                  prompt_tokens_details: {
+                    cached_tokens: cacheRead,
+                    cache_creation_tokens: cacheCreation,
+                  },
+                  cache_read_input_tokens: cacheRead,
+                  cache_creation_input_tokens: cacheCreation,
+                },
+              })}\n\n`
+            )
+          );
+        };
+
+        /**
+         * A terminal upstream failure. The same envelope as the Chat error path
+         * so AnthropicTransformer turns it into `event: error` and the request
+         * is recorded as failed instead of a clean, empty success.
+         */
+        const emitError = (message: string) => {
+          if (emittedError) return;
+          emittedError = true;
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                error: { message, type: "upstream_error" },
+                choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+              })}\n\n`
+            )
+          );
+        };
+
+        const finishOnce = (finishReason: string) => {
+          if (finished) return;
+          finished = true;
+          emitUsageChunk(terminalUsage);
+          emitChunk({}, finishReason);
+        };
+
+        const emitDone = () => {
+          if (emittedDone) return;
+          emittedDone = true;
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        };
+
+        const toolIndexFor = (item: any, outputIndex?: number) => {
+          // Identity is the call id when the event carries one: relays sometimes
+          // reuse output_index 0 for every tool call, and keying on position
+          // first would then merge two distinct calls into one tool_use block.
+          // Position is the fallback for `function_call_arguments.*` deltas,
+          // which carry only item_id/output_index.
+          const key =
+            item?.call_id || item?.id ||
+            (outputIndex !== undefined ? `idx_${outputIndex}` : undefined);
+          if (!key) return nextToolIndex++;
+          const existing = toolIndexByCallKey.get(key);
+          if (existing !== undefined) return existing;
+          const index = nextToolIndex++;
+          toolIndexByCallKey.set(key, index);
+          // Deltas address the call by item_id while `added` carries call_id:
+          // alias BOTH so the deltas join the existing block instead of opening
+          // a second (placeholder-id) block for the same call.
+          if (item?.call_id && item?.id) {
+            toolIndexByCallKey.set(item.id, index);
+            if (outputIndex !== undefined) {
+              toolIndexByCallKey.set(`idx_${outputIndex}`, index);
+            }
+          } else if (item?.id && outputIndex !== undefined) {
+            toolIndexByCallKey.set(`idx_${outputIndex}`, index);
+          }
+          return index;
+        };
+
+        /**
+         * Terminal frames may carry the WHOLE turn inline (non-streamed
+         * upstreams): function_call items and message text with no prior delta
+         * events. Emit them in upstream order — dropping them produced
+         * tool-use finishes with no tool block, or zero-content turns the
+         * empty-answer guard then 400s. Returns whether anything was emitted.
+         */
+        const emitInlineOutput = (output: any[]): boolean => {
+          let emitted = false;
+          for (const item of Array.isArray(output) ? output : []) {
+            if (item?.type === "function_call") {
+              lastActivity = "tool";
+              const index = toolIndexFor(item, undefined);
+              const id = item.call_id || item.id;
+              if (id) callIdByToolIndex.set(index, id);
+              emitChunk({
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index,
+                    id,
+                    type: "function",
+                    function: {
+                      name: item.name || "",
+                      arguments: typeof item.arguments === "string" ? item.arguments : "",
+                    },
+                  },
+                ],
+              });
+              emitted = true;
+            } else if (item?.type === "message") {
+              for (const part of Array.isArray(item.content) ? item.content : []) {
+                if (part?.type === "output_text" && typeof part.text === "string" && part.text.trim().length > 0) {
+                  lastActivity = "text";
+                  emitChunk({ role: "assistant", content: part.text });
+                  emitted = true;
+                }
+              }
+            }
+          }
+          return emitted;
+        };
+
+        const handleEvent = (data: ResponsesStreamEvent) => {
+          if (data?.response?.model) responseModel = data.response.model;
+          if (data?.response?.id) responseId = data.response.id;
+
+          switch (data?.type) {
+            case "response.output_item.added": {
+              const item: any = data.item;
+              if (item?.type !== "function_call") return;
+              lastActivity = "tool";
+              const index = toolIndexFor(item, data.output_index);
+              const id = item.call_id || item.id;
+              if (id) callIdByToolIndex.set(index, id);
+              emitChunk({
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index,
+                    id,
+                    type: "function",
+                    function: { name: item.name || "", arguments: "" },
+                  },
+                ],
+              });
+              return;
+            }
+            case "response.function_call_arguments.delta": {
+              // Each output item gets its own tool_call index; falling back to a
+              // per-item key would allocate a new index for every delta.
+              const index = toolIndexFor(
+                { id: data.item_id },
+                data.output_index
+              );
+              lastActivity = "tool";
+              const knownCallId = callIdByToolIndex.get(index);
+              emitChunk({
+                tool_calls: [
+                  {
+                    index,
+                    // Repeat the call id so a consumer that re-synthesizes a
+                    // block for this index does not invent a placeholder id.
+                    ...(knownCallId ? { id: knownCallId, type: "function" } : {}),
+                    function: { arguments: typeof data.delta === "string" ? data.delta : "" },
+                  },
+                ],
+              });
+              return;
+            }
+            case "response.output_text.annotation.added": {
+              // Web-search citations: forward as a Chat annotation delta so the
+              // Anthropic transformer can emit a web_search_tool_result block.
+              const annotation: any = data.annotation;
+              if (!annotation) return;
+              lastActivity = "annotation";
+              emitChunk({
+                annotations: [
+                  {
+                    type: "url_citation",
+                    url_citation: {
+                      url: annotation.url || "",
+                      title: annotation.title || "",
+                      content: "",
+                      start_index: annotation.start_index || 0,
+                      end_index: annotation.end_index || 0,
+                    },
+                  },
+                ],
+              });
+              return;
+            }
+            case "response.reasoning_summary_text.delta":
+            case "response.reasoning_text.delta": {
+              if (typeof data.delta !== "string" || data.delta.length === 0) return;
+              lastActivity = "thinking";
+              emitChunk({ thinking: { content: data.delta } });
+              return;
+            }
+            case "response.output_text.delta": {
+              if (typeof data.delta !== "string" || data.delta.length === 0) return;
+              lastActivity = "text";
+              const firstDeltaForItem = currentTextItemId !== data.item_id;
+              currentTextItemId = data.item_id;
+              const delta: Record<string, any> = { content: data.delta };
+              if (firstDeltaForItem) delta.role = "assistant";
+              emitChunk(delta);
+              return;
+            }
+            case "response.completed": {
+              terminalUsage = data.response?.usage;
+              const output: any[] = Array.isArray(data.response?.output) ? data.response.output : [];
+              const hasToolCall = output.some((item: any) => item?.type === "function_call");
+              // A terminal frame may carry the whole message inline (non-streamed
+              // or summary-style upstreams): no text delta ever fired, yet the
+              // answer is right there in output[]. Dropping it produced a clean
+              // turn with zero content — emit it here, once, before finishing.
+              if (lastActivity === "") emitInlineOutput(output);
+              // A "completed" turn that never delivered text, thinking or a tool
+              // call is NOT a success: reporting it as a clean finish is exactly
+              // the silent empty turn this converter exists to prevent.
+              if (!hasToolCall && lastActivity === "") {
+                const reason = String(data.response?.incomplete_details?.reason ?? "");
+                emitError(
+                  output.length === 0 && !reason
+                    ? "Upstream Responses stream completed with no output"
+                    : `Upstream Responses stream produced no content (${reason || "empty"})`
+                );
+                return;
+              }
+              finishOnce(
+                lastActivity === "tool" || hasToolCall ? "tool_calls" : "stop"
+              );
+              return;
+            }
+            case "response.incomplete": {
+              terminalUsage = data.response?.usage;
+              const reason = String(data.response?.incomplete_details?.reason ?? "");
+              // Same inline-message case as response.completed: a truncated
+              // non-delta stream still carries what it did produce.
+              if (lastActivity === "") {
+                emitInlineOutput(Array.isArray(data.response?.output) ? data.response.output : []);
+              }
+              const truncated =
+                reason === "max_output_tokens" || reason === "max_tokens";
+              if (lastActivity === "") {
+                emitError(
+                  `Upstream Responses stream produced no content (${reason || "incomplete"})`
+                );
+                return;
+              }
+              // `content_filter` must keep its signal: mapping it to `stop`
+              // reports a filtered turn as a clean end_turn.
+              finishOnce(
+                truncated ? "length" : reason === "content_filter" ? "content_filter" : "stop"
+              );
+              return;
+            }
+            case "response.failed": {
+              const failure =
+                data.response?.error || data.error || undefined;
+              emitError(
+                failure?.message ||
+                  "Upstream Responses stream failed before completing"
+              );
+              return;
+            }
+            case "error": {
+              emitError(
+                data.error?.message || data.message || "Upstream Responses stream error"
+              );
+              return;
+            }
+            default:
+              return;
+          }
+        };
+
+        const reader = bodyStream.getReader();
+
+        (async () => {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split(/\r?\n/);
+              buffer = lines.pop() || "";
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith(":") || trimmed.startsWith("event:")) {
+                  continue;
+                }
+                if (!trimmed.startsWith("data:")) continue;
+                const raw = trimmed.slice(5).trim();
+                if (!raw) continue;
+                if (raw === "[DONE]") {
+                  emitDone();
+                  continue;
+                }
+                let data: ResponsesStreamEvent;
+                try {
+                  data = JSON.parse(raw);
+                } catch {
+                  continue;
+                }
+                handleEvent(data);
+              }
+            }
+
+            buffer += decoder.decode();
+            if (buffer.trim().startsWith("data:")) {
+              const raw = buffer.trim().slice(5).trim();
+              if (raw && raw !== "[DONE]") {
+                try {
+                  handleEvent(JSON.parse(raw));
+                } catch {
+                  // partial trailing frame — ignore
+                }
+              }
+            }
+
+            // Early EOF: an error frame already speaks for itself. A turn that
+            // produced nothing gets an explicit error — never a clean finish,
+            // and never a silent empty "success".
+            if (!emittedError && !finished) {
+              if (lastActivity === "") {
+                emitError("Upstream Responses stream ended before any output");
+              } else {
+                finishOnce(lastActivity === "tool" ? "tool_calls" : "stop");
+              }
+            }
+            if (!emittedError) emitDone();
+          } catch (error) {
+            console.error("Responses→Chat stream error:", error);
+            try {
+              controller.error(error);
+            } catch {
+              // Already closed (client cancel raced the failure) — nothing to
+              // surface on a dead controller.
+            }
+            return;
+          } finally {
+            try {
+              reader.releaseLock();
+            } catch {}
+          }
+          try {
+            controller.close();
+          } catch {
+            // A cancel or an earlier error closed the controller first.
+          }
+        })();
+      },
+    });
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
+  }
+
   async transformResponseIn(
     response: Response,
     context?: any
@@ -915,28 +987,25 @@ export class OpenAIResponsesTransformer implements Transformer {
       // and route to the appropriate converter.
       const [peekStream, bodyStream] = response.body.tee();
       const reader = peekStream.getReader();
-      const inDecoder = new TextDecoder();
       let firstChunk = "";
-      // Same accumulate-until-classifiable rationale as transformResponseOut:
-      // one small first chunk must not misroute the whole stream.
-      const inFormatMarkers = [
-        "message_start",
-        "content_block_start",
-        "response.created",
-        "response.output_text.delta",
-        "response.in_progress",
-        "response.output_item.added",
-        "chat.completion.chunk",
-      ];
       try {
-        for (let i = 0; i < 8; i++) {
+        // Same accumulate-until-classifiable rationale as transformResponseOut:
+        // proxy exit nodes split the first SSE frame across small chunks, and a
+        // single read missed every marker — routing a native Responses stream
+        // into the wrong converter (the codex 0-output disease, 2463008).
+        for (let reads = 0; reads < 8 && firstChunk.length < 65536; reads++) {
           const { value, done } = await reader.read();
           if (done) break;
-          if (value) firstChunk += inDecoder.decode(value, { stream: true });
-          if (inFormatMarkers.some((m) => firstChunk.includes(m))) break;
-          if (/^\s*[{[]/.test(firstChunk)) break;
+          if (value) firstChunk += new TextDecoder().decode(value, { stream: true });
+          if (
+            looksLikeResponsesSSE(firstChunk) ||
+            firstChunk.includes("message_start") ||
+            firstChunk.includes("content_block_start") ||
+            firstChunk.includes("chat.completion.chunk") ||
+            /^\s*[{[]/.test(firstChunk)
+          ) break;
         }
-        firstChunk += inDecoder.decode();
+        firstChunk += new TextDecoder().decode();
       } finally {
         reader.releaseLock();
       }
@@ -948,11 +1017,16 @@ export class OpenAIResponsesTransformer implements Transformer {
       // Detect OpenAI Chat SSE by looking for "object":"chat.completion.chunk"
       const isOpenAIChat = firstChunk.includes("chat.completion.chunk");
       // Detect native Responses API SSE — upstream already speaks the Responses API format.
-      // Pass it through unchanged so Codex can parse it directly.
+      // Pass it through unchanged so Codex can parse it directly. The generic
+      // detector (any response.* event name, even a split-frame partial that
+      // truncated a specific marker like "response.created") is authoritative:
+      // the accumulate loop can break on that partial, and the four point
+      // checks alone would then misroute the stream to the wrong converter.
       const isResponsesAPI = firstChunk.includes("response.created") ||
         firstChunk.includes("response.output_text.delta") ||
         firstChunk.includes("response.in_progress") ||
-        firstChunk.includes("response.output_item.added");
+        firstChunk.includes("response.output_item.added") ||
+        looksLikeResponsesSSE(firstChunk);
 
       if (isResponsesAPI) {
         return new Response(bodyStream, {
@@ -1551,9 +1625,6 @@ export class OpenAIResponsesTransformer implements Transformer {
     const messageOutput = responseData.output?.find(
       (item) => item.type === "message"
     );
-    const functionCallOutput = responseData.output?.find(
-      (item) => item.type === "function_call"
-    );
     let annotations;
     if (
       messageOutput?.content?.length &&
@@ -1634,18 +1705,21 @@ export class OpenAIResponsesTransformer implements Transformer {
       }
     }
 
-    if (functionCallOutput) {
-      // 处理function_call类型的输出
-      toolCalls = [
-        {
-          id: functionCallOutput.call_id || functionCallOutput.id,
-          function: {
-            name: functionCallOutput.name,
-            arguments: functionCallOutput.arguments,
-          },
-          type: "function",
+    // EVERY function call must survive, not only the first one: a Responses
+    // turn routinely issues several parallel tool calls, and keeping just the
+    // first silently dropped the rest of the work.
+    const functionCallOutputs = (responseData.output ?? []).filter(
+      (item: any) => item.type === "function_call"
+    );
+    if (functionCallOutputs.length > 0) {
+      toolCalls = functionCallOutputs.map((call: any) => ({
+        id: call.call_id || call.id,
+        type: "function",
+        function: {
+          name: call.name,
+          arguments: call.arguments,
         },
-      ];
+      }));
     }
 
     // 构建chat格式的响应

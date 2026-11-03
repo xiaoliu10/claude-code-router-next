@@ -1,3 +1,5 @@
+import { checkinQoder, type QoderCheckinResult } from "./checkin";
+import { QoderAutoCheckin, validAutoCheckinState, type AutoCheckinState } from "./auto-checkin";
 import { constants } from "node:fs";
 import { open, mkdir, chmod, rename, rm, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -14,7 +16,7 @@ import { isQoderManaged, lockQoderProvider, qoderError, qoderSite, serializeQode
  */
 export interface QoderModelRecord { key: string; name: string; context: number; free: boolean }
 
-type Saved = { version: 1; credential: QoderCredential; models: QoderModelRecord[]; hiddenModels: string[] };
+type Saved = { version: 1; credential: QoderCredential; models: QoderModelRecord[]; hiddenModels: string[]; autoCheckin?: AutoCheckinState };
 export interface QoderServiceOptions {
   host: PluginHostCapabilities;
   fetch?: typeof fetch;
@@ -22,6 +24,9 @@ export interface QoderServiceOptions {
   site?: QoderSiteId;
   /** Test seam: inject a fake engine; the real one is built from the host dispatcher. */
   engine?: QoderEngine;
+  log?: { warn(message: string): void };
+  /** Test seam for scheduler jitter. */
+  rand?: () => number;
 }
 export interface QoderUsageSnapshot { known: boolean; stale: boolean; observedAt?: number;
   windows: Array<{ name: string; used: number; display: string }>; plan?: string; until?: string; coolingUntil?: number }
@@ -50,7 +55,8 @@ function validate(value: any): Saved {
     !field(c.access, 32768) || !softField(c.refresh, 32768) || !Number.isFinite(c.expires) ||
     !field(c.uid, 256) || !softField(c.email, 1024) || !softField(c.name, 1024) ||
     !field(c.accountId, 256) || !field(c.machineId, 128) || !validPAT(c.pat) ||
-    !validModelRecords(value.models) || !validModels(value.hiddenModels)) throw qoderError("qoder_credential_invalid");
+    !validModelRecords(value.models) || !validModels(value.hiddenModels) ||
+    (value.autoCheckin !== undefined && !validAutoCheckinState(value.autoCheckin))) throw qoderError("qoder_credential_invalid");
   return {
     version: 1,
     credential: {
@@ -59,6 +65,11 @@ function validate(value: any): Saved {
     },
     models: value.models.map((m: QoderModelRecord) => ({ key: m.key, name: m.name, context: m.context, free: m.free })),
     hiddenModels: [...new Set<string>(value.hiddenModels)],
+    ...(value.autoCheckin ? { autoCheckin: {
+      lastAttemptAt: value.autoCheckin.lastAttemptAt, lastAttemptDate: value.autoCheckin.lastAttemptDate,
+      retryCount: value.autoCheckin.retryCount,
+      lastResult: { outcome: value.autoCheckin.lastResult.outcome, at: value.autoCheckin.lastResult.at },
+    } } : {}),
   };
 }
 
@@ -96,6 +107,7 @@ export class QoderAuthService {
   private coolingUntil = 0;
   private usage?: QoderUsageSnapshot & { observedAt: number };
   private usageJob?: Promise<QoderUsageSnapshot>;
+  private readonly autoCheckin: QoderAutoCheckin;
   constructor(readonly options: QoderServiceOptions) {
     this.site = qoderSite(options.site);
     // The internal-refresh seam is wired BEFORE the engine exists. A PAT
@@ -124,6 +136,18 @@ export class QoderAuthService {
       site: this.site.id,
     });
     this.file = join(options.host.configDir, this.site.credentialFile);
+    this.autoCheckin = new QoderAutoCheckin(this.file, {
+      enabled: () => this.site.id === "qoder-cn" && !!this.saved && !this.disconnecting,
+      state: () => this.saved?.autoCheckin,
+      persist: state => this.mutate(current => ({ ...current, autoCheckin: state }), false),
+      checkin: () => this.checkin(), log: options.log, rand: options.rand,
+    });
+  }
+  /** Activation loads connected CN accounts even before the first admin/chat request. */
+  async scheduleAutoCheckin(): Promise<void> {
+    if (this.site.id !== "qoder-cn") return;
+    try { await this.load(); this.autoCheckin.scheduleAutoCheckin(); }
+    catch { this.options.log?.warn("Qoder auto check-in could not load account state"); }
   }
   /**
    * Persist a credential the engine rotated on its own during a request
@@ -157,6 +181,7 @@ export class QoderAuthService {
         this.saved = validate(JSON.parse(await handle.readFile("utf8")));
       } catch (e: any) { if (e?.code !== "ENOENT") throw qoderError("qoder_credential_unreadable", 500); }
       finally { await handle?.close(); }
+      this.autoCheckin.scheduleAutoCheckin();
     })().catch((error: unknown) => { this.loaded = undefined; throw error; });
     return this.loaded;
   }
@@ -249,6 +274,7 @@ export class QoderAuthService {
       try { await this.updateConfig(next); }
       catch (e) { await rm(this.file, { force: true }); this.saved = undefined; throw e; }
       this.expired = false; this.lastError = undefined; this.coolingUntil = 0;
+      this.autoCheckin.scheduleAutoCheckin();
       return { success: true };
     });
   }
@@ -356,6 +382,25 @@ export class QoderAuthService {
       return { success: true };
     });
   }
+  /** Manual check-in is independent of chat cooldown and model selection.
+   *  CN transactions join the exclusive lane so concurrent requests cannot
+   *  double-claim (the second observes the upstream's post-claim state).
+   *  The intl gate stays outside the lane: it does no network work and must
+   *  return immediately even while a CN transaction is queued. */
+  async checkin(): Promise<QoderCheckinResult> {
+    if (this.site.id === "qoder") return { outcome: "ineligible", message: "International check-in requires Qoder desktop device identity" };
+    return this.exclusive(async () => {
+      let result: QoderCheckinResult;
+      try {
+        const credential = await this.freshCredential();
+        result = await checkinQoder(credential, { site: this.site.id, host: this.options.host, fetch: this.options.fetch });
+      } catch {
+        result = { outcome: "failed", message: "Check-in requires a usable connected account" };
+      }
+      await this.autoCheckin.recordResult(result);
+      return result;
+    });
+  }
   async getUsage(): Promise<QoderUsageSnapshot> {
     await this.load();
     if (!this.saved || this.disconnecting) throw qoderError("qoder_not_connected", 409);
@@ -409,6 +454,7 @@ export class QoderAuthService {
       providerName: this.site.provider,
       account: saved ? maskEmail(saved.credential.email) ?? maskEmail(saved.credential.accountId) ?? undefined : undefined,
       models, modelCount: models.length,
+      ...(this.site.id === "qoder-cn" && saved?.autoCheckin ? { autoCheckin: saved.autoCheckin } : {}),
       ...(this.coolingUntil > Date.now() ? { coolingUntil: this.coolingUntil } : {}),
       ...(this.expired ? { expired: true } : {}),
       ...(this.lastError ? { lastError: this.lastError } : {}),
@@ -429,6 +475,7 @@ export class QoderAuthService {
       try { await this.updateConfig(); } catch (e) { this.disconnecting = false; throw e; }
       await rm(this.file, { force: true });
       this.saved = undefined;
+      this.autoCheckin.cancel();
       try { this.engine.dispose(); } catch { /* dispose never blocks teardown */ }
       this.usage = undefined; this.expired = false; this.lastError = undefined; this.coolingUntil = 0;
       this.disconnecting = false;

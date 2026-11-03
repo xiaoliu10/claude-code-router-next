@@ -4,6 +4,144 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2423] - 2026-11-03
+
+### Added
+
+- **new: Grok subscription provider plugin** (`@wengine-ai/ccr-provider-grok` 0.1.0): sign in with the official Grok CLI device flow or import an existing CLI login; the fixed `cli-chat-proxy.grok.com` Responses upstream, model management, usage windows and an admin card. Native Responses streams are converted per client format, so Chat and Anthropic clients work too.
+- **new: Cursor subscription provider plugin** (`@wengine-ai/ccr-provider-cursor` 0.1.0): browser PKCE, cursor-agent CLI import or API-key sign-in; HTTP/2 data plane that drops to HTTP/1 under the subscription proxy; managed Run lifecycle with retained tool continuations; model management and an admin card.
+- **automatic daily check-in/claim**: the Qoder CN card (0.3.4) and the WorkBuddy CN billing meter (1.0.2) now claim their daily credits on their own (startup jitter, next-midnight schedule, bounded same-day retries), with the manual button kept as an override and an auto-status line on the card.
+
+### Fixed
+
+- **the Responses stream converter now keys off the client, not the upstream payload**: routes set the client's expected format per attempt (`responseTargetFormat`) and a native Responses upstream is converted to the unified Chat shape for Chat/Anthropic clients while Codex keeps native pass-through. Previously the converter guessed from the upstream frames, which fed native Responses SSE straight to Anthropic clients and synthesized empty turns.
+- **terminal frames carrying the whole answer inline no longer lose it**: non-streamed Responses upstreams that put the message and tool calls only in `response.completed` now emit their text and tool blocks instead of a zero-content turn.
+- **split first SSE frames are classified correctly again**: the response-phase format peek accumulates bounded frames (proxy exit nodes split the first frame), fixing a regression that could misroute a native Responses stream into the wrong converter; a truncated partial marker (`event: response.cr`) is detected as Responses too.
+- **stream converter no longer double-closes its controller** when a client cancel races an upstream failure.
+- **short turns no longer record `upstream_model: unknown`**: the SSE converter's "unknown" placeholder label (used until the first chat chunk names the model) could be locked into the usage row on short Responses-leg streams; the capture now ignores placeholders/empties and the converter never downgrades an established model label. The third routing leg shows the real upstream model (or the routed model) again.
+
+## [2.3.2423] - 2026-11-03（中文）
+
+### 新增
+
+- **新增 Grok 订阅 provider 插件**（`@wengine-ai/ccr-provider-grok` 0.1.0）：官方 Grok CLI 设备码登录或导入已有 CLI 登录；固定 `cli-chat-proxy.grok.com` Responses 上游、模型管理、用量窗口与管理卡片。原生 Responses 流按客户端格式转换，Chat 与 Anthropic 客户端同样可用。
+- **新增 Cursor 订阅 provider 插件**（`@wengine-ai/ccr-provider-cursor` 0.1.0）：浏览器 PKCE、cursor-agent CLI 导入或 API Key 登录；HTTP/2 数据面，在订阅代理下自动降为 HTTP/1；托管 Run 生命周期（含保留的工具续跑）、模型管理与管理卡片。
+- **每日自动签到/领取**：Qoder 中国站卡片（0.3.4）与 WorkBuddy 中国站计费额度（1.0.2）现在会自动领取每日积分（启动抖动、次日午夜排程、当日有界重试），手动按钮保留为兜底，卡片新增自动状态行。
+
+### 修复
+
+- **Responses 流转换器改为按客户端而非上游载荷判断格式**：路由按每次尝试设置客户端期望格式（`responseTargetFormat`），原生 Responses 上游对 Chat/Anthropic 客户端统一转成 Chat 形态，Codex 仍保持原生透传。此前转换器靠上游帧猜测，会把原生 Responses SSE 直接塞给 Anthropic 客户端并合成空回合。
+- **终帧内联携带整段答案时不再丢失**：非流式 Responses 上游只在 `response.completed` 里放消息与工具调用时，现在会正常发出文本与工具块，而不是零内容回合。
+- **首个 SSE 帧被拆分时重新能正确分类**：响应阶段的格式探测改为有界累积（代理出口节点会拆开首帧），修复可能把原生 Responses 流误路由进错误转换器的回归；截断的部分标记（`event: response.cr`）也能识别为 Responses。
+- **客户端取消与上游失败竞态时，流转换器不再重复关闭 controller**。
+- **短回合不再记成 `upstream_model: unknown`**：SSE 转换器在首个带模型名的分块到达前使用 "unknown" 占位，短 Responses 腿上这个占位会被锁进用量行；现在捕获会忽略占位/空值、转换器也不会降级已建立的模型名，第三段路由重新显示真实上游模型（拿不到时回退路由模型）。
+
+## [2.3.2422] - 2026-11-03
+
+### Fixed
+
+- **send-level plugin failures were mislabelled as bad upstream responses**: when a
+  provider plugin's fetch failed before any HTTP status existed (local proxy down,
+  DNS, TLS, timeout), the pipeline reported a generic "invalid upstream response".
+  Status-0 send failures are now classified as `plugin_network_error` with bounded,
+  sanitized transport diagnostics taken from the cause chain (error code plus
+  host:port), so a flapping local proxy no longer reads like a plugin bug.
+- **the recovery probe could be starved by its own failure timestamp**: the managed
+  recovery gate waited on `max(lastFailureTime, lastProbeTime)`, so a provider whose
+  failures kept refreshing `lastFailureTime` — half-open traffic on a flapping proxy —
+  never became due for a probe and the circuit never self-healed. The gate now uses
+  `lastProbeTime` only.
+
+### Added
+
+- **last failure time on the home failure banner**: provider rows now show when the
+  recorded failure last occurred (locale-aware `providers.last_failure_at`), so a
+  stale red banner is distinguishable from an ongoing outage.
+
+### Housekeeping
+
+- reconciled `main` with shipped reality: merged the stacked release lanes
+  (#95-#100), including the workspace-root `private` guard, the codex 1.0.10
+  prompt-cache-key anchor (repairs sessionless clients whose cache-hit rate
+  collapsed to ~10%), the qoder 0.3.x check-in + card-family line, and plugin
+  version alignment (codex 1.0.10, qoder 0.3.3).
+
+## [2.3.2422] - 2026-11-03（中文）
+
+### 修复
+
+- **send 级插件失败被误报为上游响应异常**：provider 插件的 fetch 在拿到任何
+  HTTP 状态之前就失败（本地代理拒连、DNS、TLS、超时）时，链路只报笼统的
+  "invalid upstream response"。status 0 的发送失败现在归类为
+  `plugin_network_error`，并附带上界受控、严格消毒的传输诊断（cause 链中的
+  错误码 + host:port）——本地代理抖动不再看起来像插件坏了。
+- **恢复探活会被自己的失败时间饿死**：受托恢复门控等待
+  `max(lastFailureTime, lastProbeTime)`，而失败会不断刷新 `lastFailureTime`
+  （抖动代理上的半开流量正是如此），导致探活永远不到期、熔断永不自愈。
+  现在门控只看 `lastProbeTime`。
+
+### 新增
+
+- **首页失败横幅显示最后失败时间**：provider 行现在展示最近一次记录失败的
+  时间（locale 化的 `providers.last_failure_at`），过期红条与持续故障一眼可分。
+
+### 整理
+
+- `main` 与已发运状态对齐：合并堆积的 release lane（#95-#100），包括
+  workspace 根 `private` 守卫、codex 1.0.10 prompt-cache-key 锚定（修复无会话
+  客户端缓存命中跌至约 10% 的问题）、qoder 0.3.x 签到与卡片家族线，以及插件
+  版本对齐（codex 1.0.10、qoder 0.3.3）。
+
+## [2.3.2421] - 2026-10-31
+
+### Fixed
+
+- **plugin updates were never offered**: a plugin record stores the npm
+  *specifier* it was installed with (`@wengine-ai/ccr-provider-qoder@0.2.0`),
+  while catalog rows are keyed by bare package name. A pinned install therefore
+  matched no record, its row fell back to reading the local manifest version as
+  if it were the registry version, and `updateAvailable` could never become
+  true — so a stale local plugin looked up to date and no update affordance
+  ever appeared. The specifier tail is now stripped before matching.
+- **`upstream_model: unknown`**: the Responses lifecycle carries the model on
+  every event's `response` object, but the column was only read from
+  `response.completed`. A long stream that ended without a parsed terminal event
+  (client abort, truncated tail, proxy reconnect) recorded `unknown`, which the
+  UI rendered as a third routing leg naming nothing. The first non-empty
+  `response.model` is now captured, and the row falls back to the routed model
+  instead of a placeholder.
+- **pre-routing model in converted frames**: the Responses→Chat conversion
+  labelled early chunks with the pre-routing `body.model` (for a codex leg, the
+  client's own `ccr-opus`); it now prefers the routed model.
+
+### Added
+
+- **per-card upgrade button** in the plugin marketplace: an installed card whose
+  manifest version differs from the registry version shows an Update action that
+  reinstalls with `force`, surfaces progress, and refreshes the entry when done.
+
+## [2.3.2421] - 2026-10-31（中文）
+
+### Fixed
+
+- **插件更新永远发现不了**：插件记录里保存的是安装时的 npm **specifier**
+  （如 `@wengine-ai/ccr-provider-qoder@0.2.0`），而 catalog 行是按裸包名索引的。
+  带版本号的安装因此匹配不到记录，该行退化为把本地 manifest 版本当成 registry
+  版本，`updateAvailable` 永远不可能为 true——本地插件明明是旧版却显示已是最新，
+  升级按钮从不出现。现在匹配前会剥离 specifier 尾部版本号。
+- **`upstream_model` 写成 `unknown`**：Responses 生命周期的每个事件都在
+  `response` 对象里带 model，但该列只从 `response.completed` 读取。长流若在没有
+  解析到终止事件的情况下结束（客户端中断、尾包截断、代理重连），就会记成
+  `unknown`，UI 上表现为第三段路由链什么都没写。现在会捕获首个非空的
+  `response.model`，并在完全未回显时回退到路由模型而不是占位符。
+- **转换帧里的路由前模型名**：Responses→Chat 转换给早期分块贴的是路由前的
+  `body.model`（codex 腿上就是客户端自己的 `ccr-opus`），现在优先使用路由后模型。
+
+### Added
+
+- **插件市场卡片升级按钮**：已安装且 manifest 版本与 registry 版本不一致的卡片会
+  显示更新按钮，以 `force` 重装并展示进度，完成后刷新该条目。
+
 ## [2.3.2420] - 2026-10-31
 
 ### Fixed

@@ -1,0 +1,6 @@
+{
+  "name": "cursor",
+  "version": "0.1.0",
+  "coreApi": "1",
+  "description": "Cursor subscription provider (Pro, Pro+, Ultra, Teams): sign in with the browser, import the cursor-agent CLI sign-in or exchange a Cursor API key; requests run on the API cursor-agent talks to."
+}

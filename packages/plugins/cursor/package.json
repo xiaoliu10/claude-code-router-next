@@ -1,0 +1,32 @@
+{
+  "name": "@wengine-ai/ccr-provider-cursor",
+  "version": "0.1.0",
+  "description": "Cursor subscription provider: browser/CLI/API-key sign-in, Cursor agent-API data plane (HTTP/2 with an HTTP/1.1 fallback lane), model list, usage and admin routes.",
+  "type": "module",
+  "main": "dist/plugin.js",
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "claude-code-router",
+    "cursor",
+    "provider-plugin",
+    "ccr-provider-plugin"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.15",
+    "esbuild": "^0.25.1",
+    "fastify": "^5.4.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.2",
+    "vitest": "^4.1.9"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/*.json",
+    "dist/*.md"
+  ]
+}

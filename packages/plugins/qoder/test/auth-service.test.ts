@@ -407,6 +407,38 @@ describe("QoderAuthService isolated PAT lifecycle", () => {
 describe("QoderAuthService Qoder CN site", () => {
   const cnSite = QODER_SITES[1];
 
+  it("records manual check-in in auto state and round-trips it through credential writes at 0600", async () => {
+    const f = make(undefined, "qoder-cn");
+    f.service.options.fetch = vi.fn(async () => Response.json({ campaigns: [{
+      actionType: "CLAIM_BENEFIT", claimStatus: "CLAIMED", benefit: { amount: 20 },
+    }] }));
+    await f.service.connectPAT(PAT);
+    expect((await f.service.getStatus()).autoCheckin).toBeUndefined();
+    expect(await f.service.checkin()).toEqual({ outcome: "done", credit: 20 });
+    const state = (await f.service.getStatus()).autoCheckin;
+    expect(state).toMatchObject({ retryCount: 0, lastResult: { outcome: "done" } });
+    expect(state.lastResult.at).toBe(state.lastAttemptAt);
+    expect(statSync(f.file).mode & 0o777).toBe(0o600);
+    // A token rotation uses the same writer and must preserve the metadata.
+    await f.service.forceTokenRefresh();
+    expect(JSON.parse(readFileSync(f.file, "utf8")).autoCheckin).toEqual(state);
+    const second = new QoderAuthService({ host: f.host, engine: f.engine, site: "qoder-cn" });
+    expect((await second.getStatus()).autoCheckin).toEqual(state);
+    expect(statSync(f.file).mode & 0o777).toBe(0o600);
+    await second.disconnect();
+  });
+
+  it("never schedules the international service, even when connected", async () => {
+    const f = make();
+    await f.service.connectPAT(PAT);
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    await f.service.scheduleAutoCheckin();
+    await f.service.scheduleAutoCheckin();
+    expect(timer).not.toHaveBeenCalled();
+    expect((await f.service.getStatus()).autoCheckin).toBeUndefined();
+    timer.mockRestore();
+  });
+
   it("writes the CN credential file and CN provider entry, and removes only its own", async () => {
     const f = make(undefined, "qoder-cn");
     expect(f.service.site.id).toBe("qoder-cn");

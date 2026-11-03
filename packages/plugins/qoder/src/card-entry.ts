@@ -13,10 +13,16 @@ interface QoderCardSection {
   readonly prefix: string;
   status?: any;
   usage?: any;
+  checkin?: import("./checkin").QoderCheckinResult;
+  /** True while this section's check-in request is the one in flight. */
+  checkinPending?: boolean;
   error: boolean;
+  errorMessage?: string;
   busy: boolean;
   /** Half-typed PAT, kept across re-renders so another section cannot wipe it. */
   draft: string;
+  /** Model id whose hide/restore is in flight; drives the chip's aria-busy. */
+  pendingModel?: string | null;
   release?: () => void;
 }
 
@@ -34,11 +40,51 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     method: body === undefined ? "GET" : "POST", ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: abort.signal, timeoutMs: 45000,
   });
   const node = (tag: string, text: string, cls = "") => { const n = document.createElement(tag); n.textContent = text; n.className = cls; return n; };
+  // Model controls use the host stylesheet vocabulary from WorkBuddy/Codex.
+  const CHIP = "inline-flex max-w-full items-center gap-1 break-all whitespace-normal rounded-lg border border-white/5 bg-white/5 px-2 py-0.5 text-[10px] font-bold text-muted-foreground";
+  const CHIP_HIDE = "rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-white/10 hover:text-foreground disabled:opacity-40";
+  const BUTTON_BASE = "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-xl text-sm font-semibold ring-offset-background transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 active:scale-95";
+  const BUTTON_PRIMARY = "bg-primary text-primary-foreground shadow-lg shadow-primary/20 hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/30";
+  const BUTTON_OUTLINE = "border border-input bg-input/50 backdrop-blur-md shadow-sm hover:bg-input/80 hover:border-primary/50 hover:shadow-md hover:text-accent-foreground";
+  /** Inline copy of the lucide svg markup (paths only; icons ship as code). */
+  const icon = (paths: string[], className: string): SVGSVGElement => {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    svg.setAttribute("width", "24");
+    svg.setAttribute("height", "24");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("class", className);
+    for (const d of paths) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", d);
+      svg.appendChild(path);
+    }
+    return svg;
+  };
+  const xIcon = (className: string) => icon(["M18 6 6 18", "m6 6 12 12"], className);
+  const refreshCwIcon = (className: string) => icon([
+    "M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8",
+    "M21 3v5h-5",
+    "M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16",
+    "M8 16H3v5",
+  ], className);
+  const plugIcon = (className: string) => icon(["M12 22v-5", "M9 8V2", "M15 8V2", "M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"], className);
+  /** Locale lookup with {{var}} interpolation; unknown keys render as-is. */
+  const format = (key: string, vars: Record<string, unknown> = {}): string =>
+    String(words[key] ?? key).replace(/\{\{(\w+)\}\}/g, (_, name) => String(vars[name] ?? ""));
+  /** One action at a time across the whole card: mirrors action()'s gate. */
+  const sectionBusy = () => disposed || props.disabled || sections.some(s => s.busy);
   const sectionWords = (section: QoderCardSection) => section.site.id === "qoder"
     ? { title: words.title, description: words.description }
     : { title: words.cnTitle, description: words.cnDescription };
   const finish = (section: QoderCardSection) => {
-    section.busy = false; section.release?.(); section.release = undefined;
+    section.busy = false; section.pendingModel = null; section.release?.(); section.release = undefined;
     // onBusy is a COUNTING semaphore on the host (increment/decrement), not a
     // boolean state, so the release must be the exact balancing `false`.
     props.onBusy?.(false);
@@ -50,7 +96,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   const run = async (section: QoderCardSection, fn: () => Promise<void>) => {
     if (disposed || section.busy || props.disabled || !props.acquireManagement) return;
     const lease = props.acquireManagement(); if (!lease) return;
-    section.release = lease; section.busy = true; section.error = false; props.onBusy?.(true); render();
+    section.release = lease; section.busy = true; section.error = false; section.errorMessage = undefined; props.onBusy?.(true); render();
     try { await fn(); } catch { section.error = true; }
     finally { finish(section); }
   };
@@ -67,23 +113,114 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       throw e;
     }
   });
-  const action = (section: QoderCardSection, label: string, fn: () => void) => {
-    const button = node("button", words[label], "px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50") as HTMLButtonElement;
+  const action = (
+    section: QoderCardSection,
+    label: string,
+    fn: () => void,
+    variant: "primary" | "outline" = "outline",
+    extra = "h-8 w-full text-xs",
+  ) => {
+    const button = node("button", words[label], `${BUTTON_BASE} ${variant === "primary" ? BUTTON_PRIMARY : BUTTON_OUTLINE} ${extra}`) as HTMLButtonElement;
+    button.type = "button";
     // The management lease is a strict mutex across the whole card: while ANY
     // section is busy, this section's buttons must look disabled too, or a
     // click silently no-ops instead of explaining why.
-    button.disabled = disposed || props.disabled || sections.some(s => s.busy);
+    button.disabled = sectionBusy();
     button.onclick = fn; return button;
   };
+  // The daily check-in gets the same full-width labelled button as workbuddy's
+  // (h-8 w-full outline row), not a small icon-style action: it is a
+  // money-adjacent manual gesture and must read as one.
+  const checkinButton = (section: QoderCardSection) => {
+    const pending = !!section.checkinPending;
+    const button = node("button", pending ? words.checkin_pending : words.checkin_action, `${BUTTON_BASE} ${BUTTON_OUTLINE} h-8 w-full text-xs`) as HTMLButtonElement;
+    button.type = "button";
+    button.disabled = disposed || props.disabled || sections.some(s => s.busy) || section.status?.status !== "connected";
+    button.setAttribute("aria-busy", String(pending));
+    button.onclick = () => {
+      section.checkinPending = true;
+      void run(section, async () => {
+        try {
+          section.checkin = undefined;
+          try { section.checkin = await call(section, "/checkin", {}); }
+          catch { section.checkin = { outcome: "failed" }; }
+          await refresh(section);
+        } finally { section.checkinPending = false; }
+      });
+    };
+    return button;
+  };
+  const checkinNote = (section: QoderCardSection) => {
+    if (!section.checkin) return null;
+    const result = section.checkin;
+    const amount = result.credit;
+    const detail = result.outcome === "claimed" && typeof amount === "number" && Number.isFinite(amount) && amount > 0
+      ? lang === "zh" ? `+${amount} 积分` : `+${amount} credits` : words[`checkin_${result.outcome}`] ?? words.checkin_failed;
+    const note = node("p", detail + (result.outcome === "failed" && result.message ? `: ${result.message}` : ""), result.outcome === "failed" ? "text-xs text-destructive" : "text-xs text-muted-foreground");
+    note.setAttribute("role", "status");
+    return note;
+  };
+  const autoCheckinNote = (section: QoderCardSection) => {
+    const state = section.status?.autoCheckin as import("./auto-checkin").AutoCheckinState | undefined;
+    if (!state?.lastResult) return null;
+    const date = new Date(state.lastResult.at);
+    if (!Number.isFinite(date.getTime())) return null;
+    const today = date.toDateString() === new Date().toDateString();
+    const outcome = state.lastResult.outcome;
+    const key = outcome === "failed" && today && state.retryCount < 5 ? "autoCheckin_retrying" : `autoCheckin_${outcome}`;
+    const note = node("p", format(key, {
+      time: date.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit", hour12: false }),
+      day: today ? words.autoCheckin_today : date.toLocaleDateString(lang),
+    }), "text-xs text-muted-foreground");
+    note.setAttribute("role", "status");
+    return note;
+  };
+  /** Small outline button with the unified workbuddy/codex vocabulary. */
+  const smallButton = (label: string, extra: string, fn: () => void): HTMLButtonElement => {
+    const button = node("button", label, `${BUTTON_BASE} ${BUTTON_OUTLINE} ${extra}`) as HTMLButtonElement;
+    button.type = "button";
+    button.disabled = sectionBusy();
+    button.onclick = fn; return button;
+  };
+  // Visibility changes are per-model; always re-read server state after a
+  // batch, including when only some requests succeeded.
+  const setModelVisibility = (section: QoderCardSection, ids: string[], hidden: boolean) =>
+    void run(section, async () => {
+      let completed = 0;
+      try {
+        for (const id of ids) {
+          await call(section, "/models/visibility", { model: id, hidden });
+          completed += 1;
+        }
+      } catch (error) {
+        if (completed > 0) section.errorMessage = format(hidden ? "hide_partial" : "restore_partial", { count: completed, total: ids.length });
+        throw error;
+      } finally {
+        // A reconciliation failure must not prevent the status refresh.
+        try { await reconcile(section); } finally { await refresh(section); }
+      }
+    });
   const renderSection = (section: QoderCardSection): HTMLElement => {
-    const panel = node("div", "", "space-y-3 border-t border-border pt-4 first:border-t-0 first:pt-0");
-    panel.append(node("h3", sectionWords(section).title, "font-semibold text-lg"),
+    // Two-column skeleton shared with workbuddy/codex: status + model chips on
+    // the left, a fixed-width vertical action column on the right.
+    // Divider only ABOVE sections after the first: a `first:` variant would
+    // not be generated by the host Tailwind scan, so gate the class in code.
+    const divider = section === sections[0] ? "" : " border-t border-border";
+    const panel = node("div", "",
+      `flex flex-col gap-4 p-5 sm:flex-row sm:items-start sm:justify-between${divider}`);
+    const body = node("div", "", "min-w-0 flex-1 space-y-3");
+    const actions = node("div", "", "flex shrink-0 flex-col gap-2 sm:w-[210px]");
+    body.append(node("h3", sectionWords(section).title, "font-semibold text-lg"),
       node("p", sectionWords(section).description, "text-sm text-muted-foreground"));
-    panel.append(node("p", section.status ? words[section.status.status] ?? words.error : words.loading));
-    if (section.status?.expired) panel.append(node("p", words.expired, "text-destructive"));
-    if (section.status?.account) panel.append(node("p", `${words.account}: ${section.status.account}`));
-    if (section.error) panel.append(node("p", words.error, "text-destructive"));
-    const buttons = node("div", "", "flex flex-wrap gap-2");
+    body.append(node("p", section.status ? words[section.status.status] ?? words.error : words.loading));
+    if (section.status?.expired) body.append(node("p", words.expired, "text-destructive"));
+    if (section.status?.account) body.append(node("p", `${words.account}: ${section.status.account}`));
+    if (section.error) body.append(node("p", section.errorMessage ?? words.error, "text-destructive"));
+    const columnButton = (label: string, fn: () => void, variant: "primary" | "outline" = "outline", iconNode?: SVGSVGElement) => {
+      const button = action(section, label, fn, variant, "h-8 w-full text-xs");
+      if (iconNode) button.prepend(iconNode);
+      return button;
+    };
     if (section.status?.status === "not_connected") {
       // PAT form: password-typed input so the token never shows on screen.
       const input = node("input", "", "w-full rounded-md border border-input bg-background px-3 py-2 text-sm") as HTMLInputElement;
@@ -92,17 +229,25 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       // A render triggered by the OTHER section must not wipe a half-typed PAT.
       input.value = section.draft;
       input.oninput = () => { section.draft = input.value; };
-      const connectButton = action(section, "connect", () => connect(section, input));
       input.onkeydown = e => { if (e.key === "Enter") connect(section, input); };
-      panel.append(node("p", words.pat, "text-sm font-medium"), input);
-      buttons.append(connectButton);
+      body.append(node("p", words.pat, "text-sm font-medium"), input);
+      actions.append(columnButton("connect", () => connect(section, input), "primary", plugIcon("mr-1 h-3.5 w-3.5")));
     } else if (section.status) {
-      buttons.append(action(section, "sync", () => void run(section, async () => { await call(section, "/sync", {}); await reconcile(section); await refresh(section); })));
-      buttons.append(action(section, "usage", () => void run(section, async () => { section.usage = await call(section, "/usage", {}); })));
-      buttons.append(action(section, "disconnect", () => void run(section, async () => { await call(section, "/disconnect", {}); section.usage = undefined; await reconcile(section); await refresh(section); })));
+      if (section.site.id === "qoder-cn") {
+        const autoNote = autoCheckinNote(section);
+        if (autoNote) actions.append(autoNote);
+        actions.append(checkinButton(section));
+        const note = checkinNote(section);
+        if (note) actions.append(note);
+      } else {
+        actions.append(node("p", words.checkinDesktop, "text-xs text-muted-foreground"));
+      }
+      actions.append(columnButton("sync", () => void run(section, async () => { await call(section, "/sync", {}); await reconcile(section); await refresh(section); }),
+        "outline", refreshCwIcon("mr-1 h-3.5 w-3.5")));
+      actions.append(columnButton("usage", () => void run(section, async () => { section.usage = await call(section, "/usage", {}); })));
+      actions.append(columnButton("disconnect", () => void run(section, async () => { await call(section, "/disconnect", {}); section.usage = undefined; await reconcile(section); await refresh(section); })));
     }
-    buttons.append(action(section, "refresh", () => void run(section, () => refresh(section))));
-    panel.append(buttons);
+    actions.append(columnButton("refresh", () => void run(section, () => refresh(section))));
     // Usage windows: render defensively — shape comes from a remote payload.
     const usageLine = node("p", "", "text-sm text-muted-foreground");
     if (section.usage?.known && Array.isArray(section.usage.windows) && section.usage.windows.length) {
@@ -114,27 +259,66 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
           return `${name}: ${detail}`;
         }).join(" · ");
     } else usageLine.textContent = words.unknown;
-    panel.append(usageLine);
-    if (section.status?.coolingUntil > Date.now()) panel.append(node("p", `${words.cooling}: ${new Date(section.status.coolingUntil).toLocaleString()}`, "text-sm text-muted-foreground"));
-    panel.append(node("h4", words.models, "font-medium"));
-    if (!section.status?.models?.length) panel.append(node("p", words.noModels, "text-sm text-muted-foreground"));
-    for (const model of section.status?.models ?? []) {
-      const row = node("div", "", "flex items-center justify-between gap-2");
-      const label = `${model.id}${model.context ? ` · ${model.context}` : ""}${model.free ? ` · ${words.free}` : ""}`;
-      row.append(node("span", label, "text-sm"));
-      row.append(action(section, model.hidden ? "restore" : "hide", () => void run(section, async () => {
-        await call(section, "/models/visibility", { model: model.id, hidden: !model.hidden });
-        await reconcile(section); await refresh(section);
-      })));
-      panel.append(row);
+    body.append(usageLine);
+    if (section.status?.coolingUntil > Date.now()) body.append(node("p", `${words.cooling}: ${new Date(section.status.coolingUntil).toLocaleString()}`, "text-sm text-muted-foreground"));
+    // Qoder's count includes hidden models; keep that status meaning while
+    // matching Codex's count row and WorkBuddy's visibility controls.
+    const models = Array.isArray(section.status?.models) ? section.status.models : [];
+    const visible = models.filter((model: any) => !model.hidden);
+    const hiddenModels = models.filter((model: any) => model.hidden);
+    if (section.status?.status === "connected" || models.length) {
+      const count = node("dl", "", "grid max-w-md grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs");
+      count.append(node("dt", words.models, "text-muted-foreground"),
+        node("dd", format("models_count", { count: section.status?.modelCount ?? models.length }), "break-all text-foreground"));
+      body.append(count);
     }
+    if (!models.length) body.append(node("p", words.noModels, "text-sm text-muted-foreground"));
+    if (visible.length) {
+      const chips = node("div", "", "flex flex-wrap gap-2 pt-1");
+      for (const model of visible) {
+        const id = String(model.id);
+        const chip = node("span", id, CHIP);
+        if (model.context) chip.append(node("span", String(model.context), "font-medium text-muted-foreground/60"));
+        if (model.free) chip.append(node("span", words.free, "font-medium text-muted-foreground/60"));
+        const hide = node("button", "", CHIP_HIDE) as HTMLButtonElement;
+        hide.type = "button";
+        hide.disabled = sectionBusy();
+        hide.setAttribute("aria-label", format("hide_model", { model: id }));
+        hide.setAttribute("aria-busy", String(section.busy && section.pendingModel === id));
+        hide.append(xIcon("h-3 w-3"));
+        hide.onclick = () => { section.pendingModel = id; setModelVisibility(section, [id], true); };
+        chip.append(hide);
+        chips.append(chip);
+      }
+      body.append(chips);
+    }
+    if (hiddenModels.length) {
+      const details = node("details", "", "max-w-md text-xs text-muted-foreground");
+      details.append(node("summary", format("hidden_models", { count: hiddenModels.length }), "cursor-pointer select-none font-medium"));
+      const list = node("ul", "", "mt-2 space-y-1");
+      for (const model of hiddenModels) {
+        const id = String(model.id);
+        const item = node("li", "", "flex items-center justify-between gap-2");
+        item.append(node("span", id, "break-all font-mono"));
+        const restore = smallButton(words.restore, "h-6 shrink-0 px-2 text-[11px]",
+          () => { section.pendingModel = id; setModelVisibility(section, [id], false); });
+        restore.setAttribute("aria-label", format("restore_model", { model: id }));
+        item.append(restore);
+        list.append(item);
+      }
+      details.append(list);
+      details.append(smallButton(words.restore_all, "mt-2 h-7 px-2 text-[11px]",
+        () => setModelVisibility(section, hiddenModels.map((model: any) => String(model.id)), false)));
+      body.append(details);
+    }
+    panel.append(body, actions);
     return panel;
   };
   const render = () => {
     if (disposed) return;
     el.replaceChildren();
     panels.clear();
-    const card = node("section", "", "glass-card rounded-xl p-5 space-y-4");
+    const card = node("section", "", "glass-card rounded-2xl overflow-hidden mb-4");
     for (const section of sections) {
       const panel = renderSection(section);
       panels.set(section.site.id, panel);

@@ -32,7 +32,7 @@ import type { PluginContext } from "./core-types";
 
 export const manifest = {
   name: "workbuddy",
-  version: "1.0.0",
+  version: "1.0.2",
   coreApi: "1",
   description: "WorkBuddy (CN + international) managed subscription provider: dual-site account pools, browser login, desktop import, model sync, multi-account failover and admin routes.",
 };
@@ -45,7 +45,10 @@ export function getActivatedWorkBuddyService(): WorkBuddyAuthServiceLike | null 
   return activeService;
 }
 
+const autoCheckinChains = new Map<string, () => void>();
+
 async function activate(ctx: PluginContext): Promise<void> {
+  autoCheckinChains.get(ctx.host.configDir)?.();
   // Tokens live ONLY in the plugin's private 0600 file under the CCR config
   // dir — never in config.json, logs, admin responses or this bundle.
   const store = new WorkBuddyCredentialStore(join(ctx.host.configDir, "workbuddy-credentials.json"));
@@ -59,10 +62,13 @@ async function activate(ctx: PluginContext): Promise<void> {
       writeConfig: (next) => ctx.host.writeConfig(next),
       reloadRuntime: (config) => ctx.host.reloadRuntime(config),
       getDirectDispatcher: () => ctx.host.getDirectDispatcher(),
+      getSubscriptionDispatcher: () => ctx.host.getSubscriptionDispatcher?.(),
     },
     logger: ctx.log,
   });
+  autoCheckinChains.set(ctx.host.configDir, () => service.stopAutoCheckin());
   activeService = service;
+  await service.scheduleAutoCheckin();
 
   // Every activation owns its transformer instance wiring (service injected,
   // never the module-global handle the former core transformer resolved).

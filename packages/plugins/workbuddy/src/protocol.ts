@@ -1,7 +1,9 @@
 /** WorkBuddy protocol (CN + international). Source: magpie-community/plugins@ab38da681af7716ea9a7609f045ca91d2ad9988a
  * packages/workbuddy/index.mjs (MIT); see ../THIRD_PARTY_NOTICES.md.
  * No browser login, no prompt rewriting, no static model fallback, no source-file writes.
- * No daily check-in/reward task: free credits are server-side daily packages (D11).
+ * Daily check-in (D11, superseded on 2026-11-01 by an explicit user requirement):
+ * CN only, automatic daily with a manual override, per ACTIVE pool account, and
+ * never for the AI site, whose build has no check-in activity.
  * Browser authorization (§15) does not require a desktop installation.
  *
  * MOVED VERBATIM from the former core module `packages/core/src/services/workbuddy.ts`
@@ -13,6 +15,7 @@
  *     were deleted: every activation owns its service/store (Node may reuse the
  *     plugin module, so module state must never carry per-activation state).
  */
+import { normalizeAutoCheckin, type WorkBuddyAutoCheckinState } from "./auto-checkin";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, fstatSync, openSync, readFileSync, constants } from "node:fs";
 import fs from "node:fs/promises";
@@ -92,6 +95,11 @@ export function workBuddySite(id: WorkBuddySiteId): WorkBuddySite {
 }
 export const workBuddyChatUrl = (site: WorkBuddySite): string => `${site.origin}/v2/chat/completions`;
 export const workBuddyConfigUrl = (site: WorkBuddySite): string => `${site.origin}/v3/config`;
+// Billing (meter) endpoints. The check-in activity only exists on the CN
+// build, which serves it under the /v2 meter; the AI build has none.
+export const WORKBUDDY_CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status";
+export const WORKBUDDY_CHECKIN_CLAIM_PATH = "/v2/billing/meter/daily-checkin";
+export const WORKBUDDY_RESOURCE_SUMMARY_PATH = "/billing/meter/get-user-resource-summary";
 // CN defaults: the constants other modules already import keep their meaning.
 export const WORKBUDDY_CHAT_ORIGIN = WORKBUDDY_SITES.workbuddy.origin;
 export const WORKBUDDY_CHAT_URL = workBuddyChatUrl(WORKBUDDY_SITES.workbuddy);
@@ -140,6 +148,7 @@ export interface WorkBuddySiteState {
 }
 export interface WorkBuddyCredentialData {
   version: 2;
+  autoCheckin?: WorkBuddyAutoCheckinState;
   sites: Partial<Record<WorkBuddySiteId, WorkBuddySiteState>>;
 }
 /**
@@ -397,8 +406,9 @@ export class WorkBuddyCredentialStore {
         lastError: typeof s.lastError === "string" && s.lastError.length <= 512 ? s.lastError : null,
       };
     }
-    if (!Object.keys(sites).length) throw new Error();
-    return { version: 2, sites };
+    const autoCheckin = normalizeAutoCheckin(c.autoCheckin);
+    if (!Object.keys(sites).length && !autoCheckin) throw new Error();
+    return { version: 2, sites, ...(autoCheckin ? { autoCheckin } : {}) };
   }
 
   private migrateV1Data(c: WorkBuddyCredential): WorkBuddyCredentialData {

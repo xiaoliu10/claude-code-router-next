@@ -69,9 +69,11 @@ export interface CodexFinalizeOptions {
    */
   modelInstructions?: string;
   /**
-   * Stable per-conversation identity (thread/session id). When the body has no
-   * prompt_cache_key, this hashes together with the conversation prefix so
-   * every turn of one conversation resolves to the same key.
+   * Stable per-conversation identity (thread/session id). When the body has
+   * no prompt_cache_key, this is the whole hash seed: with it present, the
+   * key cannot collide across sessions regardless of content. Without it,
+   * the key degrades to the content anchor (applied Codex instructions +
+   * first user turn) below.
    */
   sessionId?: string;
 }
@@ -102,15 +104,42 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-/** magpie conversationKey shape: 8-4-4-4-12 hex groups from a sha256. */
+/**
+ * magpie conversationKey shape: 8-4-4-4-12 hex groups from a sha256.
+ *
+ * The anchor is the APPLIED Codex instructions (only when the model sync
+ * installed them; never an unsynced client instructions) + the first USER
+ * turn. Everything before that user turn is deliberately skipped:
+ * Claude-Code-style clients put their own system prompt (a developer
+ * message) in front and regenerate it on every turn — date, environment
+ * summary, todo state. Hashing that preamble made the derived key change
+ * every turn, so the backend treated each request as a brand-new
+ * conversation and only the fixed Codex instructions survived in cache
+ * (2026-11-02 incident: 10% cache hit on sessionless pi requests vs 94.7%
+ * on session-keyed ones; a repro with a dynamic first block hit 0%). With a
+ * real session id it is the whole seed — distinct sessions never share a
+ * key regardless of content.
+ *
+ * Two deliberate exclusions, both cache-routing-only (the stateless backend
+ * always generates from the request body, and its prefix match is
+ * token-exact, so a shared key can only share a routing bucket, never an
+ * answer):
+ *  - tools, stable developer items, and everything before the first user
+ *    turn are not hashed, so conversations differing only there share a
+ *    key;
+ *  - with no user turn, no session id and no synced instructions the key
+ *    collapses to one shared constant. That is pathological for a stateless
+ *    chat request and stays deterministic rather than randomised, since a
+ *    per-turn random id would defeat cross-turn caching entirely.
+ */
 function conversationKey(instructions: string, input: any[], sessionId: string): string {
   const parts: string[] = [];
   if (instructions) parts.push(instructions);
   for (const item of input) {
-    parts.push(JSON.stringify(item));
-    // The prefix through the first user turn identifies the thread; later turns
-    // must not change it (magpie: "up to the first user message").
-    if (item?.role === "user") break;
+    if (item?.role === "user") {
+      parts.push(JSON.stringify(item));
+      break;
+    }
   }
   const digest = sha256Hex(sessionId + "\u0000" + parts.join("\u0000"));
   return [
@@ -267,13 +296,30 @@ export function codexFinalizeBody(body: any, options: CodexFinalizeOptions = {})
   let { input } = finalizeInput(out.input);
   input = finalizeInstructions(out, input, options.modelInstructions);
   out.input = input;
+  // Only the Codex instructions the model sync installed are a STABLE anchor:
+  // the shared ~3968-token official block every request starts with. When the
+  // sync has not run, out.instructions is still the client's own prompt — the
+  // very field that drifts per turn — so it must not be hashed into the key
+  // (research: opencodex/CLIProxyAPI both anchor on content, never on a
+  // preamble they cannot vouch for).
+  const stableInstructions = typeof options.modelInstructions === "string" &&
+    options.modelInstructions.trim() !== "" &&
+    out.instructions === options.modelInstructions
+    ? out.instructions
+    : "";
 
   if (typeof out.prompt_cache_key !== "string" || out.prompt_cache_key.trim() === "") {
+    // With a real session id it is the whole seed. Without one, the seed stays
+    // empty: conversationKey() already anchors on the stable instructions +
+    // the first user turn, which are stable across a conversation. The old
+    // seed folded in input[0] (the client's volatile developer/system
+    // preamble), which reset the derived key — and the upstream cache — on
+    // every turn.
     const seed = typeof options.sessionId === "string" && options.sessionId
       ? options.sessionId
-      : JSON.stringify([out.instructions ?? "", input[0] ?? null]);
+      : "";
     out.prompt_cache_key = conversationKey(
-      typeof out.instructions === "string" ? out.instructions : "",
+      stableInstructions,
       input,
       seed,
     );

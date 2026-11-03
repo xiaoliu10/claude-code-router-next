@@ -10,7 +10,7 @@ import { createApiError } from "./middleware";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
 import { type PluginRegistry, pluginErrorFrom } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "./plugin-request-state";
-import { pluginResponseError } from "./plugin-response-error";
+import { pluginResponseError, describeTransportFailure } from "./plugin-response-error";
 import {
   isDebugLogEnabled,
   getDebugLogOptions,
@@ -190,6 +190,13 @@ async function handleTransformerEndpoint(
   // Initialize on the original request before any fallback spreads it.
   ensurePluginRequestState(req);
 
+  // Stamp codex detection BEFORE any throwing validation: handleFallback reads
+  // the stamp off the spread request, and a request that dies at normalize /
+  // family-router / provider lookup must still fall back with the correct
+  // client response format.
+  const codexDetected = isCodexClient(req);
+  (req as any).codexDetected = codexDetected;
+
   // Normalize Responses API (Codex) format into a unified chat request BEFORE
   // provider resolution. This must happen first so that a CCR family alias can be
   // routed through the shared family router below, which needs messages/system/tools
@@ -279,7 +286,7 @@ async function handleTransformerEndpoint(
   // the Anthropic transformer runs (endpoint = /v1/messages), but the response
   // needs to be converted to Responses API format for codex to parse it.
   // We flag the request so processResponseTransformers can apply the conversion.
-  const codexDetected = isCodexClient(req);
+
   const isCodexOnMessagesEndpoint =
     transformer.endPoint === "/v1/messages" &&
     codexDetected;
@@ -294,7 +301,6 @@ async function handleTransformerEndpoint(
 
   // Store codex flags on the request so handleFallback can propagate them
   (req as any).isCodexOnMessagesEndpoint = isCodexOnMessagesEndpoint;
-  (req as any).codexDetected = codexDetected;
 
   try {
     // Safety net: convert any Responses API (Codex) body that was not already
@@ -308,7 +314,15 @@ async function handleTransformerEndpoint(
     // client's original stream flag) that the response-phase transformers of
     // the SAME request must see; building a fresh object per phase silently
     // drops that state.
-    const transformerContext: any = { req, isCodexOnMessagesEndpoint, pluginRegistry: fastify.pluginRegistry };
+    const transformerContext: any = {
+      req,
+      isCodexOnMessagesEndpoint,
+      // Which wire format the CLIENT of this attempt expects (client, not
+      // upstream): the Responses transformer uses it to choose between native
+      // pass-through and conversion into the unified Chat/Anthropic shape.
+      responseTargetFormat: resolveClientResponseFormat(req, transformer, codexDetected),
+      pluginRegistry: fastify.pluginRegistry,
+    };
 
     // Process request transformer chain
     const { requestBody, config, bypass } = await processRequestTransformers(
@@ -784,6 +798,11 @@ async function handleFallback(
             pluginRegistry: fastify.pluginRegistry,
             req: newReq,
             isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
+            responseTargetFormat: resolveClientResponseFormat(
+              newReq,
+              transformer,
+              (newReq as any).codexDetected === true
+            ),
           };
 
           // Process request transformer chain
@@ -1093,6 +1112,23 @@ export function stampUpstreamSessionId(
   headers["x-litellm-session-id"] = stableSessionId;
 }
 
+type ClientResponseFormat = "responses" | "chat" | "anthropic";
+
+/**
+ * Which protocol the CLIENT of this attempt expects. Codex clients always get
+ * native Responses; /v1/messages clients get the unified Chat shape converted
+ * from Anthropic on the way out; everything else speaks Chat.
+ */
+function resolveClientResponseFormat(
+  req: any,
+  transformer: any,
+  codexDetected: boolean
+): ClientResponseFormat {
+  const stored = (req as any).codexDetected ?? codexDetected;
+  if (stored) return "responses";
+  return transformer?.endPoint === "/v1/messages" ? "anthropic" : "chat";
+}
+
 /**
  * Detect if the request comes from a codex (OpenAI Codex CLI) client.
  * Codex sometimes switches from /v1/responses to /v1/messages mid-session,
@@ -1266,7 +1302,7 @@ async function sendProviderAttempt(
   try {
     response = await dispatchUpstream();
   } catch (sendError: any) {
-    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), { errorName: sendError?.name });
+    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), describeTransportFailure(sendError));
     throw sendError;
   }
 

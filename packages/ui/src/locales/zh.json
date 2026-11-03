@@ -167,6 +167,7 @@
     "health_probe_tooltip": "基于最近一次供应商连通性探测。该数值只反映网络可达性，不等同于模型生成耗时。",
     "slow_network_warning": "网络响应较慢（{{latency}} ms），请求可能会延迟。",
     "unreachable_warning": "无法连接到该供应商：{{error}}",
+    "last_failure_at": "最后失败：{{time}}",
     "enabled": "已启用",
     "disabled": "已关闭",
     "proxy": "代理",

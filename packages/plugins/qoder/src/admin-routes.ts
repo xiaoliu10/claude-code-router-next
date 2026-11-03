@@ -36,6 +36,7 @@ export function registerQoderAdminRoutes(app: FastifyInstance, service: QoderAut
     }],
     ["POST", "sync", () => service.syncModels()],
     ["POST", "usage", () => service.getUsage()],
+    ["POST", "checkin", () => service.checkin()],
     ["POST", "models/visibility", body => {
       if (typeof body?.model !== "string" || typeof body.hidden !== "boolean") throw Object.assign(new Error(), { code: "qoder_model_unknown", statusCode: 422 });
       return service.setModelHidden(body.model, body.hidden);
