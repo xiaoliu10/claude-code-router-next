@@ -308,7 +308,15 @@ async function handleTransformerEndpoint(
     // client's original stream flag) that the response-phase transformers of
     // the SAME request must see; building a fresh object per phase silently
     // drops that state.
-    const transformerContext: any = { req, isCodexOnMessagesEndpoint, pluginRegistry: fastify.pluginRegistry };
+    const transformerContext: any = {
+      req,
+      isCodexOnMessagesEndpoint,
+      // Which wire format the CLIENT of this attempt expects (client, not
+      // upstream): the Responses transformer uses it to choose between native
+      // pass-through and conversion into the unified Chat/Anthropic shape.
+      responseTargetFormat: resolveClientResponseFormat(req, transformer, codexDetected),
+      pluginRegistry: fastify.pluginRegistry,
+    };
 
     // Process request transformer chain
     const { requestBody, config, bypass } = await processRequestTransformers(
@@ -784,6 +792,11 @@ async function handleFallback(
             pluginRegistry: fastify.pluginRegistry,
             req: newReq,
             isCodexOnMessagesEndpoint: (req as any).isCodexOnMessagesEndpoint || false,
+            responseTargetFormat: resolveClientResponseFormat(
+              newReq,
+              transformer,
+              (newReq as any).codexDetected ?? codexDetected
+            ),
           };
 
           // Process request transformer chain
@@ -1091,6 +1104,23 @@ export function stampUpstreamSessionId(
     }
   }
   headers["x-litellm-session-id"] = stableSessionId;
+}
+
+type ClientResponseFormat = "responses" | "chat" | "anthropic";
+
+/**
+ * Which protocol the CLIENT of this attempt expects. Codex clients always get
+ * native Responses; /v1/messages clients get the unified Chat shape converted
+ * from Anthropic on the way out; everything else speaks Chat.
+ */
+function resolveClientResponseFormat(
+  req: any,
+  transformer: any,
+  codexDetected: boolean
+): ClientResponseFormat {
+  const stored = (req as any).codexDetected ?? codexDetected;
+  if (stored) return "responses";
+  return transformer?.endPoint === "/v1/messages" ? "anthropic" : "chat";
 }
 
 /**
