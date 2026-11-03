@@ -684,7 +684,8 @@ export class AnthropicTransformer implements Transformer {
                   continue;
                 }
 
-                model = chunk.model || model;
+                // Never downgrade to the "unknown" placeholder if a chunk omits/empties the model.
+                model = (chunk.model && chunk.model !== "unknown") ? chunk.model : model;
 
                 if (!hasStarted && !isClosed && !hasFinished) {
                   hasStarted = true;
