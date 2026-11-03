@@ -1,3 +1,4 @@
+import { localCheckinDate, normalizeAutoCheckin } from "./auto-checkin";
 /** Self-contained WorkBuddy DOM card: no React, host imports or direct fetch.
  * All state/network/config interactions flow through the host card capabilities
  * (PluginCardMountProps). Framework-free port of the former React
@@ -28,9 +29,10 @@ import {
   workBuddyLoginOutcome, workBuddySettle, workBuddySiteStatus, workBuddyStateKey,
   workBuddyVisibleErrorKey,
 } from "./card-shared";
+import type { WorkBuddyCheckinResult, WorkBuddyCheckinResponse } from "./checkin";
 import { workbuddyLocales } from "./locales";
 
-type SiteActionKind = "login" | "sync" | "disconnect" | "usage" | "switch" | "remove" | "hide" | "restore";
+type SiteActionKind = "checkin" | "login" | "sync" | "disconnect" | "usage" | "switch" | "remove" | "hide" | "restore";
 interface SiteAction { kind: SiteActionKind; site: WorkBuddyKind; model?: string }
 type ConfirmRequest = { kind: "disconnect"; site: WorkBuddyKind } | { kind: "remove"; site: WorkBuddyKind; uid: string };
 
@@ -126,6 +128,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     usageStore.entries[site] = entries;
     writeUsageStore(usageStore);
   };
+  let checkinRequestFailed = false;
+  let checkinResult: { uid: string | null; value: WorkBuddyCheckinResult } | null = null;
   let toast: string | null = null;
   let release: (() => void) | null = null;
   let unsubscribeHost: (() => void) | null = null;
@@ -342,6 +346,26 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     toast = null;
     render();
     try {
+      if (kind === "checkin") {
+        const uid = siteStatus?.activeUid ?? null;
+        checkinResult = null;
+        checkinRequestFailed = false;
+        try {
+          const value = await post<WorkBuddyCheckinResponse>("/checkin", { expectedActiveUid: uid }, undefined, 75_000);
+          if (alive && generation === id) {
+            if (typeof value.uid === "string") checkinResult = { uid: value.uid, value };
+            else checkinRequestFailed = true;
+          }
+        } catch {
+          // A transport/conflict error has no verified operation UID.
+          if (alive && generation === id) checkinRequestFailed = true;
+        }
+        try {
+          const updated = await readStatus();
+          if (alive && generation === id) { status = updated; loadFailed = false; }
+        } catch { /* Retain UID gating against the last known status. */ }
+        return;
+      }
       if (kind === "login") {
         const session = createWorkBuddyLogin({
           startWorkBuddyLogin: async (s) => post<WorkBuddyLoginStartResponse>("/login/start", { site: s }),
@@ -626,6 +650,43 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     }
     button(actions, action?.kind === "login" && action.site === site ? t("working") : connected ? t("add_account") : t("browser_login"),
       () => void run("login", site), disabled, "primary", "h-8 w-full text-xs");
+    if (site === "workbuddy") {
+      const pending = action?.kind === "checkin";
+      const claim = button(actions, t(pending ? "checkin.pending" : "checkin.action"),
+        () => void run("checkin", site), disabled || !connected, "outline", "h-8 w-full text-xs");
+      claim.setAttribute("aria-busy", String(pending));
+      const auto = normalizeAutoCheckin(status?.autoCheckin);
+      if (auto) {
+        const today = auto.lastAttemptDate === localCheckinDate();
+        const time = new Date(auto.lastResult.at);
+        const clock = `${String(time.getHours()).padStart(2, "0")}:${String(time.getMinutes()).padStart(2, "0")}`;
+        const outcome = auto.lastResult.outcome;
+        const key = !today ? "previous" : outcome === "failed"
+          ? (auto.retryCount < 5 ? "retrying" : "failed") : outcome;
+        const note = styled("p", "text-xs text-muted-foreground", t(`checkin.auto.${key}`, {
+          time: clock, date: auto.lastAttemptDate,
+        }));
+        note.dataset.testid = "workbuddy-auto-checkin";
+        note.setAttribute("role", "status");
+        actions.append(note);
+      }
+      if (checkinRequestFailed) {
+        const note = styled("p", "text-xs text-muted-foreground", t("checkin.failed"));
+        note.setAttribute("role", "status");
+        actions.append(note);
+      }
+      if (checkinResult && checkinResult.uid === (siteStatus?.activeUid ?? null)) {
+        const result = checkinResult.value;
+        const outcomes = ["claimed", "done", "inactive", "ineligible", "failed"];
+        const outcome = outcomes.includes(result.outcome) ? result.outcome : "failed";
+        const parts = [t(`checkin.${outcome}`)];
+        if (["claimed", "done"].includes(outcome) && typeof result.credit === "number" && Number.isFinite(result.credit) && result.credit > 0) parts.push(t("checkin.credit", { count: result.credit }));
+        if (outcome === "claimed" && typeof result.streak === "number" && Number.isFinite(result.streak) && result.streak > 0) parts.push(t("checkin.streak", { count: result.streak }));
+        const note = styled("p", "text-xs text-muted-foreground", parts.join(" · "));
+        note.setAttribute("role", "status");
+        actions.append(note);
+      }
+    }
     button(actions, t("sync"), () => void run("sync", site), disabled || !connected, "outline", "h-8 w-full text-xs",
       refreshCwIcon(`mr-1 h-3.5 w-3.5 ${action?.kind === "sync" && action.site === site ? "animate-spin" : ""}`));
     button(actions, t("disconnect"), () => { confirm = { kind: "disconnect", site }; render(); }, disabled || !canDisconnect, "outline", "h-8 w-full text-xs");

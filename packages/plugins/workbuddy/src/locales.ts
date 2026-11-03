@@ -99,6 +99,18 @@ export const workbuddyLocales: Record<string, Record<string, unknown>> = {
     "workbuddy-ai_note": "Official international browser authorization",
     "privacy": "The access token is sent only to the fixed origin of the selected site: {{site}}. It never reaches this browser or the ordinary provider configuration."
   },
+  "checkin": {
+    "action": "Check in", "pending": "Checking in…", "claimed": "Claimed",
+    "done": "Already claimed today", "inactive": "No active event",
+    "ineligible": "Check in using the official app", "failed": "Check-in failed",
+    "credit": "+{{count}} credits", "streak": "{{count}} day streak",
+    "auto": {
+      "claimed": "Auto: claimed today {{time}}", "done": "Auto: already claimed today",
+      "retrying": "Auto: failed {{time}}, retrying", "failed": "Auto: failed {{time}}",
+      "inactive": "Auto: no active event", "ineligible": "Auto: use the official app",
+      "previous": "Auto: last attempt {{date}} {{time}}"
+    }
+  },
   "credits": {
     "line": "{{plan}} · used {{used}} / {{limit}}",
     "action": "Read credits",
@@ -241,6 +253,18 @@ export const workbuddyLocales: Record<string, Record<string, unknown>> = {
     "workbuddy-ai": "WorkBuddy AI（国际版）",
     "workbuddy-ai_note": "国际站官方浏览器授权",
     "privacy": "访问令牌仅发送到所选站点的固定域名：{{site}}。令牌不会到达浏览器，也不会写入普通供应商配置。"
+  },
+  "checkin": {
+    "action": "签到", "pending": "签到中…", "claimed": "签到成功",
+    "done": "今日已领", "inactive": "暂无活动",
+    "ineligible": "需在官方 app 内签到", "failed": "签到失败",
+    "credit": "+{{count}} credits", "streak": "连续 {{count}} 天",
+    "auto": {
+      "claimed": "自动领取：今天已领 {{time}}", "done": "自动领取：今日已领",
+      "retrying": "自动领取：{{time}} 失败，将重试", "failed": "自动领取：{{time}} 失败",
+      "inactive": "自动领取：暂无活动", "ineligible": "自动领取：需在官方 app 内领取",
+      "previous": "自动领取：上次尝试 {{date}} {{time}}"
+    }
   },
   "credits": {
     "line": "{{plan}} · 已用 {{used}} / {{limit}}",

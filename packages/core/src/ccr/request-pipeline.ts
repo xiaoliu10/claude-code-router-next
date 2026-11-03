@@ -82,6 +82,15 @@ function getUsageCacheKey(req: any): string {
   return req.usageCacheKey || `${req.clientType || "unknown"}:request:${getUsageSessionId(req)}`;
 }
 
+/** A real upstream model echo: non-empty and never the converter's
+ * "unknown" placeholder. The Anthropic SSE converter initializes its model
+ * label to "unknown" until the first chat chunk names one; a short stream whose
+ * first chunk omits the model would otherwise lock that placeholder into
+ * req.upstreamModel (first-write-wins), recording "unknown" in the usage row. */
+export function isRealUpstreamModel(model: unknown): model is string {
+  return typeof model === "string" && model.trim() !== "" && model !== "unknown";
+}
+
 function getRequestModel(req: any): string {
   // Prefer req.body.model (routed model) over req.model (pre-routing model)
   if (req.body?.model) {
@@ -396,7 +405,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
               // Capture the model the upstream provider actually returned. Gateways may
               // silently swap the requested model (e.g. route glm-5 to a MiniMax backend),
               // so we surface the real upstream model in usage stats.
-              if (event === 'message_start' && data?.message?.model) {
+              if (event === 'message_start' && isRealUpstreamModel(data?.message?.model)) {
                 req.upstreamModel = data.message.model;
               }
               // Responses API carries the model on every lifecycle event's
@@ -406,10 +415,10 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
               // reconnect), and waiting for the terminal event is what left
               // `unknown` in the usage rows. First non-empty value wins so a
               // later event cannot overwrite the real upstream model.
-              if (!req.upstreamModel && data?.response?.model) {
+              if (!req.upstreamModel && isRealUpstreamModel(data?.response?.model)) {
                 req.upstreamModel = data.response.model;
               }
-              if (event === 'response.completed' && data?.response?.model) {
+              if (event === 'response.completed' && isRealUpstreamModel(data?.response?.model)) {
                 req.upstreamModel = data.response.model;
               }
 
@@ -505,10 +514,10 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
               const event = (value as any).event;
               const frdata = (value as any).data;
               if (event === 'message_start' && frdata?.message?.model) {
-                req.upstreamModel = frdata.message.model;
+                if (isRealUpstreamModel(frdata?.message?.model)) req.upstreamModel = frdata.message.model;
               }
               if (event === 'response.completed' && frdata?.response?.model) {
-                req.upstreamModel = frdata.response.model;
+                if (isRealUpstreamModel(frdata?.response?.model)) req.upstreamModel = frdata.response.model;
               }
               const frame = frdata?.usage ?? frdata?.response?.usage;
               if (frame) {
