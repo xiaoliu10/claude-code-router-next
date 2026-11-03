@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2424] - 2026-11-03
+
+### Added
+
+- **new: Kiro subscription provider plugin** (`@wengine-ai/ccr-provider-kiro` 0.1.0): full OAuth sign-in for the Kiro portal (Google/GitHub), AWS Builder ID and IAM Identity Center; credential management (0600, atomic, `O_NOFOLLOW`); the runtime region is derived from the profile ARN; transformer and managed runtime; model/quota management and a multi-account card.
+- **usage provenance for estimated counts**: `usage_records` gains an additive `usage_estimated` column (schema v3) plus a summary `estimatedCount`. Providers that report estimated rather than metered usage (Kiro) mark their records, so an estimate is never presented as an exact, metered figure.
+
+### Fixed
+
+- **the cache-read heuristic no longer fires on estimated usage**: a provider whose counts are estimated cannot support the "input_tokens < request token count implies cache reads" inference, so estimated records skip it.
+- **cache-write mapping stays opt-in**: only usage carrying real Kiro provenance (`usage_source: "kiro"`) extends the historical cache-creation mapping, in both the streaming and non-streaming usage blocks.
+
+## [2.3.2424] - 2026-11-03（中文）
+
+### 新增
+
+- **新增 Kiro 订阅 provider 插件**（`@wengine-ai/ccr-provider-kiro` 0.1.0）：Kiro 门户（Google/GitHub）、AWS Builder ID、IAM Identity Center 三种完整 OAuth 登录；凭据管理（0600、原子写、`O_NOFOLLOW`）；运行时区域由 profile ARN 推导；transformer 与托管运行时；模型/配额管理与多账号卡片。
+- **估算用量的溯源标记**：`usage_records` 新增加法式 `usage_estimated` 列（schema v3）与汇总 `estimatedCount`。只报估算值而非计量值的 provider（Kiro）会标记其记录，估算值不会被当作精确计量数字展示。
+
+### 修复
+
+- **缓存读启发式不再作用于估算用量**：计数为估算值的 provider 不满足「input_tokens 小于请求 token 数即存在缓存读」的推断，估算记录跳过该推断。
+- **缓存写映射保持 opt-in**：只有携带真实 Kiro 溯源（`usage_source: "kiro"`）的用量才扩展历史 cache-creation 映射，流式与非流式 usage 块同步生效。
+
 ## [2.3.2423] - 2026-11-03
 
 ### Added
