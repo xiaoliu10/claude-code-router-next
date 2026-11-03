@@ -1579,9 +1579,10 @@ for (const path of ["native", "stateless"]) {
     // (native-session.mjs:590) and the stateless H1 Run in runOnce
     // (engine.mjs:2525), each with these NATIVE_LIMITS. Drive THAT decision
     // on a virtual clock so ~46 heartbeats always reset the idle deadline and
-    // the accumulated wait deterministically reaches quiet. Interval 64 is
-    // coprime to the 1500 idle cap, so no heartbeat ever shares a timer tick
-    // with the idle deadline.
+    // the accumulated wait deterministically reaches quiet. A 64ms beat never
+    // lands on an idle deadline (1500 % 64 = 28, 3000 % 64 = 56) and 64 < 1500
+    // means every beat re-arms idle before the deadline can fire; (64 and
+    // 1500 are not coprime — gcd is 4 — the alignment math is what matters).
     vi.useFakeTimers()
     try {
       const limits = { ...NATIVE_LIMITS, idle: 1500, quiet: 3000 }
