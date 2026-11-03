@@ -132,6 +132,7 @@ function harness(overrides: Record<string, (init?: any) => any> = {}, disabled =
   mount(host as any, props);
   cleanups.push(() => unmount(host as any));
   return {
+    unmountNow() { for (const c of [...cleanups].reverse()) c(); },
     host, callApi, open, release, onBusy: props.onBusy, refreshConfig, props, store,
     get lock() { return lock; },
     get unsubscribed() { return unsubscribed; },
@@ -166,6 +167,52 @@ describe("self-contained Codex plugin card", () => {
     expect(h.host.text()).toContain(en.disclaimer);
     // No ugly inline borders/styles anywhere in the rendered tree.
     expect(h.host.all().every(n => !n.style?.cssText)).toBe(true);
+  });
+
+  it("cooldown keeps the read-only surface visible: account rows + auto usage windows render; one bounded mount retry recovers a restart-blanked API", async () => {
+    // A cooled account reports status:"error" + coolingUntil (the upstream
+    // refusal is latched). The usage endpoint keeps working during cooldown,
+    // so the card must still show the burn percentages and reset times —
+    // exactly when the user needs them — and auto-read on mount.
+    const COOLED = {
+      ...CONNECTED, status: "error" as const,
+      lastError: "This Codex account has reached its usage limit; wait for the window to reset.",
+      coolingUntil: Date.now() + 86_400_000,
+    };
+    const h = harness({ "/status": () => COOLED, "/usage": () => USAGE });
+    await tick();
+    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status", "/usage"]);
+    expect(h.host.text()).toContain(en.status.cooldown);
+    expect(h.host.text()).toContain("user@example.test");
+    expect(h.host.text()).toContain(en.usage_primary.replace("{{window}}", "5 h"));
+    expect(h.host.text()).toContain(en.usage_secondary.replace("{{window}}", "7 d"));
+    expect(h.host.text().toLowerCase()).not.toContain("token");
+    // Mutating actions stay available but the sync path is the user's call;
+    // disconnect remains offered.
+    expect(h.host.button(en.disconnect)).toBeTruthy();
+  });
+
+  it("a mount status read that fails once (deploy restart window) retries and recovers without the failure banner", async () => {
+    let calls = 0;
+    // Fake timers must be active BEFORE harness(): the mount's 2500ms retry
+    // backoff is a setTimeout under the fake clock.
+    vi.useFakeTimers();
+    try {
+      const h = harness({
+        "/status": () => { calls += 1; return calls === 1 ? null : CONNECTED; },
+        "/usage": () => USAGE,
+      });
+      // First /status returns an invalid payload (null body) — the bounded
+      // retry must recover instead of latching the failure banner.
+      await vi.advanceTimersByTimeAsync(3000);
+      await tick();
+      expect(calls).toBe(2);
+      expect(h.host.text()).not.toContain(en.errors.request_failed);
+      expect(h.host.text()).toContain("user@example.test");
+      h.unmountNow();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("connected shows account/plan/models; quota auto-reads exactly once with window lines, never tokens", async () => {
