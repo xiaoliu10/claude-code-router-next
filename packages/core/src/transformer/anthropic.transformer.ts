@@ -21,6 +21,7 @@ import {
 import { formatBase64 } from "@/utils/image";
 import { convertToAnthropic } from "@/utils/converter";
 import { modelSupportsImages } from "@/utils/router";
+import { getUsageCacheCreationInputTokens, mergeUsageCapture } from "../ccr/usage-merge";
 
 /**
  * Read a client's thinking switch. "adaptive" and boolean true both mean the
@@ -38,6 +39,14 @@ function isThinkingEnabled(type: unknown): boolean | undefined {
     return false;
   }
   return undefined;
+}
+
+// Only opted-in usage may extend the historical cache-write mapping. Exact
+// Kiro counts carry provenance separately from the estimated-usage flag.
+function supportsCacheCreationUsage(usage: unknown): boolean {
+  if (!usage || typeof usage !== "object") return false;
+  const metadata = usage as Record<string, unknown>;
+  return metadata.usage_source === "kiro" || metadata.usage_estimated === true || metadata.kiro_estimated === true;
 }
 
 export class AnthropicTransformer implements Transformer {
@@ -758,6 +767,10 @@ export class AnthropicTransformer implements Transformer {
                     input_tokens: inputTokens,
                     output_tokens: completionTokens,
                     cache_read_input_tokens: cachedTokens,
+                    ...(supportsCacheCreationUsage(chunk.usage) ? {
+                      cache_creation_input_tokens: getUsageCacheCreationInputTokens(chunk.usage),
+                    } : {}),
+                    ...(chunk.usage.kiro_estimated === true || chunk.usage.usage_estimated === true ? { usage_estimated: true } : {}),
                   };
                   if (!stopReasonMessageDelta) {
                     stopReasonMessageDelta = {
@@ -770,12 +783,16 @@ export class AnthropicTransformer implements Transformer {
                     };
                   } else {
                     const prev = stopReasonMessageDelta.usage || {};
-                    stopReasonMessageDelta.usage = {
-                      input_tokens: incomingUsage.input_tokens || prev.input_tokens || 0,
-                      output_tokens: incomingUsage.output_tokens || prev.output_tokens || 0,
-                      cache_read_input_tokens:
-                        incomingUsage.cache_read_input_tokens || prev.cache_read_input_tokens || 0,
-                    };
+                    if (supportsCacheCreationUsage(chunk.usage) || "cache_creation_input_tokens" in prev) {
+                      stopReasonMessageDelta.usage = mergeUsageCapture(prev, incomingUsage, false);
+                    } else {
+                      stopReasonMessageDelta.usage = {
+                        input_tokens: incomingUsage.input_tokens || prev.input_tokens || 0,
+                        output_tokens: incomingUsage.output_tokens || prev.output_tokens || 0,
+                        cache_read_input_tokens:
+                          incomingUsage.cache_read_input_tokens || prev.cache_read_input_tokens || 0,
+                      };
+                    }
                   }
                 }
                 if (!choice) {
@@ -1331,7 +1348,10 @@ export class AnthropicTransformer implements Transformer {
         usage: {
           // Keep Anthropic protocol semantics for Claude Code: input_tokens is net of cache reads.
           input_tokens: inputTokens,
-          cache_creation_input_tokens: 0,
+          cache_creation_input_tokens: supportsCacheCreationUsage(openaiResponse.usage)
+            ? getUsageCacheCreationInputTokens(openaiResponse.usage)
+            : 0,
+          ...((openaiResponse.usage as any)?.kiro_estimated === true || (openaiResponse.usage as any)?.usage_estimated === true ? { usage_estimated: true } : {}),
           cache_read_input_tokens: cachedTokens,
           output_tokens: openaiResponse.usage?.completion_tokens || 0,
           server_tool_use: {

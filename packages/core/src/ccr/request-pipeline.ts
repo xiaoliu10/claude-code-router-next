@@ -685,7 +685,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // out the input token count for the whole request.
       const reportedInputTokens = usage?.input_tokens || 0;
       const rawInputTokens = reportedInputTokens || req.tokenCount || 0;
-      if (!cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
+      if (!usage?.usage_estimated && !cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
         cacheReadInputTokens = req.tokenCount - usage.input_tokens;
         if (cacheReadInputTokens) {
           console.log('[Usage] Inferred cache tokens:', {
@@ -723,6 +723,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         // matches what the client was told. `unknown` in the UI looked like a
         // routing bug rather than a missing upstream echo.
         upstreamModel: req.upstreamModel || getRequestModel(req) || undefined,
+        ...(usage?.usage_estimated === true ? { usageEstimated: true } : {}),
         modelFamily: req.modelFamily || "",
         scenarioType: req.scenarioType || "default",
         clientType: req.clientType || detectClientType(req),

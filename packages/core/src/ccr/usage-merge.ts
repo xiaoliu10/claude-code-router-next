@@ -35,6 +35,7 @@ export function normalizeUsagePayload(usage: any): any {
 
   return {
     ...usage,
+    ...(usage.kiro_estimated === true || usage.usage_estimated === true ? { usage_estimated: true } : {}),
     input_tokens: usage.input_tokens ?? usage.prompt_tokens ?? 0,
     output_tokens: usage.output_tokens ?? usage.completion_tokens ?? 0,
     cache_read_input_tokens: getUsageCacheReadInputTokens(usage),
@@ -64,6 +65,7 @@ export function mergeUsageCapture(existing: any, incoming: any, resetBase: boole
   const inc = incoming || {};
   return {
     ...base,
+    ...(inc.usage_estimated === true || base.usage_estimated === true ? { usage_estimated: true } : {}),
     input_tokens: inc.input_tokens || base.input_tokens || 0,
     output_tokens: inc.output_tokens || base.output_tokens || 0,
     cache_read_input_tokens: inc.cache_read_input_tokens || base.cache_read_input_tokens || 0,

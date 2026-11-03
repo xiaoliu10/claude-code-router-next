@@ -41,6 +41,7 @@ interface UsageRecord {
   scenarioType: string;
   clientType?: string; // "claude-code" | "codex" | "api" | "unknown"
   stream: boolean;
+  usageEstimated?: boolean;
   inputTokens: number;
   cacheReadInputTokens?: number | null;
   cacheCreationInputTokens?: number | null;
@@ -62,6 +63,7 @@ interface ModelDayData {
 }
 
 interface UsageSummary {
+  estimatedCount?: number;
   totalRequests: number;
   successCount: number;
   errorCount: number;
@@ -451,7 +453,7 @@ export function UsageStats() {
               <div className="grid grid-cols-5 gap-2 mb-3">
               <div className="rounded-lg border bg-blue-50 p-2 text-center">
                 <div className="text-lg font-bold text-blue-600">{summary.totalRequests}</div>
-                <div className="text-xs text-gray-500">{t("usage.total_requests")}</div>
+                <div className="text-xs text-gray-500">{t("usage.total_requests")}{summary.estimatedCount ? ` · ${summary.estimatedCount} estimated / 估算` : ""}</div>
                 <div className="text-xs text-green-500">{summary.successCount} ok / <span className="text-red-500">{summary.errorCount} err</span></div>
               </div>
               <div className="rounded-lg border bg-gray-50 p-2 text-center">
@@ -618,8 +620,8 @@ export function UsageStats() {
                     <td className="p-1.5">{r.provider}</td>
                     <td className="p-1.5 max-w-[280px] truncate" title={fullChain}>{modelDisplay}</td>
                     <td className="p-1.5">{r.modelFamily ? `${r.modelFamily}/${r.scenarioType}` : r.scenarioType}</td>
-                    <td className="text-right p-1.5">{formatTokens(r.inputTokens)}</td>
-                    <td className="text-right p-1.5">{formatTokens(r.outputTokens)}</td>
+                    <td className="text-right p-1.5">{r.usageEstimated ? <span title="Estimated usage / 估算用量">≈</span> : null}{formatTokens(r.inputTokens)}</td>
+                    <td className="text-right p-1.5">{r.usageEstimated ? "≈" : ""}{formatTokens(r.outputTokens)}</td>
                     <td className="text-right p-1.5">{formatTokens(r.cacheReadInputTokens ?? 0)}</td>
                     <td className="text-right p-1.5">{formatTokens(r.cacheCreationInputTokens ?? 0)}</td>
                     <td className="text-right p-1.5">{formatMs(r.ttft)}</td>
