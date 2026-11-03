@@ -249,7 +249,15 @@ export class GrokAuthService {
       if (["grok_persist_failed", "grok_raw_config_required", "grok_proxy_invalid"].includes(error?.code)) {
         this.lastError = "grok_upstream_error"; throw error;
       }
-      this.lastError = "grok_reauth_required"; throw grokError("grok_reauth_required");
+      this.lastError = "grok_reauth_required";
+      // Preserve the engine's specific guidance (e.g. "install Grok Build…")
+      // as detail on the surfaced error, so a missing-CLI diagnosis does not
+      // reduce to a generic "sign in again" with no path forward.
+      const surfaced = grokError("grok_reauth_required");
+      if (typeof error?.message === "string" && error.message && error.message !== error?.code) {
+        (surfaced as any).detail = error.message;
+      }
+      throw surfaced;
     }
     })().finally(() => { this.refresh = undefined; });
     return this.refresh;

@@ -94,7 +94,10 @@ export class GrokTransformer {
         const status = Number(error.httpStatus ?? error.status ?? 0);
         let info: { code: string; httpStatus: number; cooldownMs?: number };
         if (status === 429 || /rate.?limit|usage.?limit/.test(text)) info = { code: "grok_rate_limited", httpStatus: 429, cooldownMs: 300000 };
-        else if (status === 401 || /unauthorized|invalid.?token|authentication|sign.?in/.test(text)) info = { code: "grok_reauth_required", httpStatus: 401 };
+        // Keyword evidence latches reauth only when the upstream did NOT name a
+        // different status: a 500 whose message happens to say "authentication"
+        // is an upstream outage, not an expired sign-in.
+        else if (status === 401 || ((status === 0 || status === undefined) && /unauthorized|invalid.?token|authentication|sign.?in/.test(text))) info = { code: "grok_reauth_required", httpStatus: 401 };
         else info = { code: "grok_upstream_error", httpStatus: 502 };
         try {
           const noted = this.note?.(info);

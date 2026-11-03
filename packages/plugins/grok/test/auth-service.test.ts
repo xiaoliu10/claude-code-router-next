@@ -23,6 +23,16 @@ describe("GrokAuthService isolated CLI lifecycle", () => {
     expect(readFileSync(join(f.cliHome, "auth.json"), "utf8")).toBe(before);
     expect(existsSync(f.service.file)).toBe(false); expect(f.config().Providers).toHaveLength(1);
   });
+  it("tightens a world-readable credential file to 0600 on load", async () => {
+    const f = make(); await f.service.importCurrent();
+    chmodSync(f.service.file, 0o644);
+    expect(statSync(f.service.file).mode & 0o777).toBe(0o644);
+    // A fresh service over the same file must tighten it on first use — the
+    // write path is not the only place the mode is asserted.
+    const reopened = new GrokAuthService({ host: f.host, env: f.env, userHome: f.home });
+    await reopened.getAccessToken();
+    expect(statSync(f.service.file).mode & 0o777).toBe(0o600);
+  });
   it("coalesces forced refresh, rereads rotating credential, injects only explicit CLI proxy", async () => {
     const f = make({ proxy: "$FIXTURE_PROXY" }); await f.service.importCurrent();
     await Promise.all([f.service.forceTokenRefresh(), f.service.forceTokenRefresh(), f.service.forceTokenRefresh()]);

@@ -36,7 +36,7 @@ export function registerGrokAdminRoutes(app: FastifyInstance, service: GrokAuthS
     }],
     ["POST", "disconnect", () => service.disconnect()],
   ];
-  const safe = new Set(["grok_cli_missing", "grok_login_unknown", "grok_login_busy", "grok_login_failed", "grok_already_connected", "grok_identity_missing", "grok_not_connected", "grok_reauth_required", "grok_models_empty", "grok_model_unknown", "grok_provider_name_conflict", "grok_config_write_failed", "grok_persist_failed", "grok_credential_invalid", "grok_credential_unreadable", "grok_raw_config_required", "grok_proxy_invalid", "grok_upstream_error"]);
+  const safe = new Set(["grok_cli_missing", "grok_login_unknown", "grok_login_busy", "grok_login_failed", "grok_already_connected", "grok_identity_missing", "grok_not_connected", "grok_reauth_required", "grok_models_empty", "grok_model_unknown", "grok_provider_name_conflict", "grok_config_write_failed", "grok_persist_failed", "grok_credential_invalid", "grok_credential_unreadable", "grok_raw_config_required", "grok_proxy_invalid", "grok_upstream_error", "grok_rate_limited"]);
   for (const [method, path, action] of routes) app.route({ method, url: `/api/grok/${path}`, handler: async (req, reply) => {
     try { assertLocalGrokRequest(req, app); return await action(req.body); }
     catch (e: any) {
