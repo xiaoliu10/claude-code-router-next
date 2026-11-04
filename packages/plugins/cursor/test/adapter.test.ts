@@ -818,6 +818,7 @@ class El {
   constructor(tag: string) { this.tag = tag; }
   append(...nodes: El[]) { this.children.push(...nodes); }
   appendChild(child: El): El { this.children.push(child); return child; }
+  prepend(child: El): El { this.children.unshift(child); return child; }
   replaceChildren(...nodes: El[]) { this.children = [...nodes]; }
   remove() {}
   setAttribute(key: string, value: string) { this.attrs[key] = value; }
@@ -828,7 +829,7 @@ class El {
   scrollIntoView() {}
 }
 
-(globalThis as any).document = { createElement: (tag: string) => new El(tag) };
+(globalThis as any).document = { createElement: (tag: string) => new El(tag), createElementNS: () => new El("svg") as any };
 
 const walk = (node: El, visit: (el: El) => void): void => { visit(node); for (const child of node.children) walk(child, visit); };
 const all = (root: El, predicate: (el: El) => boolean): El[] => {

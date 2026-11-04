@@ -2,6 +2,46 @@ import type { PluginCardMountProps } from "../../../ui/src/utils/plugin-card";
 import { cursorLocales } from "./locales";
 import { mergeCursorProvider, CURSOR_PROVIDER } from "./protocol";
 
+// Family card vocabulary, shared verbatim across plugin cards (codex/qoder/workbuddy).
+const BUTTON_BASE = "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-xl text-sm font-semibold ring-offset-background transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 active:scale-95";
+const BUTTON_PRIMARY = "bg-primary text-primary-foreground shadow-lg shadow-primary/20 hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/30";
+const BUTTON_OUTLINE = "border border-input bg-input/50 backdrop-blur-md shadow-sm hover:bg-input/80 hover:border-primary/50 hover:shadow-md hover:text-accent-foreground";
+const BUTTON_DESTRUCTIVE = "border border-destructive/50 text-destructive hover:bg-destructive hover:text-destructive-foreground";
+
+
+const icon = (paths: string[], className: string): SVGSVGElement => {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  svg.setAttribute("width", "24");
+  svg.setAttribute("height", "24");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("class", className);
+  for (const d of paths) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d);
+    svg.appendChild(path);
+  }
+  return svg;
+};
+const refreshCwIcon = (className: string) => icon([
+  "M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8",
+  "M21 3v5h-5",
+  "M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16",
+  "M8 16H3v5",
+], className);
+const plugIcon = (className: string) => icon(["M12 22v-5", "M9 8V2", "M15 8V2", "M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"], className);
+const coinsIcon = (className: string) => icon([
+  "M18.09 10.37A6 6 0 1 1 10.34 18",
+  "M7 6h1v4",
+  "m16.71 13.88.7.71-2.82 2.82",
+], className);
+
 /**
  * The Cursor card. Not connected it offers the three sign-ins Cursor accounts
  * have — browser PKCE (start → poll → cancel), the cursor-agent CLI import,
@@ -9,6 +49,9 @@ import { mergeCursorProvider, CURSOR_PROVIDER } from "./protocol";
  * (UNKNOWN-tolerant), models and management. Quota evidence comes from a
  * remote payload and is rendered defensively: unknown shape renders as
  * "Quota unknown", never as fabricated numbers.
+ *
+ * Layout follows the family skeleton (codex/qoder/workbuddy): body left,
+ * fixed-width action column right, shared button vocabulary.
  */
 
 const mounted = new WeakMap<HTMLElement, () => void>();
@@ -74,8 +117,12 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       throw e;
     }
   });
-  const action = (label: string, fn: () => void, destructive = false) => {
-    const button = node("button", words[label], `px-3 py-2 rounded-md ${destructive ? "bg-destructive text-destructive-foreground hover:bg-destructive/90" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"} disabled:opacity-50`) as HTMLButtonElement;
+  // Family button builders: action-column rows (h-8 full width) — matching
+  // codex/qoder/workbuddy exactly.
+  const action = (label: string, fn: () => void, opts: { variant?: "primary" | "destructive"; icon?: SVGSVGElement; extra?: string } = {}) => {
+    const button = node("button", words[label], `${BUTTON_BASE} ${opts.variant === "primary" ? BUTTON_PRIMARY : opts.variant === "destructive" ? BUTTON_DESTRUCTIVE : BUTTON_OUTLINE} h-8 w-full text-xs${opts.extra ? ` ${opts.extra}` : ""}`) as HTMLButtonElement;
+    if (opts.icon) button.prepend(opts.icon);
+    button.type = "button";
     button.disabled = disposed || props.disabled || busy;
     button.onclick = fn; return button;
   };
@@ -84,13 +131,10 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     if (state !== "pending") return false;
     panel.append(node("p", words.browserWaiting, "text-sm text-muted-foreground"));
     if (status.login.url) {
-      const link = node("a", words.openBrowser, "text-sm underline break-all") as HTMLAnchorElement;
+      const link = node("a", words.openBrowser, "text-sm underline break-all text-primary") as HTMLAnchorElement;
       link.href = status.login.url; link.target = "_blank"; link.rel = "noopener noreferrer";
       panel.append(link, node("p", `${words.loginUrl} ${status.login.url}`, "text-xs text-muted-foreground break-all"));
     }
-    const cancelRow = node("div", "", "flex gap-2");
-    cancelRow.append(action("cancelLogin", cancelLogin));
-    panel.append(cancelRow);
     return true;
   };
   const renderNotConnected = (panel: HTMLElement) => {
@@ -98,30 +142,24 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     if (last === "failed" || last === "cancelled") {
       panel.append(node("p", last === "failed" ? `${words.loginFailed}${status.login.error ? `: ${status.login.error}` : ""}` : words.loginCancelled, "text-destructive text-sm"));
     }
-    panel.append(action("browserLogin", login));
-    const cli = action("cliLogin", () => void run(async () => { await call("/login/cli", {}); await reconcile(); await refresh(); }));
-    panel.append(cli, node("p", words.cliHint, "text-xs text-muted-foreground"));
+    panel.append(node("p", words.cliHint, "text-xs text-muted-foreground"));
     // API-key form: password-typed input so the key never shows on screen.
-    const input = node("input", "", "w-full rounded-md border border-input bg-background px-3 py-2 text-sm") as HTMLInputElement;
+    const input = node("input", "", "w-full rounded-xl border border-input bg-input/50 px-3 py-2 text-sm backdrop-blur-md") as HTMLInputElement;
     input.type = "password"; input.placeholder = words.apiKeyPlaceholder; input.autocomplete = "off";
     input.setAttribute("aria-label", words.apiKey);
     input.value = draft;
     input.oninput = () => { draft = input.value; };
-    const connectButton = action("connect", () => connectApiKey(input));
-    input.onkeydown = e => { if (e.key === "Enter") connectApiKey(input); };
+    const connect = () => connectApiKey(input);
+    const connectButton = action("connect", connect, { extra: "w-auto shrink-0 px-3" });
+    input.onkeydown = e => { if (e.key === "Enter") connect(); };
     const keyRow = node("div", "", "flex gap-2 items-center");
     keyRow.append(input, connectButton);
     panel.append(node("p", words.apiKey, "text-sm font-medium"), keyRow,
       node("p", words.apiKeyHint, "text-xs text-muted-foreground"));
   };
   const renderConnected = (panel: HTMLElement) => {
-    if (status?.expired) panel.append(node("p", words.expired, "text-destructive"));
-    if (status?.account) panel.append(node("p", `${words.account}: ${status.account}${status.plan ? ` · ${status.plan}` : ""}`));
-    panel.append(action("sync", () => void run(async () => { await call("/sync", {}); await reconcile(); await refresh(); })));
-    panel.append(action("usage", () => void run(async () => { usage = await call("/usage", {}); })));
-    panel.append(action("disconnect", () => void run(async () => {
-      await call("/disconnect", {}); usage = undefined; await reconcile(); await refresh();
-    }), true));
+    if (status?.expired) panel.append(node("p", words.expired, "text-destructive text-sm"));
+    if (status?.account) panel.append(node("p", `${words.account}: ${status.account}${status.plan ? ` · ${status.plan}` : ""}`, "text-sm text-muted-foreground"));
     // Usage windows: render defensively — shape comes from a remote payload.
     const usageLine = node("p", "", "text-sm text-muted-foreground");
     if (usage?.known && Array.isArray(usage.windows) && usage.windows.length) {
@@ -135,24 +173,42 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     } else usageLine.textContent = words.unknown;
     panel.append(usageLine);
     if (status?.coolingUntil > Date.now()) panel.append(node("p", `${words.cooling}: ${new Date(status.coolingUntil).toLocaleString()}`, "text-sm text-muted-foreground"));
-    panel.append(node("h4", words.models, "font-medium"));
+    panel.append(node("h4", words.models, "mt-2 font-medium"));
     if (!status?.models?.length) panel.append(node("p", words.noModels, "text-sm text-muted-foreground"));
     for (const model of status?.models ?? []) {
-      panel.append(node("div", `${model.id}${model.context ? ` · ${model.context}` : ""}`, "text-sm"));
+      panel.append(node("div", `${model.id}${model.context ? ` · ${model.context}` : ""}`, "min-w-0 break-all text-sm"));
     }
   };
   const render = () => {
     if (disposed) return;
     el.replaceChildren();
-    const panel = node("section", "", "glass-card rounded-xl p-5 space-y-4");
-    panel.append(node("h3", words.title, "font-semibold text-lg"),
+    const card = node("section", "", "glass-card rounded-2xl overflow-hidden mb-4");
+    const layout = node("div", "", "flex flex-col gap-4 p-5 sm:flex-row sm:items-start sm:justify-between");
+    const body = node("div", "", "min-w-0 flex-1 space-y-3");
+    const actions = node("div", "", "flex shrink-0 flex-col gap-2 sm:w-[210px]");
+    body.append(node("h3", words.title, "font-semibold text-lg"),
       node("p", words.description, "text-sm text-muted-foreground"));
-    panel.append(node("p", status ? words[status.status] ?? words.error : words.loading));
-    if (error) panel.append(node("p", words.error, "text-destructive"));
-    if (status?.status === "connected") renderConnected(panel);
-    else if (status) { if (!renderLoginPending(panel)) renderNotConnected(panel); }
-    panel.append(action("refresh", () => void run(() => refresh())));
-    el.append(panel);
+    body.append(node("p", status ? words[status.status] ?? words.error : words.loading));
+    if (error) body.append(node("p", words.error, "text-destructive text-sm"));
+    const pending = status ? renderLoginPending(body) : false;
+    if (status?.status === "connected") renderConnected(body);
+    else if (status && !pending) renderNotConnected(body);
+    if (pending) {
+      actions.append(action("cancelLogin", cancelLogin, { icon: plugIcon("h-3.5 w-3.5 shrink-0") }));
+    } else if (status?.status === "connected") {
+      actions.append(action("sync", () => void run(async () => { await call("/sync", {}); await reconcile(); await refresh(); }), { icon: refreshCwIcon("h-3.5 w-3.5 shrink-0") }));
+      actions.append(action("usage", () => void run(async () => { usage = await call("/usage", {}); }), { icon: coinsIcon("h-3.5 w-3.5 shrink-0") }));
+      actions.append(action("disconnect", () => void run(async () => {
+        await call("/disconnect", {}); usage = undefined; await reconcile(); await refresh();
+      }), { variant: "destructive" }));
+    } else if (status) {
+      actions.append(action("browserLogin", login, { variant: "primary", icon: plugIcon("h-3.5 w-3.5 shrink-0") }));
+      actions.append(action("cliLogin", () => void run(async () => { await call("/login/cli", {}); await reconcile(); await refresh(); })));
+    }
+    actions.append(action("refresh", () => void run(() => refresh()), { icon: refreshCwIcon("h-3.5 w-3.5 shrink-0") }));
+    layout.append(body, actions);
+    card.append(layout);
+    el.append(card);
   };
   const load = () => void refresh().catch(() => { error = true; if (!disposed) render(); });
   const off = props.onHostChange?.(render);

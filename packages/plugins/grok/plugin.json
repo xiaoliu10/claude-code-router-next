@@ -1,6 +1,6 @@
 {
   "name": "grok",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "coreApi": "1",
   "description": "Grok Build subscription provider: explicit CLI device sign-in/import, fixed Responses upstream, model management and quota."
 }
