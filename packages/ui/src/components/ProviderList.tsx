@@ -1,5 +1,8 @@
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { Pencil, RefreshCw, Trash2, Network, TriangleAlert } from "lucide-react";
+import { DndProvider, useDrag, useDrop } from "react-dnd";
+import { HTML5Backend } from "react-dnd-html5-backend";
+import { Pencil, RefreshCw, Trash2, Network, TriangleAlert, GripVertical } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
@@ -26,6 +29,52 @@ interface ProviderListProps {
   saving?: boolean;
   // Toggle per-provider proxy_enabled
   onProxyToggle?: (index: number, enabled: boolean) => void;
+  /**
+   * Row id per rendered provider, in the SAME order as `providers`. The list is
+   * often a search-filtered subset, so only the caller can mint ids that line
+   * up with the full config array (see providerDragId). Required whenever
+   * reordering is enabled: a locally derived fallback would not match the ids
+   * the reorder helper resolves against.
+   */
+  providerIds?: string[];
+  /** Called with the dragged row id and the drop-target row id. */
+  onReorder?: (draggedId: string, targetId: string) => void;
+}
+
+const PROVIDER_DND_TYPE = "provider-row";
+
+interface ProviderCardProps {
+  /** Row id minted by the list (see providerDragId); shared by both drag ends. */
+  dragId: string;
+  onReorder?: (draggedId: string, targetId: string) => void;
+  saving?: boolean;
+  children: React.ReactNode;
+}
+
+function ProviderCard({ dragId, onReorder, saving, children }: ProviderCardProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Both ends of the drag resolve through the same id, so a row is addressable
+  // whether or not it has a name (see providerDragId).
+  const [{ isOver }, drop] = useDrop({
+    accept: PROVIDER_DND_TYPE,
+    drop: (item: { id: string }) => onReorder?.(item.id, dragId),
+    collect: (monitor) => ({ isOver: monitor.isOver({ shallow: true }) }),
+  });
+  const [{ isDragging }, drag] = useDrag({
+    type: PROVIDER_DND_TYPE,
+    item: { id: dragId },
+    canDrag: !!onReorder && !saving,
+    collect: (monitor) => ({ isDragging: monitor.isDragging() }),
+  });
+  drag(drop(ref));
+  return (
+    <div
+      ref={ref}
+      className={`transition-opacity ${onReorder ? "cursor-grab active:cursor-grabbing" : ""} ${isOver ? "ring-2 ring-primary/60 rounded-2xl" : ""} ${isDragging ? "opacity-40" : ""}`}
+    >
+      {children}
+    </div>
+  );
 }
 
 // Get health status for a provider
@@ -297,8 +346,9 @@ function QuotaProgressBar({
   );
 }
 
-export function ProviderList({ providers, healthStates, quotaUsages, probeTelemetry, onEdit, onRemove, onToggle, onProbe, probingProviders, proxyUrl, proxyGlobalEnabled, saving, onProxyToggle }: ProviderListProps) {
+export function ProviderList({ providers, providerIds, healthStates, quotaUsages, probeTelemetry, onEdit, onRemove, onToggle, onProbe, probingProviders, proxyUrl, proxyGlobalEnabled, saving, onProxyToggle, onReorder }: ProviderListProps) {
   const { t } = useTranslation();
+  const dragEnabled = !!onReorder;
 
   // Derive proxy state once for all cards
   const hasProxyUrl = (proxyUrl || "").trim() !== "";
@@ -315,12 +365,16 @@ export function ProviderList({ providers, healthStates, quotaUsages, probeTeleme
     );
   }
 
-  return (
-    <div className="space-y-4">
-      {providers.map((provider, index) => {
+  const cards = providers.map((provider, index) => {
         if (!provider) return null;
 
         const providerName = provider.name || "Unnamed Provider";
+        // Keys and drag ids share one identity: the row id minted against the
+        // full array. Two unnamed providers would otherwise both key as the
+        // display string "Unnamed Provider" and React would reuse the wrong DOM.
+        // Without ids (reordering disabled) the index is a valid React key and
+        // is never used as a drag id, because canDrag requires onReorder.
+        const rowId = providerIds?.[index] ?? `__row_${index}`;
         const apiBaseUrl = provider.api_base_url || "No API URL";
         const models = Array.isArray(provider.models) ? provider.models : [];
         const health = getProviderHealth(providerName, healthStates);
@@ -331,7 +385,16 @@ export function ProviderList({ providers, healthStates, quotaUsages, probeTeleme
         const cardStatus = deriveProviderCardStatus(isEnabled, health, probe);
 
         return (
-          <div key={index} className="flex items-start justify-between rounded-2xl border border-white/10 bg-white/5 p-5 transition-all hover:bg-white/10 hover:border-primary/30 group animate-in shadow-lg shadow-black/5 glass-card">
+          <ProviderCard key={rowId} dragId={rowId} onReorder={onReorder} saving={saving}>
+          <div className="flex items-start justify-between rounded-2xl border border-white/10 bg-white/5 p-5 transition-all hover:bg-white/10 hover:border-primary/30 group animate-in shadow-lg shadow-black/5 glass-card">
+            {dragEnabled && (
+              <div
+                className="mr-2 -ml-1 flex h-full cursor-grab items-center self-stretch text-muted-foreground/30 transition-colors hover:text-muted-foreground active:cursor-grabbing"
+                title={t("providers.drag_hint", { defaultValue: "Drag to reorder" })}
+              >
+                <GripVertical className="h-4 w-4" />
+              </div>
+            )}
             <div className="flex-1 space-y-3">
                 <div className="flex flex-col gap-1">
                   <p className="text-lg font-bold tracking-tight text-foreground">{providerName}</p>
@@ -491,8 +554,15 @@ export function ProviderList({ providers, healthStates, quotaUsages, probeTeleme
               </div>
             </div>
           </div>
+          </ProviderCard>
         );
-      })}
-    </div>
+      });
+
+  return dragEnabled ? (
+    <DndProvider backend={HTML5Backend}>
+      <div className="space-y-4">{cards}</div>
+    </DndProvider>
+  ) : (
+    <div className="space-y-4">{cards}</div>
   );
 }
