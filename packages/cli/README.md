@@ -93,6 +93,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2425** | <ul><li>**供应商拖动排序**：卡片可拖动重排，顺序立即写入配置；拖拽按稳定行 ID 定位，搜索过滤下依然正确，无 name 的供应商也能拖。</li><li>**grok 与 cursor 卡片对齐家族样式**：统一按钮词汇、尺寸、图标与 destructive 变体，七张供应商卡片外观一致。</li></ul> |
 | **v2.3.2424** | <ul><li>**新增 Kiro 订阅 provider 插件**：Kiro 门户 / AWS Builder ID / IAM Identity Center 三种 OAuth 登录，运行时区域由 profile ARN 推导，多账号卡片与配额管理。</li><li>**估算用量溯源**：用量库新增 <code>usage_estimated</code> 列（v3 加法式迁移），估算值不再被当作精确计量展示，也不参与缓存读推断。</li></ul> |
 | **v2.3.2423** | <ul><li>**新增 Grok、Cursor 订阅 provider 插件**：Grok 走官方 CLI 设备码登录；Cursor 支持浏览器 / cursor-agent CLI / API Key 登录（订阅代理下自动降为 HTTP/1），均含模型管理与用量卡片。</li><li>**Responses 流按客户端格式转换**：修复原生 Responses 帧直接给 Chat/Anthropic 客户端造成的空回合；短回合第三段模型不再显示 unknown；终帧内联答案不再丢失。</li><li>**Qoder / WorkBuddy 中国站每日自动签到/领取积分**（启动抖动、失败当日有界重试），手动按钮保留。</li></ul> |
 | **v2.3.2422** | <ul><li>**send 级插件失败不再误报**：插件 fetch 在拿到 HTTP 状态前失败（本地代理拒连/DNS/TLS/超时）时，此前只报笼统的"invalid upstream response"；status 0 的发送失败现在归类为 <code>plugin_network_error</code>，附带上界受控、严格消毒的传输诊断（cause 链错误码 + host:port）。</li><li>**恢复探活不再被失败时间饿死**：受托恢复门控改用 lastProbeTime 判定，失败刷新 lastFailureTime 不再推迟探活，熔断可正常自愈。</li><li>**首页失败横幅显示最后失败时间**：过期红条与持续故障一眼可分。</li><li>**仓库对齐已发运状态**：合并堆积 PR #95-#100（workspace 根 private 守卫、codex 1.0.10 缓存键锚定、qoder 0.3.x 签到与卡片统一），插件版本对齐 codex 1.0.10 / qoder 0.3.3。</li></ul> |
