@@ -185,7 +185,8 @@
     "default_thinking_level_max": "max",
     "default_thinking_level_custom": "自定义",
     "default_thinking_level_custom_placeholder": "如 minimal、off，或 token 预算 4096",
-    "default_thinking_level_custom_hint": "非枚举字符串在 OpenAI 系端点（/v1/responses、chat completions）原样透传（如 minimal）；在 Anthropic 端点按别名归一到标准档位：min/minimal/light→low、xhigh/maximum/ultra→max，其余字符串忽略；纯数字在 Anthropic 端点按 token 预算精确注入（低于 1024 提到最小值 1024），档位由预算反推；max 档在 Anthropic 端点只发 32768 预算、不发 effort（上游仅最新 Opus 支持 effort=max，而支持它的 GLM 默认就是 max）。"
+    "default_thinking_level_custom_hint": "非枚举字符串在 OpenAI 系端点（/v1/responses、chat completions）原样透传（如 minimal）；在 Anthropic 端点按别名归一到标准档位：min/minimal/light→low、xhigh/maximum/ultra→max，其余字符串忽略；纯数字在 Anthropic 端点按 token 预算精确注入（低于 1024 提到最小值 1024），档位由预算反推；max 档在 Anthropic 端点只发 32768 预算、不发 effort（上游仅最新 Opus 支持 effort=max，而支持它的 GLM 默认就是 max）。",
+    "drag_hint": "拖动排序"
   },
   "router": {
     "title": "路由",

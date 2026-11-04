@@ -6,6 +6,7 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { useConfig } from "./ConfigProvider";
 import { ProviderList } from "./ProviderList";
+import { providerDragId, reorderProvidersById } from "./provider-order";
 import { useNavigate } from "react-router-dom";
 import { geminiOauthErrorKey, isManagedGeminiOauth } from "@/utils/gemini-oauth";
 import {
@@ -316,6 +317,15 @@ export function Providers() {
   // Validate config.Providers to ensure it's an array
   const validProviders = Array.isArray(config.Providers) ? config.Providers : [];
 
+  // Row ids must be minted against the FULL array, but the list renders a
+  // possibly-filtered subset. Map by object identity (O(n)) rather than
+  // indexOf (O(n^2), and wrong for a duplicated row reference).
+  const fullIndexOf = (() => {
+    const cache = new Map<unknown, number>();
+    validProviders.forEach((p, i) => { if (!cache.has(p)) cache.set(p, i); });
+    return (p: unknown): number => cache.get(p) ?? -1;
+  })();
+
 
   const handleAddProvider = () => {
     const newProvider: ProviderType = { name: "", api_base_url: "", api_key: "", models: [] };
@@ -572,6 +582,32 @@ export function Providers() {
       console.error('Failed to persist provider removal:', e);
       setToast({ message: t('app.config_saved_failed') + ': ' + (e as Error).message, type: 'error' });
       // Revert to server state on failure
+      await refreshConfig();
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Drag-and-drop reorder: operate on the FULL config array (the rendered list
+  // may be search-filtered) and persist immediately, same as toggles/removal.
+  // Ids are minted here, against the full array, so a filtered view cannot lie
+  // about a row's position (see providerDragId).
+  const handleReorderProviders = async (draggedId: string, targetId: string) => {
+    const all = Array.isArray(config.Providers) ? config.Providers : [];
+    const reordered = reorderProvidersById(all, draggedId, targetId);
+    if (reordered === all) return;
+    const newConfig = { ...config, Providers: reordered };
+    setIsSaving(true);
+    try {
+      const response = await api.updateConfig(newConfig);
+      if (response.success) {
+        setToast({ message: t('app.config_saved_success'), type: 'success' });
+      } else {
+        setToast({ message: response.message || t('app.config_saved_failed'), type: 'error' });
+      }
+      await refreshConfig();
+    } catch (e) {
+      setToast({ message: t('app.config_saved_failed') + ': ' + (e as Error).message, type: 'error' });
       await refreshConfig();
     } finally {
       setIsSaving(false);
@@ -988,6 +1024,7 @@ export function Providers() {
       <CardContent className="flex-grow overflow-y-auto p-6 custom-scrollbar">
         <ProviderList
           providers={filteredProviders}
+          providerIds={filteredProviders.map((p) => providerDragId(p, fullIndexOf(p)))}
           healthStates={healthStates}
           quotaUsages={quotaUsages}
           probeTelemetry={probeTelemetry}
@@ -1000,6 +1037,7 @@ export function Providers() {
           proxyGlobalEnabled={isGlobalProxyEnabled(config.PROXY_GLOBAL_ENABLED)}
           saving={isSaving}
           onProxyToggle={handleProxyToggle}
+          onReorder={handleReorderProviders}
         />
       </CardContent>
 

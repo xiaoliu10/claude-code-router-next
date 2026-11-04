@@ -185,7 +185,8 @@
     "default_thinking_level_max": "max",
     "default_thinking_level_custom": "Custom",
     "default_thinking_level_custom_placeholder": "e.g. minimal, off, or budget 4096",
-    "default_thinking_level_custom_hint": "Non-enum strings pass through verbatim on OpenAI-style endpoints (/v1/responses, chat completions, e.g. minimal); on Anthropic endpoints they resolve to the standard level they stand for: min/minimal/light→low, xhigh/maximum/ultra→max, anything else is ignored; a pure number is injected as an exact token budget on Anthropic endpoints (below 1024 raised to the API minimum) with the tier derived from it. The max tier sends only the 32768 budget on Anthropic endpoints — upstream only the newest Opus accepts effort=max, while the providers that do (GLM) already default to it."
+    "default_thinking_level_custom_hint": "Non-enum strings pass through verbatim on OpenAI-style endpoints (/v1/responses, chat completions, e.g. minimal); on Anthropic endpoints they resolve to the standard level they stand for: min/minimal/light→low, xhigh/maximum/ultra→max, anything else is ignored; a pure number is injected as an exact token budget on Anthropic endpoints (below 1024 raised to the API minimum) with the tier derived from it. The max tier sends only the 32768 budget on Anthropic endpoints — upstream only the newest Opus accepts effort=max, while the providers that do (GLM) already default to it.",
+    "drag_hint": "Drag to reorder"
   },
   "router": {
     "title": "Router",
