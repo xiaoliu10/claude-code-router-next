@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2425] - 2026-11-04
+
+### Added
+
+- **provider drag-and-drop reordering**: provider cards can be dragged to reorder the list. The order is written to the config immediately, on the same save path as toggles and removal (the server backs up the previous config as usual). Reordering resolves both ends of a drag by a stable row id rather than a rendered index, so it stays correct while the list is search-filtered, and unnamed rows are addressed by a NUL-prefixed id that a provider name cannot collide with.
+
+### Changed
+
+- **grok and cursor cards follow the family style**: both cards had kept the pre-family button vocabulary while codex/qoder/workbuddy had moved to the shared four-constant set and the two-column body/action skeleton. They now use the same buttons, sizes, lucide icons and destructive variant, so all seven provider cards look alike. Behaviour is unchanged.
+
+### Fixed
+
+- **an unnamed provider could not be dragged**: the list and the reorder helper minted row ids from two independent counters, so dragging a row without a name silently moved nothing.
+- **a provider named `__index_N` moved the wrong row**: named ids were raw names while unnamed ids used the same string shape, so a look-alike name shadowed the unnamed row at that index.
+- **two unnamed providers shared one React key**: both keyed as the display string "Unnamed Provider", letting React reuse the wrong DOM node.
+
+## [2.3.2425] - 2026-11-04（中文）
+
+### 新增
+
+- **供应商拖动排序**：供应商卡片可拖动重排，顺序立即写入配置，与开关、删除走同一条保存链路（服务端照常备份上一版配置）。拖拽两端按稳定行 ID 定位而非渲染下标，因此在搜索过滤状态下依然正确；无名行使用带 NUL 前缀的 ID，供应商名无法与之碰撞。
+
+### 变更
+
+- **grok 与 cursor 卡片对齐家族样式**：两张卡片此前仍是统一前的按钮词汇，而 codex/qoder/workbuddy 已迁到共享的四常量按钮集与两栏正文/动作骨架。现改用相同的按钮、尺寸、lucide 图标与 destructive 变体，七张供应商卡片外观一致。行为不变。
+
+### 修复
+
+- **无 name 的供应商无法拖动**：列表与重排辅助函数各自用独立计数器生成行 ID，导致无 name 的行拖动后毫无变化。
+- **名为 `__index_N` 的供应商会移动错行**：有名行直接用名字作 ID，无名行用同形状字符串，同名供应商会遮蔽该下标上的无名行。
+- **两个无名供应商共用同一个 React key**：都以显示文案 "Unnamed Provider" 作 key，导致 React 复用错误的 DOM 节点。
+
 ## [2.3.2424] - 2026-11-03
 
 ### Added
