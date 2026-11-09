@@ -93,6 +93,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2426** | <ul><li>**Gemini (Antigravity) 模型隐藏/恢复**：卡片列出可见模型 chips（带隐藏按钮）与隐藏列表（恢复/全部恢复）；隐藏时自动清理 Router 引用并回退默认路由，失败完整回滚。</li></ul> |
 | **v2.3.2425** | <ul><li>**供应商拖动排序**：卡片可拖动重排，顺序立即写入配置；拖拽按稳定行 ID 定位，搜索过滤下依然正确，无 name 的供应商也能拖。</li><li>**grok 与 cursor 卡片对齐家族样式**：统一按钮词汇、尺寸、图标与 destructive 变体，七张供应商卡片外观一致。</li></ul> |
 | **v2.3.2424** | <ul><li>**新增 Kiro 订阅 provider 插件**：Kiro 门户 / AWS Builder ID / IAM Identity Center 三种 OAuth 登录，运行时区域由 profile ARN 推导，多账号卡片与配额管理。</li><li>**估算用量溯源**：用量库新增 <code>usage_estimated</code> 列（v3 加法式迁移），估算值不再被当作精确计量展示，也不参与缓存读推断。</li></ul> |
 | **v2.3.2423** | <ul><li>**新增 Grok、Cursor 订阅 provider 插件**：Grok 走官方 CLI 设备码登录；Cursor 支持浏览器 / cursor-agent CLI / API Key 登录（订阅代理下自动降为 HTTP/1），均含模型管理与用量卡片。</li><li>**Responses 流按客户端格式转换**：修复原生 Responses 帧直接给 Chat/Anthropic 客户端造成的空回合；短回合第三段模型不再显示 unknown；终帧内联答案不再丢失。</li><li>**Qoder / WorkBuddy 中国站每日自动签到/领取积分**（启动抖动、失败当日有界重试），手动按钮保留。</li></ul> |
