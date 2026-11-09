@@ -380,3 +380,116 @@ describe("Gemini OAuth error bookkeeping and disconnect", () => {
     expect((await h.service.getStatus()).connected).toBe(true);
   });
 });
+
+describe("Gemini OAuth model hide/restore service seam", () => {
+  const managed = (models: string[]) => lockGeminiOauthProvider({ name: "gemini-oauth", models });
+
+  it("credential schema keeps hiddenModels: valid ids round-trip deduplicated, invalid entries reject the whole file", async () => {
+    const h = await harness();
+    await h.store.save({ ...credential(), hiddenModels: ["gemini-3-flash", "gemini-3-flash", "gemini-3-pro"] });
+    expect((await h.store.load())!.hiddenModels).toEqual(["gemini-3-flash", "gemini-3-pro"]);
+    // An empty list is the same as no hide preference: it is not persisted.
+    await h.store.save({ ...credential(), hiddenModels: [] });
+    expect((await h.store.load())!.hiddenModels).toBeUndefined();
+    // Invalid entries are a corrupt file, never a value to silently drop
+    // (a dropped entry would resurrect a model the user hid).
+    for (const hiddenModels of [
+      "not-an-array",
+      ["gemini-3-flash,gemini-3-pro"],               // a comma would split a provider,model ref
+      ["a\u0000b"],                                   // control character
+      [""],                                           // empty id
+      ["x".repeat(257)],                              // over-long id
+      [42],                                           // not a string
+      Array.from({ length: 257 }, (_, i) => `m${i}`), // above the 256-entry cap
+    ]) {
+      await fs.writeFile(h.store.path, JSON.stringify({ ...credential(), hiddenModels }), { mode: 0o600 });
+      const error = await h.store.load().catch((e) => e);
+      expect(error).toMatchObject({ code: "gemini_oauth_credential_unreadable" });
+      // The rejection never echoes the corrupt contents or token material.
+      expect(JSON.stringify(error)).not.toContain(REFRESH);
+      expect(JSON.stringify(error)).not.toContain(ACCESS);
+    }
+  });
+
+  it("hideModel requires a connected account and a model the provider actually registers", async () => {
+    const h = await harness({ Providers: [managed(["gemini-3-flash"])], Router: {} });
+    await expect(h.service.hideModel("gemini-3-flash")).rejects.toMatchObject({ code: "gemini_oauth_not_connected", statusCode: 409 });
+    await h.store.save(credential());
+    // A plausible id the provider does not expose is refused (422), as is a
+    // malformed id — both before any store/config write.
+    await expect(h.service.hideModel("gemini-3-pro")).rejects.toMatchObject({ code: "gemini_oauth_model_invalid", statusCode: 422 });
+    await expect(h.service.hideModel("bad,id")).rejects.toMatchObject({ code: "gemini_oauth_model_invalid", statusCode: 422 });
+    expect(h.config().Providers[0].models).toEqual(["gemini-3-flash"]);
+    expect((await h.store.load())!.hiddenModels).toBeUndefined();
+  });
+
+  it("hideModel clears Router refs, persists the blacklist and splits status models/hiddenModels", async () => {
+    const h = await harness({ Providers: [managed(["gemini-3-flash", "gemini-3-pro"])], Router: {
+      default: "gemini-oauth,gemini-3-flash", think: "gemini-oauth,gemini-3-flash",
+      longContext: ["gemini-oauth,gemini-3-flash", "other,x"],
+    } });
+    await h.store.save(credential());
+    expect(await h.service.hideModel("gemini-3-flash")).toEqual({
+      ok: true,
+      clearedRefs: ["default", "scenario:think", "scenario:longContext"],
+      removedModelRefs: ["gemini-oauth,gemini-3-flash"],
+      defaultFallback: "gemini-oauth,gemini-3-pro",
+      models: ["gemini-3-pro"],
+      hiddenModels: ["gemini-3-flash"],
+    });
+    expect(h.config().Providers[0].models).toEqual(["gemini-3-pro"]);
+    expect(h.config().Router).toEqual({ default: "gemini-oauth,gemini-3-pro", think: "", longContext: ["other,x"] });
+    const stored = (await h.store.load())!;
+    expect(stored.hiddenModels).toEqual(["gemini-3-flash"]);
+    // rawModelIds stay untouched: the variant mapper still resolves the hidden family.
+    expect(stored.rawModelIds).toEqual(credential().rawModelIds);
+    expect(await h.service.getStatus()).toMatchObject({ modelsCount: 1, models: ["gemini-3-pro"], hiddenModels: ["gemini-3-flash"] });
+    expect(await h.service.resolveWireModel("gemini-3-flash", "low")).toBe("gemini-3-flash-low");
+  });
+
+  it("hideModel rolls credential AND config back when the provider write fails", async () => {
+    const config = { Providers: [managed(["gemini-3-flash", "gemini-3-pro"])], Router: { default: "gemini-oauth,gemini-3-flash" } };
+    const h = await harness(config);
+    await h.store.save(credential());
+    await h.service.getStatus();
+    h.write.mockRejectedValueOnce(new Error("private disk error"));
+    await expect(h.service.hideModel("gemini-3-flash")).rejects.toMatchObject({ code: "gemini_oauth_config_write_failed", statusCode: 500 });
+    expect(h.config()).toEqual(config);
+    expect((await h.store.load())!.hiddenModels).toBeUndefined();
+    expect(await h.service.getStatus()).toMatchObject({ modelsCount: 2, models: ["gemini-3-flash", "gemini-3-pro"], hiddenModels: [] });
+  });
+
+  it("restoreModels(single) re-registers a still-discovered family without touching Router", async () => {
+    const h = await harness({ Providers: [managed(["gemini-3-pro"])], Router: { default: "ordinary,m" } });
+    // credential() carries rawModelIds gemini-3-flash-low/high: discovery still
+    // collapses them into the gemini-3-flash family, so it is restorable.
+    await h.store.save({ ...credential(), hiddenModels: ["gemini-3-flash", "gemini-2.5-gone"] });
+    expect(await h.service.restoreModels("gemini-3-flash")).toEqual({
+      ok: true, restored: ["gemini-3-flash"], models: ["gemini-3-pro", "gemini-3-flash"], hiddenModels: ["gemini-2.5-gone"],
+    });
+    expect(h.config().Providers[0].models).toEqual(["gemini-3-pro", "gemini-3-flash"]);
+    expect(h.config().Router).toEqual({ default: "ordinary,m" }); // restore NEVER rewrites Router
+    expect((await h.store.load())!.hiddenModels).toEqual(["gemini-2.5-gone"]);
+  });
+
+  it("restoreModels() (all) drops ids the account no longer exposes and clears the blacklist", async () => {
+    const h = await harness({ Providers: [managed(["gemini-3-pro"])], Router: { default: "ordinary,m" } });
+    await h.store.save({ ...credential(), hiddenModels: ["gemini-3-flash", "gemini-2.5-gone"] });
+    expect(await h.service.restoreModels()).toEqual({
+      ok: true, restored: ["gemini-3-flash"], models: ["gemini-3-pro", "gemini-3-flash"], hiddenModels: [],
+    });
+    expect(h.config().Providers[0].models).toEqual(["gemini-3-pro", "gemini-3-flash"]);
+    // The vanished id is not re-registered and leaves no blacklist entry.
+    expect((await h.store.load())!.hiddenModels).toBeUndefined();
+    expect(await h.service.getStatus()).toMatchObject({ modelsCount: 2, models: ["gemini-3-pro", "gemini-3-flash"], hiddenModels: [] });
+  });
+
+  it("restoreModels guards the connection and the model-id grammar", async () => {
+    const h = await harness({ Providers: [managed(["gemini-3-flash"])], Router: {} });
+    await expect(h.service.restoreModels()).rejects.toMatchObject({ code: "gemini_oauth_not_connected", statusCode: 409 });
+    await h.store.save(credential());
+    await expect(h.service.restoreModels("bad,id")).rejects.toMatchObject({ code: "gemini_oauth_model_invalid", statusCode: 422 });
+    // Restoring an id that is not hidden is a no-op success.
+    expect(await h.service.restoreModels("gemini-3-flash")).toEqual({ ok: true, restored: [], models: ["gemini-3-flash"], hiddenModels: [] });
+  });
+});

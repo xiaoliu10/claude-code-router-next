@@ -54,6 +54,7 @@ import {
   antigravityWireModel,
   buildAuthorizeUrl,
   clearGeminiOauthTokenCaches,
+  collapseAntigravityModels,
   createGeminiOauthTokenState,
   createPkcePair,
   discoverAntigravityProject,
@@ -94,12 +95,19 @@ export interface GeminiOauthAccount {
 
 /** On-disk schema (contract §1.3, version 2). `rawModelIds` is the one
  *  documented extension: non-secret unfolded upstream ids the variant mapper
- *  needs after a restart (the collapsed provider.models list loses them). */
+ *  needs after a restart (the collapsed provider.models list loses them).
+ *  `hiddenModels` is the user's model-hide preference: it stores the ids the
+ *  UI shows (collapsed effort-family ids), NEVER the raw upstream ids above, so
+ *  hiding a family removes exactly the id the user saw. Optional on load, so
+ *  every credential file written before it existed still reads.
+ *  `rawModelIds` stays untouched by hide/restore: the variant mapper keeps
+ *  resolving hidden families for callers that addressed them directly. */
 export interface GeminiOauthCredentialData {
   version: 2;
   kind: "antigravity";
   account: GeminiOauthAccount;
   rawModelIds?: string[];
+  hiddenModels?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +163,12 @@ export interface GeminiOauthStatusResult {
   email: string | null;
   project: string | null;
   tier: string | null;
+  /** Length of `models` (kept for older clients); hidden models are excluded. */
   modelsCount: number;
+  /** Visible managed models (UI ids — collapsed effort-family ids), in provider order. */
+  models: string[];
+  /** Hidden models (same id space as `models`), for single/all restore. */
+  hiddenModels: string[];
   lastError: { code: GeminiOauthErrorCode; message: string; validationUrl?: string } | null;
   cooldownUntil: number | null;
 }
@@ -171,6 +184,35 @@ export interface GeminiOauthDisconnectResult {
   ok: true;
   removedModelRefs: string[];
   defaultFallback: string | null;
+}
+
+export interface GeminiOauthHideResult {
+  ok: true;
+  /** Router FIELD PATHS rewritten ("default", "scenario:think", "models:<alias>", "fallback"). */
+  clearedRefs: string[];
+  /** The actual `gemini-oauth,<model>` refs that left Router (empty when none matched). */
+  removedModelRefs: string[];
+  /** Persisted `Router.default` after the rewrite ("" when it was cleared). */
+  defaultFallback: string | null;
+  models: string[];
+  hiddenModels: string[];
+}
+
+export interface GeminiOauthRestoreResult {
+  ok: true;
+  /** Models that became visible again (only discovered/registered ones). */
+  restored: string[];
+  models: string[];
+  hiddenModels: string[];
+}
+
+/**
+ * A hide/restore input that is not a plausible model id. Rejections happen
+ * before any store/config read: empty, over-long, comma-bearing (would split a
+ * `provider,model` ref) and control-character ids are all refused.
+ */
+export function isGeminiOauthModelId(value: unknown): value is string {
+  return boundedString(value, 256) && !value.includes(",");
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +265,17 @@ export function normalizeGeminiOauthData(raw: any): GeminiOauthCredentialData {
     if (ids.length > 256) throw new Error("gemini_oauth_credential_invalid");
     rawModelIds = [...new Set(ids)];
   }
+  let hiddenModels: string[] | undefined;
+  if (raw.hiddenModels !== undefined) {
+    if (!Array.isArray(raw.hiddenModels)) throw new Error("gemini_oauth_credential_invalid");
+    // Same id grammar as the hide route; anything else is a corrupt file, not
+    // a value to silently drop (a dropped entry would resurrect a model).
+    const hidden = (raw.hiddenModels as unknown[]).filter((id): id is string => boundedString(id, 256) && !id.includes(","));
+    if (hidden.length !== raw.hiddenModels.length || hidden.length > 256) {
+      throw new Error("gemini_oauth_credential_invalid");
+    }
+    hiddenModels = [...new Set(hidden)];
+  }
   const data: GeminiOauthCredentialData = {
     version: 2,
     kind: "antigravity",
@@ -237,6 +290,7 @@ export function normalizeGeminiOauthData(raw: any): GeminiOauthCredentialData {
     },
   };
   if (rawModelIds) data.rawModelIds = rawModelIds;
+  if (hiddenModels?.length) data.hiddenModels = hiddenModels;
   return data;
 }
 
@@ -310,10 +364,12 @@ function refProviderModel(value: string): [string, string] | null {
 }
 
 /**
- * Structural Router walk: drop/rewrite only `gemini-oauth,<model>` refs.
- * `default` is repointed to `firstVisible` (a still-registered Gemini model)
- * or cleared; scenario strings/arrays clear/drop; `models` alias entries are
- * removed; `families.<f>.default` is cleared. Unrelated refs are byte-identical.
+ * Structural Router walk: drop/rewrite only `gemini-oauth,<model>` refs whose
+ * model is in `models`. `default` is repointed to `firstVisible` (a still-registered
+ * Gemini model) or cleared; scenario strings/arrays clear/drop; `models` alias
+ * entries are removed; `families.<f>.default` is cleared; a nested
+ * `fallback` chain drops matching stages and a stage emptied that way is removed
+ * entirely. Unrelated refs, providers and models are byte-identical.
  */
 export function clearGeminiOauthRouterRefs(
   router: any,
@@ -367,6 +423,34 @@ export function clearGeminiOauthRouterRefs(
         (fam as any).default = "";
         clearedRefs.push(`families.${f}.default`);
       }
+    }
+  }
+  // Router.fallback is an ordered list of stages; each stage holds one or more
+  // `<provider>,<model>` refs (string or array). Drop only the matching refs and
+  // remove a stage that nothing references any more — the rest keeps its order.
+  if (Array.isArray(next.fallback)) {
+    const stages = next.fallback as any[];
+    const kept: any[] = [];
+    let changed = false;
+    for (const stage of stages) {
+      if (typeof stage === "string") {
+        if (!hit(stage)) { kept.push(stage); continue; }
+        record(stage); changed = true;
+        continue;
+      }
+      if (Array.isArray(stage) && stage.every((x) => typeof x === "string")) {
+        for (const item of stage as string[]) if (hit(item)) record(item);
+        const rest = (stage as string[]).filter((x) => !hit(x));
+        if (rest.length === stage.length) { kept.push(stage); continue; }
+        changed = true;
+        if (rest.length) kept.push(rest);
+        continue;
+      }
+      kept.push(stage);
+    }
+    if (changed) {
+      next.fallback = kept;
+      clearedRefs.push("fallback");
     }
   }
   return { router: next, clearedRefs, removedRefs };
@@ -428,6 +512,8 @@ export class GeminiOauthAuthService {
   private readonly tokenState = createGeminiOauthTokenState();
   private account: GeminiOauthAccount | null = null;
   private rawModelIds: string[] = [];
+  /** Persisted hide preference (UI model ids). Always mirrors the 0600 file. */
+  private hiddenModels: string[] = [];
   private loaded = false;
   /** Data-plane access-token refresh single-flight bridge (keyed refresh token). */
   private refreshFlight: { key: string; promise: Promise<string> } | null = null;
@@ -464,11 +550,17 @@ export class GeminiOauthAuthService {
     const data = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
     this.account = data?.account ?? null;
     this.rawModelIds = data?.rawModelIds ?? [];
+    this.hiddenModels = data?.hiddenModels ?? [];
     this.loaded = true;
     return this.account;
   }
 
-  private async writeAccount(account: GeminiOauthAccount, rawModelIds?: string[]): Promise<void> {
+  /**
+   * Persist the account block. `rawModelIds`/`hiddenModels` default to the
+   * in-memory values and are carried over explicitly: a token refresh or an
+   * error bookkeeping write must never drop the hide preference.
+   */
+  private async writeAccount(account: GeminiOauthAccount, rawModelIds?: string[], hiddenModels?: string[]): Promise<void> {
     const data: GeminiOauthCredentialData = {
       version: 2,
       kind: "antigravity",
@@ -476,16 +568,19 @@ export class GeminiOauthAuthService {
     };
     const ids = rawModelIds ?? this.rawModelIds;
     if (ids.length) data.rawModelIds = ids;
+    const hidden = hiddenModels ?? this.hiddenModels;
+    if (hidden.length) data.hiddenModels = hidden;
     await this.store.save(data);
     this.account = account;
     this.rawModelIds = ids.length ? ids : this.rawModelIds;
+    this.hiddenModels = hidden;
   }
 
   // ----------------------------------------------------------------- status --
 
   async getStatus(): Promise<GeminiOauthStatusResult> {
     const account = await this.ensureLoaded();
-    const modelsCount = await this.managedModelsCount();
+    const { models, hiddenModels } = await this.managedModels();
     const now = Date.now();
     // A parked-account error is shown only while its cooldown is live,
     // EXCEPT sticky ones: a reauth failure cannot be waited out, so it stays
@@ -509,20 +604,40 @@ export class GeminiOauthAuthService {
       email: account?.email ?? null,
       project: account?.projectId ?? null,
       tier: account?.tier ?? null,
-      modelsCount,
+      modelsCount: models.length,
+      models,
+      hiddenModels,
       lastError,
       cooldownUntil: cooling ? (account!.cooldownUntil as number) : null,
     };
   }
 
-  private async managedModelsCount(): Promise<number> {
+  /**
+   * Visible + hidden managed models, both in the UI id space. The visible list
+   * is the provider's registered list minus the hide preference, so status and
+   * the saved config always agree (including the empty list when all are
+   * hidden — no static fallback is re-added here).
+   */
+  private async managedModels(): Promise<{ models: string[]; hiddenModels: string[] }> {
+    const hiddenModels = [...this.hiddenModels].filter(isGeminiOauthModelId);
+    const hidden = new Set(hiddenModels);
+    let registered: string[] = [];
     try {
       const config = await this.readConfig();
       const provider = this.findManaged(config);
-      return Array.isArray(provider?.models) ? provider.models.filter((m: any) => typeof m === "string").length : 0;
+      registered = Array.isArray(provider?.models)
+        ? provider.models.filter((m: any): m is string => typeof m === "string")
+        : [];
     } catch {
-      return 0;
+      registered = [];
     }
+    const models = registered.filter((m) => !hidden.has(m));
+    return { models, hiddenModels };
+  }
+
+  private async managedModelsCount(): Promise<number> {
+    const { models } = await this.managedModels();
+    return models.length;
   }
 
   private findManaged(config: any): any | undefined {
@@ -819,10 +934,13 @@ export class GeminiOauthAuthService {
     try {
       await this.enqueueMutation(async () => {
         if (!isCurrent()) throw geminiOauthAdminError("gemini_oauth_login_cancelled", 409);
-        await this.writeAccount(account, rawIds);
+        // A re-authorization replaces the account, never the user's hide
+        // preference: hidden models stay hidden across a re-login.
+        const hidden = [...(previous?.hiddenModels ?? [])];
+        await this.writeAccount(account, rawIds, hidden);
         if (!isCurrent()) throw geminiOauthAdminError("gemini_oauth_login_cancelled", 409);
         try {
-          await this.upsertManagedProvider(collapsed.map((m) => m.id));
+          await this.upsertManagedProvider(collapsed.map((m) => m.id).filter((id) => !hidden.includes(id)));
         } catch (error) {
           // Provider write failed: roll the credential back so the account
           // is never half-connected.
@@ -930,19 +1048,158 @@ export class GeminiOauthAuthService {
       const currentModels: string[] = Array.isArray(provider?.models)
         ? provider.models.filter((m: any) => typeof m === "string")
         : [];
-      const nextSet = new Set(collapsedIds);
+      // The hide preference survives a sync: discovery never resurrects a
+      // hidden model, and `rawModelIds` keeps every unfolded variant so the
+      // variant mapper still resolves a hidden family.
+      const hidden = [...this.hiddenModels].filter(isGeminiOauthModelId);
+      const hiddenSet = new Set(hidden);
+      const visible = collapsedIds.filter((m) => !hiddenSet.has(m));
+      const nextSet = new Set(visible);
       const dropped = new Set(currentModels.filter((m) => !nextSet.has(m)));
-      const firstVisible = collapsedIds[0] ?? null;
+      const firstVisible = visible[0] ?? null;
       const cleaned = clearGeminiOauthRouterRefs(config.Router ?? {}, dropped, firstVisible);
       const previousConfig = structuredClone(config);
       try {
-        await this.writeAccount({ ...account, lastError: null, cooldownUntil: null }, rawIds);
-        await this.upsertManagedProvider(collapsedIds, { router: cleaned.clearedRefs.length ? cleaned.router : undefined });
+        await this.writeAccount({ ...account, lastError: null, cooldownUntil: null }, rawIds, hidden);
+        await this.upsertManagedProvider(visible, { router: cleaned.clearedRefs.length ? cleaned.router : undefined });
       } catch {
         try { await this.options.host.writeConfig(previousConfig); await this.options.host.reloadRuntime(previousConfig); } catch {}
         return { ok: false, modelsCount: currentModels.length, clearedRefs: [], error: "gemini_oauth_models_fetch_failed" } as GeminiOauthSyncResult;
       }
-      return { ok: true, modelsCount: collapsedIds.length, clearedRefs: cleaned.clearedRefs };
+      return { ok: true, modelsCount: visible.length, clearedRefs: cleaned.clearedRefs };
+    });
+  }
+
+  // ------------------------------------------------- hide / restore models ---
+
+  /**
+   * Hide one model (an explicit user action).
+   *  - The blacklist stores the id the UI showed (a collapsed effort-family id
+   *    is hidden as a whole family); `rawModelIds` keeps every unfolded variant
+   *    so the variant mapper still resolves wire ids.
+   *  - The managed provider's `models` loses the id immediately, so status, the
+   *    saved config and the picker stay consistent.
+   *  - Router is structurally cleaned for the hidden refs only; unrelated
+   *    providers/models are byte-identical.
+   *  - Credential and config writes share the single mutation queue. A failure
+   *    restores the previous credential file AND the previous config.
+   */
+  async hideModel(model: string): Promise<GeminiOauthHideResult> {
+    if (!isGeminiOauthModelId(model)) throw geminiOauthAdminError("gemini_oauth_model_invalid", 422);
+    return this.enqueueMutation(async () => {
+      const data = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
+      if (!data) throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
+      const previousHidden = data.hiddenModels ?? [];
+      const config = await this.readConfig();
+      const previousConfig = structuredClone(config);
+      const provider = this.findManaged(config);
+      // Only a model this provider actually exposes can be hidden: an arbitrary
+      // id would be written into the Router walk and the blacklist.
+      const registered = Array.isArray(provider?.models)
+        ? (provider.models as unknown[]).filter((m): m is string => typeof m === "string")
+        : [];
+      if (!registered.includes(model)) throw geminiOauthAdminError("gemini_oauth_model_invalid", 422);
+      const hidden = [...new Set([...previousHidden, model])];
+      const visible = registered.filter((m) => !hidden.includes(m));
+      const firstVisible = visible[0] ?? null;
+      const cleaned = clearGeminiOauthRouterRefs(config.Router ?? {}, new Set([model]), firstVisible);
+      try {
+        await this.store.save({ ...data, hiddenModels: hidden });
+        this.hiddenModels = hidden;
+        await this.upsertManagedProvider(visible, { router: cleaned.clearedRefs.length ? cleaned.router : undefined });
+      } catch {
+        try {
+          await this.store.save(data);
+          this.hiddenModels = previousHidden;
+          await this.options.host.writeConfig(previousConfig);
+          await this.options.host.reloadRuntime(previousConfig);
+        } catch {
+          // Sanitized: a raw error may carry a filesystem path.
+          this.log.error?.("[gemini-oauth] hide rollback failed");
+        }
+        this.log.error?.("[gemini-oauth] hide persist failed; rolled back");
+        throw geminiOauthAdminError("gemini_oauth_config_write_failed", 500);
+      }
+      const persisted = await this.readConfig().catch(() => null);
+      const defaultFallback = typeof persisted?.Router?.default === "string" ? persisted.Router.default : null;
+      return {
+        ok: true as const,
+        clearedRefs: cleaned.clearedRefs,
+        removedModelRefs: cleaned.removedRefs,
+        defaultFallback,
+        models: visible,
+        hiddenModels: hidden,
+      };
+    });
+  }
+
+  /**
+   * Restore one hidden model, or every hidden model when `model` is omitted.
+   * Restoration only re-registers models that are still part of the account's
+   * discovered set — a model the upstream no longer serves is dropped from the
+   * blacklist without being re-registered. Router is never rewritten here
+   * (re-wiring stays the user's explicit action, and an old fallback must not
+   * silently come back).
+   */
+  async restoreModels(model?: string): Promise<GeminiOauthRestoreResult> {
+    if (model !== undefined && !isGeminiOauthModelId(model)) {
+      throw geminiOauthAdminError("gemini_oauth_model_invalid", 422);
+    }
+    return this.enqueueMutation(async () => {
+      const data = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
+      if (!data) throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
+      const previousHidden = data.hiddenModels ?? [];
+      const hiddenSet = new Set(previousHidden);
+      const config = await this.readConfig();
+      const previousConfig = structuredClone(config);
+      const provider = this.findManaged(config);
+      const registered: string[] = Array.isArray(provider?.models)
+        ? (provider.models as unknown[]).filter((m): m is string => typeof m === "string")
+        : [];
+      // Restorable = hidden IDs this account still exposes. "Available" is the
+      // union of today's registration, the persisted unfolded discovery set and
+      // the family ids that set collapses into (a family hide is restorable
+      // exactly when discovery still collapses that family).
+      const rawModelIds = (data.rawModelIds ?? []).filter(isGeminiOauthModelId);
+      const available = new Set<string>([
+        ...registered,
+        ...rawModelIds,
+        ...collapseAntigravityModels(rawModelIds.map((id) => ({ id, picker: 0 }))).map((m) => m.id),
+      ]);
+      const requested = model === undefined ? [...hiddenSet] : (hiddenSet.has(model) ? [model] : []);
+      const restorable = requested.filter((m) => available.has(m));
+      // Restore-all clears every blacklist entry (an id the upstream no longer
+      // serves must not linger forever) and a single restore clears only its own,
+      // so one vanished id never blocks the others.
+      const nextHidden = model === undefined ? [] : previousHidden.filter((m) => m !== model);
+      // The provider's own order decides where a restored model sits: in a synced
+      // list a hidden family is still registered as its collapsed id, so that
+      // slot is reused instead of appending a duplicate. Only `restorable` models
+      // actually become visible.
+      const restorableSet = new Set(restorable);
+      const nextVisible: string[] = [];
+      for (const m of registered) {
+        if (restorableSet.has(m) && !nextVisible.includes(m)) { nextVisible.push(m); continue; }
+        if (!restorableSet.has(m)) nextVisible.push(m);
+      }
+      for (const m of restorable) if (!nextVisible.includes(m)) nextVisible.push(m);
+      try {
+        await this.store.save({ ...data, hiddenModels: nextHidden });
+        this.hiddenModels = nextHidden;
+        await this.upsertManagedProvider(nextVisible);
+      } catch {
+        try {
+          await this.store.save(data);
+          this.hiddenModels = previousHidden;
+          await this.options.host.writeConfig(previousConfig);
+          await this.options.host.reloadRuntime(previousConfig);
+        } catch {
+          this.log.error?.("[gemini-oauth] restore rollback failed");
+        }
+        this.log.error?.("[gemini-oauth] restore persist failed; rolled back");
+        throw geminiOauthAdminError("gemini_oauth_config_write_failed", 500);
+      }
+      return { ok: true as const, restored: restorable, models: nextVisible, hiddenModels: nextHidden };
     });
   }
 
@@ -960,9 +1217,12 @@ export class GeminiOauthAuthService {
     return this.enqueueMutation(async () => {
       const config = await this.readConfig();
       const provider = this.findManaged(config);
-      const models = new Set<string>(
-        Array.isArray(provider?.models) ? provider.models.filter((m: any) => typeof m === "string") : []
-      );
+      // Disconnect removes every registered AND hidden managed model reference,
+      // including folded variants that a previous release registered.
+      const models = new Set<string>([
+        ...(Array.isArray(provider?.models) ? provider.models.filter((m: any) => typeof m === "string") : []),
+        ...this.hiddenModels,
+      ]);
       const removedModelRefs: string[] = [];
       let defaultFallback: string | null = null;
       const previousConfig = structuredClone(config);
@@ -995,6 +1255,7 @@ export class GeminiOauthAuthService {
       await this.store.delete().catch(() => {});
       this.account = null;
       this.rawModelIds = [];
+      this.hiddenModels = [];
       this.loaded = false;
       this.refreshFlight = null;
       clearGeminiOauthTokenCaches(this.tokenState);
@@ -1072,7 +1333,11 @@ export class GeminiOauthAuthService {
     }
   }
 
-  /** Durably persist a rotated refresh token before the cache switches to it. */
+  /**
+   * Durably persist a rotated refresh token before the cache switches to it.
+   * The write spreads the CURRENT file contents, so `rawModelIds` and
+   * `hiddenModels` travel with it untouched.
+   */
   private persistRotatedRefreshToken(rotated: string, expected: string, epoch: number): Promise<void> {
     return this.enqueueMutation(async () => {
       const current = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
@@ -1085,6 +1350,7 @@ export class GeminiOauthAuthService {
       };
       await this.store.save(next);
       this.account = next.account;
+      this.hiddenModels = next.hiddenModels ?? [];
     });
   }
 
@@ -1113,7 +1379,11 @@ export class GeminiOauthAuthService {
     return !!account?.cooldownUntil && account.cooldownUntil > Date.now();
   }
 
-  /** Record a classified data-plane error: stable code + cooldown, never raw text. */
+  /**
+   * Record a classified data-plane error: stable code + cooldown, never raw
+   * text. Shares the single mutation queue; the write spreads the current file
+   * contents so the hide preference is never lost by error bookkeeping.
+   */
   noteUpstreamError(info: GeminiOauthErrorInfo): Promise<void> {
     return this.enqueueMutation(async () => {
       const current = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
@@ -1127,6 +1397,7 @@ export class GeminiOauthAuthService {
       const next: GeminiOauthCredentialData = { ...current, account };
       await this.store.save(next);
       this.account = account;
+      this.hiddenModels = next.hiddenModels ?? [];
     }).catch(() => {
       // Bookkeeping must never break the response path.
     });

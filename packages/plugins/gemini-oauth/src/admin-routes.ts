@@ -1,8 +1,9 @@
 /**
- * Gemini OAuth (Antigravity) — the six local-only, explicit user-action admin
+ * Gemini OAuth (Antigravity) — the local-only, explicit user-action admin
  * routes, MOVED VERBATIM from the former inline block in
  * `packages/core/src/ccr/admin-routes.ts` when the provider became the first
- * provider plugin.
+ * provider plugin. The model hide/restore pair (`/models/hide`,
+ * `/models/restore`) was added with the dashboard model-management surface.
  *
  * Rewiring only:
  *  - the service resolves through an injected getter (plugin.ts hands the
@@ -15,7 +16,7 @@
  * any response body or log.
  */
 import type { FastifyInstance } from "fastify";
-import { GeminiOauthAuthService } from "./auth-service";
+import { GeminiOauthAuthService, isGeminiOauthModelId } from "./auth-service";
 
 export interface GeminiOauthAdminRouteDeps {
   /** Resolved per request so tests and late wiring stay race-free. */
@@ -81,6 +82,7 @@ export function registerGeminiOauthAdminRoutes(app: FastifyInstance, deps: Gemin
     gemini_oauth_login_account_failed: 422,
     gemini_oauth_models_fetch_failed: 422,
     gemini_oauth_reauth_required: 422,
+    gemini_oauth_model_invalid: 422,
     gemini_oauth_login_persist_failed: 500,
     gemini_oauth_config_write_failed: 500,
   };
@@ -204,6 +206,56 @@ export function registerGeminiOauthAdminRoutes(app: FastifyInstance, deps: Gemin
       return await service.disconnect();
     } catch (error: any) {
       return geminiOauthRouteError(error, reply, "disconnect", "gemini_oauth_disconnect_failed");
+    }
+  });
+
+  /**
+   * Hide one model. Response fields:
+   *  - `clearedRefs`      Router FIELD PATHS rewritten ("default", "scenario:think", "models:<alias>", "fallback")
+   *  - `removedModelRefs` the actual `gemini-oauth,<model>` refs that left Router
+   *  - `defaultFallback`  persisted `Router.default` after the rewrite
+   *  - `models` / `hiddenModels` the resulting split
+   */
+  app.post("/api/gemini-oauth/models/hide", async (req: any, reply: any) => {
+    try {
+      assertLocalGeminiOauthRequest(req);
+      const service = deps.getService();
+      if (!service) return geminiOauthFailure(reply, "gemini_oauth_not_configured", 503);
+      const model = (req.body as any)?.model;
+      // Validate before the service so an invalid body never reaches a store read.
+      if (!isGeminiOauthModelId(model)) return geminiOauthFailure(reply, "gemini_oauth_model_invalid", 422);
+      const result = await service.hideModel(model);
+      return {
+        ok: true,
+        success: true,
+        model,
+        clearedRefs: result.clearedRefs,
+        removedModelRefs: result.removedModelRefs,
+        defaultFallback: result.defaultFallback,
+        models: result.models,
+        hiddenModels: result.hiddenModels,
+      };
+    } catch (error: any) {
+      return geminiOauthRouteError(error, reply, "models/hide", "gemini_oauth_model_hide_failed");
+    }
+  });
+
+  /** Restore one hidden model, or ALL of them when `model` is omitted/empty. Never rewrites Router. */
+  app.post("/api/gemini-oauth/models/restore", async (req: any, reply: any) => {
+    try {
+      assertLocalGeminiOauthRequest(req);
+      const service = deps.getService();
+      if (!service) return geminiOauthFailure(reply, "gemini_oauth_not_configured", 503);
+      const rawModel = (req.body as any)?.model;
+      let model: string | undefined;
+      if (rawModel !== undefined && rawModel !== null && rawModel !== "") {
+        if (!isGeminiOauthModelId(rawModel)) return geminiOauthFailure(reply, "gemini_oauth_model_invalid", 422);
+        model = rawModel;
+      }
+      const result = await service.restoreModels(model);
+      return { ok: true, success: true, restored: result.restored, models: result.models, hiddenModels: result.hiddenModels };
+    } catch (error: any) {
+      return geminiOauthRouteError(error, reply, "models/restore", "gemini_oauth_model_restore_failed");
     }
   });
 }

@@ -320,7 +320,12 @@ export interface GeminiOauthStatusResponse {
   email?: string | null;
   project?: string | null;
   tier?: string | null;
+  /** Length of `models` (hidden models excluded); kept for older callers. */
   modelsCount?: number;
+  /** Visible managed models, in provider order (UI / collapsed-family ids). */
+  models?: string[];
+  /** Models the user hid; same id space as `models`. */
+  hiddenModels?: string[];
   lastError?: GeminiOauthError | null;
   // Epoch ms until which the account is parked after an upstream signal.
   cooldownUntil?: number | null;
