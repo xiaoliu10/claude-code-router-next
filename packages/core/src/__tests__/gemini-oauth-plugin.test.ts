@@ -198,7 +198,7 @@ describe("gemini-oauth provider plugin: discovery, runtime, protector and routes
       expect(status.statusCode).toBe(200);
       expect(status.json()).toEqual({
         configured: true, connected: false, kind: "antigravity", email: null, project: null,
-        tier: null, modelsCount: 0, lastError: null, cooldownUntil: null,
+        tier: null, modelsCount: 0, models: [], hiddenModels: [], lastError: null, cooldownUntil: null,
       });
       const started = await post("/api/gemini-oauth/login/start");
       expect(started.statusCode).toBe(200);

@@ -122,7 +122,7 @@ describe("Gemini OAuth six admin routes: exact UI fields and no credentials", ()
     // Parse the actual UI source: a renamed/added field or type drift must fail.
     const source = ts.createSourceFile("types.ts", readFileSync(join(__dirname, "../../../ui/src/types.ts"), "utf8"), ts.ScriptTarget.Latest, true);
     const expected: Record<string, Record<string, string>> = {
-      GeminiOauthStatusResponse: { configured: "boolean", connected: "boolean", kind: "GeminiOauthKind", "email?": "string|null", "project?": "string|null", "tier?": "string|null", "modelsCount?": "number", "lastError?": "GeminiOauthError|null", "cooldownUntil?": "number|null" },
+      GeminiOauthStatusResponse: { configured: "boolean", connected: "boolean", kind: "GeminiOauthKind", "email?": "string|null", "project?": "string|null", "tier?": "string|null", "modelsCount?": "number", "models?": "string[]", "hiddenModels?": "string[]", "lastError?": "GeminiOauthError|null", "cooldownUntil?": "number|null" },
       GeminiOauthLoginStartResponse: { loginId: "string", url: "string", expiresAt: "number" },
       GeminiOauthSyncResponse: { ok: "boolean", "modelsCount?": "number", "clearedRefs?": "string[]", "error?": "GeminiOauthErrorCode|string|null" },
       GeminiOauthDisconnectResponse: { ok: "boolean", "removedModelRefs?": "string[]", "defaultFallback?": "string|null" },
@@ -148,7 +148,7 @@ describe("Gemini OAuth six admin routes: exact UI fields and no credentials", ()
     const response = await h.request("/status"); expect(response.statusCode).toBe(200);
     const expected = {
       configured: true, connected: true, kind: "antigravity", email: data.account.email, project: data.account.projectId,
-      tier: "paid-tier", modelsCount: 1, lastError: {
+      tier: "paid-tier", modelsCount: 1, models: ["gemini-3-flash"], hiddenModels: [], lastError: {
         code: "gemini_oauth_validation_required", message: "Google requires account verification before continuing.",
         validationUrl: "https://accounts.google.com/verify",
       }, cooldownUntil: (await h.store.load())!.account.cooldownUntil,
@@ -158,7 +158,7 @@ describe("Gemini OAuth six admin routes: exact UI fields and no credentials", ()
   it("disconnected status still supplies all nullable fields", async () => {
     const h = await build({ Providers: [], Router: {} });
     expect((await h.request("/status")).json()).toEqual({ configured: true, connected: false, kind: "antigravity",
-      email: null, project: null, tier: null, modelsCount: 0, lastError: null, cooldownUntil: null });
+      email: null, project: null, tier: null, modelsCount: 0, models: [], hiddenModels: [], lastError: null, cooldownUntil: null });
   });
   it("start has exactly three typed fields; cancel is exactly {ok:true}", async () => {
     const h = await build(); const response = await h.request("/login/start"); expect(response.statusCode).toBe(200);
@@ -248,6 +248,126 @@ describe("Gemini OAuth local guard and generic config protection", () => {
       gemini_oauth_managed: true, gemini_oauth_kind: "antigravity", transformer: { use: ["gemini-oauth"] } });
     expect(JSON.stringify(h.config())).not.toContain("attacker");
     const get = await h.server.app.inject({ method: "GET", url: "/api/config" }); h.noTokens(get.body);
+  });
+});
+
+describe("Gemini OAuth model hide/restore admin seam", () => {
+  const deepRouter = () => ({
+    default: "gemini-oauth,gemini-3-flash",
+    background: "gemini-oauth,gemini-3-flash",
+    think: "ordinary,m",
+    longContext: ["gemini-oauth,gemini-3-flash", "ordinary,m"],
+    models: { flashAlias: "gemini-oauth,gemini-3-flash", keep: "ordinary,m" },
+    families: { flash: { default: "gemini-oauth,gemini-3-flash" }, other: { default: "ordinary,m" } },
+    fallback: ["gemini-oauth,gemini-3-flash", ["ordinary,m", "gemini-oauth,gemini-3-flash"], ["ordinary,m"]],
+  });
+
+  it("POST /models/hide drops the managed model everywhere and keeps unrelated routes byte-identical", async () => {
+    const h = await build({ Providers: [provider(["gemini-3-flash", "gemini-3-pro"]), ordinary], Router: deepRouter() });
+    await h.store.save(credential());
+    const response = await h.request("/models/hide", { model: "gemini-3-flash" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body).toMatchObject({
+      ok: true, success: true, model: "gemini-3-flash", models: ["gemini-3-pro"], hiddenModels: ["gemini-3-flash"],
+      removedModelRefs: ["gemini-oauth,gemini-3-flash"], defaultFallback: "gemini-oauth,gemini-3-pro",
+    });
+    expect(body.clearedRefs.sort()).toEqual(["default", "fallback", "families.flash.default", "models:flashAlias", "scenario:background", "scenario:longContext"].sort());
+    // Provider list, hide preference and Router all agree.
+    expect(h.config().Providers[0].models).toEqual(["gemini-3-pro"]);
+    expect((await h.store.load())!.hiddenModels).toEqual(["gemini-3-flash"]);
+    expect(h.config().Router).toEqual({
+      default: "gemini-oauth,gemini-3-pro",
+      background: "",
+      think: "ordinary,m",
+      longContext: ["ordinary,m"],
+      models: { keep: "ordinary,m" },
+      families: { flash: { default: "" }, other: { default: "ordinary,m" } },
+      fallback: [["ordinary,m"], ["ordinary,m"]],
+    });
+    expect((await h.request("/status")).json()).toMatchObject({ models: ["gemini-3-pro"], hiddenModels: ["gemini-3-flash"], modelsCount: 1 });
+  });
+
+  it("hides every model to an empty visible list without re-adding static fallbacks", async () => {
+    const h = await build({ Providers: [provider(["gemini-3-flash", "gemini-3-pro"]), ordinary], Router: { default: "gemini-oauth,gemini-3-pro", think: "ordinary,m" } });
+    await h.store.save(credential());
+    for (const model of ["gemini-3-flash", "gemini-3-pro"]) {
+      expect((await h.request("/models/hide", { model })).statusCode).toBe(200);
+    }
+    expect(h.config().Providers[0].models).toEqual([]);
+    expect(h.config().Router).toEqual({ default: "", think: "ordinary,m" });
+    expect((await h.request("/status")).json()).toMatchObject({ models: [], hiddenModels: ["gemini-3-flash", "gemini-3-pro"], modelsCount: 0 });
+  });
+
+  it("restore-one re-registers a still-discovered family", async () => {
+    // The registered list is the SYNCED discovery set: the folded gemini-3-flash
+    // family (underlying gemini-3-flash-low/high variants from the credential).
+    const h = await build({ Providers: [provider(["gemini-3-pro", "gemini-3-flash"])], Router: { default: "ordinary,m", think: "ordinary,m" } });
+    // gemini-2.5-gone is hidden but no longer discovered upstream.
+    await h.store.save({ ...credential(), hiddenModels: ["gemini-3-flash", "gemini-2.5-gone"] });
+    const one = await h.request("/models/restore", { model: "gemini-3-flash" });
+    expect(one.statusCode).toBe(200);
+    // gemini-3-flash is a folded family whose family is still registered: it
+    // restores. gemini-2.5-gone is gone upstream: it is neither restorable nor
+    // registered, and only leaves the blacklist.
+    expect(one.json()).toMatchObject({ ok: true, success: true, restored: ["gemini-3-flash"], models: ["gemini-3-pro", "gemini-3-flash"], hiddenModels: ["gemini-2.5-gone"] });
+    // The restored family takes its discovery position (after gemini-3-pro).
+    expect(h.config().Providers[0].models).toEqual(["gemini-3-pro", "gemini-3-flash"]);
+    expect(h.config().Router).toEqual({ default: "ordinary,m", think: "ordinary,m" });
+  });
+
+  it("restore-all re-registers only still-available models and never rewrites Router", async () => {
+    const h = await build({ Providers: [provider(["gemini-3-pro"])], Router: { default: "ordinary,m", think: "ordinary,m" } });
+    // gemini-3-flash is still discovered (the credential's raw ids fold into
+    // that family); gemini-2.5-gone is not served upstream any more.
+    await h.store.save({ ...credential(), rawModelIds: ["gemini-3-flash-low", "gemini-3-flash-high"], hiddenModels: ["gemini-3-flash", "gemini-2.5-gone"] });
+    const all = await h.request("/models/restore", {});
+    expect(all.statusCode).toBe(200);
+    expect(all.json()).toMatchObject({ ok: true, success: true, restored: ["gemini-3-flash"], models: ["gemini-3-pro", "gemini-3-flash"], hiddenModels: [] });
+    expect(h.config().Providers[0].models).toEqual(["gemini-3-pro", "gemini-3-flash"]);
+    // The vanished id is not registered back and leaves no blacklist entry.
+    expect((await h.store.load())!.hiddenModels).toBeUndefined();
+    expect(h.config().Router).toEqual({ default: "ordinary,m", think: "ordinary,m" });
+  });
+
+  it("rejects invalid model bodies and unregistered models before touching any state", async () => {
+    const h = await build({ Providers: [provider(), ordinary] });
+    await h.store.save(credential());
+    const before = structuredClone(h.config());
+    const store = await h.store.load();
+    for (const model of [undefined, null, 42, "", "gemini-3-flash,gemini-3-pro", "a\u0000b", "x".repeat(257)]) {
+      const response = await h.request("/models/hide", { model });
+      expect(response.statusCode, String(model)).toBe(422);
+      expect(response.json()).toEqual({ ok: false, success: false, error: "gemini_oauth_model_invalid" });
+    }
+    const unknown = await h.request("/models/hide", { model: "not-a-gemini-model" });
+    expect(unknown.statusCode).toBe(422);
+    expect(unknown.json()).toEqual({ ok: false, success: false, error: "gemini_oauth_model_invalid" });
+    expect(h.config()).toEqual(before);
+    expect(await h.store.load()).toEqual(store);
+  });
+
+  it("the hide/restore routes keep the loopback socket guard", async () => {
+    const h = await build();
+    await h.store.save(credential());
+    for (const path of ["/models/hide", "/models/restore"]) {
+      const response = await h.request(path, { model: "gemini-3-flash" }, { remoteAddress: "203.0.113.7", headers: { origin: "http://localhost:3456", host: "localhost:3456" } });
+      expect(response.statusCode).toBe(403);
+      expect(response.json()).toEqual({ ok: false, success: false, error: "gemini_oauth_unauthorized" });
+    }
+  });
+
+  it("a config write failure rolls the hide back, keeping the blacklist unset", async () => {
+    const h = await build({ Providers: [provider(["gemini-3-flash", "gemini-3-pro"])], Router: { default: "gemini-oauth,gemini-3-flash" } });
+    await h.store.save(credential());
+    const before = structuredClone(h.config());
+    vi.mocked(configModule.writeConfigFile).mockRejectedValueOnce(new Error("private disk error"));
+    const response = await h.request("/models/hide", { model: "gemini-3-flash" });
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ ok: false, success: false, error: "gemini_oauth_config_write_failed" });
+    expect(h.config()).toEqual(before);
+    expect((await h.store.load())!.hiddenModels).toBeUndefined();
+    expect((await h.request("/status")).json()).toMatchObject({ models: ["gemini-3-flash", "gemini-3-pro"], hiddenModels: [] });
   });
 });
 

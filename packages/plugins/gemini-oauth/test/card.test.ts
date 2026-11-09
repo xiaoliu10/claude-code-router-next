@@ -269,3 +269,90 @@ describe("self-contained Gemini plugin card", () => {
     expect(h.host.text()).toContain("Registered 3 Gemini models and cleared default from Router.");
   });
 });
+
+describe("Gemini card model hide/restore surface", () => {
+  const connectedStatus = (extra: Record<string, unknown> = {}) => ({
+    configured: true, connected: true, kind: "antigravity",
+    email: "user@example.test", project: "p", tier: "paid", modelsCount: 2, ...extra,
+  });
+  const hideButtonsFor = (h: ReturnType<typeof harness>, model: string) =>
+    h.host.all().filter(n => n.tag === "button" && n.attrs["aria-label"] === en.hide_model.replace("{{model}}", model));
+
+  it("renders a chip with an accessible hide button per visible model; hiding posts /models/hide", async () => {
+    const status = connectedStatus({ models: ["gemini-3-flash", "gemini-3-pro"], hiddenModels: [] });
+    const bodies: any[] = [];
+    const h = harness({
+      "/status": () => status,
+      "/models/hide": (init: any) => {
+        bodies.push(JSON.parse(init.body));
+        return {
+          ok: true, success: true, model: "gemini-3-flash",
+          clearedRefs: ["default", "scenario:think", "models:flashAlias", "families.flash.default", "fallback", "junk:ref"],
+          removedModelRefs: ["gemini-oauth,gemini-3-flash"],
+          defaultFallback: "gemini-oauth,gemini-3-pro",
+          models: ["gemini-3-pro"], hiddenModels: ["gemini-3-flash"],
+        };
+      },
+    });
+    await tick();
+    expect(h.host.text()).toContain("gemini-3-flash");
+    expect(hideButtonsFor(h, "gemini-3-flash")).toHaveLength(1);
+    expect(hideButtonsFor(h, "gemini-3-pro")).toHaveLength(1);
+    hideButtonsFor(h, "gemini-3-flash")[0].onclick!();
+    await tick();
+    expect(bodies).toEqual([{ model: "gemini-3-flash" }]);
+    // Toast: hidden confirmation + human-readable Router cleanup labels.
+    expect(h.host.text()).toContain(en.hidden_toast.replace("{{model}}", "gemini-3-flash"));
+    expect(h.host.text()).toContain(en.router_path.default);
+    expect(h.host.text()).toContain(en.router_path.scenario.replace("{{name}}", "think"));
+    expect(h.host.text()).toContain(en.router_path.model_alias.replace("{{name}}", "flashAlias"));
+    expect(h.host.text()).toContain(en.router_path.family_default.replace("{{family}}", "flash"));
+    expect(h.host.text()).not.toContain("junk:ref");
+    // The draft merge drops exactly the refs the server reported.
+    const merge = h.refreshConfig.mock.calls.at(-1)?.[0] as any;
+    const local = { Providers: [], Router: {
+      default: "gemini-oauth,gemini-3-flash", think: ["gemini-oauth,gemini-3-flash", "other,x"],
+      models: { alias: "gemini-oauth,gemini-3-flash", keep: "other,x" },
+      fallback: ["gemini-oauth,gemini-3-flash", ["other,x"]],
+    } };
+    expect(merge(local, { Providers: [] }).Router).toEqual({
+      default: "gemini-oauth,gemini-3-pro", think: ["other,x"], models: { keep: "other,x" }, fallback: [["other,x"]],
+    });
+  });
+
+  it("renders the hidden-models list; restore posts the model, restore-all omits it", async () => {
+    const status = connectedStatus({ modelsCount: 1, models: ["gemini-3-pro"], hiddenModels: ["gemini-3-flash", "gemini-2.5-gone"] });
+    const bodies: any[] = [];
+    const h = harness({
+      "/status": () => status,
+      "/models/restore": (init: any) => {
+        bodies.push(JSON.parse(init.body));
+        return { ok: true, success: true, restored: ["gemini-3-flash"], models: ["gemini-3-pro", "gemini-3-flash"], hiddenModels: ["gemini-2.5-gone"] };
+      },
+    });
+    await tick();
+    expect(h.host.text()).toContain(en.hidden_models.replace("{{count}}", "2"));
+    expect(h.host.text()).toContain("gemini-2.5-gone");
+    const restoreButtons = h.host.all().filter(n => n.tag === "button" && n.textContent === en.restore);
+    expect(restoreButtons).toHaveLength(2);
+    restoreButtons[0].onclick!();
+    await tick();
+    expect(bodies).toEqual([{ model: "gemini-3-flash" }]);
+    expect(h.host.text()).toContain(en.restored_toast.replace("{{model}}", "gemini-3-flash"));
+    h.host.click(en.restore_all);
+    await tick();
+    expect(bodies).toEqual([{ model: "gemini-3-flash" }, {}]);
+    expect(h.host.text()).toContain(en.restored_all_toast.replace("{{count}}", "1"));
+    expect(h.release).toHaveBeenCalledTimes(2);
+  });
+
+  it("a failed hide surfaces the localized error and never leaks the raw payload", async () => {
+    const status = connectedStatus({ models: ["gemini-3-flash"], hiddenModels: [] });
+    const h = harness({ "/status": () => status, "/models/hide": () => ({ ok: false, success: false, error: "gemini_oauth_config_write_failed" }) });
+    await tick();
+    hideButtonsFor(h, "gemini-3-flash")[0].onclick!();
+    await tick();
+    expect(h.host.text()).toContain(en.errors.gemini_oauth_config_write_failed);
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+});

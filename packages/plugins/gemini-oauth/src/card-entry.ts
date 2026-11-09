@@ -10,6 +10,138 @@ import {
 import { createGeminiOauthLogin } from "../../../ui/src/utils/gemini-oauth-login";
 import { geminiOauthLocales } from "./locales";
 
+/**
+ * Exact `gemini-oauth,<model>` references a hide reported as removed from
+ * Router, and the Router PATH LABELS it rewrote. Mirrors the server's grammar
+ * (a model id of 1-256 chars without control characters or a comma) so a
+ * malformed payload can never steer the local draft cleanup. Values are only
+ * ever compared verbatim, never parsed or rendered as markup.
+ */
+const MODEL_REF_PATTERN = /^gemini-oauth,[^\x00-\x1f\x7f,]{1,256}$/;
+const ROUTER_PATH_PATTERN = /^(?:default|fallback|scenario:(?:background|think|longContext|extendedContext|webSearch|image)|models:[A-Za-z0-9_-]{1,80}|families\.[A-Za-z0-9_-]{1,80}\.default)$/;
+
+export function sanitizeGeminiOauthModelRefs(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const clean = value
+    .map(item => (typeof item === "string" ? item : ""))
+    .filter(item => MODEL_REF_PATTERN.test(item));
+  return Array.from(new Set(clean)).slice(0, 8);
+}
+
+export function sanitizeGeminiOauthRouterPaths(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const clean = value
+    .map(item => (typeof item === "string" ? item : ""))
+    .filter(item => ROUTER_PATH_PATTERN.test(item));
+  return Array.from(new Set(clean)).slice(0, 8);
+}
+
+const ROUTER_REF_SLOTS = ["default", "background", "think", "longContext", "extendedContext", "webSearch", "image"] as const;
+
+/**
+ * Hide reconciliation for the SAVED-config draft. The mutation already committed
+ * server-side; this narrow merge keeps every unrelated draft edit and only:
+ *  - replaces the managed provider entry (mergeGeminiOauthProvider),
+ *  - drops the exact refs the server reported from the local Router draft, so a
+ *    later Save cannot re-arm the hidden model (default is replaced by the
+ *    server-authoritative persisted fallback; scenarios clear/drop; aliases,
+ *    family defaults and custom entries referencing a removed ref go away),
+ *  - drops matching stages from a nested local `fallback` chain.
+ * Router is never re-wired to the hidden model, and no old route is restored.
+ */
+export function mergeGeminiOauthHiddenRefs(
+  local: any,
+  server: any,
+  removedModelRefs: unknown,
+  defaultFallback?: string | null,
+): any {
+  const merged = mergeGeminiOauthProvider(local, server);
+  const refs = sanitizeGeminiOauthModelRefs(removedModelRefs);
+  if (refs.length === 0) return merged;
+  const refSet = new Set(refs);
+  // Custom routes may hold `{ provider, model }` objects; the backend reports
+  // refs as `provider,model`, so the object form compares as that exact pair
+  // (nested objects included).
+  const entryModels = (value: unknown): string[] => {
+    if (Array.isArray(value)) return value.flatMap(entryModels);
+    if (!value || typeof value !== "object") return [];
+    const record = value as Record<string, unknown>;
+    const own = typeof record.provider === "string" && typeof record.model === "string"
+      ? [`${record.provider},${record.model}`]
+      : [];
+    return [...own, ...Object.values(record).flatMap(entryModels)];
+  };
+  const source = (local?.Router ?? {}) as Record<string, unknown>;
+  if (!source || typeof source !== "object") return merged;
+  // The draft Router is REPLACED, never mutated in place: `source` is the caller's
+  // live draft and a later Save must observe the cleaned references.
+  const router: Record<string, unknown> = { ...source };
+  for (const slot of ROUTER_REF_SLOTS) {
+    const value = router[slot];
+    if (typeof value === "string" && refSet.has(value)) {
+      router[slot] = slot === "default"
+        ? (defaultFallback === undefined
+          ? (typeof server?.Router?.default === "string" ? server.Router.default : "")
+          : (defaultFallback ?? ""))
+        : "";
+    } else if (Array.isArray(value) && value.every(item => typeof item === "string")) {
+      router[slot] = value.filter(item => !refSet.has(item as string));
+    }
+  }
+  if (source.models && typeof source.models === "object" && !Array.isArray(source.models)) {
+    const kept: Record<string, unknown> = {};
+    for (const [alias, target] of Object.entries(source.models as Record<string, unknown>)) {
+      if (typeof target === "string" && refSet.has(target)) continue;
+      kept[alias] = target;
+    }
+    router.models = kept;
+  }
+  if (source.families && typeof source.families === "object" && !Array.isArray(source.families)) {
+    const families: Record<string, unknown> = {};
+    for (const [family, config] of Object.entries(source.families as Record<string, unknown>)) {
+      if (!config || typeof config !== "object" || Array.isArray(config)) { families[family] = config; continue; }
+      const record = { ...(config as Record<string, unknown>) };
+      if (typeof record.default === "string" && refSet.has(record.default)) record.default = "";
+      families[family] = record;
+    }
+    router.families = families;
+  }
+  if (Array.isArray(source.fallback)) {
+    const kept: unknown[] = [];
+    for (const stage of source.fallback as unknown[]) {
+      if (typeof stage === "string") { if (!refSet.has(stage)) kept.push(stage); continue; }
+      if (Array.isArray(stage) && stage.every(item => typeof item === "string")) {
+        const rest = (stage as string[]).filter(item => !refSet.has(item));
+        if (rest.length) kept.push(rest);
+        continue;
+      }
+      kept.push(stage);
+    }
+    router.fallback = kept;
+  }
+  // Custom routes hold a route OBJECT (a list of them, or a name→route map at
+  // `custom.routes`). A route referencing a removed model is dropped whole; a
+  // plain string alias elsewhere is handled by reference identity.
+  const droppedRoute = (entry: unknown): boolean => entryModels(entry).some((ref) => refSet.has(ref));
+  const customRoutes = router.custom;
+  if (Array.isArray(customRoutes)) {
+    router.custom = customRoutes.filter(entry => !droppedRoute(entry));
+  } else if (customRoutes && typeof customRoutes === "object") {
+    const next = { ...(customRoutes as Record<string, unknown>) };
+    if (Array.isArray(next.routes)) {
+      next.routes = (next.routes as unknown[]).filter(entry => !droppedRoute(entry));
+    } else if (next.routes && typeof next.routes === "object") {
+      const keptRoutes: Record<string, unknown> = {};
+      for (const [name, entry] of Object.entries(next.routes as Record<string, unknown>)) {
+        if (!droppedRoute(entry)) keptRoutes[name] = entry;
+      }
+      next.routes = keptRoutes;
+    }
+    router.custom = next;
+  }
+  return { ...merged, Router: router };
+}
+
 const mounted = new WeakMap<HTMLElement, () => void>();
 
 export function mount(el: HTMLElement, props: PluginCardMountProps): void {
@@ -18,6 +150,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   let status: GeminiOauthStatusResponse | null = null;
   let errorKey: string | null = null, toast: string | null = null;
   let consentOpen = false, consentAck = false, confirmDisconnect = false;
+  let pending: { kind: "login" | "sync" | "disconnect" | "hide" | "restore"; argument: string | null } | null = null;
+  let actionGeneration = 0;
   let login: GeminiOauthLoginStartResponse | null = null;
   let session: ReturnType<typeof createGeminiOauthLogin> | null = null;
   let consentGranted = false;
@@ -129,7 +263,16 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const next = await props.callApi<GeminiOauthStatusResponse>("/status", { timeoutMs: 10_000 });
     if (alive) { status = next; loadFailed = false; }
   };
-  const settle = async (message: string) => {
+  /**
+   * Post-commit tail shared by every mutation: reconcile the host config draft,
+   * re-read status, then show the settled message. `merge` overrides the draft
+   * reconciliation; hide passes its narrow Router cleanup, everything else keeps
+   * the plain provider merge (Router and unrelated drafts preserved).
+   */
+  const settle = async (
+    message: string,
+    merge?: (current: any, server: any) => any,
+  ) => {
     // Draft reconciliation is advisory: the managed mutation already committed
     // server-side, so a failed refresh must neither block the status reread nor
     // flip the confirmed success into a generic retry error. The reconciliation
@@ -138,7 +281,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     try {
       // Preserve unrelated providers, Router and local drafts exactly as the old
       // card did. The server remains authoritative for managed entry mutations.
-      await props.refreshConfig?.((current, server) => mergeGeminiOauthProvider(current, server));
+      await props.refreshConfig?.(merge ?? ((current, server) => mergeGeminiOauthProvider(current, server)));
     } catch {
       reconciliationFailed = true;
     }
@@ -149,13 +292,21 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     release?.(); release = null;
     if (busy) { busy = false; props.onBusy?.(false); }
   };
-  const run = async (kind: "login" | "sync" | "disconnect") => {
+  /**
+   * One mutation at a time behind the shared management lease (the same mutex
+   * the page's Save uses). `pending` identifies the in-flight action for the
+   * disabled/inflight UI; every completion is generation-guarded so a superseded
+   * or disposed action can never overwrite newer state.
+   */
+  const run = async (kind: "login" | "sync" | "disconnect" | "hide" | "restore", argument?: string) => {
     if (!alive || busy || loading || props.disabled) return;
     if (props.acquireManagement) {
       release = props.acquireManagement();
       if (!release) { errorKey = "config_busy"; render(); return; }
     }
     busy = true; props.onBusy?.(true); errorKey = null; toast = null; reconcileFailed = false;
+    pending = { kind, argument: argument ?? null };
+    const generation = ++actionGeneration;
     render();
     try {
       if (kind === "login") {
@@ -167,6 +318,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
           cancelGeminiOauthLogin: loginId => post("/login/cancel", { loginId }),
         }, value => {
           if (!alive || !consentGranted) { void current.cancel().catch(() => {}); return; }
+          // A superseded login attempt must not surface its window on top of a
+          // newer action (same generation guard the other mutations use).
+          if (actionGeneration !== generation) { void current.cancel().catch(() => {}); return; }
           login = value;
           window.open(value.url, "_blank", "noopener,noreferrer");
           render();
@@ -174,28 +328,78 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         session = current;
         const email = await current.done;
         if (!alive || email === null) return;
+        if (actionGeneration !== generation) return;
         await settle(email ? t("login_success", { email }) : t("login_success_unknown"));
       } else if (kind === "sync") {
         const result = await post<any>("/sync");
         // A mutation that commits after the card was disposed still reconciles
         // and re-reads status: only the visual settlement is skipped when
         // !alive. The lease is released by the finally below, after all of it.
-        if (result?.ok !== true) { errorKey = geminiOauthErrorKey(result?.error ?? "gemini_oauth_models_fetch_failed"); await readStatus(); return; }
+        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = geminiOauthErrorKey(result?.error ?? "gemini_oauth_models_fetch_failed"); await readStatus(); return; }
         const count = result.modelsCount ?? 0;
         await settle(result.clearedRefs?.length
           ? t("synced_cleared", { count, refs: result.clearedRefs.join(", ") }) : t("synced", { count }));
+      } else if (kind === "hide" || kind === "restore") {
+        const model = argument ?? "";
+        if (kind === "hide" && !model) return;
+        if (kind === "restore" && model && !(status?.hiddenModels ?? []).includes(model)) return;
+        const result = kind === "hide"
+          ? await post<any>("/models/hide", { model })
+          : await post<any>("/models/restore", model ? { model } : {});
+        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = geminiOauthErrorKey(result); return; }
+        if (kind === "hide") {
+          // clearedRefs are Router PATH LABELS for display only — never parsed as
+          // provider/model references. Removed refs drive the draft cleanup.
+          const paths = sanitizeGeminiOauthRouterPaths(result.clearedRefs)
+            .map(path => labelRouterPath(path))
+            .filter((label): label is string => label !== null);
+          const refs = sanitizeGeminiOauthModelRefs(result.removedModelRefs);
+          const removedRefs = refs.length > 0 ? refs : sanitizeGeminiOauthModelRefs([`${GEMINI_OAUTH_PROVIDER_NAME},${model}`]);
+          const defaultFallback = typeof result.defaultFallback === "string" ? result.defaultFallback : result.defaultFallback === null ? null : undefined;
+          await settle(paths.length
+            ? `${t("hidden_toast", { model })} ${t("synced_cleared", { count: (result.models?.length ?? 0), refs: paths.join(", ") })}`
+            : t("hidden_toast", { model }),
+            (current, server) => mergeGeminiOauthHiddenRefs(current, server, removedRefs, defaultFallback));
+        } else {
+          const restored = Array.isArray(result.restored) ? result.restored.length : 0;
+          await settle(model
+            ? t("restored_toast", { model })
+            : t("restored_all_toast", { count: restored }));
+        }
       } else {
         const result = await post<any>("/disconnect");
-        if (result?.ok !== true) { errorKey = geminiOauthErrorKey(result); return; }
+        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = geminiOauthErrorKey(result); return; }
         await settle(t("disconnected"));
       }
     } catch (error) {
-      if (alive) errorKey = geminiOauthErrorKey(error);
+      if (alive && actionGeneration === generation) errorKey = geminiOauthErrorKey(error);
     } finally {
+      if (actionGeneration === generation) pending = null;
       endBusy(); session = null; login = null; consentGranted = false;
       consentOpen = false; consentAck = false;
       if (alive) render();
     }
+  };
+  /**
+   * Localized display text for a sanitized Router path label reported by hide.
+   * Scenario names reuse the existing host `router` labels (only the six known
+   * slots carry copy); an unknown slot degrades to its raw (already sanitized)
+   * name instead of inventing a translation.
+   */
+  const labelRouterPath = (path: string): string | null => {
+    const [label] = sanitizeGeminiOauthRouterPaths([path]);
+    if (!label) return null;
+    if (label === "default") return t("router_path.default");
+    if (label === "fallback") return t("router_path.scenario", { name: "fallback" });
+    if (label.startsWith("scenario:")) {
+      // The card bundle carries only the geminiOauth namespace; the host's
+      // `router.*` labels are not available here, so the slot name is passed
+      // through the localized template instead of a missing key.
+      return t("router_path.scenario", { name: label.slice("scenario:".length) });
+    }
+    if (label.startsWith("models:")) return t("router_path.model_alias", { name: label.slice("models:".length) });
+    const family = /^families\.([A-Za-z0-9_-]{1,80})\.default$/.exec(label);
+    return family ? t("router_path.family_default", { family: family[1] }) : null;
   };
   /** Modal dialog mirroring the host ui/dialog look (overlay + centered panel). */
   const dialog = (title: string, warning: string, onClose: () => void, titleIcon?: SVGSVGElement): { panel: HTMLDivElement; body: HTMLDivElement; footer: HTMLDivElement } => {
@@ -227,6 +431,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     el.setAttribute("aria-busy", String(busy || loading));
     const state = loading ? "loading" : loadFailed && !status ? "error" : geminiOauthStateKey(status);
     const connected = status?.connected === true;
+    const disabled = busy || loading || props.disabled;
 
     const card = styled("div", "glass-card rounded-2xl overflow-hidden mb-4");
     card.setAttribute("aria-busy", String(busy || loading));
@@ -258,6 +463,42 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const cooldown = formatGeminiOauthClock(status?.cooldownUntil, locale);
     if (cooldown && state === "cooldown") bodyCol.append(styled("p", "text-xs font-medium text-yellow-600", t("cooldown_until", { time: cooldown })));
     if (state === "needs_relogin") bodyCol.append(styled("p", "text-xs text-yellow-600", t("needs_relogin_help")));
+    // Model management: one chip per visible model with an accessible hide
+    // button, plus a collapsible list of hidden models (restore one / all).
+    // Ids are rendered with textContent only, never innerHTML.
+    const models = Array.isArray(status?.models) ? status!.models.filter((m): m is string => typeof m === "string" && m.length > 0) : [];
+    const hiddenModels = Array.isArray(status?.hiddenModels) ? status!.hiddenModels.filter((m): m is string => typeof m === "string" && m.length > 0) : [];
+    if (connected && models.length > 0) {
+      const chips = styled("div", "flex max-w-md flex-wrap gap-2 pt-1");
+      chips.setAttribute("aria-label", t("labels.models"));
+      for (const model of models) {
+        const chip = styled("span", "inline-flex max-w-full items-center gap-1 break-all whitespace-normal rounded-lg border border-white/5 bg-white/5 px-2 py-0.5 text-[10px] font-bold text-muted-foreground", model);
+        const hide = styled("button", "rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-white/10 hover:text-foreground disabled:pointer-events-none disabled:opacity-40") as HTMLButtonElement;
+        hide.type = "button";
+        hide.disabled = disabled;
+        hide.setAttribute("aria-label", t("hide_model", { model }));
+        hide.setAttribute("aria-busy", String(pending?.kind === "hide" && pending.argument === model));
+        hide.append(icon(["M18 6 6 18", "m6 6 12 12"], "h-3 w-3"));
+        hide.onclick = () => { void run("hide", model); };
+        chip.append(hide);
+        chips.append(chip);
+      }
+      bodyCol.append(chips);
+    }
+    if (connected && hiddenModels.length > 0) {
+      const details = styled("details", "max-w-md text-xs text-muted-foreground");
+      details.append(styled("summary", "cursor-pointer select-none font-medium", t("hidden_models", { count: hiddenModels.length })));
+      const list = styled("ul", "mt-2 space-y-1");
+      for (const model of hiddenModels) {
+        const item = styled("li", "flex items-center justify-between gap-2");
+        item.append(styled("span", "break-all font-mono", model));
+        button(item, t("restore"), () => { void run("restore", model); }, disabled || (pending !== null && pending.kind === "restore"), "outline", "h-6 shrink-0 px-2 text-[11px]");
+        list.append(item);
+      }
+      details.append(list);
+      button(details, t("restore_all"), () => { void run("restore"); }, disabled || (pending !== null && pending.kind === "restore"), "outline", "mt-2 h-7 px-2 text-[11px]");
+      bodyCol.append(details);
+    }
     for (const code of [geminiOauthStatusErrorKey(status), errorKey]) {
       if (code) bodyCol.append(errorAlert(t(`errors.${code}`) || t("errors.request_failed")));
     }
@@ -286,7 +527,6 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     bodyCol.append(about);
     if (props.disabled) bodyCol.append(styled("p", "text-xs text-muted-foreground", t("other_edit")));
 
-    const disabled = busy || loading || props.disabled;
     const actions = styled("div", "flex shrink-0 flex-col gap-2 sm:w-[210px]");
     // Deliberately NOT a login: this button only opens the risk dialog.
     button(actions, t(connected ? "reconnect" : "connect"), () => { consentAck = false; consentOpen = true; render(); }, disabled, "primary", "h-8 w-full text-xs", plugIcon("mr-1 h-3.5 w-3.5"));
