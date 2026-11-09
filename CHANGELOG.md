@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2426] - 2026-11-06
+
+### Added
+
+- **Gemini (Antigravity) model hide/restore** (`@wengine-ai/ccr-provider-gemini-oauth` 1.0.9): the card now lists visible models as chips with per-model hide buttons plus a hidden-models list with restore and restore-all. Hiding a model clears every Router reference to it (default, scenarios, model aliases, nested fallbacks) with the first visible model as the new default, persists with full rollback on failure, and survives re-login/sync; restoring never rewrites Router. The status endpoint gains `models` / `hiddenModels`, and the UI ships the new en/zh copy.
+
+## [2.3.2426] - 2026-11-06（中文）
+
+### 新增
+
+- **Gemini (Antigravity) 模型隐藏/恢复**（`@wengine-ai/ccr-provider-gemini-oauth` 1.0.9）：卡片现将可见模型以 chips 列出、每个带隐藏按钮，另有隐藏模型列表支持单个恢复与全部恢复。隐藏模型会清理 Router 中指向它的全部引用（默认路由、各场景、模型别名、嵌套 fallback），并以第一个可见模型作为新默认；持久化失败时完整回滚；重新登录/同步后隐藏偏好保留。恢复操作从不改写 Router。status 接口新增 `models` / `hiddenModels` 字段，UI 带上中英文案。
+
 ## [2.3.2425] - 2026-11-04
 
 ### Added
