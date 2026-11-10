@@ -88,6 +88,24 @@ export function getAllRateLimitInfo(): RateLimitInfo[] {
   return Array.from(store.values());
 }
 
+/**
+ * A captured quota window whose reset has already passed is stale: the
+ * upstream has reset the window and no newer sample has been captured, so the
+ * stored numbers no longer describe the window's current usage. Presenting
+ * them would freeze the UI on an old level (2026-11-10 incident: a Zhipu
+ * provider kept showing "60%" long after its window had reset because no
+ * newer x-ratelimit header ever arrived). Callers should skip the merge and
+ * fall through to fresher data — local token counts — or nothing.
+ *
+ * A sample without a reset timestamp cannot be aged out this way and is kept.
+ */
+export function isQuotaWindowExpired(
+  resetEpochSeconds: number | null | undefined,
+  nowMs: number = Date.now()
+): boolean {
+  return typeof resetEpochSeconds === "number" && resetEpochSeconds * 1000 <= nowMs;
+}
+
 function getFirstHeader(
   getHeader: (name: string) => string | null,
   names: readonly string[]

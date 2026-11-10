@@ -10,6 +10,7 @@ import { calculateTokenCount } from "../utils/router";
 import { TokenizerService } from "../services/tokenizer";
 import { getAllRateLimitInfo, initRateLimitPersistence } from "../services/rate-limit";
 import { getAllQuotaResults, initQuotaStorePersistence } from "../services/quota-store";
+import { isQuotaWindowExpired } from "../services/rate-limit";
 import { findInvalidProxyUrls } from "../services/proxy";
 import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
 import { getHealthStore } from "../services/provider-health";
@@ -307,8 +308,11 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     let previousConfig: any = null;
     try {
       previousConfig = await readConfigFile();
-    } catch {}
-    const selfProviderResult = ensureCcrSelfProvider(newConfig, previousConfig);
+    } catch {
+      // No readable previous config (first run / unreadable file): keep null so
+      // ensureCcrSelfProvider re-arms the self-referential provider.
+    }
+    ensureCcrSelfProvider(newConfig, previousConfig);
 
     // Installed provider plugins protect their own managed entries (see
     // provider-plugins/types.ts) — the gemini-oauth plugin's protector re-locks
@@ -886,10 +890,12 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       );
 
       // Merge rate limit info from upstream response headers (e.g. Kimi/Moonshot, Groq).
+      // A window whose reset has already passed is stale — skip it so the UI
+      // falls back to the local token count instead of a frozen percentage.
       const rateLimits = getAllRateLimitInfo();
       for (const quota of quotas) {
         const rl = rateLimits.find(r => r.provider === quota.provider);
-        if (rl && rl.limit != null) {
+        if (rl && rl.limit != null && !isQuotaWindowExpired(rl.reset)) {
           quota.limit5h = rl.limit;
           quota.used5h = rl.limit - (rl.remaining ?? 0);
           if (rl.reset) {
@@ -935,18 +941,28 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
           quota.used7d = stored.usedBalance;
         }
 
-        if (typeof stored.usedDailyBalance === 'number') {
+        // Same staleness rule as the header merge above: a window whose reset
+        // has passed is not current usage. Samples without a reset timestamp
+        // are kept (they cannot be aged out).
+        const storeResetExpired = isQuotaWindowExpired(
+          typeof stored.resetTime === 'string' ? Date.parse(stored.resetTime) / 1000 : undefined
+        );
+        const storeReset7dExpired = isQuotaWindowExpired(
+          typeof stored.resetTime7d === 'string' ? Date.parse(stored.resetTime7d) / 1000 : undefined
+        );
+
+        if (typeof stored.usedDailyBalance === 'number' && !storeResetExpired) {
           quota.used5h = stored.usedDailyBalance;
           quota.type5h = 'rateLimit';
         }
 
         // limitDaily maps to the 5h slot limit (used by TIME_LIMIT/TOKENS_LIMIT adapters)
-        if (typeof stored.limitDaily === 'number') {
+        if (typeof stored.limitDaily === 'number' && !storeResetExpired) {
           quota.limit5h = stored.limitDaily;
           quota.type5h = 'rateLimit';
         }
 
-        if (typeof stored.resetTime === 'string') {
+        if (typeof stored.resetTime === 'string' && !storeResetExpired) {
           if (stored.limitDaily !== undefined) {
             quota.reset5h = stored.resetTime;
           } else {
@@ -954,7 +970,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
           }
         }
 
-        if (typeof stored.resetTime7d === 'string') {
+        if (typeof stored.resetTime7d === 'string' && !storeReset7dExpired) {
           quota.reset7d = stored.resetTime7d;
         }
       }
@@ -991,7 +1007,21 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
           const manifest = JSON.parse(content);
 
           // Extract metadata fields
-          const { Providers, Router, PORT, HOST, API_TIMEOUT_MS, PROXY_URL, PROXY_GLOBAL_ENABLED, LOG, LOG_LEVEL, StatusLine, NON_INTERACTIVE_MODE, ...metadata } = manifest;
+          // Strip the runtime fields; everything else travels as preset metadata.
+          const {
+            Providers: _providers,
+            Router: _router,
+            PORT: _port,
+            HOST: _host,
+            API_TIMEOUT_MS: _apiTimeoutMs,
+            PROXY_URL: _proxyUrl,
+            PROXY_GLOBAL_ENABLED: _proxyGlobalEnabled,
+            LOG: _log,
+            LOG_LEVEL: _logLevel,
+            StatusLine: _statusLine,
+            NON_INTERACTIVE_MODE: _nonInteractiveMode,
+            ...metadata
+          } = manifest;
 
           presets.push({
             id: dirName,  // Use directory name as unique identifier
