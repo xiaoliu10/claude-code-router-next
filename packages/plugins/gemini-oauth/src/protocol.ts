@@ -55,7 +55,25 @@ export const GEMINI_OAUTH_MGMT_PLANE = "https://cloudcode-pa.googleapis.com";
 /** Code Assist is stream-only, even for non-stream clients (magpie gateway). */
 export const GEMINI_OAUTH_SSE_PATH = "/v1internal:streamGenerateContent?alt=sse";
 export const GEMINI_OAUTH_CALLBACK_PATH = "/oauth-callback";
-export const GEMINI_OAUTH_DEFAULT_VERSION = "2.9.1";
+/** Default Antigravity hub version sent in the User-Agent. The Code Assist
+ *  data plane gates the model catalogue by a MINIMUM hub version in this header:
+ *  with the original 2.9.1 persona the upstream returns a reduced catalogue
+ *  without Gemini 4, while a current hub returns the full one. Verified twice
+ *  against a live standard-tier account (same token/project, only the UA
+ *  changed): 2026-10-27 and 2026-11-10 — hub/2.9.1 returned 11 models with no
+ *  Gemini 4, hub/2.26.0+ returned 12 including gemini-4-argon; an obviously
+ *  future 99.99.99 persona was accepted identically, so the gate is a
+ *  minimum-version threshold, not a real-client check. Independently confirmed
+ *  by magpie issue #5679 (stale hub/2.9.1 → Argon 404; current hub → 200).
+ *
+ *  Pinned to 2.30.0, the version Google's own updater manifest reported on
+ *  2026-11-10 (antigravity-hub-auto-updater .../manifest/latest-arm64-mac.yml),
+ *  and the lowest version WE CONFIRMED returns the current catalogue may be
+ *  older. magpie tracks that manifest dynamically (6h cache, 2.9.1 bottom
+ *  fallback); this plugin pins a constant per its v1 contract — raise this the
+ *  next time Google gates a model behind a newer hub, or override per-deploy
+ *  via GEMINI_OAUTH_ANTIGRAVITY_VERSION. */
+export const GEMINI_OAUTH_DEFAULT_VERSION = "2.30.0";
 /** Login callback server TTL: 30 minutes. Raised from the original 10 (contract
  *  §1) — real users routinely exceed 10 minutes across password/2FA/org-SSO,
  *  and every TTL expiry looks identical to a broken callback (dead loopback
@@ -325,7 +343,12 @@ export function classifyGeminiOauthError(input: {
     "";
   const text = String(upstreamMessage ?? "");
   let parsedBody = input.body;
-  if (typeof parsedBody === "string") { try { parsedBody = JSON.parse(parsedBody); } catch {} }
+  if (typeof parsedBody === "string") {
+    // Best-effort parse: a non-JSON body stays a string and the validation-URL
+    // extractor falls back to scanning the raw text, so a parse failure here
+    // is expected and needs no handling.
+    try { parsedBody = JSON.parse(parsedBody); } catch { /* keep raw string */ }
+  }
   const validation = extractValidationUrl(parsedBody ?? text);
 
   if ((status === 403 || status === undefined || status === 200) && validation.validationRequired) {
@@ -958,6 +981,17 @@ async function fetchAvailableModelsInternal(
   for (const [id, m] of Object.entries<any>(rawModels)) {
     if (ANTIGRAVITY_HIDDEN.has(id)) continue;
     if (id.startsWith("chat_") || id.startsWith("tab_")) continue;
+    // Antigravity marks a model it will not serve this account with the
+    // boolean `disabled` field (on a real account the placeholder is reported
+    // as e.g. gemini-4-argon-disabled + disabled:true; addressing it 404s
+    // "Requested entity was not found"). This mirrors magpie's upstream fix
+    // (commit a7ed2f61, `if m.Disabled { continue }`): skip the entry at the
+    // single discovery choke point so neither the variant nor collapsed list
+    // can offer it; Google clears the flag and a refresh brings it back. Strict
+    // `=== true` is deliberate — fail open on an unexpected shape rather than
+    // silently dropping a working model (a truthy test would misread the string
+    // "false").
+    if (m?.disabled === true) continue;
     out.push({
       id,
       name: typeof m?.displayName === "string" ? m.displayName : undefined,

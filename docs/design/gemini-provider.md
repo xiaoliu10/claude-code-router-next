@@ -81,7 +81,7 @@
 
 ### 3.4 指纹
 
-UA 数据面带本次模型 id（`GeminiCLI/0.61.0/gemini-2.5-pro (darwin; arm64; terminal)`，版本硬编码）；Antigravity UA `antigravity/hub/<ver> <os>/<arch>`，版本号每 6h 从其自动更新 manifest 探测，兜底 `2.9.1`。
+UA 数据面带本次模型 id（`GeminiCLI/0.61.0/gemini-2.5-pro (darwin; arm64; terminal)`，版本硬编码）；Antigravity UA `antigravity/hub/<ver> <os>/<arch>`。**本插件 v1 硬编码 `ver=2.30.0`**（可被 env `GEMINI_OAUTH_ANTIGRAVITY_VERSION` 覆盖），不做动态探测；参考实现 magpie 则每 6h 从其自动更新 manifest（`antigravity-hub-auto-updater-.../manifest/latest-arm64-mac.yml`）探测、兑底 2.9.1。2026-11-10 核实：数据面按 UA 的 hub 最低版本阈值门控目录，旧 2.9.1 拿不到 Gemini 4，故硬编码值需随 Google 门控手动提升。
 
 ---
 
@@ -156,7 +156,7 @@ UA 数据面带本次模型 id（`GeminiCLI/0.61.0/gemini-2.5-pro (darwin; arm64
 **盲区（如实告知）**：
 - `antigravity.google/terms` 本次调研网络不可达，其 ToS 措辞沿用 2026-10-14 直读版本，未二次复核；但 Gemini CLI ToS 页与两份官方公告为本次一手直读，结论不受影响。
 - Code Assist 怪癖集是移动目标（Google 可随时改），magpie 也是 issue 驱动跟进；本设计列出的是当前快照，实施时以真实验证为准。
-- UA 版本探测（antigravity updater manifest）涉及伪装 `electron-builder` UA 的外部请求，是否移植待定（v1 可硬编码版本号 + 手动更新）。
+- UA 版本探测（antigravity updater manifest）涉及伪装 `electron-builder` UA 的外部请求，v1 决定**不移植**：硬编码版本号（当前 2.30.0）+ env 覆盖 + 发版时手动更新；动态探测（magpie 的 6h 缓存 + 兑底）留作未来增强。
 
 **待拍板**：
 1. **是否接受「实验性、风险自担」定位与 §4 的红线（不做混淆、v1 不做池化）？** —— 这是产品立场问题，不只是工程问题（magpie #2139 同题）。

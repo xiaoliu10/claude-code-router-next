@@ -136,7 +136,10 @@ describe("gemini-oauth request config: URL + header override order", () => {
     const result = await transformer().transformRequestIn(baseRequest(), {} as any, {} as any);
     expect(result.config.url).toBe(`${GEMINI_OAUTH_DATA_PLANE}${GEMINI_OAUTH_SSE_PATH}`);
     expect(result.config.headers.Authorization).toBe("Bearer live-access-token");
-    expect(result.config.headers["User-Agent"]).toMatch(/^antigravity\/hub\/\d+\.\d+\.\d+ (darwin|win32|linux)\/(x64|arm64)$/);
+    // Pin the exact hub persona on the DATA-PLANE inference header too: a
+    // silent revert to an old hub here would re-gate Gemini 4 (magpie #5679),
+    // and a shape-only regex would not catch it. The os/arch stay dynamic.
+    expect(result.config.headers["User-Agent"]).toBe(`antigravity/hub/2.30.0 ${process.platform === "win32" ? "win32" : process.platform}/${(process.arch as string) === "amd64" ? "x64" : process.arch}`);
     // routes.ts merge order: default first, transformer config spread after → ours wins.
     const merged = { Authorization: "Bearer ccr-managed-gemini-oauth", ...result.config.headers };
     expect(merged.Authorization).toBe("Bearer live-access-token");
@@ -144,7 +147,7 @@ describe("gemini-oauth request config: URL + header override order", () => {
   });
 
   it("builds the antigravity UA with the documented os/arch mapping and env override", () => {
-    expect(antigravityUserAgent()).toBe(`antigravity/hub/2.9.1 ${process.platform === "win32" ? "win32" : process.platform}/${(process.arch as string) === "amd64" ? "x64" : process.arch}`);
+    expect(antigravityUserAgent()).toBe(`antigravity/hub/2.30.0 ${process.platform === "win32" ? "win32" : process.platform}/${(process.arch as string) === "amd64" ? "x64" : process.arch}`);
     const prev = process.env.GEMINI_OAUTH_ANTIGRAVITY_VERSION;
     process.env.GEMINI_OAUTH_ANTIGRAVITY_VERSION = "9.9.9";
     expect(antigravityUserAgent()).toContain("antigravity/hub/9.9.9 ");

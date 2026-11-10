@@ -29,9 +29,11 @@ clientId   process.env.GEMINI_OAUTH_CLIENT_ID
 clientSec  process.env.GEMINI_OAUTH_CLIENT_SECRET
 scopes     cloud-platform, userinfo.email, userinfo.profile, cclog, experimentsandconfigs
 redirect   http://localhost:<随机端口>/oauth-callback        (bind 127.0.0.1:0)
-UA         antigravity/hub/2.9.1 <os>/<arch>   (os: darwin/win32/linux, arch: x64/arm64; 版本 v1 硬编码，可被 env GEMINI_OAUTH_ANTIGRAVITY_VERSION 覆盖)
+UA         antigravity/hub/2.30.0 <os>/<arch>  (os: darwin/win32/linux, arch: x64/arm64; 版本 v1 硬编码，可被 env GEMINI_OAUTH_ANTIGRAVITY_VERSION 覆盖)
 authParams response_type=code, access_type=offline, prompt=consent, state=<rand24>, code_challenge(S256), code_challenge_method=S256
 ```
+
+> UA 版本核实修订（2026-11-10）：Code Assist 数据面按 UA 里的 hub **最低版本阈值**门控模型目录（非真实性校验——实测 99.99.99 也被接受）。同一 standard-tier 账号、同 token/project，仅换 UA：hub/2.9.1 返回缩减目录且无 Gemini 4，hub/2.26.0+ 返回完整目录含 gemini-4-argon；magpie issue #5679 独立复现（旧 hub→Argon 404，当前 hub→200）。默认值由 2.9.1 提升到官方 updater manifest 当时的 2.30.0。后续 Google 再次门控新模型时需手动提升此常量，或改为动态探测 manifest。
 
 > M1 核实修订：OAuth client 参考来源为 magpie `google.go/antigravityApp`，本实现通过以上环境变量配置；缺失时返回稳定的配置未就绪错误，不回显值。禁止字符串拆分/编码绕过 GitHub Push Protection。未来若提交被拦截的公开常量，须由维护者走 GitHub 官方审查/allow 流程。M1 提交后暂停，独立审查通过再进入 M2。
 
