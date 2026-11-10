@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2427] - 2026-11-10
+
+### Fixed
+
+- **expired quota windows are no longer presented as current usage**: `/api/providers/quota` merges captured upstream rate-limit headers and active adapter results into the local token counts, but neither merge checked the window's reset timestamp — a captured level lived forever and the UI froze on it (a Zhipu provider kept showing "60%" more than ten hours after its window had reset). Both merges now skip a window whose reset has passed, so the card falls back to the local token count until a fresher sample arrives; samples without a reset timestamp are kept.
+
+## [2.3.2427] - 2026-11-10（中文）
+
+### 修复
+
+- **已过期的配额窗口不再被当作当前用量展示**：`/api/providers/quota` 会把捕获的上游 rate-limit 响应头与主动配额适配器结果合并进本地 token 统计，但两处合并都不检查窗口的重置时间——捕获到的数值永久有效，UI 卡死在旧值上（某智谱供应商的窗口重置十余小时后仍显示"60%"）。现在重置时间已过的窗口在合并时跳过，卡片回退到本地 token 统计，直到更新的采样到来；没有重置时间戳的采样保留不变。
+
 ## [2.3.2426] - 2026-11-06
 
 ### Added
