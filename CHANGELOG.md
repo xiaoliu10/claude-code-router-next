@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2428] - 2026-11-10
+
+### Fixed
+
+- **quota adapters now request uncompressed responses so a proxied gzip body cannot null out the result**: each quota adapter sends its request through an explicit undici `ProxyAgent` when a proxy is configured, but undici does not transparently gunzip the response over that dispatcher — the gzip bytes reached `response.json()`, the parse threw, and the adapter's `catch` returned null, so the provider card showed no quota (the Zhipu provider's upstream returned HTTP 200 with valid data that never reached the UI). All seven outbound header blocks now pin `Accept-Encoding: identity`, matching the pattern already used by the gemini-oauth/codex/kiro plugins. Encoding negotiation only; no parsing or auth logic changed.
+
+## [2.3.2428] - 2026-11-10（中文）
+
+### 修复
+
+- **配额适配器改为请求未压缩响应，避免代理 gzip 体导致结果为空**：各配额适配器在配置代理时通过显式 undici `ProxyAgent` 发请求，但 undici 经该 dispatcher 不会自动 gunzip 响应——gzip 字节直接进入 `response.json()`，解析抛错后被 catch 成 null，于是供应商卡片不显示配额（智谱上游其实返回了 HTTP 200 的有效数据，却没能到达 UI）。现在全部七处出站请求头固定 `Accept-Encoding: identity`，与 gemini-oauth/codex/kiro 插件已有的做法一致。仅改编码协商，解析与鉴权逻辑不变。
+
 ## [2.3.2427] - 2026-11-10
 
 ### Fixed

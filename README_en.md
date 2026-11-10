@@ -92,6 +92,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | Version | Release Details |
 | --- | --- |
+| **v2.3.2428** | <ul><li><strong>Quota adapter gzip fix</strong>: proxied quota requests pin <code>Accept-Encoding: identity</code> so an undecoded gzip body can no longer fail the parse and hide the provider quota (Zhipu and similar providers show usage again).</li></ul> |
 | **v2.3.2427** | <ul><li><strong>Expired quota window fix</strong>: a window whose reset has passed is no longer presented as current usage; the card falls back to the local token count instead of a frozen percentage.</li></ul> |
 | **v2.3.2426** | <ul><li><strong>Gemini (Antigravity) model hide/restore</strong>: the card lists visible model chips with hide buttons plus a hidden list with restore/restore-all; hiding clears Router references with a first-visible default and rolls back completely on failure.</li></ul> |
 | **v2.3.2425** | <ul><li><strong>Provider drag-and-drop reordering</strong>: drag a provider card to reorder the list; the order is written to the config immediately. Drags resolve by stable row id, so they stay correct while the list is search-filtered, and unnamed providers can be dragged too.</li><li><strong>grok and cursor cards follow the family style</strong>: shared button vocabulary, sizes, icons and destructive variant, so all seven provider cards look alike.</li></ul> |
