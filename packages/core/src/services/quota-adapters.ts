@@ -42,6 +42,10 @@ abstract class BaseQuotaAdapter implements QuotaAdapter {
       method: "GET",
       headers: {
         Accept: "application/json",
+        // undici does not transparently gunzip a response that arrives over an
+        // explicit ProxyAgent (the compressed body reaches response.json() and
+        // fails the parse), so ask the upstream for an uncompressed payload.
+        "Accept-Encoding": "identity",
         Authorization: `Bearer ${token}`,
       },
       signal: AbortSignal.timeout(timeoutMs),
@@ -177,6 +181,9 @@ class ZhipuQuotaAdapter extends BaseQuotaAdapter {
       method: "GET",
       headers: {
         Accept: "application/json",
+        // See BaseQuotaAdapter: identity avoids undici ProxyAgent gzip that
+        // would otherwise surface as a parse failure and a null quota result.
+        "Accept-Encoding": "identity",
         Authorization: authHeader,
       },
       signal: AbortSignal.timeout(timeoutMs),
@@ -308,6 +315,7 @@ class AliyunCodingPlanQuotaAdapter extends BaseQuotaAdapter {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
+        "Accept-Encoding": "identity",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         "Origin": "https://bailian.console.aliyun.com",
         "Referer": "https://bailian.console.aliyun.com/cn-beijing",
@@ -653,6 +661,7 @@ class AliyunTokenPlanQuotaAdapter extends BaseQuotaAdapter {
       headers: {
         Accept: "application/json",
         "Content-Type": "application/x-www-form-urlencoded",
+        "Accept-Encoding": "identity",
         Cookie: cookie,
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         Origin: "https://bailian.console.aliyun.com",
@@ -723,6 +732,7 @@ class AliyunTokenPlanQuotaAdapter extends BaseQuotaAdapter {
       headers: {
         Accept: "application/json",
         "Content-Type": "application/x-www-form-urlencoded",
+        "Accept-Encoding": "identity",
         // Cookie-based auth — do NOT send Authorization Bearer.
         Cookie: cookie,
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
@@ -768,6 +778,7 @@ class XfyunCodingPlanQuotaAdapter extends BaseQuotaAdapter {
       method: "GET",
       headers: {
         Accept: "application/json",
+        "Accept-Encoding": "identity",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         Origin: "https://maas.xfyun.cn",
         Referer: "https://maas.xfyun.cn/packageSubscription",
@@ -830,6 +841,7 @@ class KimiCodingPlanQuotaAdapter extends BaseQuotaAdapter {
       method: "GET",
       headers: {
         Accept: "application/json",
+        "Accept-Encoding": "identity",
         Authorization: `Bearer ${authToken.trim()}`,
       },
       signal: AbortSignal.timeout(timeoutMs),
