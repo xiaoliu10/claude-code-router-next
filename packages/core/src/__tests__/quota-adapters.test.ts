@@ -645,3 +645,88 @@ describe("AliyunTokenPlanQuotaAdapter sec_token fallback", () => {
     expect(result!.usedDailyBalance).toBe(25);
   });
 });
+
+describe("ZhipuQuotaAdapter quota fetch (gzip/identity regression)", () => {
+  const zhipuBaseUrl = "https://open.bigmodel.cn/api/anthropic/v1/messages";
+  const makeZhipu = (): LLMProvider => ({
+    name: "智谱 Coding Plan -lite",
+    baseUrl: zhipuBaseUrl,
+    apiKey: "zhipu-raw-key",
+    models: ["glm-5.3"],
+  } as LLMProvider);
+
+  // Real upstream shape captured 2026-11-10: the 5h TOKENS_LIMIT carries only
+  // a percentage (no currentValue/usage/remaining). Without Accept-Encoding:
+  // identity the response arrived gzip-compressed over an explicit ProxyAgent
+  // and undici did not gunzip it, so response.json() threw and the adapter
+  // returned null — the provider card showed no quota at all.
+  const realPayload = {
+    code: 200,
+    msg: "Operation successful",
+    data: {
+      limits: [
+        {
+          type: "TIME_LIMIT", unit: 5, number: 1, usage: 100,
+          currentValue: 28, remaining: 72, percentage: 28,
+          nextResetTime: 1796007632999,
+        },
+        {
+          type: "TOKENS_LIMIT", unit: 3, number: 5,
+          percentage: 100, nextResetTime: 1794313562965,
+        },
+      ],
+    },
+  };
+
+  it("dispatches bigmodel.cn to the Zhipu adapter", () => {
+    expect(getQuotaAdapter(zhipuBaseUrl)?.constructor.name).toBe("ZhipuQuotaAdapter");
+  });
+
+  it("sends Accept-Encoding: identity and a raw key, and parses the percentage-only 5h quota", async () => {
+    let capturedInit: (RequestInit & { dispatcher?: unknown }) | undefined;
+    let capturedUrl = "";
+    globalThis.fetch = vi.fn(async (url: any, init: any) => {
+      capturedUrl = String(url);
+      capturedInit = init;
+      return new Response(JSON.stringify(realPayload), { status: 200, headers: { "content-type": "application/json" } });
+    }) as any;
+
+    const adapter = getQuotaAdapter(zhipuBaseUrl);
+    const result = await adapter!.queryQuota(makeZhipu(), 5000, "http://127.0.0.1:7897");
+
+    expect(capturedUrl).toBe("https://api.z.ai/api/monitor/usage/quota/limit");
+    const headers = capturedInit!.headers as Record<string, string>;
+    // The regression guard: never let undici hand a gzip body to response.json().
+    expect(headers["Accept-Encoding"]).toBe("identity");
+    // Zhipu authenticates with the raw key, no Bearer prefix.
+    expect(headers.Authorization).toBe("zhipu-raw-key");
+    expect(capturedInit!.dispatcher).toBeDefined();
+
+    expect(result).toEqual({
+      usedDailyBalance: 100,
+      limitDaily: 100,
+      resetTime: new Date(1794313562965).toISOString(),
+    });
+  });
+
+  it("returns null when the api key is missing", async () => {
+    const adapter = getQuotaAdapter(zhipuBaseUrl);
+    const result = await adapter!.queryQuota({ ...makeZhipu(), apiKey: "" } as LLMProvider, 5000);
+    expect(result).toBeNull();
+  });
+
+  it("the shared base fetchJson path also requests identity encoding", async () => {
+    // DeepSeek uses BaseQuotaAdapter.fetchJson — the same ProxyAgent gzip hazard.
+    let capturedInit: RequestInit | undefined;
+    globalThis.fetch = vi.fn(async (_url: any, init: any) => {
+      capturedInit = init;
+      return new Response(JSON.stringify({
+        is_available: true,
+        balance_infos: [{ currency: "CNY", total_balance: "10.00", granted_balance: "0", topped_up_balance: "0" }],
+      }), { status: 200 });
+    }) as any;
+    const adapter = getQuotaAdapter("https://api.deepseek.com/chat/completions");
+    await adapter!.queryQuota({ name: "ds", baseUrl: "https://api.deepseek.com/chat/completions", apiKey: "k", models: [] } as LLMProvider, 5000);
+    expect((capturedInit!.headers as Record<string, string>)["Accept-Encoding"]).toBe("identity");
+  });
+});
