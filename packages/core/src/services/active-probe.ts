@@ -7,6 +7,7 @@ import { getHealthStore, ProviderHealthState } from './provider-health';
 import { captureRateLimitHeaders } from './rate-limit';
 import { getQuotaAdapter } from './quota-adapters';
 import { storeQuotaResult } from './quota-store';
+import { pollPluginQuota } from './plugin-quota';
 import type { LLMProvider } from '../types/llm';
 import { version as CCR_VERSION } from '../../package.json';
 import { getProxyDispatcher } from './proxy';
@@ -575,8 +576,10 @@ export class ActiveProbeService {
     );
     const healthStore = getHealthStore();
 
-    if (providers.length === 0) return;
-
+    // NOTE: no early return on an empty `providers` list — managed
+    // subscription providers are filtered out of it above but still get
+    // polled through the fetchQuota seam below. The `tasks.length === 0`
+    // guard before dispatch is the single empty-case exit.
     const tasks: Array<{ provider: string; models: string[]; type: string; promise: Promise<void> }> = [];
 
     for (const provider of providers) {
@@ -660,6 +663,29 @@ export class ActiveProbeService {
             this.recordProbe(provider.name, result, 'rate-limit-headers');
           }),
         });
+      }
+    }
+
+    // Managed subscription providers are excluded from the generic adapter
+    // loop above (their marker key is not a usable credential). When their
+    // runtime implements the fetchQuota seam, poll it here so plugin quota
+    // figures land in the SAME quota store the admin route reads. The seam
+    // is TTL-cached per provider, so this loop and on-demand route polls can
+    // never trigger competing upstream calls.
+    if (this.resolveManagedRuntime) {
+      const managedProviders = this.getProviders().filter(
+        p => p?.name && p.enabled !== false && needsManagedProbe(p) && !this.config.excludeProviders.includes(p.name)
+      );
+      for (const provider of managedProviders) {
+        const runtime = this.resolveManagedRuntime(provider);
+        if (runtime && typeof runtime.fetchQuota === 'function') {
+          tasks.push({
+            provider: provider.name,
+            models: Array.isArray(provider.models) ? provider.models : [],
+            type: 'managed-plugin-quota',
+            promise: pollPluginQuota(provider.name, provider, runtime),
+          });
+        }
       }
     }
 

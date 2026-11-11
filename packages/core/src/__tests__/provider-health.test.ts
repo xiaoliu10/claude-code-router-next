@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ProviderHealthStore } from "../services/provider-health";
 
 describe("ProviderHealthStore", () => {
@@ -209,5 +209,109 @@ describe("expired rateLimitUntil recovery (managed-provider stuck-open fix)", ()
     expect(after.status).toBe("open");
     expect(after.rateLimitUntil).toBeGreaterThan(Date.now());
     expect(store.isAvailable("workbuddy", "m")).toBe(false);
+  });
+});
+
+describe("lastSuccessTime recovery visibility", () => {
+  let store: ProviderHealthStore;
+
+  beforeEach(() => {
+    store = new ProviderHealthStore({ enabled: true });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stamps lastSuccessTime on every recorded success of an existing state", () => {
+    // A wide half-open threshold keeps the entry alive across repeated
+    // successes so the stamp refresh is observable.
+    const wide = new ProviderHealthStore({ enabled: true, halfOpenSuccessThreshold: 10 });
+    wide.forceOpen("provider-a", "model-a", "old failure");
+    expect(wide.getState("provider-a", "model-a")!.lastSuccessTime).toBeUndefined();
+
+    wide.recordSuccess("provider-a", "model-a");
+    expect(wide.getState("provider-a", "model-a")!.lastSuccessTime).toBe(Date.now());
+
+    // A later success moves the stamp forward.
+    vi.advanceTimersByTime(5_000);
+    wide.recordSuccess("provider-a", "model-a");
+    expect(wide.getState("provider-a", "model-a")!.lastSuccessTime).toBe(Date.now());
+
+    // The default store stamps too, on its single surviving half-open success.
+    store.forceOpen("provider-b", "model-b", "old failure");
+    store.recordSuccess("provider-b", "model-b");
+    expect(store.getState("provider-b", "model-b")!.lastSuccessTime).toBe(Date.now());
+  });
+
+  it("supports the UI staleness rule: failure before success is stale, after is active", () => {
+    // The UI computes `lastFailureTime && (!lastSuccessTime || lastFailureTime > lastSuccessTime)`.
+    store.forceOpen("provider-a", "model-a", "transient failure");
+    const failedAt = Date.now();
+
+    vi.advanceTimersByTime(60_000);
+    store.recordSuccess("provider-a", "model-a"); // open → half-open keeps the entry
+    const state = store.getState("provider-a", "model-a")!;
+    expect(state.lastFailureTime).toBe(failedAt);
+    expect(state.lastSuccessTime).toBeGreaterThan(state.lastFailureTime);
+    const staleFailure =
+      state.lastFailureTime && (!state.lastSuccessTime || state.lastFailureTime > state.lastSuccessTime);
+    expect(staleFailure).toBeFalsy();
+
+    // A NEW failure after the success flips the rule back to active.
+    vi.advanceTimersByTime(60_000);
+    store.recordFailure("provider-a", "model-a", "fresh failure");
+    const after = store.getState("provider-a", "model-a")!;
+    expect(after.lastFailureTime).toBeGreaterThan(after.lastSuccessTime!);
+    const activeFailure =
+      after.lastFailureTime && (!after.lastSuccessTime || after.lastFailureTime > after.lastSuccessTime);
+    expect(activeFailure).toBeTruthy();
+  });
+
+  it("stamps lastSuccessTime even when an unexpired rate-limit cooldown blocks the transition", () => {
+    store.forceOpen("provider-a", "model-a", "failure");
+    store.getState("provider-a", "model-a")!.rateLimitUntil = Date.now() + 3_600_000;
+
+    vi.advanceTimersByTime(1_000);
+    store.recordSuccess("provider-a", "model-a");
+
+    const state = store.getState("provider-a", "model-a")!;
+    // The circuit stays open, but the observed success is still visible.
+    expect(state.status).toBe("open");
+    expect(state.lastSuccessTime).toBe(Date.now());
+  });
+
+  it("keeps the existing open → half-open successCount reset semantics intact", () => {
+    store.forceOpen("provider-a", "model-a", "failure");
+    store.recordSuccess("provider-a", "model-a");
+    const state = store.getState("provider-a", "model-a")!;
+    expect(state.status).toBe("half-open");
+    expect(state.successCount).toBe(1);
+    expect(state.failureCount).toBe(0);
+    expect(state.lastSuccessTime).toBe(Date.now());
+  });
+
+  it("restore round-trips lastSuccessTime so persistence keeps recovery visibility", () => {
+    const successAt = Date.now();
+    store.restore({
+      provider: "provider-a",
+      model: "model-a",
+      status: "half-open",
+      failureCount: 1,
+      successCount: 1,
+      lastFailureTime: successAt - 60_000,
+      lastSuccessTime: successAt,
+      lastProbeTime: 0,
+    });
+    const restored = store.getAllStates().find((s) => s.provider === "provider-a")!;
+    expect(restored.lastSuccessTime).toBe(successAt);
+  });
+
+  it("does not create state entries for healthy models (recordSuccess stays a no-op)", () => {
+    store.recordSuccess("provider-a", "model-a");
+    expect(store.getState("provider-a", "model-a")).toBeUndefined();
+    expect(store.getAllStates()).toHaveLength(0);
   });
 });
