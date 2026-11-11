@@ -6,7 +6,7 @@ import Server from "../server";
 import { registerAdminRoutes } from "../ccr/admin-routes";
 import { loadInstalledPlugins } from "../provider-plugins/loader";
 import { ActiveProbeService } from "../services/active-probe";
-import { clearQuotaStore, getAllQuotaResults } from "../services/quota-store";
+import { clearQuotaStore, getAllQuotaResults, storeQuotaResult } from "../services/quota-store";
 import {
   hasFreshPluginQuota,
   pollPluginQuota,
@@ -34,6 +34,7 @@ const runtime = {
   fetchQuota: async () => {
     globalThis.__quotaCalls = (globalThis.__quotaCalls || 0) + 1;
     if (globalThis.__quotaThrow) throw new Error("upstream quota boom");
+    if (globalThis.__quotaHang) return new Promise(() => {});
     return globalThis.__quotaFigures ?? null;
   },
 };
@@ -147,6 +148,7 @@ describe("managed runtime fetchQuota seam", () => {
     delete (globalThis as any).__quotaCalls;
     delete (globalThis as any).__quotaFigures;
     delete (globalThis as any).__quotaThrow;
+    delete (globalThis as any).__quotaHang;
   });
 
   it("merges plugin figures into /api/providers/quota 5h and 7d slots", async () => {
@@ -253,6 +255,25 @@ describe("managed runtime fetchQuota seam", () => {
     // A second tick inside the TTL must not poll again.
     await (service as any).runQuotaProbe();
     expect((globalThis as any).__quotaCalls).toBe(1);
+  });
+
+  it("serves stored figures within the inline budget when the seam hangs", async () => {
+    ({ server } = await buildAdminRuntime(configDir));
+
+    // Seed the store so the budget path has figures to serve while the poll
+    // is still in flight.
+    storeQuotaResult("fake-sub", FULL_FIGURES);
+    (globalThis as any).__quotaHang = true;
+    resetPluginQuotaCache();
+
+    const started = Date.now();
+    const res = await server.app.inject({ method: "GET", url: "/api/providers/quota" });
+    const elapsed = Date.now() - started;
+    expect(res.statusCode).toBe(200);
+    // The route must not wait out a hung seam: inline budget plus margin.
+    expect(elapsed).toBeLessThan(4_000);
+    const quota = res.json().quotas.find((q: any) => q.provider === "fake-sub");
+    expect(quota.used5h).toBe(FULL_FIGURES.usedDailyBalance);
   });
 });
 

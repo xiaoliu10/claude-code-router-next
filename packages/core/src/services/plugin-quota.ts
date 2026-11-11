@@ -19,6 +19,14 @@ import { storeQuotaResult } from "./quota-store";
 /** Per-provider refresh interval for the plugin quota seam. */
 export const PLUGIN_QUOTA_TTL_MS = 60_000;
 
+/**
+ * Upper bound the /api/providers/quota route waits for an on-demand plugin
+ * poll. A blackholed proxy must not hang the admin endpoint: when the budget
+ * elapses the route serves the stored figures and the in-flight poll still
+ * lands in the store for the next request.
+ */
+export const PLUGIN_QUOTA_INLINE_BUDGET_MS = 2_500;
+
 interface CacheEntry {
   /** Epoch ms of the last settled (success, null or failed) poll. */
   fetchedAt: number;

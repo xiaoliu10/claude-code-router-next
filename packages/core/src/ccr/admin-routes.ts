@@ -10,7 +10,7 @@ import { calculateTokenCount } from "../utils/router";
 import { TokenizerService } from "../services/tokenizer";
 import { getAllRateLimitInfo, initRateLimitPersistence } from "../services/rate-limit";
 import { getAllQuotaResults, initQuotaStorePersistence } from "../services/quota-store";
-import { pollPluginQuota } from "../services/plugin-quota";
+import { pollPluginQuota, PLUGIN_QUOTA_INLINE_BUDGET_MS } from "../services/plugin-quota";
 import { isQuotaWindowExpired } from "../services/rate-limit";
 import { findInvalidProxyUrls } from "../services/proxy";
 import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
@@ -908,7 +908,14 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
             if (!runtime || typeof runtime.fetchQuota !== "function") return undefined;
             return pollPluginQuota(provider.name, provider, runtime);
           });
-        await Promise.all(managedPolls);
+        const managedPollList = managedPolls.filter((poll): poll is Promise<void> => !!poll);
+        if (managedPollList.length) {
+          const budget = new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, PLUGIN_QUOTA_INLINE_BUDGET_MS);
+            (timer as any).unref?.();
+          });
+          await Promise.race([Promise.all(managedPollList), budget]);
+        }
       }
 
       const quotas = computeProviderQuota(providers);
