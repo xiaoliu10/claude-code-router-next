@@ -91,6 +91,63 @@ function createPayloadPump(body: ReadableStream<Uint8Array>) {
   return { readPayload, cancel };
 }
 
+/**
+ * Bounded content-type recovery window. A mislabeled Code Assist reply (the
+ * undici ProxyAgent path intermittently drops Content-Type on a 200 SSE body)
+ * is recognized from its first bytes alone; 4 KiB always covers the first SSE
+ * frame and every hidden-error JSON body the upstream emits.
+ */
+const GEMINI_OAUTH_CONTENT_TYPE_PEEK_BYTES = 4 * 1024;
+
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
+  return out;
+}
+
+/**
+ * Read at most `maxBytes` from `body` for content sniffing while preserving
+ * every byte: the returned `replay` stream re-emits the buffered chunks first
+ * and then keeps pumping the SAME underlying reader, so no byte is consumed
+ * twice or lost. The peek itself never cancels the upstream.
+ */
+async function peekBodyBytes(
+  body: ReadableStream<Uint8Array>,
+  maxBytes: number
+): Promise<{ head: Uint8Array; replay: ReadableStream<Uint8Array> }> {
+  const reader = body.getReader();
+  const buffered: Uint8Array[] = [];
+  let total = 0;
+  while (total < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffered.push(value);
+    total += value.length;
+  }
+  const head = concatChunks(buffered);
+  const replay = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of buffered) controller.enqueue(chunk);
+    },
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) { controller.close(); return; }
+      controller.enqueue(value);
+    },
+    cancel() { reader.cancel().catch(() => {}); },
+  });
+  return { head, replay };
+}
+
+/** A fresh Response carrying `body` with one header overridden. */
+function responseWithHeader(response: Response, body: BodyInit, name: string, value: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set(name, value);
+  return new Response(body, { status: response.status, statusText: response.statusText, headers });
+}
+
 export class GeminiOauthTransformer implements PluginTransformer {
   static TransformerName = "gemini-oauth";
   name = "gemini-oauth";
@@ -223,11 +280,65 @@ export class GeminiOauthTransformer implements PluginTransformer {
       return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
     }
 
-    if (!contentType.includes("stream") || !response.body) return response;
+    if (contentType.includes("stream")) {
+      if (!response.body) return response;
+      return this.transformCodeAssistStream(response, response.body as ReadableStream<Uint8Array>, context);
+    }
 
+    // Unknown or missing Content-Type. The undici ProxyAgent path intermittently
+    // strips Content-Type from a 200 SSE reply (production-confirmed): without a
+    // sniff the wrapped Code Assist frames pass through untouched and the core's
+    // empty-answer guard fails every non-stream request. Peek the first bytes
+    // WITHOUT consuming them, then dispatch by what the body actually is.
+    if (response.body) {
+      const { head, replay } = await peekBodyBytes(
+        response.body as ReadableStream<Uint8Array>,
+        GEMINI_OAUTH_CONTENT_TYPE_PEEK_BYTES
+      );
+      const text = new TextDecoder().decode(head).trimStart();
+      if (text.startsWith("data:")) {
+        const replayResponse = responseWithHeader(response, replay, "Content-Type", "text/event-stream");
+        return this.transformCodeAssistStream(replayResponse, replay, context);
+      }
+      if (text.startsWith("{") || text.startsWith("[")) {
+        // The head only proves the shape: parse the COMPLETE replayed body so a
+        // document larger than the peek window is still recognized.
+        const jsonText = await new Response(replay).text();
+        let json: any = null;
+        try { json = jsonText ? JSON.parse(jsonText) : null; } catch { json = null; }
+        if (json?.error) throw this.classifiedFrameError(json.error?.message ?? jsonText);
+        const headers = new Headers(response.headers);
+        headers.set("Content-Type", "application/json");
+        return new Response(jsonText, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      }
+      // Neither SSE nor JSON: replay the exact original bytes with the original
+      // headers (the peek buffered only; no byte is dropped or rewritten).
+      return new Response(replay, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    }
+    return response;
+  }
+
+  /**
+   * The Code Assist SSE lane, shared by the Content-Type branch and the
+   * content-sniff fallback: unwrap the envelope and split by what the CLIENT
+   * asked for (stream conversion or one aggregated completion).
+   */
+  private async transformCodeAssistStream(
+    response: Response,
+    body: ReadableStream<Uint8Array>,
+    context?: PluginTransformerContext
+  ): Promise<Response> {
     // The pump is created once; the peek phase and the streaming/aggregate
     // phase share the same reader.
-    const pump = createPayloadPump(response.body as ReadableStream<Uint8Array>);
+    const pump = createPayloadPump(body);
     let firstPayload = await pump.readPayload();
     if (!firstPayload) {
       throw geminiOauthError(classifyGeminiOauthError({ message: "empty Code Assist stream" }));

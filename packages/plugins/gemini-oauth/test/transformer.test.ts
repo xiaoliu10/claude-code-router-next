@@ -241,6 +241,59 @@ describe("gemini-oauth SSE unwrap (contract §1.2)", () => {
   });
 });
 
+describe("gemini-oauth content-sniff defence (missing Content-Type)", () => {
+  // Production: the undici ProxyAgent path intermittently drops Content-Type on
+  // a 200 SSE reply, so the reply must be recognized from its first bytes —
+  // never passed through as an opaque body (the empty-answer-guard incident).
+  const envelopeFrames = () => [
+    { response: geminiTextChunk("Hel") },
+    { response: geminiTextChunk("lo", { finishReason: undefined }) },
+  ];
+  /** A 200 reply with NO headers at all (Uint8Array bodies carry no implicit
+   *  content-type), exactly the wire shape a header-stripping proxy produces. */
+  const untyped = (frames: unknown[]): Response =>
+    new Response(new TextEncoder().encode(frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join("")), { status: 200 });
+
+  it("unwraps an untyped 200 SSE reply into Anthropic SSE for a streaming client", async () => {
+    const upstream = untyped(envelopeFrames());
+    expect(upstream.headers.get("content-type")).toBeNull();
+    const res = await transformer().transformResponseOut(upstream, { geminiOauthClientStream: true } as any);
+    expect(res.headers.get("content-type")).toMatch(/text\/event-stream/);
+    const chunks = await readSseData(res);
+    const text = chunks.map((c) => c.choices?.[0]?.delta?.content).filter(Boolean).join("");
+    expect(text).toBe("Hello");
+  });
+
+  it("aggregates an untyped 200 SSE reply into one completion for a non-stream client", async () => {
+    const res = await transformer().transformResponseOut(
+      untyped(envelopeFrames()),
+      { geminiOauthClientStream: false } as any,
+    );
+    const json: any = await res.json();
+    expect(json.object).toBe("chat.completion");
+    expect(json.choices[0].message.content).toBe("Hello");
+    expect(json.choices[0].finish_reason).toBe("stop");
+  });
+
+  it("still classifies an untyped 200 JSON hidden-error envelope", async () => {
+    const upstream = new Response(
+      new TextEncoder().encode(JSON.stringify({ error: { message: "Resource has been exhausted" } })),
+      { status: 200 },
+    );
+    await expect(transformer().transformResponseOut(upstream, {} as any)).rejects.toMatchObject({
+      code: "gemini_oauth_quota_exceeded",
+    });
+  });
+
+  it("replays every buffered and streamed byte for an untyped non-SSE body without inventing a content type", async () => {
+    const original = `plain bytes\nsecond line\n${"x".repeat(8 * 1024)}`;
+    const upstream = new Response(new TextEncoder().encode(original), { status: 200 });
+    const res = await transformer().transformResponseOut(upstream, {} as any);
+    expect(res.headers.get("content-type")).toBeNull();
+    expect(await res.text()).toBe(original);
+  });
+});
+
 describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", () => {
   it("adds the skip_thought_signature_validator sentinel to unsigned function calls of non-Gemini-3 models", () => {
     const body = {

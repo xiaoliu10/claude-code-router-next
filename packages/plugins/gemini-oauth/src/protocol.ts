@@ -149,6 +149,22 @@ function boundedInit(init: RequestInit = {}): RequestInit {
 }
 
 /**
+ * Test seam for the management-plane header contract: every bounded call
+ * requests identity encoding unless the caller pinned one. Production call
+ * sites pin Accept-Encoding explicitly (see refreshAccessToken / callCodeAssist);
+ * this seam exists so tests can assert the contract itself.
+ */
+export function boundedInitForTest(init: RequestInit = {}): RequestInit {
+  const headers = new Headers(init.headers);
+  let pinned = false;
+  for (const key of headers.keys()) {
+    if (key.toLowerCase() === "accept-encoding") pinned = true;
+  }
+  if (!pinned) headers.set("Accept-Encoding", "identity");
+  return boundedInit({ ...init, headers });
+}
+
+/**
  * Fixed Google origins must ignore configured CCR/proxy environment routing.
  * The plugin host hands over its direct dispatcher; until activation (and in
  * tests that inject their own fetch) the provider is a no-op.
@@ -559,21 +575,38 @@ export async function refreshAccessToken(
           retryable: true,
         });
       }
-      const json: any = await res.json().catch(() => ({}));
+      const rawBody = await res.text().catch(() => "");
+      let json: any = null;
+      try { json = rawBody ? JSON.parse(rawBody) : null; } catch { /* non-JSON body */ }
+      const googleErrorCode = typeof json?.error === "string" && json.error ? json.error : undefined;
       if (!res.ok || !json?.access_token) {
-        // Refresh failed → the stored refresh token is no longer accepted:
-        // re-auth required, no automatic rotation (contract §1).
+        // Google explicitly rejected the grant (an OAuth error payload on an
+        // auth status): the stored refresh token is no longer accepted — re-auth
+        // required, no automatic rotation (contract §1).
         //
         // The cooldown matters as much as the code: a thrown refresh error never
         // reaches noteUpstreamError (no data-plane response to classify), so
         // without it this — the most common way a login expires — left no
         // account state at all. The recovery probe then found nothing parked and
         // spent a real refresh call on the dead token every interval.
+        //
+        // Everything else is transport trouble, NOT a dead login: a filtering
+        // proxy's 503 page or a stripped-header compressed body parses as no
+        // Google error, so the failure is transient and the account keeps its
+        // login state (a retry may simply succeed).
+        if ((res.status === 400 || res.status === 401) && googleErrorCode) {
+          throw geminiOauthError({
+            code: "gemini_oauth_reauth_required",
+            message: "Gemini OAuth 登录态已失效，请重新授权登录。",
+            httpStatus: 401,
+            cooldownMs: GEMINI_OAUTH_REAUTH_COOLDOWN_MS,
+          });
+        }
         throw geminiOauthError({
-          code: "gemini_oauth_reauth_required",
-          message: "Gemini OAuth 登录态已失效，请重新授权登录。",
-          httpStatus: 401,
-          cooldownMs: GEMINI_OAUTH_REAUTH_COOLDOWN_MS,
+          code: "gemini_oauth_transient",
+          message: "Gemini OAuth token refresh failed; retry later.",
+          httpStatus: res.status >= 400 && res.status < 600 ? res.status : 502,
+          retryable: true,
         });
       }
       const expiresIn = Number.isFinite(json.expires_in) ? Number(json.expires_in) : 3600;
@@ -1030,6 +1063,200 @@ export async function fetchAvailableModels(
   fetchImpl: GeminiOauthFetch = defaultGeminiOauthFetch
 ): Promise<GeminiOauthModelInfo[]> {
   return collapseAntigravityModels(await fetchAvailableModelsInternal(accessToken, project, tier, fetchImpl));
+}
+
+// ---------------------------------------------------------------------------
+// Quota: retrieveUserQuota / retrieveUserQuotaSummary (data plane, POST Bearer)
+// ---------------------------------------------------------------------------
+
+/** One per-model quota bucket (v1internal:retrieveUserQuota). */
+export interface GeminiOauthModelQuota {
+  remaining: number;
+  resetAt?: string;
+}
+
+/** One (pool, window) figure from a retrieveUserQuotaSummary group. */
+export interface GeminiOauthQuotaPool {
+  /** Normalized group display name ("Gemini", "Claude & GPT"). */
+  pool: string;
+  /** Upstream window label as sent ("5h", "weekly"). */
+  window: string;
+  remaining: number;
+  resetAt?: string;
+}
+
+/** Raw upstream quota, already normalized. Either endpoint failing degrades
+ *  its own half to empty — the snapshot never throws. */
+export interface GeminiOauthQuotaSnapshot {
+  models: Record<string, GeminiOauthModelQuota>;
+  pools: GeminiOauthQuotaPool[];
+}
+
+/** The provider-quota contract the runtime exposes to the core. */
+export interface GeminiOauthProviderQuota {
+  usedDailyBalance?: number;
+  limitDaily?: number;
+  resetTime?: string;
+  usedBalance?: number;
+  totalBalance?: number;
+  resetTime7d?: string;
+}
+
+/** Normalize a summary group's display name into a pool label: drop the
+ *  trailing " models" suffix and spell "and" as an ampersand
+ *  ("Gemini Models" → "Gemini", "Claude and GPT models" → "Claude & GPT"). */
+export function geminiQuotaPoolName(displayName: unknown): string {
+  if (typeof displayName !== "string") return "";
+  const trimmed = displayName.trim();
+  if (!trimmed) return "";
+  return trimmed.replace(/\s+models?$/i, "").replace(/\s+and\s+/gi, " & ").trim();
+}
+
+/** Canonical reset timestamp: any parseable upstream time becomes ISO; a
+ *  non-parseable one is dropped rather than passed through raw. */
+function normalizeQuotaResetAt(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
+function finiteFraction(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** Parse both endpoint replies into the normalized snapshot (pure). */
+function parseGeminiOauthQuota(rawModels: any, rawSummary: any): GeminiOauthQuotaSnapshot {
+  const models: Record<string, GeminiOauthModelQuota> = {};
+  for (const bucket of Array.isArray(rawModels?.buckets) ? rawModels.buckets : []) {
+    const id = typeof bucket?.modelId === "string" ? bucket.modelId : "";
+    const remaining = finiteFraction(bucket?.remainingFraction);
+    if (!id || remaining === undefined) continue;
+    // The *_vertex twins are a different serving stack with separate numbers;
+    // the OAuth data plane never serves them, so they must not dilute the
+    // per-model picture. A disabled bucket is a placeholder — drop it too.
+    if (id.endsWith("_vertex") || bucket?.disabled === true) continue;
+    const resetAt = normalizeQuotaResetAt(bucket?.resetTime);
+    models[id] = { remaining, ...(resetAt ? { resetAt } : {}) };
+  }
+  const pools: GeminiOauthQuotaPool[] = [];
+  for (const group of Array.isArray(rawSummary?.groups) ? rawSummary.groups : []) {
+    const pool = geminiQuotaPoolName(group?.displayName);
+    for (const bucket of Array.isArray(group?.buckets) ? group.buckets : []) {
+      const window = typeof bucket?.window === "string" ? bucket.window : "";
+      const remaining = finiteFraction(bucket?.remainingFraction);
+      if (!window || remaining === undefined) continue;
+      // A disabled bucket is a placeholder the account cannot spend; drop it.
+      if (bucket?.disabled === true) continue;
+      const resetAt = normalizeQuotaResetAt(bucket?.resetTime);
+      pools.push({ pool, window, remaining, ...(resetAt ? { resetAt } : {}) });
+    }
+  }
+  return { models, pools };
+}
+
+/**
+ * Read the subscription quota: per-model buckets plus the grouped window
+ * summary from the Code Assist data plane. Both calls share the management
+ * transport (Bearer token, identity encoding, bounded, no redirects); a
+ * failing endpoint degrades its own half to empty instead of failing the
+ * snapshot, so callers always get a well-formed answer.
+ */
+export async function fetchGeminiOauthQuota(params: {
+  accessToken: string;
+  project: string;
+  fetchImpl?: GeminiOauthFetch;
+}): Promise<GeminiOauthQuotaSnapshot> {
+  const fetchImpl = params.fetchImpl ?? defaultGeminiOauthFetch;
+  let rawModels: any = null;
+  try {
+    rawModels = await callCodeAssist({
+      base: GEMINI_OAUTH_DATA_PLANE,
+      method: "retrieveUserQuota",
+      body: { project: params.project },
+      accessToken: params.accessToken,
+      fetchImpl,
+    });
+  } catch {
+    // Degraded below — the snapshot stays well-formed.
+  }
+  let rawSummary: any = null;
+  try {
+    rawSummary = await callCodeAssist({
+      base: GEMINI_OAUTH_DATA_PLANE,
+      method: "retrieveUserQuotaSummary",
+      body: { project: params.project },
+      accessToken: params.accessToken,
+      fetchImpl,
+    });
+  } catch {
+    // Degraded below — the per-model buckets still work alone.
+  }
+  return parseGeminiOauthQuota(rawModels, rawSummary);
+}
+
+/** A resetAt that still parses (validated, passed through verbatim). */
+function parsableResetAt(value: unknown): string | undefined {
+  return typeof value === "string" && value && Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
+function worstPool(pools: GeminiOauthQuotaPool[]): GeminiOauthQuotaPool | undefined {
+  let worst: GeminiOauthQuotaPool | undefined;
+  for (const p of pools) if (!worst || p.remaining < worst.remaining) worst = p;
+  return worst;
+}
+
+/** The worst pool's own reset, else the first parsable reset in the window. */
+function windowResetAt(pools: GeminiOauthQuotaPool[], worst?: GeminiOauthQuotaPool): string | undefined {
+  const own = worst ? parsableResetAt(worst.resetAt) : undefined;
+  if (own) return own;
+  for (const p of pools) {
+    const reset = parsableResetAt(p.resetAt);
+    if (reset) return reset;
+  }
+  return undefined;
+}
+
+/**
+ * Map a quota snapshot onto the shared provider-quota contract. Per window the
+ * WORST (lowest remaining) pool decides the usage figures: the 5h window feeds
+ * usedDailyBalance/limitDaily/resetTime, the weekly one usedBalance/
+ * totalBalance/resetTime7d (balances reported on a fixed 0-100 scale). When
+ * the summary produced no 5h pool at all, the per-model buckets degrade into
+ * the 5h window — model buckets carry no weekly figure, so no 7d output is
+ * ever invented from them. Returns null when no numeric figure exists anywhere.
+ */
+export function geminiQuotaToProviderQuota(quota: GeminiOauthQuotaSnapshot | null | undefined): GeminiOauthProviderQuota | null {
+  const pools = Array.isArray(quota?.pools) ? quota!.pools : [];
+  const dailyPools = pools.filter((p) => p?.window === "5h" && Number.isFinite(p?.remaining));
+  const weeklyPools = pools.filter((p) => (p?.window === "weekly" || p?.window === "7d") && Number.isFinite(p?.remaining));
+
+  let fiveHour = dailyPools;
+  if (!fiveHour.length) {
+    // Summary unavailable (or silent): degrade to the per-model buckets.
+    const models = quota?.models ?? {};
+    fiveHour = Object.entries(models)
+      .filter(([, m]) => Number.isFinite(m?.remaining))
+      .map(([pool, m]) => ({ pool, window: "5h", remaining: m.remaining, ...(m.resetAt ? { resetAt: m.resetAt } : {}) }));
+  }
+
+  const out: GeminiOauthProviderQuota = {};
+  const dailyWorst = worstPool(fiveHour);
+  if (dailyWorst) {
+    out.usedDailyBalance = Math.round((1 - dailyWorst.remaining) * 100);
+    out.limitDaily = 100;
+    const reset = windowResetAt(fiveHour, dailyWorst);
+    if (reset) out.resetTime = reset;
+  }
+  const weeklyWorst = worstPool(weeklyPools);
+  if (weeklyWorst) {
+    out.usedBalance = Math.round((1 - weeklyWorst.remaining) * 100);
+    out.totalBalance = 100;
+    const reset = windowResetAt(weeklyPools, weeklyWorst);
+    if (reset) out.resetTime7d = reset;
+  }
+  if (out.usedDailyBalance === undefined && out.usedBalance === undefined) return null;
+  return out;
 }
 
 // ---------------------------------------------------------------------------

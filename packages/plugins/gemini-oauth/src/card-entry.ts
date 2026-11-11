@@ -164,6 +164,24 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const text = key.split(".").reduce<any>((obj, k) => obj?.[k], bundle);
     return (typeof text === "string" ? text : "").replace(/\{\{(\w+)\}\}/g, (_, name) => String(vars[name] ?? ""));
   };
+  /**
+   * Map an error-shaped value to a code the card can localize. The bundle's
+   * `errors` section IS the whitelist: a code renders only when it carries
+   * copy for it (this includes the plugin-local model-management codes the
+   * shared UI allowlist does not know). Anything else — unknown codes, raw
+   * upstream text — collapses to the shared mapping's generic failure; server
+   * message text is never rendered.
+   */
+  const cardErrorKey = (error: unknown): string => {
+    const raw = typeof error === "string"
+      ? error
+      : error && typeof error === "object"
+        ? ((error as { reason?: unknown }).reason ?? (error as { error?: unknown }).error ?? (error as { code?: unknown }).code)
+        : null;
+    const errors = (bundle as { errors?: Record<string, unknown> }).errors;
+    if (typeof raw === "string" && errors && typeof errors[raw] === "string") return raw;
+    return geminiOauthErrorKey(error);
+  };
   const cancelText = locale === "zh" ? "取消" : "Cancel";
   const post = <T,>(path: string, body: any = {}, signal?: AbortSignal) => props.callApi<T>(path, {
     method: "POST", body: JSON.stringify(body), signal,
@@ -335,7 +353,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         // A mutation that commits after the card was disposed still reconciles
         // and re-reads status: only the visual settlement is skipped when
         // !alive. The lease is released by the finally below, after all of it.
-        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = geminiOauthErrorKey(result?.error ?? "gemini_oauth_models_fetch_failed"); await readStatus(); return; }
+        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = cardErrorKey(result?.error ?? "gemini_oauth_models_fetch_failed"); await readStatus(); return; }
         const count = result.modelsCount ?? 0;
         await settle(result.clearedRefs?.length
           ? t("synced_cleared", { count, refs: result.clearedRefs.join(", ") }) : t("synced", { count }));
@@ -346,7 +364,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         const result = kind === "hide"
           ? await post<any>("/models/hide", { model })
           : await post<any>("/models/restore", model ? { model } : {});
-        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = geminiOauthErrorKey(result); return; }
+        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = cardErrorKey(result); return; }
         if (kind === "hide") {
           // clearedRefs are Router PATH LABELS for display only — never parsed as
           // provider/model references. Removed refs drive the draft cleanup.
@@ -368,11 +386,11 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         }
       } else {
         const result = await post<any>("/disconnect");
-        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = geminiOauthErrorKey(result); return; }
+        if (result?.ok !== true) { if (actionGeneration === generation) errorKey = cardErrorKey(result); return; }
         await settle(t("disconnected"));
       }
     } catch (error) {
-      if (alive && actionGeneration === generation) errorKey = geminiOauthErrorKey(error);
+      if (alive && actionGeneration === generation) errorKey = cardErrorKey(error);
     } finally {
       if (actionGeneration === generation) pending = null;
       endBusy(); session = null; login = null; consentGranted = false;
@@ -488,6 +506,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     if (connected && hiddenModels.length > 0) {
       const details = styled("details", "max-w-md text-xs text-muted-foreground");
       details.append(styled("summary", "cursor-pointer select-none font-medium", t("hidden_models", { count: hiddenModels.length })));
+      const note = t("hidden_note");
+      if (note) details.append(styled("p", "mt-1 text-[11px] text-muted-foreground/70", note));
       const list = styled("ul", "mt-2 space-y-1");
       for (const model of hiddenModels) {
         const item = styled("li", "flex items-center justify-between gap-2");
