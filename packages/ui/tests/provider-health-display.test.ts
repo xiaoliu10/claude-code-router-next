@@ -67,3 +67,8 @@ test("entries without lastFailureTime keep legacy open-badge behavior", () => {
   assert.equal(isFailureStale({ lastSuccessTime: SUCCESS_AFTER }), false);
   assert.equal(isFailureStale({}), false);
 });
+
+test("null stamps (server always emits the key) behave like absent ones", () => {
+  assert.equal(isFailureStale({ lastFailureTime: FAIL, lastSuccessTime: null }), false);
+  assert.equal(isFailureStale({ lastFailureTime: null, lastSuccessTime: SUCCESS_AFTER }), false);
+});

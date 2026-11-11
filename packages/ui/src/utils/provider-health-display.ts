@@ -10,8 +10,8 @@
  * (no path aliases, no JSX).
  */
 export interface FailureTimestamps {
-  lastFailureTime?: number;
-  lastSuccessTime?: number;
+  lastFailureTime?: number | null;
+  lastSuccessTime?: number | null;
 }
 
 /**
@@ -26,7 +26,8 @@ export interface FailureTimestamps {
  * - no lastFailureTime: legacy open/half-open badge rendering, unchanged.
  */
 export function isFailureStale(entry: FailureTimestamps): boolean {
-  if (entry.lastSuccessTime === undefined || entry.lastFailureTime === undefined) {
+  // null (server payloads that always emit the key) behaves like "absent".
+  if (entry.lastSuccessTime == null || entry.lastFailureTime == null) {
     return false;
   }
   // Only a failure strictly newer than the last success is still live; a
