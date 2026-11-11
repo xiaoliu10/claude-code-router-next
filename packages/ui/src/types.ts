@@ -233,6 +233,9 @@ export interface ProviderHealthState {
   failureCount: number;
   successCount: number;
   lastFailureTime: number;
+  // Epoch ms of the last recorded success on this entry. Optional because only
+  // newer servers send it; lets the UI hide failures that already recovered.
+  lastSuccessTime?: number;
   lastError?: string;
   rateLimitUntil?: number | null;
 }
