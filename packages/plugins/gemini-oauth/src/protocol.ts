@@ -1874,6 +1874,8 @@ export interface GeminiOauthAuthServiceLike {
   getProject(): Promise<string>;
   /** Record a classified upstream error (cooldown/lastError) when possible. */
   noteUpstreamError?(info: GeminiOauthErrorInfo): Promise<void> | void;
+  /** Clear non-sticky failure residue after a completed successful exchange. */
+  noteRequestSuccess?(): Promise<void> | void;
   /** Map a requested (possibly collapsed family) model id to the concrete
    *  upstream variant id the effort picks. Absent → pass the id through. */
   resolveWireModel?(requested: string, effort?: string): Promise<string>;

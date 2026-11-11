@@ -107,24 +107,49 @@ function concatChunks(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
+type SniffedShape = "sse" | "json" | "unknown";
+
+/**
+ * Classify the trimmed head prefix of a body whose Content-Type cannot be
+ * trusted. SSE comment heartbeats (`: ping`) and event-first frames are still
+ * SSE — both the Code Assist pump and the core's shared peek helper tolerate
+ * them, so the sniff must not fall through to the raw-replay branch on them
+ * (that is exactly the wrapped-frame passthrough this defence exists to stop).
+ */
+function sniffHeadPrefix(text: string): SniffedShape {
+  const head = text.trimStart();
+  if (!head) return "unknown";
+  if (head.startsWith("data:") || head.startsWith("event:") || head.startsWith(":")) return "sse";
+  if (head.startsWith("{") || head.startsWith("[")) return "json";
+  return "unknown";
+}
+
 /**
  * Read at most `maxBytes` from `body` for content sniffing while preserving
  * every byte: the returned `replay` stream re-emits the buffered chunks first
  * and then keeps pumping the SAME underlying reader, so no byte is consumed
- * twice or lost. The peek itself never cancels the upstream.
+ * twice or lost. The peek itself never cancels the upstream. `stopWhen` lets
+ * the caller classify incrementally and stop buffering the moment the shape
+ * is decided — a streaming client must not wait for the whole peek window on
+ * a slow upstream.
  */
 async function peekBodyBytes(
   body: ReadableStream<Uint8Array>,
-  maxBytes: number
+  maxBytes: number,
+  stopWhen?: (text: string) => boolean
 ): Promise<{ head: Uint8Array; replay: ReadableStream<Uint8Array> }> {
   const reader = body.getReader();
+  const decoder = new TextDecoder();
   const buffered: Uint8Array[] = [];
   let total = 0;
+  let text = "";
   while (total < maxBytes) {
     const { done, value } = await reader.read();
     if (done) break;
     buffered.push(value);
     total += value.length;
+    text += decoder.decode(value, { stream: true });
+    if (stopWhen?.(text)) break;
   }
   const head = concatChunks(buffered);
   const replay = new ReadableStream<Uint8Array>({
@@ -171,6 +196,21 @@ export class GeminiOauthTransformer implements PluginTransformer {
     try {
       const service = this.options?.authService ?? this.options?.getAuthService?.() ?? getGeminiOauthAuthService();
       void service?.noteUpstreamError?.(info);
+    } catch {
+      // Never let bookkeeping break the response path.
+    }
+  }
+
+  /**
+   * Clear non-sticky failure residue once the upstream produced real output:
+   * a recovered account must not keep reporting its last quota/validation
+   * marker while requests succeed. Fire-and-forget; bookkeeping never blocks
+   * or breaks the response path.
+   */
+  private noteRequestSuccess(): void {
+    try {
+      const service = this.options?.authService ?? this.options?.getAuthService?.() ?? getGeminiOauthAuthService();
+      void service?.noteRequestSuccess?.();
     } catch {
       // Never let bookkeeping break the response path.
     }
@@ -293,14 +333,15 @@ export class GeminiOauthTransformer implements PluginTransformer {
     if (response.body) {
       const { head, replay } = await peekBodyBytes(
         response.body as ReadableStream<Uint8Array>,
-        GEMINI_OAUTH_CONTENT_TYPE_PEEK_BYTES
+        GEMINI_OAUTH_CONTENT_TYPE_PEEK_BYTES,
+        (seen) => sniffHeadPrefix(seen) !== "unknown"
       );
-      const text = new TextDecoder().decode(head).trimStart();
-      if (text.startsWith("data:")) {
+      const shape = sniffHeadPrefix(new TextDecoder().decode(head));
+      if (shape === "sse") {
         const replayResponse = responseWithHeader(response, replay, "Content-Type", "text/event-stream");
         return this.transformCodeAssistStream(replayResponse, replay, context);
       }
-      if (text.startsWith("{") || text.startsWith("[")) {
+      if (shape === "json") {
         // The head only proves the shape: parse the COMPLETE replayed body so a
         // document larger than the peek window is still recognized.
         const jsonText = await new Response(replay).text();
@@ -368,6 +409,21 @@ export class GeminiOauthTransformer implements PluginTransformer {
     const encoder = new TextEncoder();
     const firstFrame = unwrapCodeAssistFrame(firstPayload);
     const firstChunk = normalizeChunkToolNames(firstFrame.response ?? {});
+    // Note account recovery on the first frame that carries real output
+    // (text or a function call; thinking-only frames do not count). Covers
+    // both the streaming lane and the aggregate lane, which both read this
+    // replayed stream.
+    let successNoted = false;
+    const noteSuccessOnce = (chunk: any) => {
+      if (successNoted) return;
+      const parts = chunk?.candidates?.[0]?.content?.parts;
+      if (!Array.isArray(parts)) return;
+      if (parts.some((part: any) => (part?.text && part?.thought !== true) || part?.functionCall)) {
+        successNoted = true;
+        self.noteRequestSuccess();
+      }
+    };
+    noteSuccessOnce(firstChunk);
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(firstChunk)}\n\n`));
@@ -384,6 +440,7 @@ export class GeminiOauthTransformer implements PluginTransformer {
             }
             if (frame.malformed) continue;
             const chunk = normalizeChunkToolNames(frame.response ?? {});
+            noteSuccessOnce(chunk);
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
           }
           controller.close();

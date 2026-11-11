@@ -292,6 +292,47 @@ describe("gemini-oauth content-sniff defence (missing Content-Type)", () => {
     expect(res.headers.get("content-type")).toBeNull();
     expect(await res.text()).toBe(original);
   });
+
+  it("recognizes an event-first untyped SSE reply as SSE", async () => {
+    const body = `event: chunk\n` + envelopeFrames().map((f) => `data: ${JSON.stringify(f)}\n\n`).join("");
+    const upstream = new Response(new TextEncoder().encode(body), { status: 200 });
+    const res = await transformer().transformResponseOut(upstream, { geminiOauthClientStream: false } as any);
+    const json: any = await res.json();
+    expect(json.choices[0].message.content).toBe("Hello");
+  });
+
+  it("recognizes a comment-heartbeat-first untyped SSE reply as SSE", async () => {
+    const body = `: ping\n\n` + envelopeFrames().map((f) => `data: ${JSON.stringify(f)}\n\n`).join("");
+    const upstream = new Response(new TextEncoder().encode(body), { status: 200 });
+    const res = await transformer().transformResponseOut(upstream, { geminiOauthClientStream: false } as any);
+    const json: any = await res.json();
+    expect(json.choices[0].message.content).toBe("Hello");
+  });
+
+  it("notes account recovery once a frame carries real output", async () => {
+    const svc: any = stubService();
+    svc.successes = 0;
+    svc.noteRequestSuccess = async () => { svc.successes += 1; };
+    const res = await new GeminiOauthTransformer({ authService: svc }).transformResponseOut(
+      untyped(envelopeFrames()),
+      { geminiOauthClientStream: true } as any,
+    );
+    await readSseData(res);
+    expect(svc.successes).toBe(1);
+  });
+
+  it("does not note recovery for thinking-only output", async () => {
+    const svc: any = stubService();
+    svc.successes = 0;
+    svc.noteRequestSuccess = async () => { svc.successes += 1; };
+    const thinkingOnly = [{ response: { responseId: "r", modelVersion: "gemini-3-flash", candidates: [{ content: { parts: [{ text: "hmm", thought: true }] } }] } }];
+    const res = await new GeminiOauthTransformer({ authService: svc }).transformResponseOut(
+      untyped(thinkingOnly),
+      { geminiOauthClientStream: true } as any,
+    );
+    await readSseData(res);
+    expect(svc.successes).toBe(0);
+  });
 });
 
 describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", () => {

@@ -239,6 +239,19 @@ async function activate(ctx: PluginContext): Promise<void> {
       let value: GeminiOauthProviderQuota | null = null;
       try {
         const svc = requireService();
+        // A parked account or a sticky-dead login must not spend a token
+        // refresh (and the durable credential write its failure bookkeeping
+        // performs) on an advisory quota poll — same predicate the account
+        // probe applies before touching the network.
+        if (await svc.isAccountCooling?.()) {
+          quotaCache = { expiresAt: now + QUOTA_CACHE_TTL_MS, value: null };
+          return null;
+        }
+        const accountStatus: any = await svc.getStatus?.().catch(() => null);
+        if (isStickyGeminiOauthError(accountStatus?.lastError?.code)) {
+          quotaCache = { expiresAt: now + QUOTA_CACHE_TTL_MS, value: null };
+          return null;
+        }
         const [accessToken, project] = await Promise.all([svc.getAccessToken(), svc.getProject()]);
         const snapshot = await fetchGeminiOauthQuota({ accessToken, project, fetchImpl: quotaFetch });
         value = geminiQuotaToProviderQuota(snapshot);
