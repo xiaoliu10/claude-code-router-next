@@ -472,3 +472,52 @@ describe("CodexTransformer — bounded scan and cancellation", () => {
     expect(rest).toContain("\"delta\":\"b\"");
   });
 });
+
+describe("CodexTransformer — success bookkeeping", () => {
+  it("notes request success exactly once when the stream commits real output", async () => {
+    let successes = 0;
+    const service = stubService({ noteRequestSuccess: async () => { successes++; } });
+    const t = new CodexTransformer({ service });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "response.output_text.delta", delta: "Hello" },
+      { type: "response.output_text.delta", delta: " world" },
+      { type: "response.completed", response: { id: "r", output: [{ type: "message" }] } },
+    ]);
+    await readAll(await t.transformResponseOut(sseResponse(text), {} as any));
+    expect(successes).toBe(1);
+  });
+
+  it("notes success on a completed turn whose output only appears in the final event", async () => {
+    let successes = 0;
+    const service = stubService({ noteRequestSuccess: async () => { successes++; } });
+    const t = new CodexTransformer({ service });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "response.completed", response: { id: "r", output: [{ type: "message" }] } },
+    ]);
+    await readAll(await t.transformResponseOut(sseResponse(text), {} as any));
+    expect(successes).toBe(1);
+  });
+
+  it("does not note success for an empty completed turn", async () => {
+    let successes = 0;
+    const service = stubService({ noteRequestSuccess: async () => { successes++; } });
+    const t = new CodexTransformer({ service });
+    const text = sse([{ type: "response.completed", response: { id: "r", output: [] } }]);
+    await expect(readAll(await t.transformResponseOut(sseResponse(text), {} as any))).rejects.toThrow();
+    expect(successes).toBe(0);
+  });
+
+  it("does not note success for a terminal error stream", async () => {
+    let successes = 0;
+    const service = stubService({ noteRequestSuccess: async () => { successes++; } });
+    const t = new CodexTransformer({ service });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "error", error: { type: "usage_limit_reached", message: "limit", resets_in_seconds: 120 } },
+    ]);
+    await expect(readAll(await t.transformResponseOut(sseResponse(text), {} as any))).rejects.toMatchObject({ code: "codex_usage_limit" });
+    expect(successes).toBe(0);
+  });
+});

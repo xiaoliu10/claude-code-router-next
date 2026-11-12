@@ -285,6 +285,21 @@ export class CodexTransformer implements PluginTransformer {
     }
   }
 
+  /**
+   * Clear non-sticky failure residue once the upstream produced real output:
+   * a recovered account must not keep reporting its last rejection/quota
+   * marker as a permanent error while requests succeed. Fire-and-forget;
+   * bookkeeping never blocks or breaks the response path.
+   */
+  private noteRequestSuccess(): void {
+    try {
+      const result: any = this.service.noteRequestSuccess?.();
+      if (result && typeof result.then === "function") result.then(undefined, () => {});
+    } catch {
+      // Bookkeeping must never fail the response path.
+    }
+  }
+
   private observeHeaderRateLimits(response: Response): void {
     const limits = readCodexRateLimitHeaders(response.headers);
     if (limits) this.reportRateLimits(limits);
@@ -310,6 +325,9 @@ export class CodexTransformer implements PluginTransformer {
     // Set when the upstream emitted any real output. A terminal event without it
     // is an empty turn, not a successful one.
     let sawOutput = false;
+    // Success bookkeeping fires at most once per response, at the first
+    // commit point (fire-and-forget; never blocks or breaks the reply).
+    let successNoted = false;
 
     const handleEvent = async (data: string): Promise<boolean> => {
       // true => commit (stop inspecting)
@@ -377,6 +395,7 @@ export class CodexTransformer implements PluginTransformer {
         event.type === "response.output_item.done"
       )) {
         sawOutput = true;
+        if (!successNoted) { successNoted = true; this.noteRequestSuccess(); }
         return true;
       }
       // A `response.completed` only commits the stream if the turn actually
@@ -389,6 +408,7 @@ export class CodexTransformer implements PluginTransformer {
       if (event.type === "response.completed") {
         if (sawOutput || responseHasOutput(event.response)) {
           sawOutput = true;
+          if (!successNoted) { successNoted = true; this.noteRequestSuccess(); }
           return true;
         }
         throw codexEmptyAnswerError();

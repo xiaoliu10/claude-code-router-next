@@ -857,3 +857,39 @@ describe("hide / restore models", () => {
     expect((await h.store.load())!.hiddenModels).toEqual(["gpt-a"]);
   });
 });
+
+describe("Codex success bookkeeping", () => {
+  it("noteRequestSuccess clears non-sticky residue so the card leaves the error state", async () => {
+    const { service } = await connected();
+    // A single rejected request (e.g. 400 on an unsupported payload) must not
+    // latch status="error" forever — that residue reads as "login dropped".
+    await service.noteUpstreamError({ code: "codex_request_rejected", message: "x", httpStatus: 400 });
+    expect((await service.getStatus()).status).toBe("error");
+    await service.noteRequestSuccess();
+    expect((await service.getStatus()).status).toBe("connected");
+    expect((await (service as any).store.load())!.account.lastError).toBeNull();
+  });
+
+  it("noteRequestSuccess clears the error-derived cooldown once a request succeeds", async () => {
+    const { service } = await connected();
+    await service.noteUpstreamError({ code: "codex_usage_limit", message: "x", httpStatus: 429, cooldownMs: 60_000 });
+    expect(await service.isAccountCooling()).toBe(true);
+    await service.noteRequestSuccess();
+    expect(await service.isAccountCooling()).toBe(false);
+    expect((await (service as any).store.load())!.account.lastError).toBeNull();
+  });
+
+  it("keeps the sticky reauth marker — only a fresh login clears it", async () => {
+    const { service } = await connected();
+    await service.noteUpstreamError({ code: "codex_reauth_required", message: "x", httpStatus: 401 });
+    await service.noteRequestSuccess();
+    expect((await service.getStatus()).status).toBe("error");
+    expect((await (service as any).store.load())!.account.lastError!.code).toBe("codex_reauth_required");
+  });
+
+  it("is a no-op when nothing is latched", async () => {
+    const { service } = await connected();
+    await service.noteRequestSuccess();
+    expect((await service.getStatus()).status).toBe("connected");
+  });
+});
