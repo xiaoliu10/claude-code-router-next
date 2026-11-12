@@ -1,6 +1,6 @@
 {
   "name": "@wengine-ai/ccr-provider-kiro",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Kiro subscription authentication and account management",
   "type": "module",
   "main": "dist/plugin.js",

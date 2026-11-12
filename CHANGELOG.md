@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2429] - 2026-11-12
+
+### Added
+
+- **Codex manual usage reset** (`@wengine-ai/ccr-provider-codex`): the provider card lists the account's gifted usage-reset credits with the upstream-owned allowance and earliest expiry. A confirmation dialog is the only path to consumption — mounting, polling, quota refresh and every other action never spend a credit. Concurrent second consumes are rejected (`429`) by a synchronous latch instead of queueing; the per-confirmation idempotency key is retained across retries of the same credit until a terminal outcome, so a lost response cannot double-spend (the upstream dedupes per key); locally spent markers are cleared on disconnect and account switch. New admin routes `GET/POST /api/codex/reset-credits[/consume]` keep the local-only guard and map outcomes to stable status codes. All upstream envelopes parse fail-closed; en/zh copy ships in parity.
+
+### Fixed
+
+- **Gemini OAuth transport and quota** (`@wengine-ai/ccr-provider-gemini-oauth`): recognize Code Assist SSE when the upstream omits `Content-Type` and replay the bytes without loss; fetch real quota windows through the shared plugin quota pipeline; recovered requests no longer leave a stale failure badge or banner on the provider card (quota-poll breaker and recovery bookkeeping hardened).
+- **exact model routing no longer hijacked by family names**: a model id that an enabled provider explicitly exposes (bare or `provider,model`, case-insensitive, `[1m]` variants normalized) now short-circuits family and scenario routing and dispatches the canonical catalog id — Gemini's Claude models are reachable by name again and a half-open circuit can recover instead of sticking to fallback. Client-spelled names are preserved for usage attribution; strict project routing is exempt.
+- **Kiro hidden models stay hidden**: status now reports visible models only, with hidden ids in a separate field (the gemini contract); model sync no longer resurrects hidden models.
+- **Kiro promotional bonus credits displayed**: ACTIVE bonus balances with remaining allowance are parsed into separate usage windows with their expiry timestamps (`expires@`), instead of being dropped; invalid dates omit the timestamp instead of breaking usage or login rendering.
+- **Codex "keeps dropping login" (HTTP 400 on history replay)**: the unified assistant `thinking` field leaked into Responses input items and the Codex backend rejected replayed history with `400 Unknown parameter: input[N].thinking`. The field is now stripped in the shared Responses transformer and at finalization; thinking-only assistant items are omitted while tool-call history remains intact. Successful streamed output also clears non-reauth error residue, and the SSE inspection now runs when `Content-Type` is absent — a recovered request no longer reads as a dropped login. Sticky reauth and the quota cooldown remain protected.
+- **`@wengine-ai/ccr-provider-kiro` 0.1.1**: ships the hidden-model and bonus-credit fixes above.
+
+## [2.3.2429] - 2026-11-12（中文）
+
+### 新增
+
+- **Codex 手动用量重置**（`@wengine-ai/ccr-provider-codex`）：供应商卡片展示账号赠送的用量重置次数（次数完全来自上游 `available_count`，附最早到期时间）。确认弹窗是唯一触发消耗的入口——挂载、轮询、配额刷新及所有其他操作绝不消耗重置次数。并发第二次点击由同步锁直接拒绝（`429`）而非排队；同一确认的重试复用同一幂等键直到终态，丢失响应不会重复消耗（上游按键去重）；本地已耗标记在断开连接/账号切换时清理。新增管理路由 `GET/POST /api/codex/reset-credits[/consume]`，保留仅本地访问守卫，结果映射为稳定状态码。所有上游响应按 fail-closed 解析；中英文文案完全对齐。
+
+### 修复
+
+- **Gemini OAuth 传输与配额**（`@wengine-ai/ccr-provider-gemini-oauth`）：上游省略 `Content-Type` 时仍能识别 Code Assist SSE 并无损回放字节；经共享插件配额管线获取真实配额窗口；恢复后的请求不再在供应商卡片上残留过期失败徽标/横幅（配额轮询熔断与恢复记账加固）。
+- **精确模型路由不再被家族名劫持**：已启用供应商显式暴露的模型 id（裸名或 `provider,model`、大小写不敏感、`[1m]` 变体归一化）现在短路家族与场景路由并按规范目录 id 分发——Gemini 的 Claude 模型可按名称直达，半开熔断器可恢复而非粘死在 fallback。客户端拼写的名称保留用于用量归属；严格项目路由不受影响。
+- **Kiro 隐藏模型保持隐藏**：status 只返回可见模型，隐藏 id 单独字段返回（gemini 契约）；模型同步不再复活已隐藏模型。
+- **Kiro 促销赠送额度展示**：ACTIVE 且有剩余额度的 bonus 余额解析为独立用量窗口并显示到期时间（`expires@`），不再被丢弃；非法日期省略时间戳而不是破坏用量或登录渲染。
+- **Codex「掉登录」（历史回放 HTTP 400）**：统一 assistant `thinking` 字段泄漏进 Responses input 项，Codex 后端以 `400 Unknown parameter: input[N].thinking` 拒绝回放历史。现在共享 Responses 转换器与 finalize 阶段均剥离该字段；仅含 thinking 的 assistant 项被省略而工具调用历史保持完整。流式成功输出同时清除非 reauth 的错误残留，且上游省略 `Content-Type` 时也执行 SSE 检查——恢复的请求不再被误读为掉登录。粘性 reauth 与配额冷却保持受保护。
+- **`@wengine-ai/ccr-provider-kiro` 0.1.1**：随包发布上述隐藏模型与赠送额度修复。
+
 ## [2.3.2428] - 2026-11-10
 
 ### Fixed
