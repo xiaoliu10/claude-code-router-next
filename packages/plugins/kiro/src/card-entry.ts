@@ -341,7 +341,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         const { reconcileFailed: failed } = await settle(id);
         if (!alive || generation !== id) return;
         reconcileFailed = failed;
-        toast = t("synced", { count: status?.models.length ?? result.models?.length ?? 0 });
+        // /sync returns the full reconciled catalog; status.models is now
+        // visible-only, so prefer the sync result for the "synced N models" toast.
+        toast = t("synced", { count: result.models?.length ?? status?.models.length ?? 0 });
       } else if (kind === "hide") {
         const model = argument ?? "";
         if (!model) return;

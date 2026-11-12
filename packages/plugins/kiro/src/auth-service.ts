@@ -341,7 +341,12 @@ export class KiroAuthService {
     await this.persist({ ...this.saved, accounts }); }); }
   async noteUpstreamError(info: PluginClassifiedError, account?: string) { await this.load(); try { await this.markError(this.select(account), info); } catch { /* Telemetry never breaks the response path. */ } }
   async getStatus() { await this.load(); return { connected: !!this.saved.accounts.length, status: this.saved.accounts.length ? "connected" : "disconnected", providerName: KIRO_PROVIDER,
-    accounts: this.saved.accounts.map(publicAccount), models: this.saved.models, hiddenModels: this.saved.hiddenModels, plan: this.saved.accounts[0]?.plan ?? null,
+    // `models` is the VISIBLE catalog (same contract as the gemini-oauth
+    // status endpoint): hidden ids are reported separately via hiddenModels,
+    // so the card's visible-chips row never renders a hidden model after a
+    // reload — the hide action's optimistic patch only masked this until the
+    // next status fetch.
+    accounts: this.saved.accounts.map(publicAccount), models: this.saved.models.filter(m => !this.saved.hiddenModels.includes(m.id)), hiddenModels: this.saved.hiddenModels, plan: this.saved.accounts[0]?.plan ?? null,
     usage: this.saved.accounts.map(c => ({ account: c.id, ...(this.usage.get(c.id) ?? { known: false, stale: true, windows: [] }) })) }; }
   async getUsage(account?: string) {
     const c = await this.getCredential(account);

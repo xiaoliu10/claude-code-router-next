@@ -195,3 +195,53 @@ describe("Kiro browser credentials", () => {
   });
 
 });
+
+describe("Kiro status model visibility contract", () => {
+  // The card renders every entry of status.models as a visible chip; hidden
+  // ids must therefore never appear in status.models (same contract as the
+  // gemini-oauth status endpoint) or a reload resurrects hidden models.
+  it("excludes hidden ids from status.models and reports them via hiddenModels", async () => {
+    const f = await setup();
+    const record = (id: string) => ({ id, key: id, name: id, context: 200_000, output: 64_000, images: false });
+    await writeFile(f.service.file, JSON.stringify({
+      version: 1,
+      accounts: [],
+      models: [record("alpha"), record("beta"), record("gamma")],
+      hiddenModels: ["beta"],
+    }), { mode: 0o600 });
+    const status = await f.service.getStatus();
+    expect(status.models.map(m => m.id)).toEqual(["alpha", "gamma"]);
+    expect(status.hiddenModels).toEqual(["beta"]);
+
+    // Restore flips visibility through the same saved shape.
+    await f.service.setModelHidden("beta", false);
+    const restored = await f.service.getStatus();
+    expect(restored.models.map(m => m.id)).toEqual(["alpha", "beta", "gamma"]);
+    expect(restored.hiddenModels).toEqual([]);
+
+    // And hiding through the service keeps the visible list clean.
+    await f.service.setModelHidden("gamma", true);
+    const hiddenAgain = await f.service.getStatus();
+    expect(hiddenAgain.models.map(m => m.id)).toEqual(["alpha", "beta"]);
+    expect(hiddenAgain.hiddenModels).toEqual(["gamma"]);
+  });
+
+  it("keeps the persisted provider model list free of hidden ids", async () => {
+    const f = await setup();
+    const record = (id: string) => ({ id, key: id, name: id, context: 200_000, output: 64_000, images: false });
+    await writeFile(f.service.file, JSON.stringify({
+      version: 1,
+      accounts: [],
+      models: [record("alpha"), record("beta")],
+      hiddenModels: ["beta"],
+    }), { mode: 0o600 });
+    // No accounts connected: the provider entry is absent from config, but a
+    // connected account must write only visible model ids (existing behavior
+    // of config(); asserted here to lock the invariant).
+    const status = await f.service.getStatus();
+    expect(status.models.map(m => m.id)).toEqual(["alpha"]);
+    const disk = JSON.parse(await readFile(f.service.file, "utf8"));
+    expect(disk.models.map((m: any) => m.id)).toEqual(["alpha", "beta"]);
+    expect(disk.hiddenModels).toEqual(["beta"]);
+  });
+});
