@@ -158,7 +158,7 @@ describe("real host controller × real Codex card seam", () => {
     expect(seam.fetches).toEqual(["/plugins/codex/card.js"]);
     expect(seam.host.children).toHaveLength(1);
     const cardEl = seam.host.children[0];
-    expect(seam.calls).toEqual(["/status", "/usage"]); // mount status + one auto quota read
+    expect(seam.calls).toEqual(["/status", "/usage", "/reset-credits"]); // mount status + auto quota + reset listing
     expect(cardEl.button(en.sync).disabled).toBe(false);
 
     seam.disabled.value = true;
@@ -166,7 +166,7 @@ describe("real host controller × real Codex card seam", () => {
     expect(cardEl.button(en.sync).disabled).toBe(true);
     expect(cardEl.button(en.disconnect).disabled).toBe(true);
     expect(cardEl.text()).toContain(en.other_edit);
-    expect(seam.calls).toEqual(["/status", "/usage"]); // no remount, no remount status read, nothing cancelled
+    expect(seam.calls).toEqual(["/status", "/usage", "/reset-credits"]); // no remount, no remount status read, nothing cancelled
     expect(seam.releases).toBe(0);
     expect(seam.imports).toBe(1);
 
@@ -255,7 +255,7 @@ describe("real host controller × real Codex card seam", () => {
     expect(seam.imports).toBe(1);
     // The card issued its initial status read plus the auto quota read, both
     // through the bridge with the plugin name attached.
-    expect(seam.calls).toEqual(["/status", "/usage"]);
+    expect(seam.calls).toEqual(["/status", "/usage", "/reset-credits"]);
     expect(seam.blobs.length).toBe(1);
     // The deep-link focus key is the managed provider's name — consumed once.
     const seam2 = seamHarness();

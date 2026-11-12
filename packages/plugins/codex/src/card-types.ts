@@ -66,6 +66,27 @@ export interface CodexUsageView {
   secondary?: CodexUsageWindowView;
 }
 
+/** One gifted usage-reset credit (GET /reset-credits item). */
+export interface CodexResetCreditView {
+  id: string;
+  status: string;
+  expiresAt?: number;
+  title?: string;
+}
+
+/** Reset-credit listing; availableCount is the upstream-owned allowance. */
+export interface CodexResetCreditsView {
+  credits: CodexResetCreditView[];
+  availableCount: number;
+}
+
+/** Consume outcome (POST /reset-credits/consume). */
+export interface CodexResetConsumeView {
+  outcome: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
+  windowsReset: number;
+  availableCount?: number;
+}
+
 /** POST /sync and POST /disconnect. `error` is a stable code. */
 export interface CodexMutationView {
   success: boolean;
@@ -180,6 +201,41 @@ export function parseCodexMutation(value: unknown): CodexMutationView {
   const modelCount = finiteNumber(value.modelCount);
   if (modelCount !== null) next.modelCount = modelCount;
   return next;
+}
+
+/** Fail-closed reset-credit listing parser (null = no reset surface). */
+export function parseCodexResetCredits(value: unknown): CodexResetCreditsView | null {
+  if (!isRecord(value)) return null;
+  const availableCount = finiteNumber(value.availableCount);
+  if (availableCount === null || availableCount < 0 || !Number.isInteger(availableCount)) return null;
+  const credits: CodexResetCreditView[] = [];
+  if (Array.isArray(value.credits)) {
+    if (value.credits.length > 256) return null;
+    for (const raw of value.credits) {
+      if (!isRecord(raw)) return null;
+      const id = typeof raw.id === "string" && raw.id.length > 0 && raw.id.length <= 256 ? raw.id : null;
+      const status = typeof raw.status === "string" && raw.status.length > 0 && raw.status.length <= 32 ? raw.status : null;
+      if (!id || !status) return null;
+      const expiresAt = finiteNumber(raw.expiresAt);
+      const title = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim().slice(0, 200) : undefined;
+      credits.push({ id, status, ...(expiresAt !== null && expiresAt > 0 ? { expiresAt } : {}), ...(title ? { title } : {}) });
+    }
+  }
+  return { credits, availableCount };
+}
+
+/** Fail-closed consume-outcome parser (null = unrecognized envelope). */
+export function parseCodexResetConsume(value: unknown): CodexResetConsumeView | null {
+  if (!isRecord(value)) return null;
+  const outcome = value.outcome;
+  if (outcome !== "reset" && outcome !== "nothing_to_reset" && outcome !== "no_credit" && outcome !== "already_redeemed") return null;
+  const windowsReset = finiteNumber(value.windowsReset);
+  const availableCount = finiteNumber(value.availableCount);
+  return {
+    outcome,
+    windowsReset: windowsReset !== null && windowsReset >= 0 ? Math.floor(windowsReset) : 0,
+    ...(availableCount !== null && availableCount >= 0 ? { availableCount: Math.floor(availableCount) } : {}),
+  };
 }
 
 /**

@@ -20,12 +20,14 @@ import { clearCodexRouterRefs } from "./router";
 import type { PluginCardMountProps } from "../../../ui/src/utils/plugin-card";
 import type {
   CodexLoginPollView, CodexLoginStartView, CodexStatusView, CodexUsageView,
+  CodexResetCreditsView, CodexResetCreditView,
 } from "./card-types";
 import {
   CODEX_PROVIDER_NAME, clearCodexUsageCache, codexConnected, codexStateKey,
   codexWindowUnit, formatCodexClock, freshCodexUsage, isValidCodexCallbackUrl,
   maskCodexAccountId, mergeCodexProvider, parseCodexLoginPoll,
   parseCodexLoginStart, parseCodexMutation, parseCodexStatus, parseCodexUsage,
+  parseCodexResetCredits, parseCodexResetConsume,
   rememberCodexUsage, sanitizeCodexErrorCode,
 } from "./card-types";
 import { codexLocales } from "./locales";
@@ -213,7 +215,7 @@ function wait(ms: number, signal: AbortSignal, wakeListeners?: Set<() => void>):
 const mounted = new WeakMap<HTMLElement, () => void>();
 
 type UsagePhase = "idle" | "reading" | "ready" | "unavailable";
-type ActionKind = "login" | "sync" | "disconnect" | "usage" | "hide" | "restore";
+type ActionKind = "login" | "sync" | "disconnect" | "usage" | "hide" | "restore" | "reset";
 /** The one explicit action in flight; `model` scopes hide/restore per chip. */
 interface ActiveAction { kind: ActionKind; model?: string }
 
@@ -245,6 +247,13 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   let toast: string | null = null;
   let reconcileFailed = false;
   let confirmDisconnect = false;
+  let confirmReset = false;
+  // The confirmation is an idempotent intent: a transport failure keeps the
+  // same credit target so a user retry re-issues the same confirmation.
+  // Reset credits: read-only background listing; null = surface absent. The
+  // oldest available credit is the default target (upstream CLI behavior).
+  let resetCredits: CodexResetCreditsView | null = null;
+  let resetPhase: "idle" | "reading" | "ready" | "unavailable" = "idle";
   let login: CodexLoginStartView | null = null;
   let cancelling = false;
   let pasteField: HTMLInputElement | null = null;
@@ -421,6 +430,31 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     await readUsage(id, true);
   };
 
+  // ---- reset credits (read-only listing; consumption is explicit-only) -----
+  // Read once per visit like usage. The listing never mutates anything; the
+  // consume endpoint is reached ONLY from the confirmation dialog's button.
+  const readResetCredits = async (id: number) => {
+    resetPhase = "reading";
+    try {
+      const raw = await props.callApi<unknown>("/reset-credits", { timeoutMs: 10_000 });
+      const parsed = parseCodexResetCredits(raw);
+      if (alive && generation === id) {
+        resetCredits = parsed;
+        resetPhase = parsed ? "ready" : "unavailable";
+      }
+    } catch {
+      if (alive && generation === id) { resetCredits = null; resetPhase = "unavailable"; }
+    }
+    if (alive) render();
+  };
+
+  const oldestResetCredit = (): CodexResetCreditView | null => {
+    const available = (resetCredits?.credits ?? []).filter(c => c.status === "available");
+    if (!available.length) return null;
+    // Expired-soonest first (upstream CLI ordering); missing expiry sorts last.
+    return available.slice().sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity))[0];
+  };
+
   const run = async (kind: ActionKind, argument?: string) => {
     if (!alive || locked || loading || props.disabled) return;
     if (kind === "usage") {
@@ -444,6 +478,35 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     reconcileFailed = false;
     render();
     try {
+      if (kind === "reset") {
+        // Explicit confirmation only. The credit id was captured when the
+        // dialog opened; the backend re-validates availability/identity and
+        // the service reuses the pending idempotency key on retry.
+        const creditId = argument || undefined;
+        const result = parseCodexResetConsume(await post<unknown>("/reset-credits/consume", creditId ? { creditId } : {}, undefined, 60_000));
+        if (!alive || generation !== id) return;
+        confirmReset = false;
+        if (!result) { errorKey = "reset_failed"; return; }
+        // Terminal outcomes invalidate both surfaces; the authoritative
+        // remaining count comes from a fresh listing, never a local guess.
+        if (result.outcome === "reset" || result.outcome === "already_redeemed") {
+          clearCodexUsageCache();
+          usage = null; usageUpdatedAt = null; usagePhase = "idle";
+          resetPhase = "idle";
+          void readResetCredits(generation);
+          void readUsage(generation, true);
+          toast = t(result.outcome === "reset" ? "reset_done" : "reset_already", {
+            count: String(result.availableCount ?? resetCredits?.availableCount ?? 0),
+          });
+        } else if (result.outcome === "no_credit") {
+          resetCredits = { credits: [], availableCount: 0 };
+          resetPhase = "ready";
+          toast = t("reset_none_left");
+        } else {
+          toast = t("reset_nothing");
+        }
+        return;
+      }
       if (kind === "login") {
         const current = createCodexLogin({
           start: () => post<CodexLoginStartView>("/login/start", {}),
@@ -481,6 +544,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
         // card re-reads instead of showing the old plan until the TTL lapses.
         clearCodexUsageCache();
         usage = null; usageUpdatedAt = null; usagePhase = "idle";
+        // A fresh login may be a DIFFERENT account: the reset row belongs to
+        // the previous one and must not survive.
+        resetCredits = null; resetPhase = "idle"; confirmReset = false;
         const { fresh, reconcileFailed: failed } = await settle(id);
         if (!alive || generation !== id) return;
         reconcileFailed = failed;
@@ -532,10 +598,11 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
           return;
         }
         clearCodexUsageCache();
-        const { fresh, reconcileFailed: failed } = await settle(id);
+        const { reconcileFailed: failed } = await settle(id);
         if (!alive || generation !== id) return;
         reconcileFailed = failed;
         usage = null; usagePhase = "idle"; usageUpdatedAt = null;
+        resetCredits = null; resetPhase = "idle"; confirmReset = false;
         toast = t("disconnected");
       }
     } catch (error) {
@@ -546,6 +613,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
             : kind === "sync" ? "sync_failed"
             : kind === "hide" ? "hide_failed"
             : kind === "restore" ? "restore_failed"
+            : kind === "reset" ? "reset_failed"
             : "disconnect_failed");
       }
     } finally {
@@ -693,6 +761,22 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       } else if (usagePhase === "unavailable") {
         usageBox.append(styled("p", "text-[11px] text-muted-foreground", t("usage_unavailable")));
       }
+      // Gifted usage resets: explicit-only consume, upstream-owned allowance.
+      // The row renders whenever the listing succeeded; zero availability
+      // disables the control instead of hiding it (the user sees the limit).
+      if (resetPhase === "ready" && resetCredits) {
+        const row = styled("div", "flex flex-wrap items-center justify-between gap-2 border-t border-white/5 pt-1.5");
+        const target = oldestResetCredit();
+        const remaining = resetCredits.availableCount;
+        row.append(styled("span", "text-[11px] text-muted-foreground", t("reset_available", { count: String(remaining) })));
+        if (target?.expiresAt) {
+          const expiry = formatCodexClock(target.expiresAt, locale);
+          if (expiry) row.append(styled("span", "text-[10px] text-muted-foreground/60", t("reset_expires", { time: expiry })));
+        }
+        button(row, t("reset_button"), () => { confirmReset = true; render(); },
+          disabled || remaining <= 0 || !target, "outline", "h-7 px-2 text-[11px]");
+        usageBox.append(row);
+      }
       body.append(usageBox);
     }
 
@@ -786,6 +870,23 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       panel.append(footer);
       el.append(panel);
     }
+
+    if (confirmReset) {
+      const panel = styled("div", "max-w-md space-y-2 rounded-xl border border-primary/30 bg-primary/5 p-4");
+      panel.setAttribute("role", "alertdialog");
+      panel.setAttribute("aria-label", t("reset_title"));
+      const target = oldestResetCredit();
+      panel.append(
+        styled("h3", "text-sm font-semibold tracking-tight text-foreground", t("reset_title")),
+        styled("p", "text-xs text-muted-foreground", t("reset_warning", { count: String(resetCredits?.availableCount ?? 0) })),
+      );
+      const footer = styled("div", "flex justify-end gap-2");
+      button(footer, t("cancel"), () => { if (!action) { confirmReset = false; render(); } }, !!action, "outline", "h-8 text-xs");
+      button(footer, action ? t("working") : t("reset_confirm"), () => { if (confirmReset) void run("reset", target?.id); },
+        loading || action !== null || props.disabled || !target || (resetCredits?.availableCount ?? 0) <= 0, "primary", "h-8 text-xs");
+      panel.append(footer);
+      el.append(panel);
+    }
   };
 
   mounted.set(el, () => {
@@ -826,7 +927,10 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       // is a read that works during cooldown, so read it there too — not
       // only in the connected state.
       const mountState = codexStateKey(status);
-      if (mountState === "connected" || mountState === "cooldown") void autoReadUsage();
+      if (mountState === "connected" || mountState === "cooldown") {
+        void autoReadUsage();
+        void readResetCredits(generation);
+      }
     });
   };
   mountRead(false);

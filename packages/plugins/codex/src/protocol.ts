@@ -66,6 +66,12 @@ export const CODEX_AUTHORIZE_PATH = "/oauth/authorize";
 export const CODEX_TOKEN_PATH = "/oauth/token";
 
 export const CODEX_BACKEND_BASE = "https://chatgpt.com/backend-api/codex";
+/** ChatGPT management-plane origin (wham usage + reset credits). */
+export const CODEX_CHATGPT_ORIGIN = "https://chatgpt.com";
+/** Rate-limit reset credit listing (openai/codex backend-client rate_limit_resets.rs). */
+export const CODEX_RESET_CREDITS_PATH = "/backend-api/wham/rate-limit-reset-credits";
+/** Rate-limit reset credit consumption (idempotent by redeem_request_id). */
+export const CODEX_RESET_CONSUME_PATH = "/backend-api/wham/rate-limit-reset-credits/consume";
 export const CODEX_WHAM_USAGE_PATH = "/backend-api/wham/usage";
 
 /**
@@ -185,7 +191,12 @@ export type CodexAdminCode =
   | "codex_credential_invalid"
   | "codex_credential_unreadable"
   | "codex_config_write_failed"
-  | "codex_model_invalid";
+  | "codex_model_invalid"
+  | "codex_reset_busy"
+  | "codex_reset_no_credit"
+  | "codex_reset_unavailable"
+  | "codex_reset_invalid"
+  | "codex_reset_failed";
 
 /** The managed runtime throws this before any network touch when the account is cooling. */
 export type CodexThrownCode = CodexErrorCode | "codex_account_cooling";
@@ -267,7 +278,6 @@ export function classifyCodexError(status: number, body: unknown, _systemText?: 
     if (resetInMs) return Math.max(resetInMs, 60_000);
     return undefined;
   };
-  const now = Date.now();
 
   if (/usage_limit_reached|RESOURCE_EXHAUSTED|limit reached/i.test(errType) ||
       (status === 429 && /usage_limit_reached|limit reached/i.test(message))) {
@@ -640,6 +650,154 @@ export function rateLimitsSaturated(limits: QuotaCodexRateLimits, now: number): 
     if (w.usedPercent >= 100 && typeof w.resetAt === "number" && w.resetAt > now) return true;
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Rate-limit reset credits (gifted usage resets; upstream openai/codex)
+// ---------------------------------------------------------------------------
+
+/** One available reset credit (upstream RateLimitResetCreditDetails). */
+export interface CodexResetCredit {
+  id: string;
+  status: string;
+  /** Epoch ms, when parseable. */
+  expiresAt?: number;
+  title?: string;
+  description?: string;
+}
+
+/** Listing result. `available_count` is the upstream-owned allowance. */
+export interface CodexResetCredits {
+  credits: CodexResetCredit[];
+  availableCount: number;
+}
+
+export type CodexResetConsumeOutcome = "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
+
+export interface CodexResetConsumeResult {
+  outcome: CodexResetConsumeOutcome;
+  windowsReset: number;
+}
+
+const RESET_CREDIT_TITLES: Record<string, string> = {
+  codex_rate_limits: "Full reset",
+};
+
+function parseResetCredit(raw: any): CodexResetCredit | null {
+  if (!raw || typeof raw !== "object") return null;
+  if (typeof raw.id !== "string" || !raw.id || raw.id.length > 256) return null;
+  if (typeof raw.status !== "string" || !raw.status || raw.status.length > 32) return null;
+  const expires = typeof raw.expires_at === "string" && raw.expires_at ? Date.parse(raw.expires_at) : NaN;
+  const title = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim().slice(0, 200)
+    : RESET_CREDIT_TITLES[typeof raw.reset_type === "string" ? raw.reset_type : ""];
+  const description = typeof raw.description === "string" && raw.description.trim() ? raw.description.trim().slice(0, 300) : undefined;
+  return {
+    id: raw.id,
+    status: raw.status,
+    ...(Number.isFinite(expires) && expires > 0 ? { expiresAt: expires } : {}),
+    ...(title ? { title } : {}),
+    ...(description ? { description } : {}),
+  };
+}
+
+/** Fail-closed listing parser: unknown shapes yield null ("no reset surface"). */
+export function parseCodexResetCredits(raw: unknown): CodexResetCredits | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as any;
+  const availableCount = typeof r.available_count === "number" && Number.isFinite(r.available_count)
+    ? Math.max(0, Math.floor(r.available_count)) : null;
+  if (availableCount === null) return null;
+  const credits: CodexResetCredit[] = [];
+  if (Array.isArray(r.credits)) {
+    if (r.credits.length > 256) return null;
+    for (const item of r.credits) {
+      const credit = parseResetCredit(item);
+      if (!credit) return null;
+      credits.push(credit);
+    }
+  }
+  return { credits, availableCount };
+}
+
+function parseResetOutcome(code: unknown): CodexResetConsumeOutcome | null {
+  switch (code) {
+    case "reset": return "reset";
+    case "nothing_to_reset": return "nothing_to_reset";
+    case "no_credit": return "no_credit";
+    case "already_redeemed": return "already_redeemed";
+    default: return null;
+  }
+}
+
+async function resetCreditsFetch(params: {
+  url: string; method: "GET" | "POST"; body?: unknown;
+  accessToken: string; accountId?: string; fetchImpl: CodexFetch;
+}): Promise<{ ok: boolean; status: number; json: any }> {
+  const res = await params.fetchImpl(params.url, boundedFetchInit({
+    method: params.method,
+    headers: {
+      ...codexManagementHeaders(params.accessToken, params.accountId),
+      ...(params.body !== undefined ? { "Content-Type": "application/json" } : {}),
+    },
+    ...(params.body !== undefined ? { body: JSON.stringify(params.body) } : {}),
+  }));
+  const text = await res.text().catch(() => "");
+  let json: any = null;
+  try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+  return { ok: res.ok, status: res.status, json };
+}
+
+/** List available reset credits. Null = surface absent/unreadable, never fatal. */
+export async function fetchCodexResetCredits(params: {
+  accessToken: string;
+  accountId?: string;
+  fetchImpl: CodexFetch;
+  origin?: string;
+}): Promise<CodexResetCredits | null> {
+  const origin = params.origin ?? CODEX_CHATGPT_ORIGIN;
+  const res = await resetCreditsFetch({
+    url: `${origin}${CODEX_RESET_CREDITS_PATH}`, method: "GET",
+    accessToken: params.accessToken, accountId: params.accountId, fetchImpl: params.fetchImpl,
+  });
+  if (!res.ok) return null;
+  return parseCodexResetCredits(res.json);
+}
+
+/**
+ * Consume one reset credit. `redeemRequest` is the client's idempotency key;
+ * the CALLER owns retention: a retried confirmation reuses the pending key
+ * (upstream dedupes per key, so a lost response cannot double-spend). Unknown
+ * envelopes throw codex_upstream_error; known outcomes are returned verbatim.
+ */
+export async function consumeCodexResetCredit(params: {
+  redeemRequest: string;
+  creditId?: string;
+  accessToken: string;
+  accountId?: string;
+  fetchImpl: CodexFetch;
+  origin?: string;
+}): Promise<CodexResetConsumeResult> {
+  const origin = params.origin ?? CODEX_CHATGPT_ORIGIN;
+  const res = await resetCreditsFetch({
+    url: `${origin}${CODEX_RESET_CONSUME_PATH}`, method: "POST",
+    body: { redeem_request_id: params.redeemRequest, ...(params.creditId ? { credit_id: params.creditId } : {}) },
+    accessToken: params.accessToken, accountId: params.accountId, fetchImpl: params.fetchImpl,
+  });
+  if (res.status === 401 || res.status === 403) {
+    throw codexError({ code: "codex_reauth_required", message: CODEX_SAFE_MESSAGES.codex_reauth_required, httpStatus: 401 });
+  }
+  const outcome = res.ok && res.json ? parseResetOutcome(res.json.code) : null;
+  if (!outcome) {
+    throw codexError({
+      code: "codex_upstream_error",
+      message: `Codex reset consume failed (HTTP ${res.status}).`,
+      httpStatus: 502,
+      retryable: res.status >= 500 || res.status === 429,
+    });
+  }
+  const windowsReset = typeof res.json.windows_reset === "number" && Number.isFinite(res.json.windows_reset)
+    ? Math.max(0, Math.floor(res.json.windows_reset)) : 0;
+  return { outcome, windowsReset };
 }
 
 // ---------------------------------------------------------------------------

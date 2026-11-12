@@ -149,6 +149,7 @@ describe("self-contained Codex plugin card", () => {
   it("mount performs only a status read; visual contract uses host classes, never inline styles", async () => {
     const h = harness({ "/status": () => NOT_CONNECTED });
     await tick();
+    // Not connected: no quota/reset reads at all.
     expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status"]);
     expect(h.host.text()).toContain(en.status.not_connected);
     const card = h.host.all().find(n => n.className?.includes("glass-card"))!;
@@ -181,7 +182,7 @@ describe("self-contained Codex plugin card", () => {
     };
     const h = harness({ "/status": () => COOLED, "/usage": () => USAGE });
     await tick();
-    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status", "/usage"]);
+    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status", "/usage", "/reset-credits"]);
     expect(h.host.text()).toContain(en.status.cooldown);
     expect(h.host.text()).toContain("user@example.test");
     expect(h.host.text()).toContain(en.usage_primary.replace("{{window}}", "5 h"));
@@ -217,7 +218,7 @@ describe("self-contained Codex plugin card", () => {
 
   it("connected shows account/plan/models; quota auto-reads exactly once with window lines, never tokens", async () => {
     const h = harness(); await tick();
-    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status", "/usage"]);
+    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status", "/usage", "/reset-credits"]);
     expect(h.host.text()).toContain("user@example.test");
     expect(h.host.text()).toContain("9f8e7d…5678"); // masked account id, never the full uuid
     expect(h.host.text()).not.toContain("9f8e7d6c-1234-5678-90ab-cdef12345678");
@@ -243,7 +244,7 @@ describe("self-contained Codex plugin card", () => {
         savedAt: Date.now(), entry: { value: USAGE, at: Date.now() },
       }));
       await tick();
-      expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status"]);
+      expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status", "/reset-credits"]);
       expect(h.host.text()).toContain("5 h");
       expect(h.host.text()).toContain(en.usage_updated.slice(0, 8));
       unmount(h.host as any);
