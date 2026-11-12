@@ -472,3 +472,95 @@ describe("CodexTransformer — bounded scan and cancellation", () => {
     expect(rest).toContain("\"delta\":\"b\"");
   });
 });
+
+describe("CodexTransformer — unlabeled upstream streams", () => {
+  it("replays split SSE bytes and records success without Content-Type", async () => {
+    const success = vi.fn(async () => {});
+    const service = stubService({ noteRequestSuccess: success });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "response.output_text.delta", delta: "OK" },
+      { type: "response.completed", response: { output: [{ type: "message" }] } },
+    ]);
+    const bytes = new TextEncoder().encode(text);
+    const body = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(bytes.slice(0, 7));
+      controller.enqueue(bytes.slice(7, 53));
+      controller.enqueue(bytes.slice(53));
+      controller.close();
+    } });
+    const response = new Response(body);
+    expect(response.headers.get("content-type")).toBeNull();
+    const out = await new CodexTransformer({ service }).transformResponseOut(response);
+    expect(await out.text()).toBe(text);
+    expect(success).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies an unlabeled terminal error without recording success", async () => {
+    const success = vi.fn(async () => {});
+    const service = stubService({ noteRequestSuccess: success });
+    const bytes = new TextEncoder().encode(sse([{ type: "error", error: { type: "usage_limit_reached", resets_in_seconds: 60 } }]));
+    const out = await new CodexTransformer({ service }).transformResponseOut(new Response(bytes));
+    await expect(out.text()).rejects.toMatchObject({ code: "codex_usage_limit" });
+    expect(success).not.toHaveBeenCalled();
+    expect(service.errors.at(-1)).toMatchObject({ code: "codex_usage_limit" });
+  });
+
+  it.each([undefined, "application/json"])("does not treat a JSON error as success (%s)", async (contentType) => {
+    const success = vi.fn(async () => {});
+    const raw = new TextEncoder().encode(JSON.stringify({ error: { message: "rejected" } }));
+    const headers = contentType ? { "content-type": contentType } : undefined;
+    const out = await new CodexTransformer({ service: stubService({ noteRequestSuccess: success }) }).transformResponseOut(new Response(raw, { headers }));
+    expect(await out.text()).toBe(new TextDecoder().decode(raw));
+    expect(success).not.toHaveBeenCalled();
+  });
+});
+
+describe("CodexTransformer — success bookkeeping", () => {
+  it("notes request success exactly once when the stream commits real output", async () => {
+    let successes = 0;
+    const service = stubService({ noteRequestSuccess: async () => { successes++; } });
+    const t = new CodexTransformer({ service });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "response.output_text.delta", delta: "Hello" },
+      { type: "response.output_text.delta", delta: " world" },
+      { type: "response.completed", response: { id: "r", output: [{ type: "message" }] } },
+    ]);
+    await readAll(await t.transformResponseOut(sseResponse(text), {} as any));
+    expect(successes).toBe(1);
+  });
+
+  it("notes success on a completed turn whose output only appears in the final event", async () => {
+    let successes = 0;
+    const service = stubService({ noteRequestSuccess: async () => { successes++; } });
+    const t = new CodexTransformer({ service });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "response.completed", response: { id: "r", output: [{ type: "message" }] } },
+    ]);
+    await readAll(await t.transformResponseOut(sseResponse(text), {} as any));
+    expect(successes).toBe(1);
+  });
+
+  it("does not note success for an empty completed turn", async () => {
+    let successes = 0;
+    const service = stubService({ noteRequestSuccess: async () => { successes++; } });
+    const t = new CodexTransformer({ service });
+    const text = sse([{ type: "response.completed", response: { id: "r", output: [] } }]);
+    await expect(readAll(await t.transformResponseOut(sseResponse(text), {} as any))).rejects.toThrow();
+    expect(successes).toBe(0);
+  });
+
+  it("does not note success for a terminal error stream", async () => {
+    let successes = 0;
+    const service = stubService({ noteRequestSuccess: async () => { successes++; } });
+    const t = new CodexTransformer({ service });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "error", error: { type: "usage_limit_reached", message: "limit", resets_in_seconds: 120 } },
+    ]);
+    await expect(readAll(await t.transformResponseOut(sseResponse(text), {} as any))).rejects.toMatchObject({ code: "codex_usage_limit" });
+    expect(successes).toBe(0);
+  });
+});

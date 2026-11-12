@@ -164,6 +164,12 @@ function normalizeItem(item: any, boundCallIds: Map<unknown, unknown>): any | nu
   const next: any = { ...item };
   // No id ever rides on an item of a stateless request.
   delete next.id;
+  // The backend rejects unknown top-level item fields with 400
+  // "Unknown parameter: input[N].thinking" (observed live): the unified
+  // assistant shape carries a top-level `thinking` field extracted by
+  // anthropic.transformer for OpenAI-compatible reasoning upstreams. Defense
+  // in depth — the openai-responses transformer strips it upstream of here.
+  delete next.thinking;
   // The backend rejects role:"system"; developer carries the same meaning.
   if (next.role === "system") next.role = "developer";
   if (next.call_id !== undefined) {

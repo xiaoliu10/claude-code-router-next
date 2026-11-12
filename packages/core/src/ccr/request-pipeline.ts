@@ -68,7 +68,7 @@ export function getPipelineEventEmitter(): EventEmitter {
   return event;
 }
 
-function ensureClientContext(req: any, config: Record<string, any>): void {
+function ensureClientContext(req: any, config: Record<string, unknown>): void {
   if (!req.clientContext || !req.usageCacheKey || !req.usageSessionId) {
     applyClientAdapter(req, config);
   }
@@ -146,7 +146,13 @@ export interface CcrPreHandlerCallbacks {
 }
 
 function normalizeCcrRequest(req: any): void {
-  const url = new URL(`http://127.0.0.1${req.url}`);
+  let url: URL;
+  try {
+    url = new URL(`http://127.0.0.1${req.url}`);
+  } catch {
+    // Malformed request target: skip normalization, let the router reject it.
+    return;
+  }
   req.pathname = url.pathname;
   const isMessages = url.pathname.endsWith("/v1/messages");
   const isResponses = url.pathname.endsWith("/v1/responses");
@@ -172,7 +178,12 @@ async function runAuthClientPhase(req: any, reply: any, config: any): Promise<vo
   });
   if (reply.sent) return;
 
-  const url = new URL(`http://127.0.0.1${req.url}`);
+  let url: URL;
+  try {
+    url = new URL(`http://127.0.0.1${req.url}`);
+  } catch {
+    return;
+  }
   req.pathname = url.pathname;
   if (req.pathname.endsWith("/v1/messages") && req.pathname !== "/v1/messages") {
     req.preset = req.pathname.replace("/v1/messages", "").replace("/", "");
@@ -220,7 +231,12 @@ export { normalizeCcrRequest };
 export function registerRequestPipeline(serverInstance: any, config: any): void {
   // Hook 1: onRequest — request timing
   serverInstance.addHook("onRequest", async (req: any) => {
-    const url = new URL(`http://127.0.0.1${req.url}`);
+    let url: URL;
+    try {
+      url = new URL(`http://127.0.0.1${req.url}`);
+    } catch {
+      return;
+    }
     req.pathname = url.pathname;
     if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/responses")) && !req.requestStartTime) {
       req.requestStartTime = performance.now();
@@ -231,7 +247,15 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
   // before the API namespaces. Namespace requests are authenticated inside the
   // ordered dispatcher so adapter detection still runs before Codex handling.
   serverInstance.addHook("preHandler", async (req: any, reply: any) => {
-    const pathname = req.pathname || new URL(`http://127.0.0.1${req.url}`).pathname;
+    let pathname = req.pathname;
+    if (!pathname) {
+      try {
+        pathname = new URL(`http://127.0.0.1${req.url}`).pathname;
+      } catch {
+        // Unparseable target: keep authenticating (fail closed on auth).
+        pathname = "";
+      }
+    }
     if (pathname.endsWith("/v1/messages") || pathname.endsWith("/v1/responses")) return;
     // See runAuthCodexPhase: resolve on the auth function's own settlement too,
     // because auth-failure paths call reply.send() without invoking `done`.
@@ -575,7 +599,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         } else if (payload && typeof payload === 'object') {
           req.errorResponseBody = JSON.stringify(payload);
         }
-      } catch (e) {
+      } catch {
         // Ignore serialization errors
       }
     }
@@ -645,11 +669,20 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // Extract error message if request failed
       let errorMessage: string | undefined;
       let errorResponseBody: string | undefined;
-      // Check for SSE stream error (errors inside HTTP 200 response)
+      // Check for SSE stream error (errors inside HTTP 200 response).
       const sseError = req.sseError;
       const hasSseError = sseError && (sseError.type || sseError.code || sseError.message);
       const hasOutputTokens = usage?.output_tokens && usage.output_tokens > 0;
-      const isFailedRequest = hardFailed || (hasSseError && !hasOutputTokens);
+      // The transformer stamps this once a content block is actually enqueued
+      // for the client (text/thinking/tool/annotation). A late SSE error frame
+      // after real output must NOT turn an answer the client fully received
+      // into a recorded failure — that kept healthy providers permanently red
+      // and paid an extra retry wait on every successful turn. An HTTP 200 with
+      // zero content blocks never sets this flag, so the empty-answer guard
+      // (thrown before the stream is forwarded) and a genuine error-only stream
+      // are still judged as failures here.
+      const contentDelivered = req.contentDelivered === true;
+      const isFailedRequest = hardFailed || (hasSseError && !hasOutputTokens && !contentDelivered);
       if (isFailedRequest) {
         errorMessage = req.errorMessage || reply.errorMessage || (req.error?.message || req.error?.toString?.() || undefined);
         if (hasSseError) {

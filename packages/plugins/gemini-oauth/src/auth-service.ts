@@ -1403,6 +1403,32 @@ export class GeminiOauthAuthService {
     });
   }
 
+  /**
+   * Clear a latched TRANSIENT error marker after a confirmed-successful
+   * exchange: lastError/cooldownUntil describe a problem waiting (or a user
+   * action) was supposed to fix, and a request that just succeeded proves it
+   * fixed. A sticky (reauth) marker stays — waiting cannot fix it and one good
+   * request cannot prove the login healthy again, so only the fresh-login flow
+   * clears it. Serialized on the mutation queue like every account write;
+   * silently ignored when disconnected or on a write failure (bookkeeping
+   * never breaks the response path).
+   */
+  async noteRequestSuccess(): Promise<void> {
+    await this.enqueueMutation(async () => {
+      const current = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
+      if (!current) return; // disconnected meanwhile — nothing to clear
+      if (!current.account.lastError && !current.account.cooldownUntil) return; // no marker latched
+      if (isStickyGeminiOauthError(current.account.lastError?.code)) return; // only a re-login clears it
+      const account: GeminiOauthAccount = { ...current.account, lastError: null, cooldownUntil: null };
+      const next: GeminiOauthCredentialData = { ...current, account };
+      await this.store.save(next);
+      this.account = account;
+      this.hiddenModels = next.hiddenModels ?? [];
+    }).catch(() => {
+      // Bookkeeping must never break the response path.
+    });
+  }
+
   // ------------------------------------------------------- config mutation ---
 
   /**

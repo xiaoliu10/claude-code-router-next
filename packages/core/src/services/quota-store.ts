@@ -39,6 +39,11 @@ export function getAllQuotaResults(): StoredQuotaResult[] {
   return Array.from(quotaStore.values()).map((result) => ({ ...result }));
 }
 
+/** Test-only: drop every in-memory quota sample so stores stay isolated. */
+export function clearQuotaStore(): void {
+  quotaStore.clear();
+}
+
 // --- Persistence ---
 
 function loadFromDisk(): void {

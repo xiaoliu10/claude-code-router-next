@@ -770,6 +770,10 @@ export interface CodexServiceLike {
   getAccountId(): Promise<string>;
   forceTokenRefresh(): Promise<void>;
   noteUpstreamError(info: PluginClassifiedError): Promise<void> | void;
+  /** Data-plane success channel: clears non-sticky failure residue (lastError,
+   *  error cooldown) once the upstream produced real output. Optional so older
+   *  hosts keep working. Never throws. */
+  noteRequestSuccess?(): Promise<void> | void;
   isAccountCooling(): Promise<boolean>;
   getModelInstructions(model: string): string | undefined;
   /** Persist a data-plane rate-limit observation (storage/cooling only). Never throws. */

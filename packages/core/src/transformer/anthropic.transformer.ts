@@ -49,6 +49,23 @@ function supportsCacheCreationUsage(usage: unknown): boolean {
   return metadata.usage_source === "kiro" || metadata.usage_estimated === true || metadata.kiro_estimated === true;
 }
 
+/** Usage frame accumulated for the terminal message_delta SSE event. */
+interface StreamMessageDeltaUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens?: number;
+  usage_estimated?: boolean;
+  [key: string]: number | boolean | undefined;
+}
+
+/** Terminal message_delta frame built while converting a chat-completions stream. */
+interface StreamMessageDelta {
+  type: "message_delta";
+  delta: { stop_reason: string; stop_sequence: string | null };
+  usage: StreamMessageDeltaUsage;
+}
+
 export class AnthropicTransformer implements Transformer {
   name = "Anthropic";
   endPoint = "/v1/messages";
@@ -78,8 +95,11 @@ export class AnthropicTransformer implements Transformer {
     };
   }
 
+  // The Transformer interface declares this parameter as `any` (the wire body
+  // is an untyped Anthropic request); keep the implementation signature aligned
+  // with that contract instead of asserting a dictionary type.
   async transformRequestOut(
-    request: Record<string, any>
+    request: any
   ): Promise<UnifiedChatRequest> {
     const messages: UnifiedMessage[] = [];
 
@@ -485,13 +505,29 @@ export class AnthropicTransformer implements Transformer {
       start: async (controller) => {
         const encoder = new TextEncoder();
         const messageId = `msg_${Date.now()}`;
-        let stopReasonMessageDelta: null | Record<string, any> = null;
+        let stopReasonMessageDelta: StreamMessageDelta | null = null;
         // Fallback only until the first chat chunk carries an upstream model;
         // prefer the requested model so the UI never shows a placeholder.
         let model = String((context?.req?.body as any)?.model ?? "unknown");
         let hasStarted = false;
         let hasTextContentStarted = false;
         let hasFinished = false;
+        // Whether at least one content block (text, thinking, tool_use or an
+        // annotation result) was actually enqueued for the client. The
+        // onResponse health judgement reads req.contentDelivered: an SSE error
+        // frame that arrives after real output must not flip a request the
+        // client already received into a recorded failure.
+        // Per-attempt invariant: start every conversion with the flag cleared
+        // so a retry/fallback spread never inherits a previous attempt's
+        // delivery stamp.
+        if (context?.req) {
+          context.req.contentDelivered = false;
+        }
+        const markContentDelivered = () => {
+          if (context?.req) {
+            context.req.contentDelivered = true;
+          }
+        };
         const toolCalls = new Map<number, any>();
         const toolCallIndexToContentBlockIndex = new Map<number, number>();
         let totalChunks = 0;
@@ -551,7 +587,6 @@ export class AnthropicTransformer implements Transformer {
                 isClosed = true;
                 return;
               }
-
               // Close any remaining open content block
               if (currentContentBlockIndex >= 0) {
                 const contentBlockStop = {
@@ -673,7 +708,10 @@ export class AnthropicTransformer implements Transformer {
                   tppe: "Original Response",
                 });
                 if (chunk.error) {
-                  // Mark SSE error on request for usage tracking
+                  // Mark SSE error on request for usage tracking. A late error
+                  // frame does not overwrite the delivery marker: when content
+                  // already reached the client the onResponse hook ignores this
+                  // flag for the health/usage failure judgement.
                   if (context?.req) {
                     context.req.sseError = chunk.error;
                   }
@@ -806,6 +844,7 @@ export class AnthropicTransformer implements Transformer {
                   } else {
                     if (!isThinkingStarted) {
                       const thinkingBlockIndex = assignContentBlockIndex();
+                      markContentDelivered();
                       const contentBlockStart = {
                         type: "content_block_start",
                         index: thinkingBlockIndex,
@@ -895,6 +934,7 @@ export class AnthropicTransformer implements Transformer {
                   if (!hasTextContentStarted && !hasFinished) {
                     hasTextContentStarted = true;
                     const textBlockIndex = assignContentBlockIndex();
+                    markContentDelivered();
                     const contentBlockStart = {
                       type: "content_block_start",
                       index: textBlockIndex,
@@ -956,6 +996,7 @@ export class AnthropicTransformer implements Transformer {
 
                   choice?.delta?.annotations.forEach((annotation: any) => {
                     const annotationBlockIndex = assignContentBlockIndex();
+                    markContentDelivered();
                     const contentBlockStart = {
                       type: "content_block_start",
                       index: annotationBlockIndex,
@@ -1034,6 +1075,7 @@ export class AnthropicTransformer implements Transformer {
                         toolCall.id || `call_ccr_${toolCallIndex}`;
                       const toolCallName =
                         toolCall.function?.name || `tool_${toolCallIndex}`;
+                      markContentDelivered();
                       const contentBlockStart = {
                         type: "content_block_start",
                         index: newContentBlockIndex,

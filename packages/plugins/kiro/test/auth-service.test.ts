@@ -28,7 +28,7 @@ async function setup() {
     if (url.includes("/client/register")) data = { clientId: "client", clientSecret: "client-secret" };
     else if (url.includes("/refreshToken") || body?.grantType === "refresh_token") { refreshCount++; return Response.json({ accessToken: "rotated", expiresIn: 3600 }, { status: refreshStatus }); }
     else if (url.includes("/token")) data = { accessToken: "access", refreshToken: "refresh", expiresIn: 3600, profileArn: "arn:aws:codewhisperer:eu-west-1:123:profile/test" };
-    else if (url.includes("Get-Usage-Limits")) data = { userInfo: { email: "same@example.com" }, subscriptionInfo: { subscriptionTitle: "KIRO PRO" }, usageBreakdownList: [{ currentUsageWithPrecision: 5, usageLimitWithPrecision: 100, nextDateReset: 1_800_000_000 }] };
+    else if (url.includes("Get-Usage-Limits")) data = { userInfo: { email: "same@example.com" }, subscriptionInfo: { subscriptionTitle: "KIRO PRO" }, usageBreakdownList: [{ currentUsageWithPrecision: 5, usageLimitWithPrecision: 100, nextDateReset: 1_800_000_000, bonuses: [{ bonusType: "FIRST_UPGRADE_TRIAL", displayName: "Trial credits", description: "Trial credits from your first upgrade", status: "ACTIVE", currentUsage: 0, usageLimit: 500, expiresAt: 1_825_987_881.184 }, { displayName: "Old promo", status: "EXPIRED", currentUsage: 10, usageLimit: 50, expiresAt: 1_700_000_000 }, { displayName: "Zero limit", status: "ACTIVE", currentUsage: 0, usageLimit: 0 }] }] };
     else if (url.includes("List-Available-Profiles")) data = { profiles: [{ arn: "arn:aws:codewhisperer:eu-west-1:123:profile/test" }] };
     else if (url.includes("List-Available-Models")) data = url.includes("nextToken") ? { models: [{ modelId: "auto", tokenLimits: { maxInputTokens: 1000 } }], defaultModel: { modelId: "auto" } } : { models: [{ modelId: "claude", modelName: "Claude", supportedInputTypes: ["IMAGE"], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 8000 } }], nextToken: "page2" };
     else throw new Error(`Unexpected URL ${url}`);
@@ -194,4 +194,103 @@ describe("Kiro browser credentials", () => {
     } finally { vi.useRealTimers(); }
   });
 
+});
+
+describe("Kiro status model visibility contract", () => {
+  // The card renders every entry of status.models as a visible chip; hidden
+  // ids must therefore never appear in status.models (same contract as the
+  // gemini-oauth status endpoint) or a reload resurrects hidden models.
+  it("excludes hidden ids from status.models and reports them via hiddenModels", async () => {
+    const f = await setup();
+    const record = (id: string) => ({ id, key: id, name: id, context: 200_000, output: 64_000, images: false });
+    await writeFile(f.service.file, JSON.stringify({
+      version: 1,
+      accounts: [],
+      models: [record("alpha"), record("beta"), record("gamma")],
+      hiddenModels: ["beta"],
+    }), { mode: 0o600 });
+    const status = await f.service.getStatus();
+    expect(status.models.map(m => m.id)).toEqual(["alpha", "gamma"]);
+    expect(status.hiddenModels).toEqual(["beta"]);
+
+    // Restore flips visibility through the same saved shape.
+    await f.service.setModelHidden("beta", false);
+    const restored = await f.service.getStatus();
+    expect(restored.models.map(m => m.id)).toEqual(["alpha", "beta", "gamma"]);
+    expect(restored.hiddenModels).toEqual([]);
+
+    // And hiding through the service keeps the visible list clean.
+    await f.service.setModelHidden("gamma", true);
+    const hiddenAgain = await f.service.getStatus();
+    expect(hiddenAgain.models.map(m => m.id)).toEqual(["alpha", "beta"]);
+    expect(hiddenAgain.hiddenModels).toEqual(["gamma"]);
+  });
+
+  it("keeps the persisted provider model list free of hidden ids", async () => {
+    const f = await setup();
+    const record = (id: string) => ({ id, key: id, name: id, context: 200_000, output: 64_000, images: false });
+    await writeFile(f.service.file, JSON.stringify({
+      version: 1,
+      accounts: [],
+      models: [record("alpha"), record("beta")],
+      hiddenModels: ["beta"],
+    }), { mode: 0o600 });
+    // No accounts connected: the provider entry is absent from config, but a
+    // connected account must write only visible model ids (existing behavior
+    // of config(); asserted here to lock the invariant).
+    const status = await f.service.getStatus();
+    expect(status.models.map(m => m.id)).toEqual(["alpha"]);
+    const disk = JSON.parse(await readFile(f.service.file, "utf8"));
+    expect(disk.models.map((m: any) => m.id)).toEqual(["alpha", "beta"]);
+    expect(disk.hiddenModels).toEqual(["beta"]);
+  });
+});
+
+describe("Kiro usage bonus credits", () => {
+  it("surfaces ACTIVE bonus credits as their own expiring window", async () => {
+    const f = await setup();
+    await login(f.service, "portal", "google", "eu-west-1");
+    const usage = await f.service.getUsage();
+    expect(usage.windows.map(w => w.name)).toEqual(["Credits", "Trial credits"]);
+    const bonus = usage.windows.find(w => w.name === "Trial credits")!;
+    expect(bonus).toMatchObject({ amount: 0, limit: 500, unit: "credits", display: "0 / 500", used: 0 });
+    expect(bonus.expiresAt).toBe(new Date(1_825_987_881.184 * 1000).toISOString());
+    expect(bonus.resetsAt).toBeUndefined();
+    // The main window keeps its reset semantics.
+    const main = usage.windows.find(w => w.name === "Credits")!;
+    expect(main.resetsAt).toBe(new Date(1_800_000_000 * 1000).toISOString());
+    expect(main.expiresAt).toBeUndefined();
+  });
+});
+
+describe("Kiro usage timestamp hardening", () => {
+  it("degrades out-of-range timestamps to none instead of throwing (login path safety)", async () => {
+    const f = await setup();
+    await login(f.service, "portal", "google", "eu-west-1");
+    f.network.mockImplementationOnce(async () => Response.json({
+      userInfo: { email: "same@example.com" },
+      subscriptionInfo: { subscriptionTitle: "KIRO PRO" },
+      usageBreakdownList: [{
+        currentUsageWithPrecision: 5, usageLimitWithPrecision: 100,
+        nextDateReset: 1.8e15, // microseconds-scale garbage: Date would throw RangeError
+        bonuses: [
+          { displayName: "", description: "Gift", status: "ACTIVE", currentUsage: 1, usageLimit: 50, expiresAt: 1e20 },
+          { displayName: "Plain", status: "ACTIVE", currentUsage: 0, usageLimit: 10 },
+        ],
+      }],
+    }));
+    const usage = await f.service.getUsage(); // must not throw
+    const main = usage.windows.find(w => w.name === "Credits")!;
+    expect(main.resetsAt).toBeUndefined();
+    // Empty displayName falls back to description — never "" (which the card
+    // parser would relabel "Credits", colliding with the real Credits window).
+    const gift = usage.windows.find(w => w.name === "Gift")!;
+    expect(gift).toBeDefined();
+    expect(gift.expiresAt).toBeUndefined();
+    // A bonus without any timestamp still renders as a window.
+    const plain = usage.windows.find(w => w.name === "Plain")!;
+    expect(plain).toBeDefined();
+    expect(plain.resetsAt).toBeUndefined();
+    expect(plain.expiresAt).toBeUndefined();
+  });
 });

@@ -363,9 +363,9 @@ export class CodexAuthService {
   private get log(): Required<CodexServiceLogger> {
     const l = this.options.logger;
     return {
-      info: (m) => { try { l?.info?.(m); } catch {} },
-      warn: (m) => { try { l?.warn?.(m); } catch {} },
-      error: (m) => { try { l?.error?.(m); } catch {} },
+      info: (m) => { try { l?.info?.(m); } catch { /* a broken logger must never break the service */ } },
+      warn: (m) => { try { l?.warn?.(m); } catch { /* a broken logger must never break the service */ } },
+      error: (m) => { try { l?.error?.(m); } catch { /* a broken logger must never break the service */ } },
     };
   }
 
@@ -693,7 +693,7 @@ export class CodexAuthService {
     if (server) {
       server.on("request", (req, res) => {
         try { this.handleCallback(req, res, job); }
-        catch { try { res.statusCode = 500; res.end(); } catch {} }
+        catch { try { res.statusCode = 500; res.end(); } catch { /* best-effort error response; the socket may already be gone */ } }
       });
     }
 
@@ -1183,6 +1183,34 @@ export class CodexAuthService {
     return this.latestCooldown(data) !== undefined;
   }
 
+  /**
+   * Data-plane success channel: clears non-sticky failure residue once the
+   * upstream produced real output. Without this a single rejected request
+   * (e.g. a 400 on an unsupported payload) latches status="error" on the card
+   * until the next re-login — users experience that as "the login keeps
+   * dropping" even though the token was never invalid. The sticky reauth
+   * marker survives: one good request cannot prove the saved sign-in healthy
+   * again, so only a fresh login clears it. rateLimitCooldownUntil is a
+   * separate quota-window truth with its own expiry and is left alone.
+   * Serialized on the mutation queue like every account write; silently
+   * ignored when disconnected or on a write failure (bookkeeping never breaks
+   * the response path).
+   */
+  noteRequestSuccess(): Promise<void> {
+    return this.enqueueMutation(async () => {
+      const current = await this.store.load().catch((): CodexCredentialData | null => null);
+      if (!current) return; // disconnected meanwhile — nothing to clear
+      if (!current.account.lastError && !current.account.cooldownUntil) return; // no residue latched
+      if (current.account.lastError?.code === "codex_reauth_required") return; // only a re-login clears it
+      await this.saveData({
+        ...current,
+        account: { ...current.account, lastError: null, cooldownUntil: null },
+      });
+    }).catch(() => {
+      // Bookkeeping must never break the response path.
+    });
+  }
+
   /** Data-plane error channel (usage_limit_reached, 401, …). Never throws. */
   noteUpstreamError(info: PluginClassifiedError): Promise<void> {
     return this.enqueueMutation(async () => {
@@ -1270,7 +1298,7 @@ export class CodexAuthService {
             try {
               await this.options.host.writeConfig(previousConfig);
               await this.options.host.reloadRuntime?.(previousConfig);
-            } catch {}
+            } catch { /* best-effort rollback; the original failure is thrown below */ }
             throw codexAdminError("codex_config_write_failed", 500);
           }
         }

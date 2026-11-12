@@ -28,12 +28,16 @@ import {
   GEMINI_OAUTH_SSE_PATH,
   classifyGeminiOauthError,
   fetchAvailableModels,
+  fetchGeminiOauthQuota,
   geminiOauthError,
+  geminiQuotaToProviderQuota,
   isGeminiOauthRuntime,
   protectGeminiOauthConfig,
   isStickyGeminiOauthError,
   type GeminiOauthAuthServiceLike,
   type GeminiOauthErrorInfo,
+  type GeminiOauthFetch,
+  type GeminiOauthProviderQuota,
 } from "./protocol";
 import type {
   ManagedRuntime,
@@ -81,7 +85,23 @@ async function activate(ctx: PluginContext): Promise<void> {
 
   const requireService = (): GeminiOauthAuthServiceLike => service;
 
-  const runtime: ManagedRuntime = {
+  // Runtime quota seam. The snapshot is a display-only read behind a 60s TTL
+  // cache: quota polling must not turn into per-request upstream traffic, and
+  // every failure (no login, network, an unparseable reply) degrades to null
+  // without ever throwing — the core's quota surface is advisory.
+  const QUOTA_CACHE_TTL_MS = 60_000;
+  let quotaCache: { expiresAt: number; value: GeminiOauthProviderQuota | null } | null = null;
+  // Same channel as every other fixed-origin management call: the
+  // subscription dispatcher with identity encoding (pinned inside the
+  // protocol fetch wrapper), never the proxy env routing.
+  const quotaFetch: GeminiOauthFetch = (url, init) =>
+    fetch(url, { ...init, dispatcher: upstreamDispatcher() } as RequestInit);
+
+  type GeminiOauthManagedRuntime = ManagedRuntime & {
+    fetchQuota(): Promise<GeminiOauthProviderQuota | null>;
+  };
+
+  const runtime: GeminiOauthManagedRuntime = {
     name: "gemini-oauth",
     isManaged: (provider) => isGeminiOauthRuntime(provider),
     // Circuit breaker BEFORE any network touch — including token refresh
@@ -204,6 +224,44 @@ async function activate(ctx: PluginContext): Promise<void> {
     },
     // Token hygiene: suppress request/response debug logs for this provider.
     suppressDebugLog: true,
+
+    /**
+     * Subscription quota for the core's quota surface. Reads the account's
+     * live token/project through the auth service and the two data-plane
+     * quota endpoints through the subscription dispatcher, mapped onto the
+     * shared provider-quota contract. 60s in-memory TTL; null on any failure,
+     * never throws (a null result is itself cached so a polling UI cannot
+     * hammer a failing endpoint).
+     */
+    fetchQuota: async (): Promise<GeminiOauthProviderQuota | null> => {
+      const now = Date.now();
+      if (quotaCache && quotaCache.expiresAt > now) return quotaCache.value;
+      let value: GeminiOauthProviderQuota | null = null;
+      try {
+        const svc = requireService();
+        // A parked account or a sticky-dead login must not spend a token
+        // refresh (and the durable credential write its failure bookkeeping
+        // performs) on an advisory quota poll — same predicate the account
+        // probe applies before touching the network.
+        if (await svc.isAccountCooling?.()) {
+          quotaCache = { expiresAt: now + QUOTA_CACHE_TTL_MS, value: null };
+          return null;
+        }
+        const accountStatus: any = await svc.getStatus?.().catch(() => null);
+        if (isStickyGeminiOauthError(accountStatus?.lastError?.code)) {
+          quotaCache = { expiresAt: now + QUOTA_CACHE_TTL_MS, value: null };
+          return null;
+        }
+        const [accessToken, project] = await Promise.all([svc.getAccessToken(), svc.getProject()]);
+        const snapshot = await fetchGeminiOauthQuota({ accessToken, project, fetchImpl: quotaFetch });
+        value = geminiQuotaToProviderQuota(snapshot);
+      } catch {
+        // No login, refresh failure, network or parse trouble: advisory only.
+        value = null;
+      }
+      quotaCache = { expiresAt: now + QUOTA_CACHE_TTL_MS, value };
+      return value;
+    },
   };
 
   ctx.registerTransformer(ActivatedGeminiTransformer as unknown as new () => any);

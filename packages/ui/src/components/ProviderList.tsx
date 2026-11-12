@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Provider, ProviderHealthState, ProviderProbeTelemetry, ProviderQuotaUsage } from "@/types";
-import { formatFailureTime } from "@/utils/provider-health-display";
+import { formatFailureTime, isFailureStale } from "@/utils/provider-health-display";
 
 interface ProviderListProps {
   providers: Provider[];
@@ -99,27 +99,48 @@ function getProviderHealth(providerName: string, healthStates?: ProviderHealthSt
   const openStates = providerStates.filter(s => s.status === 'open');
   const halfOpenStates = providerStates.filter(s => s.status === 'half-open');
 
-  if (openStates.length > 0) {
+  // Check if any model is in open or half-open state. Failures that a later
+  // success already recovered (stale residue) don't count: failure states are
+  // never auto-cleared server-side, so without this filter an old red badge
+  // and error banner would stick to the card forever.
+  const activeOpenStates = openStates.filter(s => !isFailureStale(s));
+  const activeHalfOpenStates = halfOpenStates.filter(s => !isFailureStale(s));
+
+  // The entry that supplies the banner timestamp must also supply its error
+  // text: pairing fields from different entries could show one model's
+  // message under another model's failure time.
+  const newestFailure = (states: typeof activeOpenStates) =>
+    states.reduce((a, b) => ((b.lastFailureTime ?? 0) >= (a.lastFailureTime ?? 0) ? b : a));
+
+  if (activeOpenStates.length > 0) {
+    const newest = newestFailure(activeOpenStates);
     return {
       status: 'open',
       hasFailure: true,
-      lastError: openStates[0].lastError,
-      // Newest stamp across the circuit-open models — the banner answers
-      // "when did this provider last fail", not "which model failed first".
-      lastFailureTime: Math.max(...openStates.map(s => s.lastFailureTime ?? 0)) || undefined,
+      lastError: newest.lastError,
+      lastFailureTime: newest.lastFailureTime ?? undefined,
     };
   }
 
-  if (halfOpenStates.length > 0) {
+  if (activeHalfOpenStates.length > 0) {
+    const newest = newestFailure(activeHalfOpenStates);
     return {
       status: 'half-open',
       hasFailure: true,
-      lastError: halfOpenStates[0].lastError,
-      lastFailureTime: Math.max(...halfOpenStates.map(s => s.lastFailureTime ?? 0)) || undefined,
+      lastError: newest.lastError,
+      lastFailureTime: newest.lastFailureTime ?? undefined,
     };
   }
 
-  // All models are in closed state (recovering)
+  // A recovering breaker whose recorded failures already recovered: keep the
+  // "recovering" status (the breaker really is probing again) but hide the
+  // stale failure residue.
+  if (halfOpenStates.length > 0) {
+    return { status: 'half-open', hasFailure: false };
+  }
+
+  // All models are in closed state, or every recorded failure has since been
+  // followed by a success (recovered) — the card returns to its normal state.
   return { status: 'closed', hasFailure: false };
 }
 

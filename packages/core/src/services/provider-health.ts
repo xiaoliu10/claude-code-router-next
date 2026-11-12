@@ -12,6 +12,12 @@ export interface ProviderHealthState {
   failureCount: number;
   successCount: number;
   lastFailureTime: number;
+  /** Epoch ms of the last recorded successful request. Optional so states and
+   *  persisted files written before this field stay valid. The UI uses
+   *  `lastFailureTime && (!lastSuccessTime || lastFailureTime > lastSuccessTime)`
+   *  to tell a stale failure (a later success already recovered the model)
+   *  from a still-active one. */
+  lastSuccessTime?: number;
   lastProbeTime: number;
   lastError?: string;
   /** Epoch ms before which a rate-limited model should NOT be probed or used.
@@ -86,6 +92,10 @@ export class ProviderHealthStore {
     }
 
     state.successCount++;
+    // Stamp every observed success on an existing entry. Unlike the circuit
+    // transitions below this never deletes the entry, so the UI can compare it
+    // against lastFailureTime even while half-open.
+    state.lastSuccessTime = Date.now();
 
     // Rate-limited models must NOT be recovered by a generic models-endpoint probe.
     // They can only be recovered by the dedicated rate-limit recovery probe
@@ -499,6 +509,7 @@ function loadFromDisk(store: ProviderHealthStore): void {
         failureCount: item.failureCount ?? 0,
         successCount: item.successCount ?? 0,
         lastFailureTime: item.lastFailureTime ?? 0,
+        lastSuccessTime: item.lastSuccessTime,
         lastProbeTime: item.lastProbeTime ?? 0,
         lastError: item.lastError,
         rateLimitUntil: item.rateLimitUntil,

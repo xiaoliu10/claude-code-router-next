@@ -5,6 +5,37 @@
  */
 
 /**
+ * The slice of a health-state entry needed to decide failure staleness.
+ * Structural on purpose: keeps this helper importable by the node --test lane
+ * (no path aliases, no JSX).
+ */
+export interface FailureTimestamps {
+  lastFailureTime?: number | null;
+  lastSuccessTime?: number | null;
+}
+
+/**
+ * Whether a recorded failure is stale "recovered residue": the same
+ * provider/model entry has a success timestamp at or after the failure, so the
+ * failed badge and error banner must be hidden and the card returns to its
+ * normal state. Failure states are never auto-cleared server-side, so the UI
+ * has to age them out.
+ *
+ * Missing timestamps keep the legacy behavior (failure stays visible):
+ * - no lastSuccessTime (older server payloads): nothing to compare against;
+ * - no lastFailureTime: legacy open/half-open badge rendering, unchanged.
+ */
+export function isFailureStale(entry: FailureTimestamps): boolean {
+  // null (server payloads that always emit the key) behaves like "absent".
+  if (entry.lastSuccessTime == null || entry.lastFailureTime == null) {
+    return false;
+  }
+  // Only a failure strictly newer than the last success is still live; a
+  // success at exactly the failure time counts as recovered.
+  return entry.lastFailureTime <= entry.lastSuccessTime;
+}
+
+/**
  * Human-readable "last failure" stamp: HH:mm for today, full date+time
  * otherwise. Locale-independent so tests and both UI languages stay stable.
  * Returns "" for non-finite input so callers can skip rendering.

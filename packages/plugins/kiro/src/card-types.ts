@@ -41,6 +41,8 @@ export interface KiroUsageWindowView {
   unit: string;
   display: string;
   resetsAt?: string;
+  /** Bonus windows expire instead of resetting; mutually exclusive in practice. */
+  expiresAt?: string;
 }
 export interface KiroUsageView {
   known: boolean;
@@ -186,6 +188,7 @@ export function parseKiroUsage(value: unknown): KiroUsageView | null {
       unit: text(raw.unit, 64) || "credits",
       display: text(raw.display, 200) || `${amount} / ${limit}`,
       ...(text(raw.resetsAt, 64) ? { resetsAt: text(raw.resetsAt, 64) } : {}),
+      ...(text(raw.expiresAt, 64) ? { expiresAt: text(raw.expiresAt, 64) } : {}),
     });
   }
   return {

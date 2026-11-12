@@ -10,6 +10,7 @@ import { calculateTokenCount } from "../utils/router";
 import { TokenizerService } from "../services/tokenizer";
 import { getAllRateLimitInfo, initRateLimitPersistence } from "../services/rate-limit";
 import { getAllQuotaResults, initQuotaStorePersistence } from "../services/quota-store";
+import { pollPluginQuota, PLUGIN_QUOTA_INLINE_BUDGET_MS } from "../services/plugin-quota";
 import { isQuotaWindowExpired } from "../services/rate-limit";
 import { findInvalidProxyUrls } from "../services/proxy";
 import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
@@ -787,6 +788,9 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
           failureCount: s.failureCount,
           successCount: s.successCount,
           lastFailureTime: s.lastFailureTime,
+          // Recovery visibility: the UI compares lastFailureTime against
+          // lastSuccessTime to tell a stale failure from an active one.
+          lastSuccessTime: s.lastSuccessTime ?? null,
           lastError: s.lastError,
           rateLimitUntil: s.rateLimitUntil ?? null,
         })),
@@ -884,6 +888,36 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     try {
       const config = await readConfigFile();
       const providers = config.Providers || [];
+
+      // Managed plugin runtimes that expose the fetchQuota seam: poll on
+      // demand here as well as from the periodic active-probe loop. The
+      // per-provider 60s TTL inside pollPluginQuota means a UI refresh storm
+      // cannot turn into an upstream request storm. Results are written to the
+      // shared quota store, so the stored-result merge below is the single
+      // read path for plugin and adapter figures alike. Failures resolve to
+      // "no data" and never fail the route. Provider entries come from the
+      // provider service (LLMProvider shape, apiKey/baseUrl) — the same shape
+      // the plugin's isManaged predicate and fetchQuota contract expect.
+      const pluginRegistry = (_app as any)._server?.pluginRegistry;
+      const providerService = (_app as any)._server?.providerService;
+      if (pluginRegistry && providerService?.getProviders) {
+        const managedPolls = (providerService.getProviders() as any[])
+          .filter((p: any) => p?.name && p.enabled !== false)
+          .map((provider: any) => {
+            const runtime = pluginRegistry.getManagedRuntimeFor(provider);
+            if (!runtime || typeof runtime.fetchQuota !== "function") return undefined;
+            return pollPluginQuota(provider.name, provider, runtime);
+          });
+        const managedPollList = managedPolls.filter((poll): poll is Promise<void> => !!poll);
+        if (managedPollList.length) {
+          const budget = new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, PLUGIN_QUOTA_INLINE_BUDGET_MS);
+            (timer as any).unref?.();
+          });
+          await Promise.race([Promise.all(managedPollList), budget]);
+        }
+      }
+
       const quotas = computeProviderQuota(providers);
       const quotaMap = new Map<string, ProviderQuotaUsage>(
         quotas.map(quota => [quota.provider, quota])

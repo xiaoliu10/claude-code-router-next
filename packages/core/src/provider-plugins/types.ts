@@ -25,6 +25,32 @@ export interface PluginManifest {
   description?: string;
 }
 
+/**
+ * Quota figures reported by a managed runtime's `fetchQuota` seam.
+ *
+ * The field family mirrors `ProviderQuotaResult` in services/quota-adapters so a
+ * plugin sample flows through the SAME storage and 5h/7d UI mapping as the
+ * built-in quota adapters: the daily fields feed the short (5h) window while
+ * the balance fields feed the 7d window. All fields are optional — a runtime
+ * reports whichever figures its subscription endpoint exposes.
+ */
+export interface ProviderQuotaFigures {
+  /** Spend/usage inside the current short (daily/5h) window. */
+  usedDailyBalance?: number;
+  /** Explicit limit for the short window, when the endpoint exposes one. */
+  limitDaily?: number;
+  /** ISO timestamp at which the short window resets. */
+  resetTime?: string;
+  /** Spend inside the 7d/weekly balance window. */
+  usedBalance?: number;
+  /** Total balance/limit for the 7d window. */
+  totalBalance?: number;
+  /** ISO timestamp at which the 7d window resets. */
+  resetTime7d?: string;
+  /** Currency code; when absent the UI renders the figures as rate-limit units. */
+  currency?: string;
+}
+
 /** A classified upstream error, shared shape across providers (contract §1.6). */
 export interface PluginClassifiedError {
   code: string;
@@ -170,6 +196,16 @@ export interface ManagedRuntime {
    * `dispatchRequest` (see `PluginDispatchInput`).
    */
   probeLiveness?(input: ManagedProbeInput): Promise<Response>;
+  /**
+   * Optional quota probe for the subscription account. The core polls it from
+   * the same quota-probe loop as the built-in adapters and merges the result
+   * into /api/providers/quota through the shared quota store. Calls are
+   * TTL-cached per provider name (60s), so a runtime may implement this as a
+   * plain authenticated fetch without its own throttling. Return null (or
+   * reject) when no figures are available — the core treats that as "no data",
+   * never as a request failure.
+   */
+  fetchQuota?(provider: LLMProvider): Promise<ProviderQuotaFigures | null>;
   /**
    * Opt-in 401 handling: when set, the core performs ONE forced refresh and
    * re-dispatch on 401 before classifying. `refresh` must persist rotated

@@ -263,7 +263,18 @@ export class OpenAIResponsesTransformer implements Transformer {
         return;
       }
 
-      input.push(message);
+      // The unified assistant shape carries an optional top-level `thinking`
+      // field (anthropic.transformer extracts it from client thinking blocks
+      // for OpenAI-compatible reasoning upstreams). The Responses API rejects
+      // unknown top-level item fields — a second turn with carried-back
+      // thinking history fails with 400 "Unknown parameter:
+      // input[N].thinking" — so strip it here; the reasoning content itself
+      // was already dropped from the content array by normalizeRequestContent.
+      const { thinking: _strippedThinking, ...responsesItem } = message as any;
+      // A thinking-only assistant turn has no Responses message content.
+      // Tool calls were emitted above and must survive this omission.
+      if (message.role === "assistant" && responsesItem.content === undefined) return;
+      input.push(responsesItem);
     });
 
     (request as any).input = input;
@@ -954,7 +965,7 @@ export class OpenAIResponsesTransformer implements Transformer {
           } finally {
             try {
               reader.releaseLock();
-            } catch {}
+            } catch { /* best-effort: the reader may already be released */ }
           }
           try {
             controller.close();
