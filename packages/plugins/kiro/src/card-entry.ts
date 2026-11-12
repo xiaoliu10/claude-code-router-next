@@ -483,8 +483,14 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     fill.style.width = `${percent}%`;
     track.append(fill);
     parent.append(track);
-    const reset = kiroResetTime(window_.resetsAt, locale);
-    if (reset) parent.append(styled("p", "text-[10px] text-muted-foreground/60", t("credits_reset", { time: reset })));
+    // Bonus windows carry an expiry instead of a reset timestamp.
+    const expires = kiroResetTime(window_.expiresAt, locale);
+    if (expires) {
+      parent.append(styled("p", "text-[10px] text-muted-foreground/60", t("credits_expires", { time: expires })));
+    } else {
+      const reset = kiroResetTime(window_.resetsAt, locale);
+      if (reset) parent.append(styled("p", "text-[10px] text-muted-foreground/60", t("credits_reset", { time: reset })));
+    }
   };
 
   const renderLoginForm = (parent: HTMLElement, disabled: boolean): void => {

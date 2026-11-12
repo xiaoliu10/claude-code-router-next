@@ -19,7 +19,7 @@ export interface KiroCredential {
 }
 export interface KiroModelRecord { id: string; key: string; name: string; context: number; output: number; images: boolean }
 export interface KiroUsageSnapshot { known: boolean; stale: boolean; plan?: string; user?: string; observedAt?: number;
-  windows: Array<{ name: string; used: number; amount: number; limit: number; unit: string; display: string; resetsAt?: string }> }
+  windows: Array<{ name: string; used: number; amount: number; limit: number; unit: string; display: string; resetsAt?: string; expiresAt?: string }> }
 interface Saved { version: 1; accounts: KiroCredential[]; models: KiroModelRecord[]; hiddenModels: string[] }
 interface Login { id: string; state: string; verifier: string; port: number; server: Server; timer: ReturnType<typeof setTimeout>;
   stage: "portal" | "aws"; region: string; provider?: string; clientId?: string; clientSecret?: string; url: string;
@@ -201,6 +201,17 @@ export class KiroAuthService {
       for (const v of entries) { const amount = Number(v.currentUsageWithPrecision) || 0, limit = Number(v.usageLimitWithPrecision) || 0;
         const reset = Number(v.freeTrialExpiry ?? v.nextDateReset ?? l.nextDateReset);
         if (limit > 0) windows.push({ name: v.label, used: amount / limit * 100, amount, limit, unit: "credits", display: `${amount} / ${limit}`, ...(reset > 0 && Number.isFinite(reset) ? { resetsAt: new Date(reset * 1000).toISOString() } : {}) }); }
+      // Promotional / gifted credits ("bonuses", e.g. FIRST_UPGRADE_TRIAL) are
+      // separate balances attached to the same breakdown entry. Surface each
+      // ACTIVE one as its own window; its timestamp is an EXPIRY, not a reset.
+      for (const b of Array.isArray(u.bonuses) ? u.bonuses : []) {
+        if (b?.status !== "ACTIVE") continue;
+        const bAmount = Number(b.currentUsageWithPrecision ?? b.currentUsage) || 0;
+        const bLimit = Number(b.usageLimitWithPrecision ?? b.usageLimit) || 0;
+        const expires = Number(b.expiresAt);
+        if (!(bLimit > 0)) continue;
+        windows.push({ name: String(b.displayName ?? b.description ?? "Bonus"), used: bAmount / bLimit * 100, amount: bAmount, limit: bLimit, unit: "credits", display: `${bAmount} / ${bLimit}`, ...(expires > 0 && Number.isFinite(expires) ? { expiresAt: new Date(expires * 1000).toISOString() } : {}) });
+      }
     }
     return { known: true, stale: false, plan: String(l.subscriptionInfo?.subscriptionTitle ?? ""), user: l.userInfo?.email, observedAt: this.now(), windows };
   }

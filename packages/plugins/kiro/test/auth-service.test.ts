@@ -28,7 +28,7 @@ async function setup() {
     if (url.includes("/client/register")) data = { clientId: "client", clientSecret: "client-secret" };
     else if (url.includes("/refreshToken") || body?.grantType === "refresh_token") { refreshCount++; return Response.json({ accessToken: "rotated", expiresIn: 3600 }, { status: refreshStatus }); }
     else if (url.includes("/token")) data = { accessToken: "access", refreshToken: "refresh", expiresIn: 3600, profileArn: "arn:aws:codewhisperer:eu-west-1:123:profile/test" };
-    else if (url.includes("Get-Usage-Limits")) data = { userInfo: { email: "same@example.com" }, subscriptionInfo: { subscriptionTitle: "KIRO PRO" }, usageBreakdownList: [{ currentUsageWithPrecision: 5, usageLimitWithPrecision: 100, nextDateReset: 1_800_000_000 }] };
+    else if (url.includes("Get-Usage-Limits")) data = { userInfo: { email: "same@example.com" }, subscriptionInfo: { subscriptionTitle: "KIRO PRO" }, usageBreakdownList: [{ currentUsageWithPrecision: 5, usageLimitWithPrecision: 100, nextDateReset: 1_800_000_000, bonuses: [{ bonusType: "FIRST_UPGRADE_TRIAL", displayName: "Trial credits", description: "Trial credits from your first upgrade", status: "ACTIVE", currentUsage: 0, usageLimit: 500, expiresAt: 1_825_987_881.184 }, { displayName: "Old promo", status: "EXPIRED", currentUsage: 10, usageLimit: 50, expiresAt: 1_700_000_000 }, { displayName: "Zero limit", status: "ACTIVE", currentUsage: 0, usageLimit: 0 }] }] };
     else if (url.includes("List-Available-Profiles")) data = { profiles: [{ arn: "arn:aws:codewhisperer:eu-west-1:123:profile/test" }] };
     else if (url.includes("List-Available-Models")) data = url.includes("nextToken") ? { models: [{ modelId: "auto", tokenLimits: { maxInputTokens: 1000 } }], defaultModel: { modelId: "auto" } } : { models: [{ modelId: "claude", modelName: "Claude", supportedInputTypes: ["IMAGE"], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 8000 } }], nextToken: "page2" };
     else throw new Error(`Unexpected URL ${url}`);
@@ -243,5 +243,22 @@ describe("Kiro status model visibility contract", () => {
     const disk = JSON.parse(await readFile(f.service.file, "utf8"));
     expect(disk.models.map((m: any) => m.id)).toEqual(["alpha", "beta"]);
     expect(disk.hiddenModels).toEqual(["beta"]);
+  });
+});
+
+describe("Kiro usage bonus credits", () => {
+  it("surfaces ACTIVE bonus credits as their own expiring window", async () => {
+    const f = await setup();
+    await login(f.service, "portal", "google", "eu-west-1");
+    const usage = await f.service.getUsage();
+    expect(usage.windows.map(w => w.name)).toEqual(["Credits", "Trial credits"]);
+    const bonus = usage.windows.find(w => w.name === "Trial credits")!;
+    expect(bonus).toMatchObject({ amount: 0, limit: 500, unit: "credits", display: "0 / 500", used: 0 });
+    expect(bonus.expiresAt).toBe(new Date(1_825_987_881.184 * 1000).toISOString());
+    expect(bonus.resetsAt).toBeUndefined();
+    // The main window keeps its reset semantics.
+    const main = usage.windows.find(w => w.name === "Credits")!;
+    expect(main.resetsAt).toBe(new Date(1_800_000_000 * 1000).toISOString());
+    expect(main.expiresAt).toBeUndefined();
   });
 });
