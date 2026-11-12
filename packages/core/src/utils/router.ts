@@ -269,7 +269,11 @@ const getProjectSpecificRouter = async (
         if (sessionConfig && sessionConfig.Router && Object.keys(sessionConfig.Router).length > 0) {
           return sessionConfig.Router;
         }
-      } catch {}
+      } catch (error) {
+        // Optional per-session Router: a missing or malformed session file
+        // simply falls through to the project/global Router resolution below.
+        void error;
+      }
     }
 
     // A managed explicit project id must resolve to the exact stored project.
@@ -615,8 +619,6 @@ function resolveScenarioFallbackModel(
   family?: string,
   requireRoute?: boolean
 ): string | null {
-  const healthStore = getHealthStore();
-
   // Iterate through fallback stages: family-specific first, then global
   const fallbackStages = [familyFallback?.[scenarioType], globalFallback?.[scenarioType]];
 
@@ -916,16 +918,29 @@ const getUseModel = async (
     }
   }
 
-  // Routing precedence: model family first, then explicit "provider,model",
-  // then default/scenario routing. Family routing takes priority so an enabled
-  // family mapping always wins; only when no family matches do we honor a
-  // fully-qualified "provider,model" override from the client. Strict project
-  // mode still skips the explicit shortcut below (project Router authoritative).
-  //
-  // Model family routing: extract opus/sonnet/haiku and use family-specific config
+  // Routing precedence: explicit "provider,model" and exact provider-exposed
+  // models first (family mapping must not hijack a model some provider really
+  // serves), then model family, then default/scenario routing. Strict project
+  // mode routes through the project Router only — no client-driven shortcuts
+  // (the project's family config stays authoritative there).
+  const requestedModel = typeof req.body?.model === 'string' ? req.body.model : '';
+  const hasProviderPrefix = requestedModel.indexOf(',') > 0;
+  // Match the model id case-insensitively (consistent with findProviderModel)
+  // and ignore the [1m] extended-context suffix (extractModelFamily strips it
+  // the same way for family detection).
+  const requestedModelPart = (hasProviderPrefix
+    ? requestedModel.slice(requestedModel.indexOf(',') + 1).trim()
+    : requestedModel
+  ).replace(/\[1m\]$/i, '');
+  const normalizedModelPart = requestedModelPart.toLowerCase();
+  const owningProvider = !isStrictProject && normalizedModelPart
+    ? providers.find((provider: any) => provider?.enabled !== false
+      && Array.isArray(provider?.models)
+      && provider.models.some((m: any) => typeof m === 'string' && m.toLowerCase() === normalizedModelPart))
+    : undefined;
   const { family, extended: modelExtended, isCcrAlias } = extractModelFamily(req.body.model);
   const familyConfig = Router?.families?.[family || ''] as RouterFamilyConfig | undefined;
-  if (familyConfig && Router?.enableFamilyRouting) {
+  if (familyConfig && Router?.enableFamilyRouting && !owningProvider) {
     req.log.info(`Using model family routing for: ${family}${modelExtended ? ' (1M)' : ''}`);
     req.modelFamily = family;
     req.familyFallback = familyConfig.fallback;
@@ -994,6 +1009,20 @@ const getUseModel = async (
       if (lastResort) return { model: lastResort, scenarioType: 'modelMapping' };
     }
     req.log.warn(`Mapped model ${mappedModel} unavailable (fail pool), skipping`);
+  }
+
+  // A bare id that some provider serves exactly (and that no Router.models
+  // mapping rewrote above) keeps its name: qualify it for the owning provider
+  // and skip scenario/default routing so Router.default/think/background can
+  // never replace an explicitly named, routable model. The comma'd variant is
+  // already handled (with fail-pool + fallback) by the explicit block above.
+  // Fail-pool awareness is intentionally skipped here: an open circuit for
+  // this model must still get its recovery probe through the normal dispatch
+  // path, and handleFallback engages only when the attempt itself fails.
+  if (owningProvider && !hasProviderPrefix) {
+    const resolvedModel = `${(owningProvider as any).name},${requestedModel}`;
+    req.log.info(`Exact provider model ${requestedModel} routes to ${resolvedModel}`);
+    return { model: resolvedModel, scenarioType: 'default' };
   }
 
   const clientContext = req.clientContext as ClientContext | undefined;
