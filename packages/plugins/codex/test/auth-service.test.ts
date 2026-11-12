@@ -893,3 +893,23 @@ describe("Codex success bookkeeping", () => {
     expect((await service.getStatus()).status).toBe("connected");
   });
 });
+
+describe("Codex success bookkeeping — quota window isolation", () => {
+  it("never clears rateLimitCooldownUntil: a success must not disable quota cooling", async () => {
+    const { service } = await connected();
+    const resetAt = Date.now() + 3_600_000;
+    await service.noteRateLimits({
+      primary: { usedPercent: 100, windowSeconds: 18000, resetAt },
+      observedAt: Date.now(), source: "sse",
+    });
+    expect(await service.isAccountCooling()).toBe(true);
+    await service.noteRequestSuccess();
+    expect(await service.isAccountCooling()).toBe(true);
+    expect((await (service as any).store.load())!.account.rateLimitCooldownUntil).not.toBeNull();
+    // The error channel stays clearable next to it.
+    await service.noteUpstreamError({ code: "codex_request_rejected", message: "x", httpStatus: 400 });
+    await service.noteRequestSuccess();
+    expect((await (service as any).store.load())!.account.lastError).toBeNull();
+    expect((await (service as any).store.load())!.account.rateLimitCooldownUntil).not.toBeNull();
+  });
+});
