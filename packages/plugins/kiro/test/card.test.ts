@@ -882,3 +882,27 @@ describe("createKiroLogin", () => {
     expect(KIRO_POLL_TIMEOUT).toBe("kiro_poll_timeout");
   });
 });
+
+describe("kiro card bonus window rendering", () => {
+  it("keeps expiresAt through parsing and renders Expires instead of Resets for bonus windows", async () => {
+    const expiresAt = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    const bonusUsage = {
+      account: "acc-aaa", known: true, stale: false, plan: "Kiro Pro",
+      windows: [
+        { name: "Credits", used: 25, amount: 25, limit: 100, unit: "credits", display: "25 / 100", resetsAt: new Date(Date.now() + 86_400_000).toISOString() },
+        { name: "Trial credits", used: 0, amount: 0, limit: 500, unit: "credits", display: "0 / 500", expiresAt },
+      ],
+    };
+    const parsed = parseKiroUsage(bonusUsage)!;
+    expect(parsed.windows[1].expiresAt).toBe(expiresAt);
+    const at = Date.now();
+    const h = harness({ status: connectedStatus({ accounts: [ACCOUNT_A] }), cachedUsage: { value: parsed, at } });
+    await flush(); await flush();
+    const text = h.host.text();
+    expect(text).toContain("Trial credits: 0 / 500");
+    expect(text).toContain("Expires ");
+    // Exactly one reset line (main window) and one expiry line (bonus window).
+    expect(text.match(/Resets /g)?.length ?? 0).toBe(1);
+    expect(text.match(/Expires /g)?.length ?? 0).toBe(1);
+  });
+});

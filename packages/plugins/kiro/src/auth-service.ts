@@ -194,13 +194,24 @@ export class KiroAuthService {
     c.accountId = c.email ? `${c.email}${names[c.uid] ? ` (${names[c.uid]})` : ""}` : "Kiro account";
     this.usage.set(c.id, this.usageOf(l));
   }
+  /**
+   * Epoch seconds → ISO string, or null when Date cannot represent the value.
+   * A contract-violating upstream timestamp (microseconds, absurd magnitudes)
+   * must degrade to "no timestamp", never throw: usageOf sits on the login
+   * path (identify) and a RangeError there would fail the whole sign-in.
+   */
+  private epochIso(secs: number): string | null {
+    const ms = secs * 1000;
+    return Number.isFinite(ms) && Math.abs(ms) <= 8.64e15 ? new Date(ms).toISOString() : null;
+  }
   private usageOf(l: Json): KiroUsageSnapshot {
     const windows: KiroUsageSnapshot["windows"] = [];
     for (const u of l.usageBreakdownList ?? []) {
       const entries = [{ ...u, label: u.displayNamePlural ?? u.displayName ?? "Credits" }, ...(u.freeTrialInfo?.freeTrialStatus === "ACTIVE" ? [{ ...u.freeTrialInfo, label: "Free trial" }] : [])];
       for (const v of entries) { const amount = Number(v.currentUsageWithPrecision) || 0, limit = Number(v.usageLimitWithPrecision) || 0;
         const reset = Number(v.freeTrialExpiry ?? v.nextDateReset ?? l.nextDateReset);
-        if (limit > 0) windows.push({ name: v.label, used: amount / limit * 100, amount, limit, unit: "credits", display: `${amount} / ${limit}`, ...(reset > 0 && Number.isFinite(reset) ? { resetsAt: new Date(reset * 1000).toISOString() } : {}) }); }
+        if (limit > 0) { const iso = reset > 0 ? this.epochIso(reset) : null;
+          windows.push({ name: v.label, used: amount / limit * 100, amount, limit, unit: "credits", display: `${amount} / ${limit}`, ...(iso ? { resetsAt: iso } : {}) }); } }
       // Promotional / gifted credits ("bonuses", e.g. FIRST_UPGRADE_TRIAL) are
       // separate balances attached to the same breakdown entry. Surface each
       // ACTIVE one as its own window; its timestamp is an EXPIRY, not a reset.
@@ -210,7 +221,8 @@ export class KiroAuthService {
         const bLimit = Number(b.usageLimitWithPrecision ?? b.usageLimit) || 0;
         const expires = Number(b.expiresAt);
         if (!(bLimit > 0)) continue;
-        windows.push({ name: String(b.displayName ?? b.description ?? "Bonus"), used: bAmount / bLimit * 100, amount: bAmount, limit: bLimit, unit: "credits", display: `${bAmount} / ${bLimit}`, ...(expires > 0 && Number.isFinite(expires) ? { expiresAt: new Date(expires * 1000).toISOString() } : {}) });
+        const iso = expires > 0 ? this.epochIso(expires) : null;
+        windows.push({ name: String(b.displayName || b.description || "Bonus"), used: bAmount / bLimit * 100, amount: bAmount, limit: bLimit, unit: "credits", display: `${bAmount} / ${bLimit}`, ...(iso ? { expiresAt: iso } : {}) });
       }
     }
     return { known: true, stale: false, plan: String(l.subscriptionInfo?.subscriptionTitle ?? ""), user: l.userInfo?.email, observedAt: this.now(), windows };

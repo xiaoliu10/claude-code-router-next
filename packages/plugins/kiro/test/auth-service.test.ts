@@ -262,3 +262,35 @@ describe("Kiro usage bonus credits", () => {
     expect(main.expiresAt).toBeUndefined();
   });
 });
+
+describe("Kiro usage timestamp hardening", () => {
+  it("degrades out-of-range timestamps to none instead of throwing (login path safety)", async () => {
+    const f = await setup();
+    await login(f.service, "portal", "google", "eu-west-1");
+    f.network.mockImplementationOnce(async () => Response.json({
+      userInfo: { email: "same@example.com" },
+      subscriptionInfo: { subscriptionTitle: "KIRO PRO" },
+      usageBreakdownList: [{
+        currentUsageWithPrecision: 5, usageLimitWithPrecision: 100,
+        nextDateReset: 1.8e15, // microseconds-scale garbage: Date would throw RangeError
+        bonuses: [
+          { displayName: "", description: "Gift", status: "ACTIVE", currentUsage: 1, usageLimit: 50, expiresAt: 1e20 },
+          { displayName: "Plain", status: "ACTIVE", currentUsage: 0, usageLimit: 10 },
+        ],
+      }],
+    }));
+    const usage = await f.service.getUsage(); // must not throw
+    const main = usage.windows.find(w => w.name === "Credits")!;
+    expect(main.resetsAt).toBeUndefined();
+    // Empty displayName falls back to description — never "" (which the card
+    // parser would relabel "Credits", colliding with the real Credits window).
+    const gift = usage.windows.find(w => w.name === "Gift")!;
+    expect(gift).toBeDefined();
+    expect(gift.expiresAt).toBeUndefined();
+    // A bonus without any timestamp still renders as a window.
+    const plain = usage.windows.find(w => w.name === "Plain")!;
+    expect(plain).toBeDefined();
+    expect(plain.resetsAt).toBeUndefined();
+    expect(plain.expiresAt).toBeUndefined();
+  });
+});
