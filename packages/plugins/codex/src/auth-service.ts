@@ -24,7 +24,7 @@
  */
 import { clearCodexRouterRefs } from "./router";
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { promises as fs, constants } from "node:fs";
 import { dirname, join } from "node:path";
 import type { PluginClassifiedError, PluginHostCapabilities } from "../../../core/src/provider-plugins/types";
@@ -39,8 +39,10 @@ import {
   codexAdminError,
   buildCodexAuthorizeUrl,
   createCodexPkce,
+  consumeCodexResetCredit,
   exchangeCodexCode,
   fetchCodexModels,
+  fetchCodexResetCredits,
   fetchCodexUsage,
   isCodexManagedConfigProvider,
   isCodexModelId,
@@ -61,6 +63,8 @@ import {
   type CodexLoginStart,
   type CodexModelInfo,
   type CodexRateLimits,
+  type CodexResetCredits,
+  type CodexResetConsumeResult,
   type CodexStatus,
   type CodexTokens,
   type CodexUsage,
@@ -354,6 +358,21 @@ export class CodexAuthService {
   private refreshFlight: { key: string; promise: Promise<string> } | null = null;
   private forceRefreshRequested = false;
   private usageCache: { at: number; value: CodexUsage | null } | null = null;
+  /** Reset-credit listing cache (same short-TTL shape as usage). */
+  private resetCache: { at: number; value: CodexResetCredits | null } | null = null;
+  /** Single-flight for reset consumption: a queued second consume could
+   *  redeem a second credit — reject instead. Assigned SYNCHRONOUSLY before
+   *  any await (no race window). Key = in-flight redeem id. */
+  private resetFlight: { redeemRequest: string; promise: Promise<CodexResetConsumeResult> } | null = null;
+  /** Pending confirmation state: the redeem key survives a transport failure
+   *  so a user-initiated retry reuses the SAME idempotency key until a
+   *  terminal outcome (upstream dedupes per key — a lost response therefore
+   *  cannot double-spend). Cleared on terminal outcomes and disconnect. */
+  private pendingReset: { redeemRequest: string; creditId?: string } | null = null;
+  /** Locally marked spent credits: written only on a CONFIRMED terminal
+   *  outcome; prevents re-consumption of a known-spent credit within this
+   *  service lifetime. Upstream stays authoritative. */
+  private readonly spentResetCredits = new Set<string>();
 
   constructor(private readonly options: CodexAuthServiceOptions) {
     this.store = options.store ?? new CodexCredentialStore(join(options.configDir, CODEX_CREDENTIAL_FILE));
@@ -1001,6 +1020,9 @@ export class CodexAuthService {
     this.refreshFlight = null;
     this.forceRefreshRequested = false;
     this.usageCache = null;
+    this.resetCache = null;          // account identity changed — never reuse
+    this.spentResetCredits.clear();  // the previous account's reset state
+    this.pendingReset = null;
     const result: CodexLoginPoll = { status: "connected", models: registered, modelCount: registered.length };
     job.result = result;
     this.lastResult.set(job.loginId, result);
@@ -1176,6 +1198,103 @@ export class CodexAuthService {
     return usage;
   }
 
+  // ------------------------------------------------------ reset credits -
+
+  /**
+   * Available gifted usage resets. Null = surface absent/unreadable or the
+   * caller is not connected. Short-TTL cached like usage; locally marked
+   * spent credits are excluded from the visible availability.
+   */
+  async getResetCredits(): Promise<CodexResetCredits | null> {
+    const data = await this.ensureLoaded();
+    if (!data?.account) return null;
+    if (this.resetCache && this.now - this.resetCache.at < USAGE_CACHE_MS) {
+      return this.resetCache.value;
+    }
+    const accessToken = await this.getAccessToken().catch(() => null);
+    if (!accessToken) return null;
+    const fresh = await this.ensureLoaded(true);
+    const listing = await fetchCodexResetCredits({
+      accessToken,
+      accountId: fresh?.account.accountId || undefined,
+      fetchImpl: (url, init) => this.directFetch(url, init),
+    }).catch(() => null);
+    const value = listing && listing.credits.length
+      ? { ...listing, credits: listing.credits.filter((c) => !this.spentResetCredits.has(c.id)) }
+      : listing;
+    this.resetCache = { at: this.now, value };
+    return value;
+  }
+
+  /**
+   * Consume ONE gifted reset credit. Explicit user action only — never called
+   * by mount/poll/refresh. Single-flight: a second concurrent consume is
+   * rejected (two queued consumes could redeem two credits). The idempotency
+   * key is minted here at confirmation time and retained across user-initiated
+   * retries of the same confirmation (upstream dedupes on it), so a lost
+   * response cannot double-spend. Outcomes map to the upstream taxonomy;
+   * `reset`/`already_redeemed` clear the usage cache and locally mark the
+   * credit spent, then the caller re-lists for the authoritative count.
+   */
+  async consumeResetCredit(creditId?: string): Promise<CodexResetConsumeResult & { availableCount?: number }> {
+    // Synchronous busy latch: assigned BEFORE the first await so two
+    // concurrent route calls can never both pass this check.
+    if (this.resetFlight) throw codexAdminError("codex_reset_busy", 429);
+    // A retried confirmation of the SAME credit reuses the pending redeem key
+    // (idempotent upstream); a different/absent credit mints a fresh one.
+    const redeemRequest = this.pendingReset && this.pendingReset.creditId === creditId
+      ? this.pendingReset.redeemRequest
+      : randomUUID();
+    const promise = (async (): Promise<CodexResetConsumeResult> => {
+      try {
+        const data = await this.ensureLoaded();
+        if (!data?.account) throw codexAdminError("codex_not_connected", 409);
+        if (creditId && this.spentResetCredits.has(creditId)) {
+          throw codexAdminError("codex_reset_no_credit", 409);
+        }
+        const accessToken = await this.getAccessToken();
+        const fresh = await this.ensureLoaded(true);
+        const accountId = fresh?.account.accountId || undefined;
+        return await consumeCodexResetCredit({
+          redeemRequest,
+          ...(creditId ? { creditId } : {}),
+          accessToken,
+          accountId,
+          fetchImpl: (url, init) => this.directFetch(url, init),
+        });
+      } catch (error: any) {
+        if (error?.code === "codex_reauth_required") throw codexAdminError("codex_reauth_required", 422);
+        if (error?.code === "codex_upstream_error") throw codexAdminError("codex_reset_unavailable", 502);
+        throw error;
+      }
+    })();
+    this.pendingReset = { redeemRequest, ...(creditId ? { creditId } : {}) };
+    this.resetFlight = { redeemRequest, promise };
+    try {
+      const result = await this.resetFlight.promise;
+      // Terminal outcome: the confirmation is settled — the pending key is
+      // consumed, spent credits are marked (best-effort identity — when no
+      // creditId was sent the backend picked one, so only the count can be
+      // invalidated), and the authoritative listing is refreshed.
+      if (result.outcome === "reset" || result.outcome === "already_redeemed") {
+        if (creditId) this.spentResetCredits.add(creditId);
+        this.usageCache = null;
+        this.resetCache = null;
+      } else if (result.outcome === "no_credit") {
+        this.resetCache = { at: this.now, value: { credits: [], availableCount: 0 } };
+      }
+      this.pendingReset = null;
+      let availableCount: number | undefined;
+      if (result.outcome === "reset" || result.outcome === "already_redeemed") {
+        const listing = await this.getResetCredits().catch(() => null);
+        availableCount = listing?.availableCount;
+      }
+      return { ...result, ...(availableCount !== undefined ? { availableCount } : {}) };
+    } finally {
+      if (this.resetFlight?.redeemRequest === redeemRequest) this.resetFlight = null;
+    }
+  }
+
   // -------------------------------------------------------------- cooling/... -
 
   async isAccountCooling(): Promise<boolean> {
@@ -1309,6 +1428,9 @@ export class CodexAuthService {
       this.refreshFlight = null;
       this.forceRefreshRequested = false;
       this.usageCache = null;
+      this.resetCache = null;
+      this.spentResetCredits.clear();
+      this.pendingReset = null;
       return { success: true as const };
     });
   }

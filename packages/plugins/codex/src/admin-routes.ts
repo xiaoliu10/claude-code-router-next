@@ -26,7 +26,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import type { CodexAuthService } from "./auth-service";
-import { isCodexModelId } from "./protocol";
+import { codexAdminError, isCodexModelId } from "./protocol";
 
 export interface CodexAdminRouteDeps {
   /** Resolved per request so tests and late wiring stay race-free. */
@@ -94,6 +94,11 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
     codex_models_fetch_failed: 422,
     codex_reauth_required: 422,
     codex_model_invalid: 422,
+    codex_reset_busy: 429,
+    codex_reset_no_credit: 409,
+    codex_reset_unavailable: 502,
+    codex_reset_invalid: 422,
+    codex_reset_failed: 500,
   };
 
   const isCodexErrorCode = (value: unknown): value is string =>
@@ -300,6 +305,48 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
       return usage;
     } catch (error: any) {
       return codexRouteError(error, reply, "usage", "codex_request_failed");
+    }
+  });
+
+  /** Available gifted usage resets (read-only listing; upstream-owned count). */
+  app.get("/api/codex/reset-credits", async (req: any, reply: any) => {
+    try {
+      assertLocalCodexRequest(req);
+      const service = deps.getService();
+      if (!service) {
+        reply.status(503);
+        return { ok: false, success: false, error: "codex_request_failed" };
+      }
+      reply.status(200);
+      return await service.getResetCredits();
+    } catch (error: any) {
+      return codexRouteError(error, reply, "reset-credits", "codex_request_failed");
+    }
+  });
+
+  /**
+   * Consume ONE gifted reset credit — the only mutating reset path, invoked
+   * exclusively from the card's confirmation dialog. Never called by mount,
+   * polling or quota refresh.
+   */
+  app.post("/api/codex/reset-credits/consume", async (req: any, reply: any) => {
+    try {
+      assertLocalCodexRequest(req);
+      const service = deps.getService();
+      if (!service) {
+        reply.status(503);
+        return { ok: false, success: false, error: "codex_request_failed" };
+      }
+      const raw = (req.body as any)?.creditId;
+      // Absent = backend picks the oldest credit (CLI parity). Anything else
+      // must be a bounded opaque id.
+      const creditId = raw === undefined || raw === null || raw === "" ? undefined
+        : typeof raw === "string" && raw.length > 0 && raw.length <= 256 ? raw
+        : (() => { throw codexAdminError("codex_reset_invalid", 422); })();
+      const result = await service.consumeResetCredit(creditId);
+      return { ok: true, success: true, ...result };
+    } catch (error: any) {
+      return codexRouteError(error, reply, "reset-credits/consume", "codex_reset_failed");
     }
   });
 
