@@ -336,3 +336,23 @@ describe("codexFinalizeBody — purity", () => {
     expect(codexFinalizeBody("nope").stream).toBe(true);
   });
 });
+
+describe("finalize-body — unknown top-level item fields", () => {
+  it("strips the top-level thinking field from input items (backend rejects it with 400 unknown_parameter)", () => {
+    const body: any = codexFinalizeBody(base({
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "4" }],
+          thinking: { content: "silent", signature: "sig" },
+        },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "done" }] },
+      ],
+    }));
+    const input = body.input as any[];
+    expect(input).toHaveLength(3);
+    for (const item of input) expect(item.thinking).toBeUndefined();
+  });
+});
