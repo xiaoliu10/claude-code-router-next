@@ -2,7 +2,7 @@ import { get_encoding } from "tiktoken";
 import { sessionUsageCache, Usage } from "./cache";
 import { readFile } from "fs/promises";
 import { opendir, stat } from "fs/promises";
-import { join } from "path";
+import { isAbsolute, join } from "path";
 import {
   CLAUDE_PROJECTS_DIR,
   HOME_DIR,
@@ -920,24 +920,37 @@ const getUseModel = async (
 
   // Routing precedence: explicit "provider,model" and exact provider-exposed
   // models first (family mapping must not hijack a model some provider really
-  // serves), then model family, then default/scenario routing. Strict project
-  // mode routes through the project Router only — no client-driven shortcuts
-  // (the project's family config stays authoritative there).
+  // serves), then model family, then default/scenario routing. Exception:
+  // qualified "provider,model" names are resolved by the pre-existing explicit
+  // block below BEFORE Router.models mapping — mapping precedence applies to
+  // bare exact names only. Strict project mode routes through the project
+  // Router exclusively — no client-driven shortcuts (the project's family
+  // config stays authoritative there).
   const requestedModel = typeof req.body?.model === 'string' ? req.body.model : '';
   const hasProviderPrefix = requestedModel.indexOf(',') > 0;
   // Match the model id case-insensitively (consistent with findProviderModel)
   // and ignore the [1m] extended-context suffix (extractModelFamily strips it
-  // the same way for family detection).
+  // the same way for family detection). Dispatch must use the CANONICAL
+  // catalog id: the ownership match is lenient, but wire ids are not — a
+  // client-cased or [1m]-suffixed spelling would not resolve downstream.
+  // req.originalModel (captured at router entry) keeps the client spelling
+  // for usage records.
   const requestedModelPart = (hasProviderPrefix
     ? requestedModel.slice(requestedModel.indexOf(',') + 1).trim()
     : requestedModel
   ).replace(/\[1m\]$/i, '');
   const normalizedModelPart = requestedModelPart.toLowerCase();
-  const owningProvider = !isStrictProject && normalizedModelPart
-    ? providers.find((provider: any) => provider?.enabled !== false
-      && Array.isArray(provider?.models)
-      && provider.models.some((m: any) => typeof m === 'string' && m.toLowerCase() === normalizedModelPart))
-    : undefined;
+  let owningProvider: any = undefined;
+  let canonicalModelId: string | undefined;
+  if (!isStrictProject && normalizedModelPart) {
+    for (const provider of providers) {
+      if (provider?.enabled === false || !Array.isArray(provider?.models)) continue;
+      const found = provider.models.find(
+        (m: any) => typeof m === 'string' && m.toLowerCase() === normalizedModelPart
+      );
+      if (found) { owningProvider = provider; canonicalModelId = found; break; }
+    }
+  }
   const { family, extended: modelExtended, isCcrAlias } = extractModelFamily(req.body.model);
   const familyConfig = Router?.families?.[family || ''] as RouterFamilyConfig | undefined;
   if (familyConfig && Router?.enableFamilyRouting && !owningProvider) {
@@ -966,6 +979,17 @@ const getUseModel = async (
   // Handle explicit provider,model format (only when family routing did not match).
   // In strict project mode, skip this shortcut — the project Router is
   // authoritative and must decide the target, not the client's explicit override.
+  // Canonicalize a qualified exact-provider name whose model part carries a
+  // variant the catalog lookup cannot resolve (e.g. the "[1m]" suffix): the
+  // explicit block below then applies its normal fail-pool + fallback logic to
+  // the canonical id. req.originalModel keeps the client spelling for usage.
+  if (hasProviderPrefix && owningProvider && canonicalModelId) {
+    const canonicalRoute = `${owningProvider.name},${canonicalModelId}`;
+    if (req.body.model !== canonicalRoute) {
+      req.log.info(`Normalizing exact provider model ${req.body.model} to ${canonicalRoute}`);
+      req.body.model = canonicalRoute;
+    }
+  }
   if (req.body.model.includes(",") && !isStrictProject) {
     const model = resolveConfiguredModel(req.body.model, providers, false, 'default', enableFallback, allowPromotion, isStrictProject);
     if (model) {
@@ -1020,7 +1044,7 @@ const getUseModel = async (
   // this model must still get its recovery probe through the normal dispatch
   // path, and handleFallback engages only when the attempt itself fails.
   if (owningProvider && !hasProviderPrefix) {
-    const resolvedModel = `${(owningProvider as any).name},${requestedModel}`;
+    const resolvedModel = `${owningProvider.name},${canonicalModelId}`;
     req.log.info(`Exact provider model ${requestedModel} routes to ${resolvedModel}`);
     return { model: resolvedModel, scenarioType: 'default' };
   }
@@ -1289,7 +1313,20 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
     const customRouterPath = !isStrictProject ? configService.get("CUSTOM_ROUTER_PATH") : undefined;
     if (customRouterPath) {
       try {
-        const customRouter = require(customRouterPath);
+        // Allowlisted shape only: an absolute filesystem path to a JS module.
+        // CUSTOM_ROUTER_PATH is an operator-controlled config value; anything
+        // else (relative or non-JS) is treated as misconfiguration instead of
+        // being handed to the module loader.
+        if (typeof customRouterPath !== "string" || !isAbsolute(customRouterPath) || !/\.(c|m)?js$/i.test(customRouterPath)) {
+          throw new Error(`CUSTOM_ROUTER_PATH must be an absolute .js/.cjs/.mjs path, got: ${String(customRouterPath).slice(0, 120)}`);
+        }
+        const customRouterModule = await import(customRouterPath);
+        const customRouter = typeof customRouterModule === "function"
+          ? customRouterModule
+          : (customRouterModule as any)?.default;
+        if (typeof customRouter !== "function") {
+          throw new Error(`CUSTOM_ROUTER_PATH module does not export a function: ${customRouterPath}`);
+        }
         model = await customRouter(req, configService.getAll(), {
           event,
         });
