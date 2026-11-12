@@ -473,6 +473,49 @@ describe("CodexTransformer — bounded scan and cancellation", () => {
   });
 });
 
+describe("CodexTransformer — unlabeled upstream streams", () => {
+  it("replays split SSE bytes and records success without Content-Type", async () => {
+    const success = vi.fn(async () => {});
+    const service = stubService({ noteRequestSuccess: success });
+    const text = sse([
+      { type: "response.created", response: { id: "r" } },
+      { type: "response.output_text.delta", delta: "OK" },
+      { type: "response.completed", response: { output: [{ type: "message" }] } },
+    ]);
+    const bytes = new TextEncoder().encode(text);
+    const body = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(bytes.slice(0, 7));
+      controller.enqueue(bytes.slice(7, 53));
+      controller.enqueue(bytes.slice(53));
+      controller.close();
+    } });
+    const response = new Response(body);
+    expect(response.headers.get("content-type")).toBeNull();
+    const out = await new CodexTransformer({ service }).transformResponseOut(response);
+    expect(await out.text()).toBe(text);
+    expect(success).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies an unlabeled terminal error without recording success", async () => {
+    const success = vi.fn(async () => {});
+    const service = stubService({ noteRequestSuccess: success });
+    const bytes = new TextEncoder().encode(sse([{ type: "error", error: { type: "usage_limit_reached", resets_in_seconds: 60 } }]));
+    const out = await new CodexTransformer({ service }).transformResponseOut(new Response(bytes));
+    await expect(out.text()).rejects.toMatchObject({ code: "codex_usage_limit" });
+    expect(success).not.toHaveBeenCalled();
+    expect(service.errors.at(-1)).toMatchObject({ code: "codex_usage_limit" });
+  });
+
+  it.each([undefined, "application/json"])("does not treat a JSON error as success (%s)", async (contentType) => {
+    const success = vi.fn(async () => {});
+    const raw = new TextEncoder().encode(JSON.stringify({ error: { message: "rejected" } }));
+    const headers = contentType ? { "content-type": contentType } : undefined;
+    const out = await new CodexTransformer({ service: stubService({ noteRequestSuccess: success }) }).transformResponseOut(new Response(raw, { headers }));
+    expect(await out.text()).toBe(new TextDecoder().decode(raw));
+    expect(success).not.toHaveBeenCalled();
+  });
+});
+
 describe("CodexTransformer — success bookkeeping", () => {
   it("notes request success exactly once when the stream commits real output", async () => {
     let successes = 0;

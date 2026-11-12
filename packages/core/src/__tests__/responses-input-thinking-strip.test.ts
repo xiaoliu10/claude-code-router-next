@@ -35,7 +35,7 @@ describe("OpenAIResponsesTransformer — request input sanitation", () => {
     expect(assistant.content).toEqual([{ type: "output_text", text: "4" }]);
   });
 
-  it("keeps assistant turns whose content was only a thinking block (content dropped, item kept)", async () => {
+  it("omits thinking-only assistant turns after content normalization", async () => {
     const t = new OpenAIResponsesTransformer();
     const request: any = {
       messages: [
@@ -49,10 +49,20 @@ describe("OpenAIResponsesTransformer — request input sanitation", () => {
       ],
     };
     const result: any = await t.transformRequestIn(request, {} as any);
-    const assistant = result.input[1];
-    expect(assistant.thinking).toBeUndefined();
-    // normalizeRequestContent filtered the thinking block: content is gone.
-    expect(assistant.content).toBeUndefined();
+    expect(result.input).toHaveLength(2);
+    expect(result.input.map((item: any) => item.role)).toEqual(["user", "user"]);
+  });
+
+  it("preserves tool-only history while omitting unsupported thinking", async () => {
+    const t = new OpenAIResponsesTransformer();
+    const result: any = await t.transformRequestIn({ messages: [
+      { role: "assistant", thinking: { content: "plan" }, content: [{ type: "thinking", thinking: "plan" }], tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "done" },
+    ] } as any);
+    expect(result.input).toEqual([
+      { type: "function_call", name: "lookup", arguments: "{}", call_id: "call_1" },
+      { type: "function_call_output", call_id: "call_1", output: "done" },
+    ]);
   });
 
   it("does not strip thinking-shaped fields inside item content (input_text items are untouched)", async () => {

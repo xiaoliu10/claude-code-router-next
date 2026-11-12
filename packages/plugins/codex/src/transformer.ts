@@ -262,12 +262,14 @@ export class CodexTransformer implements PluginTransformer {
   async transformResponseOut(response: Response, context?: PluginTransformerContext): Promise<Response> {
     this.observeHeaderRateLimits(response);
     const contentType = response.headers.get("content-type") ?? "";
-    if (!contentType.includes("text/event-stream") || !response.body) {
-      // Non-stream body: a Responses JSON error envelope (HTTP 200) is handled
-      // by the core's hidden-error path against the runtime classifier; here we
-      // only make sure a `{"error":{…}}` 200 does not slip through as content.
+    if (!response.body || contentType.toLowerCase().includes("application/json")) {
+      // Explicit JSON error envelopes remain owned by the core classifier.
       return response;
     }
+    // The fixed Codex upstream can return SSE without Content-Type. The
+    // bounded scanner recognizes actual SSE events and replays every byte,
+    // so unlabeled replies still update success/error/quota bookkeeping;
+    // non-SSE bodies pass through without recording success.
     return this.inspectStream(response, context);
   }
 
@@ -313,14 +315,13 @@ export class CodexTransformer implements PluginTransformer {
    * After the prefix, bytes pass through untouched, including [DONE] and
    * comments; a client cancel propagates to the upstream reader.
    */
-  private inspectStream(response: Response, context?: PluginTransformerContext): Response {
+  private inspectStream(response: Response, _context?: PluginTransformerContext): Response {
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
     const chunks: Uint8Array[] = [];
     let pending = "";
     let scanned = 0;
     let committed = false;
-    let finished = false;
     let rateLimitsSeen = false;
     // Set when the upstream emitted any real output. A terminal event without it
     // is an empty turn, not a successful one.

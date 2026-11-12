@@ -271,6 +271,9 @@ export class OpenAIResponsesTransformer implements Transformer {
       // input[N].thinking" — so strip it here; the reasoning content itself
       // was already dropped from the content array by normalizeRequestContent.
       const { thinking: _strippedThinking, ...responsesItem } = message as any;
+      // A thinking-only assistant turn has no Responses message content.
+      // Tool calls were emitted above and must survive this omission.
+      if (message.role === "assistant" && responsesItem.content === undefined) return;
       input.push(responsesItem);
     });
 
