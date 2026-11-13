@@ -77,7 +77,9 @@
 - 端点恒为 `{base}/v1internal:streamGenerateContent?alt=sse`（即使非流式请求也流式打再聚合）。
 - 请求体 = Gemini 原生体（`contents/systemInstruction/tools/generationConfig`）包 `{model, project, request}` 信封；发送前账号侧补：Gemini 系 `user_prompt_id`（随机 12 字节）+ 实验旗标改写模型 id；Antigravity 系 `userAgent:"antigravity"` + `requestType:"agent"` + `requestId:"agent-<rand>"` + `request.sessionId`（首条 user 文本 SHA256 前 8 字节经 63-bit mask，会话内稳定）。
 - 响应 SSE data 行 = `{response: <Gemini chunk>}` 或 `{error:{message}}`（**流式错误无 HTTP status，只能按消息文本分类**）。
-- 怪癖集（magpie 已踩平，逐条有测试）：functionCall 必带 `thoughtSignature`（Gemini 3 的用真值，其余可填哨兵 `"skip_thought_signature_validator"`）；functionResponse 与 functionCall 数量必须配平（未答补合成结果）；历史不得以 model turn 开头/结尾；Antigravity 上 Claude 系 `maxOutputTokens` 必填；`default_api:` 工具名命名空间。
+- 怪癖集（magpie 已踩平，逐条有测试）：functionCall 所在 part 必带可 base64 解码的 `thoughtSignature`；保留原生真值，所有模型（含 Gemini 3+）对缺失、不可解码值或已知外部标记（`ccr_`/`rs_` 前缀、GLM 的 24 位十六进制签名）的 functionCall 补兼容哨兵 `"skip_thought_signature_validator"`、其他 part 移除这些不可用签名，用于跨模型工具历史（2026-11-13 对 Argon/Hydrogen 实测：全缺签名、真值+哨兵混合、哨兵替换伪造值均可接受）；functionResponse 与 functionCall 数量必须配平（未答补合成结果）；历史不得以 model turn 开头/结尾；Antigravity 上 Claude 系 `maxOutputTokens` 必填；`default_api:` 工具名命名空间。
+
+客户端提供 schema 的 `web_search` 仍是客户端 function declaration，不得仅按名称改成 Google `googleSearch`；无 schema 的搜索标记保留原内置搜索语义。真实失败会话同时包含客户端搜索与其他工具，错误转换会触发上游 Built-in tools / Function calling 组合限制。
 
 ### 3.4 指纹
 

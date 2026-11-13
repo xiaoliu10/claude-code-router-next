@@ -34,7 +34,7 @@ import { GeminiOauthCredentialStore, type GeminiOauthAuthService } from "../src/
 import { getGeminiOauthAuthService } from "../src/protocol";
 import { GeminiOauthTransformer } from "../src/transformer";
 import {
-  GEMINI_OAUTH_API_KEY, GEMINI_OAUTH_DATA_PLANE, GEMINI_OAUTH_SSE_PATH,
+  GEMINI_OAUTH_API_KEY, GEMINI_OAUTH_DATA_PLANE, GEMINI_OAUTH_SSE_PATH, SKIP_THOUGHT_SIGNATURE,
   clearGeminiOauthTokenCaches, lockGeminiOauthProvider,
 } from "../src/protocol";
 
@@ -57,6 +57,14 @@ const credential = () => ({ version: 2 as const, kind: "antigravity" as const, a
   importedAt: "2026-01-01T00:00:00.000Z", lastError: null, cooldownUntil: null,
 } });
 const noopLog = { info: () => {}, warn: () => {}, error: () => {} };
+/** Google transports thought_signature as TYPE_BYTES: mirror its decode rule. */
+const isTransportableSignature = (value: any) => {
+  if (typeof value !== "string" || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(value)) return false;
+  const unpadded = value.replace(/=+$/, "");
+  const remainder = unpadded.length % 4;
+  const padding = value.length - unpadded.length;
+  return remainder !== 1 && (padding === 0 || padding === (4 - remainder) % 4);
+};
 
 beforeEach(() => {
   vi.stubEnv("GEMINI_OAUTH_CLIENT_ID", "dummy-client-id"); vi.stubEnv("GEMINI_OAUTH_CLIENT_SECRET", "dummy-client-secret");
@@ -146,6 +154,125 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     expect(f.fetch).toHaveBeenCalledTimes(1); expect(f.requests[0].url).toBe(ordinary.api_base_url);
     expect(f.requests[0].headers.get("authorization")).toBe("Bearer ordinary-key");
     expect(service.token).not.toHaveBeenCalled(); expect(service.note).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("accepts unsigned Anthropic tool history on Gemini 4 (stream=%s)", async (stream) => {
+    const model = "gemini-4-argon";
+    const h = await build({ Providers: [provider([model])], Router: {} });
+    stubDataService(h);
+    const requests: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: any) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      const calls = body.request.contents.flatMap((turn: any) => turn.parts).filter((part: any) => part.functionCall);
+      return calls.length > 0 && calls.every((part: any) => isTransportableSignature(part.thoughtSignature))
+        ? healthy()
+        : json({ error: { message: "Function call is missing a thought_signature", status: "INVALID_ARGUMENT" } }, 400);
+    }));
+    const response = await h.server.app.inject({ method: "POST", url: "/v1/messages", payload: {
+      model: `gemini-oauth,${model}`, stream, max_tokens: 64,
+      tools: [{ name: "get_value", description: "Get a value.", input_schema: { type: "object", properties: {} } }],
+      messages: [
+        { role: "user", content: "Get a value." },
+        { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "get_value", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "OK" }] },
+      ],
+    } });
+    h.noTokens(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("healthy");
+    expect(requests).toHaveLength(1);
+    const calls = requests[0].request.contents.flatMap((turn: any) => turn.parts).filter((part: any) => part.functionCall);
+    expect(calls).toEqual([expect.objectContaining({
+      functionCall: expect.objectContaining({ id: "c1", name: "get_value" }),
+      thoughtSignature: SKIP_THOUGHT_SIGNATURE,
+    })]);
+  });
+  it.each([
+    [false, "ccr_1794539565734"], [true, "ccr_1794539565734"],
+    [false, "abcd="], [true, "abcd="],
+  ])("repairs invalid thinking signatures replayed on Gemini 4 (stream=%s, signature=%s)", async (stream, signature) => {
+    const model = "gemini-4-argon";
+    const h = await build({ Providers: [provider([model])], Router: {} });
+    stubDataService(h);
+    const requests: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: any) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      const parts = body.request.contents.flatMap((turn: any) => turn.parts);
+      const poisoned = parts.some((part: any) => part.thoughtSignature !== undefined && !isTransportableSignature(part.thoughtSignature));
+      const calls = parts.filter((part: any) => part.functionCall);
+      return !poisoned && calls.every((part: any) => isTransportableSignature(part.thoughtSignature))
+        ? healthy()
+        : json({ error: { message: "Invalid value at 'request.contents[1].parts[0].thought_signature' (TYPE_BYTES), Base64 decoding failed", status: "INVALID_ARGUMENT" } }, 400);
+    }));
+    const response = await h.server.app.inject({ method: "POST", url: "/v1/messages", payload: {
+      model: `gemini-oauth,${model}`, stream, max_tokens: 64,
+      tools: [{ name: "get_value", description: "Get a value.", input_schema: { type: "object", properties: {} } }],
+      messages: [
+        { role: "user", content: "Get a value." },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "recalling", signature },
+          { type: "text", text: "calling the tool" },
+          { type: "tool_use", id: "c1", name: "get_value", input: {} },
+        ] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "OK" }] },
+      ],
+    } });
+    h.noTokens(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("healthy");
+    expect(requests).toHaveLength(1);
+    const parts = requests[0].request.contents.flatMap((turn: any) => turn.parts);
+    const call = parts.find((part: any) => part.functionCall);
+    expect(call.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+    expect(parts.find((part: any) => part.text === "calling the tool")).not.toHaveProperty("thoughtSignature");
+    expect(parts.some((part: any) => part.thoughtSignature !== undefined && !isTransportableSignature(part.thoughtSignature))).toBe(false);
+  });
+  it.each([false, true])("routes client web_search with GLM tool history without built-in search or foreign signatures (stream=%s)", async (stream) => {
+    const model = "gemini-4-argon";
+    const h = await build({ Providers: [provider([model])], Router: {} });
+    stubDataService(h);
+    const sent: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: any) => {
+      const body = JSON.parse(init.body);
+      sent.push(body);
+      if (body.request.tools.some((tool: any) => tool.googleSearch)) {
+        return json({ error: { message: "Please enable tool_config.include_server_side_tool_invocations to use Built-in tools with Function calling." } }, 400);
+      }
+      const parts = body.request.contents.flatMap((turn: any) => turn.parts);
+      if (parts.some((part: any) => part.thoughtSignature === "a".repeat(24))) {
+        return json({ error: { message: "Corrupted thought signature." } }, 400);
+      }
+      return healthy();
+    }));
+    const schema = { type: "object", properties: { query: { type: "string" } }, required: ["query"] };
+    const response = await h.server.app.inject({ method: "POST", url: "/v1/messages", payload: {
+      model: "gemini-oauth," + model, stream, max_tokens: 64,
+      tools: [
+        { name: "web_search", description: "Search using the client.", input_schema: schema },
+        { name: "read", input_schema: { type: "object", properties: {} } },
+      ],
+      messages: [
+        { role: "user", content: "Search the documentation." },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "Searching", signature: "a".repeat(24) },
+          { type: "text", text: "Look up the docs." },
+          { type: "tool_use", id: "search-1", name: "web_search", input: { query: "documentation" } },
+        ] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "search-1", content: "Found docs." }] },
+      ],
+    } });
+    h.noTokens(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("healthy");
+    expect(sent).toHaveLength(1);
+    expect(sent[0].request.tools).toEqual([{ functionDeclarations: [
+      { name: "web_search", description: "Search using the client.", parameters: schema },
+      { name: "read", description: "", parameters: { type: "object", properties: {} } },
+    ] }]);
+    const parts = sent[0].request.contents.flatMap((turn: any) => turn.parts);
+    expect(parts.find((part: any) => part.functionCall)?.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+    expect(parts.find((part: any) => part.text === "Look up the docs.")).not.toHaveProperty("thoughtSignature");
   });
   it("401 → 200 forces one refresh and makes exactly two fixed-origin requests", async () => {
     const h = await build(); const service = stubDataService(h);
