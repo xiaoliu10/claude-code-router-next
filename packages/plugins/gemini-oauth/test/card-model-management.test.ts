@@ -134,7 +134,9 @@ describe("Gemini card model chips", () => {
     expect(h.host.byLabel(t(en, "hide_model", { model: "gemini-3-pro" }))).toBeTruthy();
     // A hidden section renders only when something is hidden.
     expect(text).not.toContain(t(en, "hidden_models", { count: 1 }));
-    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status"]);
+    // Mount reads are read-only: status plus the single quota snapshot fetch.
+    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status", "/quota"]);
+    for (const [, init] of h.callApi.mock.calls) expect((init as any)?.method ?? "GET").toBe("GET");
   });
 
   it("hide posts only the model, reconciles the managed provider and reports the settled toast", async () => {
@@ -153,7 +155,7 @@ describe("Gemini card model chips", () => {
     h.host.clickLabel(t(en, "hide_model", { model: "gemini-3-flash" })); await tick();
     const hideCall = h.callApi.mock.calls.find(([path]) => path === "/models/hide");
     expect(hideCall?.[1]?.body).toBe(JSON.stringify({ model: "gemini-3-flash" }));
-    expect(h.paths()).toEqual(["/status", "/models/hide", "/status"]);
+    expect(h.paths()).toEqual(["/status", "/quota", "/models/hide", "/status"]);
     expect(h.refreshConfig).toHaveBeenCalledTimes(1);
     expect(h.release).toHaveBeenCalledTimes(1);
     expect(h.props.onBusy.mock.calls.map(([busy]: [boolean]) => busy)).toEqual([true, false]);
@@ -286,7 +288,7 @@ describe("Gemini card model chips", () => {
     await tick();
     expect(onHostChangeHarness.host.byLabel(t(en, "hide_model", { model: "gemini-3-flash" })).disabled).toBe(true);
     expect(onHostChangeHarness.host.button(t(en, "restore_all")).disabled).toBe(true);
-    expect(onHostChangeHarness.paths()).toEqual(["/status"]);
+    expect(onHostChangeHarness.paths()).toEqual(["/status", "/quota"]);
     expect(h.paths().length).toBe(readsBefore);
   });
 
@@ -308,7 +310,7 @@ describe("Gemini card model chips", () => {
     await tick();
     h.props.acquireManagement = () => null; // another save holds the lease
     h.host.clickLabel(t(en, "hide_model", { model: "gemini-3-flash" })); await tick();
-    expect(h.paths()).toEqual(["/status"]);
+    expect(h.paths()).toEqual(["/status", "/quota"]);
     expect(h.host.text()).toContain(en.errors.config_busy);
   });
 

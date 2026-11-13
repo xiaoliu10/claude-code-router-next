@@ -91,9 +91,13 @@ function harness(overrides: Record<string, (init?: any) => any> = {}, disabled =
 }
 const en = geminiOauthLocales.en.geminiOauth as any;
 describe("self-contained Gemini plugin card", () => {
-  it("mount performs only a status read; checkbox acknowledgement gates the ONLY login action", async () => {
+  it("mount performs only the two read-only reads (status + quota); checkbox acknowledgement gates the ONLY login action", async () => {
     const h = harness(); await tick();
-    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status"]);
+    expect(h.callApi.mock.calls.map(([path]) => path)).toEqual(["/status", "/quota"]);
+    // Both mount reads are GETs: no login, sync, disconnect or other mutation.
+    for (const [, init] of h.callApi.mock.calls) expect((init as any)?.method ?? "GET").toBe("GET");
+    // Reads never take the management lease.
+    expect(h.release).toHaveBeenCalledTimes(0);
     expect(h.host.text()).toContain(en.status.connected);
     // Visual contract: the pre-migration look is expressed through host
     // stylesheet classes (glass card, badges, primary/outline button
@@ -111,7 +115,7 @@ describe("self-contained Gemini plugin card", () => {
     expect(h.host.text()).toContain(en.risk);
     expect(h.host.button(en.risk_continue).disabled).toBe(true);
     h.host.click(en.risk_continue); await tick();
-    expect(h.callApi).toHaveBeenCalledTimes(1);
+    expect(h.callApi).toHaveBeenCalledTimes(2); // still just the two read-only mount reads
     const ack = h.host.all().find(n => n.tag === "input")!;
     ack.checked = true; ack.onchange?.();
     h.host.click(en.risk_continue); await tick();
