@@ -899,6 +899,9 @@ export interface CodexStatus {
   hiddenModels: string[];
   coolingUntil?: number;
   lastError?: string | null;
+  /** Stable latch code (e.g. codex_usage_limit) so the card can render a
+   *  translated reason instead of collapsing the sentence to a generic one. */
+  lastErrorCode?: string;
 }
 
 export interface CodexLoginStart {

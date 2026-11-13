@@ -30,6 +30,8 @@ export interface CodexStatusView {
   hiddenModels?: string[];
   coolingUntil?: number;
   lastError?: string | null;
+  /** Stable latch code — the card prefers it for a translated reason. */
+  lastErrorCode?: string;
 }
 
 export type CodexLoginMode = "callback" | "paste";
@@ -138,6 +140,10 @@ export function parseCodexStatus(value: unknown): CodexStatusView | null {
   const coolingUntil = finiteNumber(value.coolingUntil);
   if (coolingUntil !== null) next.coolingUntil = coolingUntil;
   if (typeof value.lastError === "string") next.lastError = value.lastError;
+  if (typeof value.lastErrorCode === "string" && value.lastErrorCode) {
+    const code = sanitizeCodexErrorCode(value.lastErrorCode);
+    if (code) next.lastErrorCode = code;
+  }
   return next;
 }
 
