@@ -408,6 +408,10 @@ describe("Gemini OAuth read-only GET /quota route", () => {
 
   it("an older service without getQuota degrades to a quiet null instead of failing", async () => {
     const h = await build();
+    // Stage the legacy shape explicitly: the service now implements getQuota,
+    // so an older host must be simulated, not assumed. Assignment (not delete)
+    // also shadows a prototype method.
+    (h.service as any).getQuota = undefined;
     expect(typeof (h.service as any).getQuota).toBe("undefined");
     const response = await quotaGet(h);
     expect(response.statusCode).toBe(200);

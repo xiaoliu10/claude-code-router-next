@@ -318,8 +318,15 @@ describe("Gemini OAuth error bookkeeping and disconnect", () => {
     const h = await harness(); await h.store.save(credential());
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    // Hold the refresh in flight so the disconnect lands mid-call.
+    // Signal the moment the flight reaches the network seam: getAccessToken()
+    // captures its epoch synchronously just before the refresh (and its fetch)
+    // starts, so this barrier makes "epoch captured before disconnect"
+    // deterministic — a fixed setTimeout raced under parallel-suite load and
+    // let the flight capture the NEW epoch after the disconnect.
+    let enteredFetch: (() => void) | undefined;
+    const fetchEntered = new Promise<void>((resolve) => { enteredFetch = resolve; });
     h.options.fetch = (async () => {
+      enteredFetch!();
       await gate;
       return new Response(JSON.stringify({ error: "invalid_grant" }), {
         status: 400, headers: { "content-type": "application/json" },
@@ -328,7 +335,7 @@ describe("Gemini OAuth error bookkeeping and disconnect", () => {
     const service = new GeminiOauthAuthService(h.options);
 
     const flight = service.getAccessToken().catch((error) => error);
-    await new Promise((resolve) => setTimeout(resolve, 5)); // let the call reach the network seam
+    await fetchEntered;
     await service.disconnect();
     await h.store.save(credential()); // a fresh account is authorized meanwhile
     release!();
