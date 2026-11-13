@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2431] - 2026-11-13
+
+### Fixed
+
+- **Kiro content-filter refusals no longer trigger account-wide cooldown or block quota reads** (`@wengine-ai/ccr-provider-kiro` 0.1.2): upstream `metadataEvent` refusals (`stopReason: "CONTENT_FILTERED"` / `stopDetails.refusal`) with no assistant text previously fell through to `kiro_stream_truncated` (502), which parked the entire account in a 5-minute cooldown and blocked `POST /api/kiro/usage` with `429 kiro_account_cooling`. Refusals are now classified as `kiro_content_filtered` (HTTP 422, `nonRetryable: true`), account cooldowns are restricted to account-level conditions (`kiro_rate_limited`, `kiro_reauth_required`, or explicit `cooldownMs`), read-only management lanes (`getUsage` / `syncModels`) remain usable during a 429 cooldown (including token refresh), and expired `ACTIVE` bonus windows are excluded.
+- **Kiro quota surfaced on the main Providers view** (`@wengine-ai/ccr-provider-kiro` 0.1.2): implemented `fetchQuota` on the Kiro managed runtime via `kiroUsageToQuotaFigures()`, reporting active credit pools into `/api/providers/quota`.
+- **Plugin upgrade loop and stale-dist package guard**: fixed why clicking "Upgrade" on Kiro kept reappearing after restart (`@wengine-ai/ccr-provider-kiro@0.1.1` shipped a stale `dist/plugin.json` declaring `0.1.0`). Catalog `updateAvailable` now uses `semver` (`gt(valid(published), valid(installed))`) so newer local builds never prompt a downgrade, archive installation rejects payloads whose `package.json` version mismatches `plugin.json`, and Kiro's build enforces version alignment before writing artifacts with `"prepack": "npm run build"`.
+- **`@wengine-ai/ccr-provider-kiro` 0.1.2**: ships the Kiro refusal, cooldown isolation, `fetchQuota`, and clean-dist fixes above (replacing the stale `0.1.1` tarball).
+
+## [2.3.2431] - 2026-11-13（中文）
+
+### 修复
+
+- **Kiro 内容过滤拒答不再触发全账号冷却或阻塞额度查询**（`@wengine-ai/ccr-provider-kiro` 0.1.2）：上游返回不带助手文本的 `metadataEvent` 拒答（`stopReason: "CONTENT_FILTERED"` / `stopDetails.refusal`）此前会落入 `kiro_stream_truncated`（502），导致整个账号被冷却 5 分钟并使 `POST /api/kiro/usage` 返回 `429 kiro_account_cooling`。现将空拒答流正确分类为 `kiro_content_filtered`（HTTP 422，`nonRetryable: true`），账号冷却仅限账号级状态（`kiro_rate_limited`、`kiro_reauth_required` 或显式 `cooldownMs`），只读管理通道（`getUsage` / `syncModels`）在 429 冷却期内仍可正常使用（含 token 刷新），并过滤已过期的 `ACTIVE` 赠送额度窗口。
+- **Kiro 额度接入主供应商列表**（`@wengine-ai/ccr-provider-kiro` 0.1.2）：为 Kiro 受管运行时实现 `fetchQuota` 与 `kiroUsageToQuotaFigures()`，将有效 credits 窗口上报至 `/api/providers/quota`。
+- **彻底解决插件「升级死循环」与陈旧产物防护**：定位并修复点击 Kiro「升级」重启后仍提示升级的问题（npm 上 `@wengine-ai/ccr-provider-kiro@0.1.1` 的压缩包内含陈旧的 `0.1.0` 清单）。目录页 `updateAvailable` 改用 `semver`（`gt(valid(published), valid(installed))`）避免本地较新版本被误提示降级；安装包校验在 `package.json` 与 `plugin.json` 版本不一致时直接拒绝覆盖；Kiro 构建脚本将版本一致校验前置到写出产物前并新增 `"prepack": "npm run build"`。
+- **`@wengine-ai/ccr-provider-kiro` 0.1.2**：随包发布上述 Kiro 拒答隔离、额度接入与干净构建修复（替代陈旧的 `0.1.1` 包）。
+
 ## [2.3.2430] - 2026-11-13
 
 ### Fixed
