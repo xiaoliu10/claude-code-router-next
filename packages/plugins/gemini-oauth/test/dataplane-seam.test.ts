@@ -58,8 +58,13 @@ const credential = () => ({ version: 2 as const, kind: "antigravity" as const, a
 } });
 const noopLog = { info: () => {}, warn: () => {}, error: () => {} };
 /** Google transports thought_signature as TYPE_BYTES: mirror its decode rule. */
-const isTransportableSignature = (value: any) =>
-  typeof value === "string" && /^[A-Za-z0-9+/_-]+={0,2}$/.test(value) && value.replace(/=+$/, "").length % 4 !== 1;
+const isTransportableSignature = (value: any) => {
+  if (typeof value !== "string" || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(value)) return false;
+  const unpadded = value.replace(/=+$/, "");
+  const remainder = unpadded.length % 4;
+  const padding = value.length - unpadded.length;
+  return remainder !== 1 && (padding === 0 || padding === (4 - remainder) % 4);
+};
 
 beforeEach(() => {
   vi.stubEnv("GEMINI_OAUTH_CLIENT_ID", "dummy-client-id"); vi.stubEnv("GEMINI_OAUTH_CLIENT_SECRET", "dummy-client-secret");
@@ -182,7 +187,10 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
       thoughtSignature: SKIP_THOUGHT_SIGNATURE,
     })]);
   });
-  it.each([false, true])("repairs fabricated thinking signatures replayed on Gemini 4 (stream=%s)", async (stream) => {
+  it.each([
+    [false, "ccr_1794539565734"], [true, "ccr_1794539565734"],
+    [false, "abcd="], [true, "abcd="],
+  ])("repairs invalid thinking signatures replayed on Gemini 4 (stream=%s, signature=%s)", async (stream, signature) => {
     const model = "gemini-4-argon";
     const h = await build({ Providers: [provider([model])], Router: {} });
     stubDataService(h);
@@ -203,7 +211,7 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
       messages: [
         { role: "user", content: "Get a value." },
         { role: "assistant", content: [
-          { type: "thinking", thinking: "recalling", signature: "ccr_1794539565734" },
+          { type: "thinking", thinking: "recalling", signature },
           { type: "text", text: "calling the tool" },
           { type: "tool_use", id: "c1", name: "get_value", input: {} },
         ] },
@@ -217,6 +225,7 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     const parts = requests[0].request.contents.flatMap((turn: any) => turn.parts);
     const call = parts.find((part: any) => part.functionCall);
     expect(call.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+    expect(parts.find((part: any) => part.text === "calling the tool")).not.toHaveProperty("thoughtSignature");
     expect(parts.some((part: any) => part.thoughtSignature !== undefined && !isTransportableSignature(part.thoughtSignature))).toBe(false);
   });
   it.each([false, true])("routes client web_search with GLM tool history without built-in search or foreign signatures (stream=%s)", async (stream) => {
