@@ -48,8 +48,10 @@ import {
   normalizeChunkToolNames,
   unwrapCodeAssistFrame,
   isStickyGeminiOauthError,
+  geminiOauthPoolCoolingError,
   type GeminiOauthAuthServiceLike,
   type GeminiOauthErrorInfo,
+  type GeminiOauthRequestIdentity,
 } from "./protocol";
 import type { PluginTransformer, PluginTransformerContext, PluginUnifiedChatRequest } from "./core-types";
 
@@ -173,6 +175,17 @@ function responseWithHeader(response: Response, body: BodyInit, name: string, va
   return new Response(body, { status: response.status, statusText: response.statusText, headers });
 }
 
+interface GeminiResponseContext {
+  model: string;
+  identity?: GeminiOauthRequestIdentity;
+  systemText: string;
+}
+
+function hasRealOutput(chunk: any): boolean {
+  const parts = chunk?.candidates?.[0]?.content?.parts;
+  return Array.isArray(parts) && parts.some((part: any) => (part?.text && part?.thought !== true) || part?.functionCall);
+}
+
 export class GeminiOauthTransformer implements PluginTransformer {
   static TransformerName = "gemini-oauth";
   name = "gemini-oauth";
@@ -192,10 +205,10 @@ export class GeminiOauthTransformer implements PluginTransformer {
     return injected;
   }
 
-  private noteUpstreamError(info: GeminiOauthErrorInfo): void {
+  private noteUpstreamError(info: GeminiOauthErrorInfo, request?: GeminiResponseContext): void {
     try {
       const service = this.options?.authService ?? this.options?.getAuthService?.() ?? getGeminiOauthAuthService();
-      void service?.noteUpstreamError?.(info);
+      void Promise.resolve(service?.noteUpstreamError?.(info, request?.model, request?.identity)).catch(() => {});
     } catch {
       // Never let bookkeeping break the response path.
     }
@@ -207,23 +220,23 @@ export class GeminiOauthTransformer implements PluginTransformer {
    * marker while requests succeed. Fire-and-forget; bookkeeping never blocks
    * or breaks the response path.
    */
-  private noteRequestSuccess(): void {
+  private noteRequestSuccess(request?: GeminiResponseContext): void {
     try {
       const service = this.options?.authService ?? this.options?.getAuthService?.() ?? getGeminiOauthAuthService();
-      void service?.noteRequestSuccess?.();
+      void Promise.resolve(service?.noteRequestSuccess?.(request?.model, request?.identity)).catch(() => {});
     } catch {
       // Never let bookkeeping break the response path.
     }
   }
 
   /** Stream error frames carry no HTTP status — classify by message text. */
-  private classifyFrame(message: string): GeminiOauthErrorInfo {
-    return classifyGeminiOauthError({ message });
+  private classifyFrame(message: string, request?: GeminiResponseContext, body?: unknown): GeminiOauthErrorInfo {
+    return classifyGeminiOauthError({ message, body, systemText: request?.systemText });
   }
 
-  private classifiedFrameError(message: string): Error {
-    const info = this.classifyFrame(message);
-    this.noteUpstreamError(info);
+  private classifiedFrameError(message: string, request?: GeminiResponseContext, body?: unknown): Error {
+    const info = this.classifyFrame(message, request, body);
+    this.noteUpstreamError(info, request);
     return geminiOauthError(info);
   }
 
@@ -235,7 +248,8 @@ export class GeminiOauthTransformer implements PluginTransformer {
     const service = this.resolveAuthService();
     // Check before refreshing credentials: the route's later send guard alone
     // cannot stop a token-endpoint request initiated by this transformer.
-    if (await service.isAccountCooling?.()) {
+    const identity = await service.captureRequestIdentity?.();
+    if (await service.isAccountCooling?.(request.model)) {
       // A cooling account is parked for one of several reasons, and they demand
       // different user action: quota/validation clears on its own, an expired
       // login never does. Say which one instead of a blanket "try later",
@@ -251,6 +265,12 @@ export class GeminiOauthTransformer implements PluginTransformer {
         retryable: false,
       });
     }
+    const status = await service.getStatus?.().catch(() => null);
+    if (isStickyGeminiOauthError(status?.lastError?.code)) {
+      throw geminiOauthError({ code: "gemini_oauth_reauth_required", message: "Gemini OAuth 登录态已失效，请重新授权登录。", httpStatus: 401, retryable: false });
+    }
+    const lock = await service.getPoolCooldown?.(request.model);
+    if (lock) throw geminiOauthPoolCoolingError(lock);
     // The shared API-key Gemini builder flattens system messages into user
     // turns. Antigravity needs the original system instruction structurally
     // separate, both for its semantics and the system-only identity classifier.
@@ -268,7 +288,11 @@ export class GeminiOauthTransformer implements PluginTransformer {
       messages: request.messages.filter((message) => message.role !== "system"),
     });
     if (systemText) geminiBody.systemInstruction = { parts: [{ text: systemText }] };
+    if (context) context.geminiOauthRequest = { model: request.model, identity, systemText } satisfies GeminiResponseContext;
     const [token, project] = await Promise.all([service.getAccessToken(), service.getProject()]);
+    if (identity && service.isRequestIdentityCurrent && !(await service.isRequestIdentityCurrent(identity))) {
+      throw geminiOauthError({ code: "gemini_oauth_reauth_required", message: "Gemini OAuth account changed during the request.", httpStatus: 401, retryable: false });
+    }
 
     applyAntigravityQuirks(geminiBody, request.model, (request as any)?.max_tokens);
     // The provider's model list holds collapsed family ids (gemini-3.7-flash);
@@ -309,13 +333,15 @@ export class GeminiOauthTransformer implements PluginTransformer {
 
   async transformResponseOut(response: Response, context?: PluginTransformerContext): Promise<Response> {
     const contentType = response.headers.get("Content-Type") ?? "";
+    const request: GeminiResponseContext | undefined = context?.geminiOauthRequest;
 
     // A 200 JSON body from Code Assist is a hidden error (or a stray envelope).
     if (contentType.includes("application/json") && response.body) {
       const text = await response.text();
       let json: any = null;
       try { json = text ? JSON.parse(text) : null; } catch { json = null; }
-      if (json?.error) throw this.classifiedFrameError(json.error?.message ?? text);
+      if (json?.error) throw this.classifiedFrameError(json.error?.message ?? text, request, json);
+      if (hasRealOutput(json?.response ?? json)) this.noteRequestSuccess(request);
       // Not an error: hand a fresh body back (the original is consumed).
       return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
     }
@@ -347,7 +373,8 @@ export class GeminiOauthTransformer implements PluginTransformer {
         const jsonText = await new Response(replay).text();
         let json: any = null;
         try { json = jsonText ? JSON.parse(jsonText) : null; } catch { json = null; }
-        if (json?.error) throw this.classifiedFrameError(json.error?.message ?? jsonText);
+        if (json?.error) throw this.classifiedFrameError(json.error?.message ?? jsonText, request, json);
+        if (hasRealOutput(json?.response ?? json)) this.noteRequestSuccess(request);
         const headers = new Headers(response.headers);
         headers.set("Content-Type", "application/json");
         return new Response(jsonText, {
@@ -379,31 +406,33 @@ export class GeminiOauthTransformer implements PluginTransformer {
   ): Promise<Response> {
     // The pump is created once; the peek phase and the streaming/aggregate
     // phase share the same reader.
+    const request: GeminiResponseContext | undefined = context?.geminiOauthRequest;
     const pump = createPayloadPump(body);
     let firstPayload = await pump.readPayload();
     if (!firstPayload) {
       throw geminiOauthError(classifyGeminiOauthError({ message: "empty Code Assist stream" }));
     }
     const firstFrame = unwrapCodeAssistFrame(firstPayload);
-    if (firstFrame.error) throw this.classifiedFrameError(firstFrame.error.message);
+    if (firstFrame.error) throw this.classifiedFrameError(firstFrame.error.message, request);
 
     const clientWantsStream = context ? context.geminiOauthClientStream !== false : true;
     if (clientWantsStream) {
-      const unwrapped = this.replayUnwrapped(pump, firstPayload, response);
+      const unwrapped = this.replayUnwrapped(pump, firstPayload, response, request);
       // Only the envelope peeling is new: the plain Gemini SSE stream goes
       // through the EXISTING Gemini conversion chain.
       // Managed credentials/errors must not reach protocol-level debug logging.
       return geminiTransformResponseOut(unwrapped, this.name);
     }
-    const unwrapped = this.replayUnwrapped(pump, firstPayload, response);
-    return this.aggregateCompletion(unwrapped);
+    const unwrapped = this.replayUnwrapped(pump, firstPayload, response, request);
+    return this.aggregateCompletion(unwrapped, request);
   }
 
   /** A fresh SSE response replaying the peeked first frame + the pumped rest. */
   private replayUnwrapped(
     pump: ReturnType<typeof createPayloadPump>,
     firstPayload: string,
-    response: Response
+    response: Response,
+    request?: GeminiResponseContext
   ): Response {
     const self = this;
     const encoder = new TextEncoder();
@@ -420,7 +449,7 @@ export class GeminiOauthTransformer implements PluginTransformer {
       if (!Array.isArray(parts)) return;
       if (parts.some((part: any) => (part?.text && part?.thought !== true) || part?.functionCall)) {
         successNoted = true;
-        self.noteRequestSuccess();
+        self.noteRequestSuccess(request);
       }
     };
     noteSuccessOnce(firstChunk);
@@ -433,8 +462,8 @@ export class GeminiOauthTransformer implements PluginTransformer {
             if (payload === null) break;
             const frame = unwrapCodeAssistFrame(payload);
             if (frame.error) {
-              const info = self.classifyFrame(frame.error.message);
-              self.noteUpstreamError(info);
+              const info = self.classifyFrame(frame.error.message, request);
+              self.noteUpstreamError(info, request);
               controller.error(geminiOauthError(info));
               return;
             }
@@ -465,7 +494,7 @@ export class GeminiOauthTransformer implements PluginTransformer {
    * frame throws classified BEFORE the Response is returned, so fallback
    * engages.
    */
-  private async aggregateCompletion(response: Response): Promise<Response> {
+  private async aggregateCompletion(response: Response, request?: GeminiResponseContext): Promise<Response> {
     const pump = createPayloadPump(response.body!);
     const text: string[] = [];
     const thinking: string[] = [];
@@ -480,7 +509,7 @@ export class GeminiOauthTransformer implements PluginTransformer {
       const payload = await pump.readPayload();
       if (payload === null) break;
       const frame = unwrapCodeAssistFrame(payload);
-      if (frame.error) throw this.classifiedFrameError(frame.error.message);
+      if (frame.error) throw this.classifiedFrameError(frame.error.message, request);
       if (frame.malformed) continue;
       const chunk = normalizeChunkToolNames(frame.response ?? {});
       if (chunk?.responseId) id = chunk.responseId;

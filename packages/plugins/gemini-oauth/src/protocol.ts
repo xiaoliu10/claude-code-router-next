@@ -191,7 +191,8 @@ export type GeminiOauthErrorCode =
   | "gemini_oauth_reauth_required"
   | "gemini_oauth_upstream_error"
   | "gemini_oauth_transient"
-  | "gemini_oauth_account_cooling";
+  | "gemini_oauth_account_cooling"
+  | "gemini_oauth_pool_cooling";
 
 export interface GeminiOauthErrorInfo {
   code: GeminiOauthErrorCode;
@@ -238,6 +239,22 @@ export const GEMINI_OAUTH_REAUTH_COOLDOWN_MS = 60 * 60 * 1000; // 60min
  * visible after its cooldown lapses. The cooldown exists purely to bound the
  * recovery probe's network spend, NOT to mean "the problem went away".
  */
+/** A breaker decision, not upstream evidence: never persisted as a lock. */
+export function isGeminiOauthBreakerCode(code: string | null | undefined): boolean {
+  return code === "gemini_oauth_account_cooling" || code === "gemini_oauth_pool_cooling";
+}
+
+/** Build the client-facing error for an independent-pool cooldown gate. */
+export function geminiOauthPoolCoolingError(lock: { pool: string; until: number }, now = Date.now()): Error {
+  return geminiOauthError({
+    code: "gemini_oauth_pool_cooling",
+    message: `Gemini OAuth quota pool ${lock.pool} is cooling.`,
+    httpStatus: 429,
+    cooldownMs: Math.max(1, lock.until - now),
+    retryable: false,
+  });
+}
+
 export function isStickyGeminiOauthError(code: string | null | undefined): boolean {
   return code === "gemini_oauth_reauth_required";
 }
@@ -1077,7 +1094,7 @@ export interface GeminiOauthModelQuota {
 
 /** One (pool, window) figure from a retrieveUserQuotaSummary group. */
 export interface GeminiOauthQuotaPool {
-  /** Normalized group display name ("Gemini", "Claude & GPT"). */
+  /** Original upstream summary group identity; never inferred from model buckets. */
   pool: string;
   /** Upstream window label as sent ("5h", "weekly"). */
   window: string;
@@ -1121,8 +1138,9 @@ function normalizeQuotaResetAt(value: unknown): string | undefined {
 }
 
 function finiteFraction(value: unknown): number | undefined {
+  if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return undefined;
   const n = Number(value);
-  return Number.isFinite(n) ? n : undefined;
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : undefined;
 }
 
 /** Parse both endpoint replies into the normalized snapshot (pure). */
@@ -1141,7 +1159,7 @@ function parseGeminiOauthQuota(rawModels: any, rawSummary: any): GeminiOauthQuot
   }
   const pools: GeminiOauthQuotaPool[] = [];
   for (const group of Array.isArray(rawSummary?.groups) ? rawSummary.groups : []) {
-    const pool = geminiQuotaPoolName(group?.displayName);
+    const pool = typeof group?.displayName === "string" ? group.displayName.trim() : "";
     for (const bucket of Array.isArray(group?.buckets) ? group.buckets : []) {
       const window = typeof bucket?.window === "string" ? bucket.window : "";
       const remaining = finiteFraction(bucket?.remainingFraction);
@@ -1867,22 +1885,29 @@ export function isGeminiOauthRuntime(p: any): boolean {
 // module exposed via setGeminiOauthRuntime.
 // ---------------------------------------------------------------------------
 
+/** Opaque account identity captured BEFORE dispatch; never contains credentials. */
+export interface GeminiOauthRequestIdentity { epoch: number; account: string }
+
 export interface GeminiOauthAuthServiceLike {
   /** Live access token (refreshing under the hood). */
   getAccessToken(): Promise<string>;
   /** The account's Code Assist project id. */
   getProject(): Promise<string>;
   /** Record a classified upstream error (cooldown/lastError) when possible. */
-  noteUpstreamError?(info: GeminiOauthErrorInfo): Promise<void> | void;
+  noteUpstreamError?(info: GeminiOauthErrorInfo, model?: string, identity?: GeminiOauthRequestIdentity): Promise<void> | void;
   /** Clear non-sticky failure residue after a completed successful exchange. */
-  noteRequestSuccess?(): Promise<void> | void;
+  noteRequestSuccess?(model?: string, identity?: GeminiOauthRequestIdentity): Promise<void> | void;
+  captureRequestIdentity?(): Promise<GeminiOauthRequestIdentity>;
+  isRequestIdentityCurrent?(identity: GeminiOauthRequestIdentity): Promise<boolean>;
+  getPoolCooldown?(model: string): Promise<{ pool: string; until: number } | null>;
+  getQuota?(): Promise<GeminiOauthQuotaSnapshot | null>;
   /** Map a requested (possibly collapsed family) model id to the concrete
    *  upstream variant id the effort picks. Absent → pass the id through. */
   resolveWireModel?(requested: string, effort?: string): Promise<string>;
   /** Drop the cached access token (the 401 seam's one forced re-send). */
   forceTokenRefresh?(): Promise<void>;
   /** True while the account is parked by a recorded cooldown. */
-  isAccountCooling?(): Promise<boolean>;
+  isAccountCooling?(model?: string): Promise<boolean>;
   /** Account status snapshot (used by the recovery probe to report the parked
    *  window). Optional so older hosts keep working. */
   getStatus?(): Promise<any>;

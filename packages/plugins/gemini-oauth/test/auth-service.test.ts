@@ -265,11 +265,13 @@ describe("Gemini OAuth error bookkeeping and disconnect", () => {
   it("cooling is false initially, true until expiry, and automatically false afterwards", async () => {
     const h = await harness(); await h.store.save(credential());
     expect(await h.service.isAccountCooling()).toBe(false);
-    await h.service.noteUpstreamError(classifyGeminiOauthError({ status: 429 }));
-    expect(await h.service.isAccountCooling()).toBe(true);
-    const until = (await h.store.load())!.account.cooldownUntil!;
+    await h.service.noteUpstreamError(classifyGeminiOauthError({ status: 429 }), "gemini-4-argon-high");
+    expect(await h.service.isAccountCooling()).toBe(false);
+    expect(await h.service.getPoolCooldown("gemini-4-argon-low")).not.toBeNull();
+    const until = (await h.store.load())!.poolLocks!["gemini-4-argon"];
     vi.spyOn(Date, "now").mockReturnValue(until + 1);
     expect(await h.service.isAccountCooling()).toBe(false);
+    expect(await h.service.getPoolCooldown("gemini-4-argon")).toBeNull();
     expect(await h.service.getStatus()).toMatchObject({ lastError: null, cooldownUntil: null });
   });
   it("a 401 parks the account, so the recovery probe stops spending real requests on it", async () => {

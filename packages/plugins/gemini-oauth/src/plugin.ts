@@ -27,18 +27,18 @@ import {
   GEMINI_OAUTH_DATA_PLANE,
   GEMINI_OAUTH_SSE_PATH,
   classifyGeminiOauthError,
-  fetchAvailableModels,
-  fetchGeminiOauthQuota,
   geminiOauthError,
   geminiQuotaToProviderQuota,
   isGeminiOauthRuntime,
   protectGeminiOauthConfig,
   isStickyGeminiOauthError,
+  geminiOauthPoolCoolingError,
   type GeminiOauthAuthServiceLike,
   type GeminiOauthErrorInfo,
-  type GeminiOauthFetch,
+  type GeminiOauthRequestIdentity,
   type GeminiOauthProviderQuota,
 } from "./protocol";
+import { geminiOauthPoolHasQuota } from "./quota-pools";
 import type {
   ManagedRuntime,
   PluginClassifiedError,
@@ -85,17 +85,22 @@ async function activate(ctx: PluginContext): Promise<void> {
 
   const requireService = (): GeminiOauthAuthServiceLike => service;
 
-  // Runtime quota seam. The snapshot is a display-only read behind a 60s TTL
-  // cache: quota polling must not turn into per-request upstream traffic, and
-  // every failure (no login, network, an unparseable reply) degrades to null
-  // without ever throwing — the core's quota surface is advisory.
-  const QUOTA_CACHE_TTL_MS = 60_000;
-  let quotaCache: { expiresAt: number; value: GeminiOauthProviderQuota | null } | null = null;
-  // Same channel as every other fixed-origin management call: the
-  // subscription dispatcher with identity encoding (pinned inside the
-  // protocol fetch wrapper), never the proxy env routing.
-  const quotaFetch: GeminiOauthFetch = (url, init) =>
-    fetch(url, { ...init, dispatcher: upstreamDispatcher() } as RequestInit);
+  // Core preserves this opaque object across both gates and HTTP bookkeeping.
+  // Keeping identities here avoids exposing account details to the host.
+  const requests = new WeakMap<object, GeminiOauthRequestIdentity>();
+  const checkIdentity = async (state?: object): Promise<GeminiOauthRequestIdentity | undefined> => {
+    if (!state) return undefined; // Hosts predating request-local state.
+    const svc = requireService();
+    let identity = requests.get(state);
+    if (!identity) {
+      identity = await svc.captureRequestIdentity?.();
+      if (identity) requests.set(state, identity);
+    }
+    if (identity && svc.isRequestIdentityCurrent && !(await svc.isRequestIdentityCurrent(identity))) {
+      throw geminiOauthError({ code: "gemini_oauth_reauth_required", message: "Gemini OAuth account changed during the request.", httpStatus: 401, retryable: false });
+    }
+    return identity;
+  };
 
   type GeminiOauthManagedRuntime = ManagedRuntime & {
     fetchQuota(): Promise<GeminiOauthProviderQuota | null>;
@@ -104,11 +109,13 @@ async function activate(ctx: PluginContext): Promise<void> {
   const runtime: GeminiOauthManagedRuntime = {
     name: "gemini-oauth",
     isManaged: (provider) => isGeminiOauthRuntime(provider),
+    modelScopedRecovery: true,
     // Circuit breaker BEFORE any network touch — including token refresh
     // (the Gemini lesson: a parked account must not spend a refresh call).
-    ensureUsable: async () => {
+    ensureUsable: async (context) => {
+      await checkIdentity((context as any)?.requestState);
       const svc = requireService();
-      if (await svc.isAccountCooling?.()) {
+      if (await svc.isAccountCooling?.(context?.model)) {
         // This breaker runs BEFORE every real request, so its copy is what the
         // user actually sees. "Cooling" covers very different causes: quota,
         // verification and risk-control all clear on their own, an expired login
@@ -125,6 +132,12 @@ async function activate(ctx: PluginContext): Promise<void> {
           retryable: false,
         });
       }
+      const status = await svc.getStatus?.().catch(() => null);
+      if (isStickyGeminiOauthError(status?.lastError?.code)) {
+        throw geminiOauthError({ code: "gemini_oauth_reauth_required", message: "Gemini OAuth 登录态已失效，请重新授权登录。", httpStatus: 401, retryable: false });
+      }
+      const lock = context?.model ? await svc.getPoolCooldown?.(context.model) : null;
+      if (lock) throw geminiOauthPoolCoolingError(lock);
     },
 
     /**
@@ -133,9 +146,9 @@ async function activate(ctx: PluginContext): Promise<void> {
      * reachability for an account that cannot answer wastes calls and risks a
      * longer cooldown.
      */
-    probeAccountState: async () => {
+    probeAccountState: async (context) => {
       const svc = requireService();
-      if (!(await svc.isAccountCooling?.())) {
+      if (!(await svc.isAccountCooling?.(context?.model))) {
         // Not cooling, but a login-class error is sticky: it survives its
         // cooldown on purpose (waiting cannot fix it, only re-auth can). Without
         // this check the probe treated an expired-token account as available
@@ -145,6 +158,8 @@ async function activate(ctx: PluginContext): Promise<void> {
         if (isStickyGeminiOauthError(code)) {
           return { available: false, reason: "reauth_required" };
         }
+        const lock = context?.model ? await svc.getPoolCooldown?.(context.model) : null;
+        if (lock) return { available: false, reason: "pool_cooling", parkedUntil: lock.until };
         return { available: true };
       }
       let parkedUntil: number | undefined;
@@ -158,32 +173,12 @@ async function activate(ctx: PluginContext): Promise<void> {
       return { available: false, reason: "account_cooling", parkedUntil };
     },
 
-    /**
-     * Level 2: the account state says "usable", but that says nothing about the
-     * network or the upstream. Make a real authenticated call to the model-list
-     * endpoint: it exercises token → upstream → response and is the cheapest such
-     * round trip (no chat quota).
-     *
-     * Deliberately NOT `getAccessToken()`: that returns the CACHED token when warm,
-     * so it would report healthy even with the network completely down — a false
-     * positive that would put a dead account back in the model list.
-     */
-    probeLiveness: async ({ config }) => {
-      const svc = requireService();
-      try {
-        const token = await svc.getAccessToken();
-        const project = await svc.getProject();
-        const models = await fetchAvailableModels(token, project, "");
-        return new Response(JSON.stringify({ ok: true, count: models.length }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      } catch (error: any) {
-        return new Response(JSON.stringify({ error: error?.code ?? "probe_failed" }), {
-          status: 503,
-          headers: { "content-type": "application/json" },
-        });
-      }
+    // Model-list reachability is insufficient: only actual quota headroom for
+    // the queried pool can restore it. This read never sends a chat request.
+    probeLiveness: async ({ model }) => {
+      const snapshot = await requireService().getQuota?.().catch(() => null);
+      const ok = geminiOauthPoolHasQuota(snapshot, model);
+      return new Response(JSON.stringify({ ok }), { status: ok ? 200 : 503, headers: { "content-type": "application/json" } });
     },
     lockUpstream: async (config) => {
       // The upstream is Code Assist, never a config-supplied base_url.
@@ -213,9 +208,9 @@ async function activate(ctx: PluginContext): Promise<void> {
       const info = classifyGeminiOauthError({ status, body: parsed ?? body, systemText });
       return info as PluginClassifiedError;
     },
-    noteUpstreamError: async (info: PluginClassifiedError) => {
+    noteUpstreamError: async (info: PluginClassifiedError, context) => {
       // Bookkeeping (cooldown/lastError) never throws into the response path.
-      await (requireService().noteUpstreamError?.(info as GeminiOauthErrorInfo) ?? Promise.resolve());
+      await (requireService().noteUpstreamError?.(info as GeminiOauthErrorInfo, context?.model, (context as any)?.requestState ? requests.get((context as any).requestState) : undefined) ?? Promise.resolve());
     },
     // One forced refresh + one re-dispatch on 401; the core enforces the
     // exactly-once discipline around this hook.
@@ -225,43 +220,10 @@ async function activate(ctx: PluginContext): Promise<void> {
     // Token hygiene: suppress request/response debug logs for this provider.
     suppressDebugLog: true,
 
-    /**
-     * Subscription quota for the core's quota surface. Reads the account's
-     * live token/project through the auth service and the two data-plane
-     * quota endpoints through the subscription dispatcher, mapped onto the
-     * shared provider-quota contract. 60s in-memory TTL; null on any failure,
-     * never throws (a null result is itself cached so a polling UI cannot
-     * hammer a failing endpoint).
-     */
-    fetchQuota: async (): Promise<GeminiOauthProviderQuota | null> => {
-      const now = Date.now();
-      if (quotaCache && quotaCache.expiresAt > now) return quotaCache.value;
-      let value: GeminiOauthProviderQuota | null = null;
-      try {
-        const svc = requireService();
-        // A parked account or a sticky-dead login must not spend a token
-        // refresh (and the durable credential write its failure bookkeeping
-        // performs) on an advisory quota poll — same predicate the account
-        // probe applies before touching the network.
-        if (await svc.isAccountCooling?.()) {
-          quotaCache = { expiresAt: now + QUOTA_CACHE_TTL_MS, value: null };
-          return null;
-        }
-        const accountStatus: any = await svc.getStatus?.().catch(() => null);
-        if (isStickyGeminiOauthError(accountStatus?.lastError?.code)) {
-          quotaCache = { expiresAt: now + QUOTA_CACHE_TTL_MS, value: null };
-          return null;
-        }
-        const [accessToken, project] = await Promise.all([svc.getAccessToken(), svc.getProject()]);
-        const snapshot = await fetchGeminiOauthQuota({ accessToken, project, fetchImpl: quotaFetch });
-        value = geminiQuotaToProviderQuota(snapshot);
-      } catch {
-        // No login, refresh failure, network or parse trouble: advisory only.
-        value = null;
-      }
-      quotaCache = { expiresAt: now + QUOTA_CACHE_TTL_MS, value };
-      return value;
-    },
+    // Both the legacy provider summary and the detailed admin view share the
+    // service's single-flight cache, dispatcher and account guards.
+    fetchQuota: async (): Promise<GeminiOauthProviderQuota | null> =>
+      geminiQuotaToProviderQuota(await requireService().getQuota?.().catch(() => null)),
   };
 
   ctx.registerTransformer(ActivatedGeminiTransformer as unknown as new () => any);

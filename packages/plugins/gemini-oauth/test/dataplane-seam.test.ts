@@ -128,6 +128,11 @@ function stubDataService(h: Awaited<ReturnType<typeof build>>) {
   const note = vi.spyOn(h.service, "noteUpstreamError").mockResolvedValue();
   return { token, refresh, note };
 }
+// Bookkeeping now carries optional model/identity arguments; assert on the
+// classified info alone so this stays valid before and after the core starts
+// forwarding the model context.
+const noted = (spy: any): any[] => spy.mock.calls.map(([info]: any) => info);
+
 function upstreamSequence(first: () => Response, second: () => Response = healthy) {
   const requests: Array<{ url: string; headers: Headers; body: any; init: any }> = [];
   const fetch = vi.fn(async (url: any, init: any) => {
@@ -163,14 +168,14 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     const fail = () => json({ error: { message: "UNAUTHENTICATED" } }, 401); const f = upstreamSequence(fail, fail);
     const response = await h.send(); expect(response.statusCode).toBe(401); expect(response.body).toContain("gemini_oauth_reauth_required");
     expect(f.fetch).toHaveBeenCalledTimes(2); expect(service.refresh).toHaveBeenCalledTimes(1);
-    expect(service.note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_reauth_required" }));
+    expect(noted(service.note)).toEqual(expect.arrayContaining([expect.objectContaining({ code: "gemini_oauth_reauth_required" })]));
   });
   it("429 + system identity + exact exhaustion text is identity_blocked (6h)", async () => {
     const h = await build(); const { note } = stubDataService(h);
     const fail = () => json({ error: { message: "Resource has been exhausted" } }, 429); const f = upstreamSequence(fail, fail);
     const response = await h.send([{ role: "system", content: MARKER }, { role: "user", content: "hi" }]);
     expect(response.statusCode).toBe(400); expect(response.body).toContain("gemini_oauth_identity_blocked");
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_identity_blocked", cooldownMs: 6 * 60 * 60_000 }));
+    expect(noted(note)).toEqual(expect.arrayContaining([expect.objectContaining({ code: "gemini_oauth_identity_blocked", cooldownMs: 6 * 60 * 60_000 })]));
     expect(f.requests[0].body.request.systemInstruction.parts.some((p: any) => p.text.includes(MARKER))).toBe(true);
     expect(JSON.stringify(f.requests[0].body.request.contents)).not.toContain(MARKER);
   });
@@ -197,7 +202,7 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     const response = await h.send([{ role: "system", content: MARKER }, { role: "user", content: "hi" }]);
     expect(response.statusCode).toBe(429); expect(response.body).toContain("gemini_oauth_quota_exceeded");
     expect(response.body).not.toContain("gemini_oauth_identity_blocked");
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_quota_exceeded", cooldownMs: 15 * 60_000 }));
+    expect(noted(note)).toEqual(expect.arrayContaining([expect.objectContaining({ code: "gemini_oauth_quota_exceeded", cooldownMs: 15 * 60_000 })]));
     expect(note.mock.calls.every(([info]) => info.cooldownMs !== 6 * 60 * 60_000)).toBe(true);
   });
   it("NEGATIVE: marker only in USER text cannot turn genuine quota 429 into a 6h identity cooldown", async () => {
@@ -208,7 +213,7 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     expect(response.body).not.toContain("gemini_oauth_identity_blocked");
     expect(JSON.stringify(f.requests[0].body.request.contents)).toContain(MARKER);
     expect(JSON.stringify(f.requests[0].body.request.systemInstruction ?? {})).not.toContain(MARKER);
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_quota_exceeded", cooldownMs: 15 * 60_000 }));
+    expect(noted(note)).toEqual(expect.arrayContaining([expect.objectContaining({ code: "gemini_oauth_quota_exceeded", cooldownMs: 15 * 60_000 })]));
     expect(note.mock.calls.every(([info]) => info.cooldownMs !== 6 * 60 * 60_000)).toBe(true);
   });
   it.each([
@@ -220,7 +225,7 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
       { reason: "VALIDATION_REQUIRED", metadata: { validation_url: url, access_token: ACCESS } },
     ] } }, 403); upstreamSequence(fail, fail);
     const response = await h.send(); expect(response.statusCode).toBe(403); expect(response.body).toContain("gemini_oauth_validation_required");
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_validation_required", validationUrl: expected, cooldownMs: 30 * 60_000 }));
+    expect(noted(note)).toEqual(expect.arrayContaining([expect.objectContaining({ code: "gemini_oauth_validation_required", validationUrl: expected, cooldownMs: 30 * 60_000 })]));
     expect(response.body).not.toContain("private-one"); expect(response.body).not.toContain("private-two"); expect(response.body).not.toContain("details");
   });
   it("strips client Authorization/x-api-key and marker credentials on EVERY upstream attempt", async () => {
@@ -260,7 +265,9 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     const fail = () => sse({ error: { message: "UNAUTHENTICATED" } }); upstreamSequence(fail, fail);
     const response = await h.send(undefined, { payload: { model: "gemini-oauth,gemini-3-flash", messages: [{ role: "user", content: "hi" }], stream } });
     expect(response.statusCode).not.toBe(200); expect(response.body).toContain("gemini_oauth_reauth_required");
-    expect(note).toHaveBeenCalledWith(expect.objectContaining({ code: "gemini_oauth_reauth_required" }));
+    expect(noted(note)).toEqual(expect.arrayContaining([expect.objectContaining({ code: "gemini_oauth_reauth_required" })]));
+    // The transformer stamps the dispatched model on the request-local context.
+    expect(note.mock.calls[0][1]).toBe("gemini-3-flash");
   });
   it("hidden HTTP-200 JSON errors classify through the plugin seam with bookkeeping", async () => {
     const h = await build(); const { note } = stubDataService(h);

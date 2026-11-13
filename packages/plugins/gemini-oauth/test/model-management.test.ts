@@ -136,9 +136,10 @@ describe("hidden-model persistence (backward compatible credential schema)", () 
     expect(stored.account.refreshToken).toBe(ROTATED);
     expect(stored.hiddenModels).toEqual([FAMILY[0]]);
 
-    await h.service.noteUpstreamError(classifyGeminiOauthError({ status: 429 }));
+    await h.service.noteUpstreamError(classifyGeminiOauthError({ status: 429 }), FAMILY[0]);
     stored = (await h.store.load())!;
-    expect(stored.account.lastError).toEqual({ code: "gemini_oauth_quota_exceeded" });
+    expect(stored.account.lastError).toBeNull();
+    expect(stored.poolLocks?.[FAMILY[0]]).toBeGreaterThan(Date.now());
     expect(stored.hiddenModels).toEqual([FAMILY[0]]);
     expect(stored.rawModelIds).toEqual(credential().rawModelIds);
 
@@ -360,7 +361,7 @@ describe("sync and re-login keep the hide preference", () => {
 
 
 describe("noteRequestSuccess clears stale account markers", () => {
-  it("clears a stale validation cooldown+lastError after a completed exchange, keeps reauth", async () => {
+  it("keeps active validation and reauth guards when an older exchange succeeds", async () => {
     const h = await harness();
     const cred = credential();
     await h.store.save({
@@ -373,8 +374,8 @@ describe("noteRequestSuccess clears stale account markers", () => {
     });
     await (h.service.noteRequestSuccess() as unknown as Promise<void>);
     const stored = (await h.store.load())!;
-    expect(stored.account.lastError).toBeNull();
-    expect(stored.account.cooldownUntil).toBeNull();
+    expect(stored.account.lastError?.code).toBe("gemini_oauth_validation_required");
+    expect(stored.account.cooldownUntil).toBeGreaterThan(Date.now());
 
     // reauth is only cleared by the fresh-login flow.
     await h.service.noteUpstreamError({ code: "gemini_oauth_reauth_required" } as any);
