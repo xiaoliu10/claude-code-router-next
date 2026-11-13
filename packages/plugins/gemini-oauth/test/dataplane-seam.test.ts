@@ -34,7 +34,7 @@ import { GeminiOauthCredentialStore, type GeminiOauthAuthService } from "../src/
 import { getGeminiOauthAuthService } from "../src/protocol";
 import { GeminiOauthTransformer } from "../src/transformer";
 import {
-  GEMINI_OAUTH_API_KEY, GEMINI_OAUTH_DATA_PLANE, GEMINI_OAUTH_SSE_PATH,
+  GEMINI_OAUTH_API_KEY, GEMINI_OAUTH_DATA_PLANE, GEMINI_OAUTH_SSE_PATH, SKIP_THOUGHT_SIGNATURE,
   clearGeminiOauthTokenCaches, lockGeminiOauthProvider,
 } from "../src/protocol";
 
@@ -146,6 +146,38 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     expect(f.fetch).toHaveBeenCalledTimes(1); expect(f.requests[0].url).toBe(ordinary.api_base_url);
     expect(f.requests[0].headers.get("authorization")).toBe("Bearer ordinary-key");
     expect(service.token).not.toHaveBeenCalled(); expect(service.note).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("accepts unsigned Anthropic tool history on Gemini 4 (stream=%s)", async (stream) => {
+    const model = "gemini-4-argon";
+    const h = await build({ Providers: [provider([model])], Router: {} });
+    stubDataService(h);
+    const requests: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: any) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      const calls = body.request.contents.flatMap((turn: any) => turn.parts).filter((part: any) => part.functionCall);
+      return calls.length > 0 && calls.every((part: any) => part.thoughtSignature)
+        ? healthy()
+        : json({ error: { message: "Function call is missing a thought_signature", status: "INVALID_ARGUMENT" } }, 400);
+    }));
+    const response = await h.server.app.inject({ method: "POST", url: "/v1/messages", payload: {
+      model: `gemini-oauth,${model}`, stream, max_tokens: 64,
+      tools: [{ name: "get_value", description: "Get a value.", input_schema: { type: "object", properties: {} } }],
+      messages: [
+        { role: "user", content: "Get a value." },
+        { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "get_value", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "OK" }] },
+      ],
+    } });
+    h.noTokens(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("healthy");
+    expect(requests).toHaveLength(1);
+    const calls = requests[0].request.contents.flatMap((turn: any) => turn.parts).filter((part: any) => part.functionCall);
+    expect(calls).toEqual([expect.objectContaining({
+      functionCall: expect.objectContaining({ id: "c1", name: "get_value" }),
+      thoughtSignature: SKIP_THOUGHT_SIGNATURE,
+    })]);
   });
   it("401 → 200 forces one refresh and makes exactly two fixed-origin requests", async () => {
     const h = await build(); const service = stubDataService(h);

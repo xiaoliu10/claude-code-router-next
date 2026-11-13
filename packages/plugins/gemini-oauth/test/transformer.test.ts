@@ -336,7 +336,7 @@ describe("gemini-oauth content-sniff defence (missing Content-Type)", () => {
 });
 
 describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", () => {
-  it("adds the skip_thought_signature_validator sentinel to unsigned function calls of non-Gemini-3 models", () => {
+  it("adds the skip_thought_signature_validator sentinel to unsigned legacy model calls", () => {
     const body = {
       contents: [
         { role: "model", parts: [{ functionCall: { id: "c1", name: "t", args: {} } }] },
@@ -354,17 +354,55 @@ describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", 
     expect((body2.contents[0].parts[0] as any).thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
   });
 
-  it("keeps real signatures on Gemini 3 models and does not sentinel them", () => {
-    const body = {
-      contents: [
-        { role: "model", parts: [{ functionCall: { id: "c1", name: "t", args: {} }, thoughtSignature: "real-sig" }] },
-        { role: "model", parts: [{ functionCall: { id: "c2", name: "t", args: {} } }] },
-      ],
-    };
-    applyThoughtSignatureSentinel(body, "gemini-3-flash");
-    expect((body.contents[0].parts[0] as any).thoughtSignature).toBe("real-sig");
-    expect((body.contents[1].parts[0] as any).thoughtSignature).toBeUndefined();
-  });
+  it.each(["gemini-3-flash", "gemini-4-argon", "gemini-4-hydrogen"])(
+    "preserves real signatures and repairs only unsigned calls for %s",
+    (model) => {
+      const signed = { functionCall: { id: "c1", name: "t", args: {} }, thoughtSignature: "real-sig" };
+      const unsigned = { functionCall: { id: "c2", name: "t", args: {} } };
+      const emptySignature = { functionCall: { id: "c3", name: "t", args: {} }, thoughtSignature: "" };
+      const text = { text: "tool calls follow", thoughtSignature: "text-sig" };
+      const response = { functionResponse: { id: "c2", name: "t", response: { result: "OK" } } };
+      const body = { contents: [
+        { role: "model", parts: [text, signed, unsigned, emptySignature] },
+        { role: "user", parts: [response] },
+      ] };
+      applyThoughtSignatureSentinel(body, model);
+      expect(signed.thoughtSignature).toBe("real-sig");
+      expect(unsigned).toHaveProperty("thoughtSignature", SKIP_THOUGHT_SIGNATURE);
+      expect(emptySignature.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+      expect(text).toEqual({ text: "tool calls follow", thoughtSignature: "text-sig" });
+      expect(response).not.toHaveProperty("thoughtSignature");
+      const repaired = structuredClone(body);
+      applyThoughtSignatureSentinel(body, model);
+      expect(body).toEqual(repaired);
+    },
+  );
+
+  it.each(["gemini-3-flash", "gemini-4-argon", "gemini-4-hydrogen"])(
+    "converts cross-model tool history for %s without changing the client messages",
+    async (model) => {
+      const request = baseRequest({ model, messages: [
+        { role: "user", content: "Get both values." },
+        { role: "assistant", content: "", tool_calls: [
+          { id: "c1", type: "function", function: { name: "get_value", arguments: "{}" } },
+          { id: "c2", type: "function", function: { name: "get_value", arguments: "{}" } },
+        ] },
+        { role: "tool", tool_call_id: "c1", content: "first" },
+        { role: "tool", tool_call_id: "c2", content: "second" },
+        { role: "assistant", content: "", thinking: { content: "", signature: "real-sig" }, tool_calls: [
+          { id: "c3", type: "function", function: { name: "get_value", arguments: "{}" } },
+        ] },
+        { role: "tool", tool_call_id: "c3", content: "third" },
+      ] });
+      const original = structuredClone(request);
+      const { body } = await transformer().transformRequestIn(request, {});
+      const calls = body.request.contents.flatMap((turn: any) => turn.parts).filter((part: any) => part.functionCall);
+      expect(calls.map((part: any) => [part.functionCall.id, part.thoughtSignature])).toEqual([
+        ["c1", SKIP_THOUGHT_SIGNATURE], ["c2", SKIP_THOUGHT_SIGNATURE], ["c3", "real-sig"],
+      ]);
+      expect(request).toEqual(original);
+    },
+  );
 
   it("pairs unanswered function calls with a synthetic result (magpie pairFunctionTurns)", () => {
     const contents = [

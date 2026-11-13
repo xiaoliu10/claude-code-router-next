@@ -1306,12 +1306,6 @@ export function buildCodeAssistEnvelope(params: {
 // Request-body quirk patches (magpie internal/gateway/codeassist.go)
 // ---------------------------------------------------------------------------
 
-/** magpie geminiVersion: the major version in a Gemini model id. */
-export function geminiGeneration(model: string): number {
-  const m = model.match(/(?:^|\/)gemini-(\d+)/);
-  return m ? Number(m[1]) : 0;
-}
-
 function isClaudeModel(model: string): boolean {
   return model.toLowerCase().includes("claude");
 }
@@ -1323,13 +1317,14 @@ function eachTurnPart(body: Record<string, any>, fn: (part: any, turn: any) => v
 }
 
 /**
- * skip_thought_signature_validator sentinel (contract §1.1, magpie L35-38):
- * function calls of non-Gemini-3 models that carry no real thoughtSignature
- * get the sentinel that tells Google not to validate. Gemini 3+ keeps only
- * its own real signatures.
+ * Cross-model histories can contain function calls without a Gemini thought
+ * signature. Use the compatibility sentinel for those calls on every model,
+ * including Gemini 3+, which otherwise rejects the history with HTTP 400.
+ * Preserve existing signatures so native Gemini continuations keep their state.
  */
-export function applyThoughtSignatureSentinel(body: Record<string, any>, model: string): void {
-  if (geminiGeneration(model) >= 3) return;
+export function applyThoughtSignatureSentinel(body: Record<string, any>, _model: string): void {
+  // The model argument preserves the existing call-site contract; the
+  // compatibility sentinel now applies to unsigned calls across all models.
   eachTurnPart(body, (part) => {
     if (part?.functionCall && !part.thoughtSignature) {
       part.thoughtSignature = SKIP_THOUGHT_SIGNATURE;

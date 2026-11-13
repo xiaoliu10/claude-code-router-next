@@ -36,6 +36,8 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
 > UA 版本核实修订（2026-11-10）：Code Assist 数据面按 UA 里的 hub **最低版本阈值**门控模型目录（非真实性校验——实测 99.99.99 也被接受）。同一 standard-tier 账号、同 token/project，仅换 UA：hub/2.9.1 返回缩减目录且无 Gemini 4，hub/2.26.0+ 返回完整目录含 gemini-4-argon；magpie issue #5679 独立复现（旧 hub→Argon 404，当前 hub→200）。默认值由 2.9.1 提升到官方 updater manifest 当时的 2.30.0。后续 Google 再次门控新模型时需手动提升此常量，或改为动态探测 manifest。
 
 > M1 核实修订：OAuth client 参考来源为 magpie `google.go/antigravityApp`，本实现通过以上环境变量配置；缺失时返回稳定的配置未就绪错误，不回显值。禁止字符串拆分/编码绕过 GitHub Push Protection。未来若提交被拦截的公开常量，须由维护者走 GitHub 官方审查/allow 流程。M1 提交后暂停，独立审查通过再进入 M2。
+>
+> 工具签名核实修订（2026-11-13）：Google 对 functionCall 所在 part 强制校验非空 `thoughtSignature`。原 magpie 哨兵仅覆盖 Gemini 3 以下；实测 Gemini 4 对缺少签名的跨模型工具历史返回 400，补 `skip_thought_signature_validator` 后 Argon/Hydrogen 均 200，真实 part 级签名与哨兵混合的历史也均 200。实现保留已有非空签名，仅修补缺失字段，不重写或验证其他模型的既有签名。
 
 - OAuth：授权码 + PKCE(S256)；code 换 token POST form（grant_type=authorization_code, client_id, client_secret, code_verifier, code, redirect_uri）。**登录回调服务器 30 分钟超时**（v1.0.3 起，原 10 分钟对真人密码/2FA 流程过紧）。
 - token 刷新：内存缓存按 refresh_token 键；有效期 >2min 复用；否则 grant_type=refresh_token 刷新；单飞（并发请求共享同一次刷新）；刷新失败→错误码 `gemini_oauth_reauth_required`。未返回 refresh_token 时保留原值；若返回替换值须安全持久化后更新缓存身份，不能假设永不轮换。
@@ -61,7 +63,7 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
 - config.url = `{dataPlane}/v1internal:streamGenerateContent?alt=sse`；headers 只注入 `Authorization: Bearer <live access token>` 与 `User-Agent`（transformer 返回的 config.headers 会覆盖默认 Bearer，次序已验证 `routes.ts:1313-1319`）。
 - **transformer 不设 endPoint**（`workbuddy.transformer.ts:7-11` 同因：避免端点撞车）。
 - body 怪癖补丁（实现前必须 gh api 读 magpie `internal/gateway/codeassist.go` 对应行段，忠实移植 + 用其测试用例形状写单测）：
-  - L35-38 `skip_thought_signature_validator` 哨兵：非 Gemini 3 模型的 functionCall 补 thoughtSignature 哨兵；
+  - `skip_thought_signature_validator` 哨兵：所有模型（含 Gemini 3+）的 functionCall part 缺少 thoughtSignature 时补兼容哨兵，保留已有非空签名；仅覆盖“缺少签名”的跨模型工具历史，不重写已存在的其他模型签名（在 magpie L35-38 的原始补丁基础上扩展）；
   - L417-462 functionResponse 与 functionCall 配平（未答补合成结果）；
   - L317-330 历史首/尾不得是 model turn 的修正；
   - L278-330 tools/generationConfig 细节；
