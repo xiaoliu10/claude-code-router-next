@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { KiroAuthService } from "./auth-service";
 import type { ManagedRuntime, PluginHostCapabilities } from "./core-types";
-import { classifyKiroError, isKiroManaged, runtimeURL, validRegion, kiroError } from "./protocol";
+import { classifyKiroError, isKiroManaged, runtimeURL, validRegion, kiroError, kiroUsageToQuotaFigures } from "./protocol";
 import { kiroFailure } from "./transformer";
 
 /** Own the bounded auth replay and fixed regional origin; never send the config marker. */
@@ -11,6 +11,10 @@ export function createKiroManagedRuntime(service: KiroAuthService, host: PluginH
     ensureUsable: () => service.ensureUsable(), signRequest: async () => ({}),
     classifyError: status => classifyKiroError(status),
     noteUpstreamError: info => service.noteUpstreamError(info),
+    async fetchQuota() {
+      try { return kiroUsageToQuotaFigures(await service.getUsage()); }
+      catch { return null; }
+    },
     async dispatchRequest({ requestBody, config, req }) {
       let credential = await service.getCredential();
       const controller = new AbortController(), abort = () => controller.abort();

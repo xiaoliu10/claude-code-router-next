@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { buildKiro, kiroResponse, requestState, KiroTransformer, kiroToolName } from "../src/transformer";
+import { kiroUsageToQuotaFigures } from "../src/protocol";
 import { createKiroManagedRuntime } from "../src/managed-runtime";
 import type { KiroAuthService } from "../src/auth-service";
 
@@ -214,5 +215,45 @@ describe("Kiro transport", () => {
     f.service.getCredential.mockResolvedValue({ id: "account", access: "first", region: "us-east-1", profile: "arn:aws:codewhisperer:eu-west-1:123:profile/test" });
     const response = await f.dispatch(); await response.text();
     expect(f.network.mock.calls[0][0]).toBe("https://runtime.eu-west-1.kiro.dev/generateAssistantResponse");
+  });
+  it("classifies empty CONTENT_FILTERED / refusal streams as kiro_content_filtered (422) without cooldown", async () => {
+    const refusalStream = upstream([
+      ["metadataEvent", { stopReason: "CONTENT_FILTERED", stopDetails: { refusal: { category: "REASONING_EXTRACTION" } } }],
+      ["contextUsageEvent", { contextUsagePercentage: 35.5 }],
+    ]);
+    const service = { getStatus: vi.fn(async () => ({ models: [] })), noteUpstreamError: vi.fn(async () => {}) };
+    const transformer = new KiroTransformer(service as unknown as KiroAuthService);
+    const context: any = {};
+    await transformer.transformRequestIn(req, {}, context);
+    await expect(transformer.transformResponseOut(new Response(refusalStream.body, { headers: { "x-ccr-kiro-account": "acc-1" } }), context)).rejects.toMatchObject({
+      code: "kiro_content_filtered", statusCode: 422, pluginClassified: true, nonRetryable: true,
+    });
+    expect(service.noteUpstreamError).toHaveBeenCalledWith(expect.objectContaining({ code: "kiro_content_filtered", httpStatus: 422 }), "acc-1");
+    expect((service.noteUpstreamError.mock.calls[0] as any)[0].cooldownMs).toBeUndefined();
+  });
+  it("maps partial content + CONTENT_FILTERED to refusal / content_filter without changing account health", async () => {
+    const partialRefusal = upstream([
+      ["assistantResponseEvent", { content: "Cannot comply." }],
+      ["metadataEvent", { stopReason: "CONTENT_FILTERED", stopDetails: { refusal: { category: "SAFETY" } } }],
+    ]);
+    const service = { getStatus: vi.fn(async () => ({ models: [] })), noteUpstreamError: vi.fn(async () => {}) };
+    const transformer = new KiroTransformer(service as unknown as KiroAuthService);
+    const context: any = {};
+    await transformer.transformRequestIn(req, {}, context);
+    const res = await transformer.transformResponseOut(new Response(partialRefusal.body, { headers: { "x-ccr-kiro-account": "acc-1" } }), context);
+    const body = await res.text();
+    expect(body).toContain('"finish_reason":"content_filter"');
+    expect(service.noteUpstreamError).not.toHaveBeenCalled();
+  });
+  it("exposes fetchQuota on managed runtime and returns null on missing or failed usage", async () => {
+    const f = setup();
+    (f.service as any).getUsage = vi.fn()
+      .mockResolvedValueOnce({ known: true, stale: false, windows: [{ name: "Credits", used: 10, amount: 50, limit: 500, unit: "credits", display: "50 / 500", resetsAt: "2026-12-01T00:00:00.000Z" }] })
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce({ known: false, stale: true, windows: [] });
+    await expect(f.rt.fetchQuota!({} as any)).resolves.toEqual({ usedBalance: 50, totalBalance: 500, resetTime7d: "2026-12-01T00:00:00.000Z" });
+    await expect(f.rt.fetchQuota!({} as any)).resolves.toBeNull();
+    await expect(f.rt.fetchQuota!({} as any)).resolves.toBeNull();
+    expect(kiroUsageToQuotaFigures(null)).toBeNull();
   });
 });

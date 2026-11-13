@@ -189,6 +189,26 @@ class ThinkingParser {
   }
 }
 
+/** Kiro signals a conversation-level refusal through metadataEvent.stopDetails. */
+export function kiroRefusalOf(metadata: Json): { category: string } | null {
+  const refusal = object(metadata.stopDetails).refusal;
+  if (!refusal && !/CONTENT_FILTERED/i.test(String(metadata.stopReason ?? ""))) return null;
+  const category = refusal?.category;
+  return { category: typeof category === "string" && category.length <= 128 ? category : "CONTENT_FILTERED" };
+}
+
+/**
+ * Classify a data-plane refusal: the model declined THIS conversation, the
+ * account itself is healthy. A per-conversation refusal must never park the
+ * account (no cooldown) — otherwise one filtered session blocks every other
+ * session AND the read-only management/quota lanes for the whole cooldown.
+ */
+export function kiroRefusalError(): Error & { code: string; statusCode: number } {
+  return Object.assign(new Error("Kiro declined this conversation (content filter) / Kiro 拒绝继续该会话（内容过滤），请更换模型或开启新会话"), {
+    code: "kiro_content_filtered", statusCode: 422, pluginClassified: true, nonRetryable: true,
+  });
+}
+
 export function kiroFailure(status: number, body: Json = {}): Error & { statusCode: number; code: string } {
   const reason = `${body.message ?? ""} ${body.reason ?? ""}`;
   if (/CONTENT_LENGTH_EXCEEDS_THRESHOLD|input is too long/i.test(reason)) status = 400;
@@ -206,6 +226,7 @@ export async function* kiroEvents(response: Response, state: KiroRequestState, c
   if (!response.body) throw kiroError("kiro_stream_truncated", 502);
   const id = `msg_${randomUUID()}`, think = new ThinkingParser();
   let started = false, index = -1, open = "", currentTool = "", hasTools = false, chars = 0, visible = false, stop = "end_turn", pct = 0, reported = false;
+  let refusal: { category: string } | null = null;
   const usage: Json = { input_tokens: 0, output_tokens: 0 };
   const start = function* (): Generator<Event> { if (!started) { started = true; yield { type: "message_start", message: { id, type: "message", role: "assistant", model: state.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }; } };
   const close = function* (): Generator<Event> { if (open) yield { type: "content_block_stop", index }; open = ""; };
@@ -239,6 +260,7 @@ export async function* kiroEvents(response: Response, state: KiroRequestState, c
       }
       if (m.stop) yield* close();
     } else if (kind === "metadataEvent" || kind === "messageMetadataEvent") {
+      refusal ??= kiroRefusalOf(m);
       if (m.stopReason) stop = ({ max_tokens: "max_tokens", content_filtered: "refusal", tool_use: "tool_use" } as Record<string, string>)[String(m.stopReason).toLowerCase()] ?? "end_turn";
       const tu = m.tokenUsage;
       if (tu && typeof tu === "object") {
@@ -253,6 +275,10 @@ export async function* kiroEvents(response: Response, state: KiroRequestState, c
     // Supplementary links/metering are metadata, not assistant text or token counts.
   }
   for (const part of think.feed("", true)) yield* content(part.type, part.text);
+  // A refusal frame is a COMPLETE upstream answer that carries no assistant
+  // content — not a truncated stream. Classifying it as truncation (502) both
+  // misdiagnosed the cause and cooled the whole account for 5 minutes.
+  if (!visible && refusal) throw kiroRefusalError();
   if (!visible) throw kiroError("kiro_stream_truncated", 502);
   yield* close();
   if (!reported) { usage.input_tokens = pct > 0 && state.contextWindow > 0 ? Math.floor(pct * state.contextWindow / 100) : state.inputEstimate; usage.output_tokens = Math.ceil(chars / 4); usage.kiro_estimated = true; }
@@ -338,6 +364,12 @@ export class KiroTransformer {
     const account = response.headers.get("x-ccr-kiro-account") ?? undefined;
     const note = async (error: unknown) => {
       const status = Number((error as { statusCode?: number }).statusCode) || 502;
+      // A per-conversation refusal says nothing about account health: record it
+      // WITHOUT a cooldown so other sessions and the management lanes keep working.
+      if ((error as { code?: string }).code === "kiro_content_filtered") {
+        await this.service?.noteUpstreamError({ code: "kiro_content_filtered", message: "kiro_content_filtered", httpStatus: 422 }, account).catch(() => {});
+        return;
+      }
       const failure = kiroFailure(status);
       await this.service?.noteUpstreamError({ code: failure.code, message: failure.message, httpStatus: status, ...(status === 429 ? { cooldownMs: 300000 } : {}) }, account).catch(() => {});
     };

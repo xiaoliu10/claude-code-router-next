@@ -43,6 +43,7 @@ export interface KiroUsageSnapshot {
         unit: string;
         display: string;
         resetsAt?: string;
+        expiresAt?: string;
     }>;
 }
 export interface KiroServiceOptions {
@@ -102,6 +103,13 @@ export declare class KiroAuthService {
     /** A profile without a region-bearing ARN needs a Kiro region; ask Kiro's own regions in order. */
     private discoverProfile;
     private identify;
+    /**
+     * Epoch seconds → ISO string, or null when Date cannot represent the value.
+     * A contract-violating upstream timestamp (microseconds, absurd magnitudes)
+     * must degrade to "no timestamp", never throw: usageOf sits on the login
+     * path (identify) and a RangeError there would fail the whole sign-in.
+     */
+    private epochIso;
     private usageOf;
     private listen;
     private end;
@@ -133,7 +141,15 @@ export declare class KiroAuthService {
     private select;
     ensureUsable(account?: string): Promise<void>;
     getCredential(account?: string): Promise<KiroCredential>;
+    /**
+     * Credential for READ-ONLY management lanes (quota, model sync). A data-plane
+     * cooldown must never block them: they are how the user inspects a parked
+     * account, and they spend no chat quota. Only a dead login (needReauth)
+     * still refuses — a refresh on an expired token cannot succeed.
+     */
+    private managementCredential;
     forceTokenRefresh(account?: string): Promise<KiroCredential>;
+    private refreshCredential;
     /**
      * Merges freshly rotated tokens into the account as it is stored *now*, not into the snapshot
      * the refresh started from: a concurrent cooldown/reauth update replaces the account object, and
@@ -142,6 +158,14 @@ export declare class KiroAuthService {
      * Callers hold the exclusive credential-commit lane.
      */
     private upsert;
+    /**
+     * Latch account state. Cooldown is reserved for ACCOUNT-level conditions
+     * (rate limit, quota, auth): an explicit cooldownMs, or a code in the
+     * cooldown set. Conversation-level failures (content-filter refusals) and
+     * transient data-plane 502s must NOT park the account — one filtered
+     * conversation would otherwise block every other session AND the read-only
+     * quota/management lanes for the whole window (the 2026-11-13 incident).
+     */
     private markError;
     noteUpstreamError(info: PluginClassifiedError, account?: string): Promise<void>;
     getStatus(): Promise<{
@@ -178,6 +202,7 @@ export declare class KiroAuthService {
                 unit: string;
                 display: string;
                 resetsAt?: string;
+                expiresAt?: string;
             }>;
             account: string;
         }[];

@@ -23,6 +23,9 @@ const messages: Record<typeof KIRO_ERROR_CODES[number], [string, string]> = {
   kiro_rate_limited: ["Kiro rate limit reached", "已触发 Kiro 限流"],
   kiro_request_failed: ["Kiro management request failed", "Kiro 管理请求失败"],
   kiro_model_unknown: ["Unknown Kiro model", "未知的 Kiro 模型"],
+  kiro_content_filtered: ["Kiro declined to continue this conversation (content filter); try another model or start a new conversation", "Kiro 拒绝继续该会话（内容过滤），请更换模型或开启新会话"],
+  kiro_stream_truncated: ["Kiro response stream ended early", "Kiro 响应流提前结束"],
+  kiro_stream_invalid: ["Kiro response stream was malformed", "Kiro 响应流格式错误"],
 };
 
 /**
