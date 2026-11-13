@@ -131,6 +131,48 @@ describe("gemini-oauth envelope shape (contract §1.1)", () => {
   });
 });
 
+describe("gemini-oauth search tool ownership", () => {
+  it("keeps a schema-bearing web_search as a client function alongside other tools and its history", async () => {
+    const search = {
+      type: "function", function: {
+        name: "web_search", description: "Search using the client provider.",
+        parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+      },
+    };
+    const request = baseRequest({ tools: [search, {
+      type: "function", function: { name: "read", parameters: { type: "object", properties: {} } },
+    }], messages: [
+      { role: "user", content: "Search the documentation." },
+      { role: "assistant", content: "", tool_calls: [
+        { id: "search-1", type: "function", function: { name: "web_search", arguments: JSON.stringify({ query: "docs" }) } },
+      ] },
+      { role: "tool", tool_call_id: "search-1", content: "Found the documentation." },
+    ] });
+    const original = structuredClone(request);
+    const { body } = await transformer().transformRequestIn(request, {});
+    const declarations = body.request.tools.flatMap((tool: any) => tool.functionDeclarations ?? []);
+    expect(declarations.find((tool: any) => tool.name === "web_search")).toEqual({
+      name: "web_search", description: search.function.description, parameters: search.function.parameters,
+    });
+    expect(declarations.map((tool: any) => tool.name)).toEqual(["web_search", "read"]);
+    expect(body.request.tools.some((tool: any) => tool.googleSearch)).toBe(false);
+    const calls = body.request.contents.flatMap((turn: any) => turn.parts).filter((part: any) => part.functionCall);
+    expect(calls[0].functionCall.name).toBe("web_search");
+    expect(request).toEqual(original);
+  });
+
+  it("preserves schema-less built-in search while treating an empty schema as a client function", async () => {
+    const native = await transformer().transformRequestIn(baseRequest({
+      tools: [{ type: "function", function: { name: "web_search" } }],
+    }), {});
+    expect(native.body.request.tools).toEqual([{ googleSearch: {} }]);
+    const client = await transformer().transformRequestIn(baseRequest({
+      tools: [{ type: "function", function: { name: "web_search", parameters: {} } }],
+    }), {});
+    expect(client.body.request.tools).toEqual([{ functionDeclarations: [{ name: "web_search", description: undefined, parameters: {} }] }]);
+  });
+});
+
 describe("gemini-oauth request config: URL + header override order", () => {
   it("targets the fixed data-plane SSE URL and overrides the marker Authorization", async () => {
     const result = await transformer().transformRequestIn(baseRequest(), {} as any, {} as any);
@@ -362,12 +404,16 @@ describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", 
       const emptySignature = { functionCall: { id: "c3", name: "t", args: {} }, thoughtSignature: "" };
       const fabricatedCcr = { functionCall: { id: "c4", name: "t", args: {} }, thoughtSignature: "ccr_1794539565734" };
       const fabricatedRs = { functionCall: { id: "c5", name: "t", args: {} }, thoughtSignature: "rs_045a9ed30cdae06a2537de87e6b27ceef678cd011d2167cf6d" };
+      const foreignGlm = { functionCall: { id: "c6", name: "t", args: {} }, thoughtSignature: "abcdef0123456789abcdef01" };
+      const decodableMarker = { functionCall: { id: "c7", name: "t", args: {} }, thoughtSignature: "ccr_test" };
+      const nativePadded = { functionCall: { id: "c8", name: "t", args: {} }, thoughtSignature: Buffer.alloc(256, 17).toString("base64") };
       const text = { text: "tool calls follow", thoughtSignature: "text-sig" };
       const poisonedText = { text: "carry fabricated marker", thoughtSignature: "ccr_1234567890123" };
       const decodableForeignText = { text: "carry decodable marker", thoughtSignature: "EjRWeJq83vEi" };
+      const foreignGlmText = { text: "foreign text", thoughtSignature: "ABCDEF0123456789ABCDEF01" };
       const response = { functionResponse: { id: "c2", name: "t", response: { result: "OK" } } };
       const body = { contents: [
-        { role: "model", parts: [text, signed, unsigned, emptySignature, fabricatedCcr, fabricatedRs, poisonedText, decodableForeignText] },
+        { role: "model", parts: [text, signed, unsigned, emptySignature, fabricatedCcr, fabricatedRs, foreignGlm, decodableMarker, nativePadded, poisonedText, decodableForeignText, foreignGlmText] },
         { role: "user", parts: [response] },
       ] };
       applyThoughtSignatureSentinel(body, model);
@@ -376,6 +422,10 @@ describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", 
       expect(emptySignature.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
       expect(fabricatedCcr.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
       expect(fabricatedRs.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+      expect(foreignGlm.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+      expect(decodableMarker.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+      expect(nativePadded.thoughtSignature).toBe(Buffer.alloc(256, 17).toString("base64"));
+      expect(foreignGlmText).not.toHaveProperty("thoughtSignature");
       expect(text).toEqual({ text: "tool calls follow", thoughtSignature: "text-sig" });
       expect(poisonedText).not.toHaveProperty("thoughtSignature");
       expect(decodableForeignText).toEqual({ text: "carry decodable marker", thoughtSignature: "EjRWeJq83vEi" });
@@ -383,6 +433,26 @@ describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", 
       const repaired = structuredClone(body);
       applyThoughtSignatureSentinel(body, model);
       expect(body).toEqual(repaired);
+    },
+  );
+
+  it.each(["abcd=", "abc==", "ab=", 42, { signature: "opaque" }])(
+    "repairs malformed client signatures before the TYPE_BYTES boundary: %j",
+    (signature) => {
+      const call = { functionCall: { name: "read", args: {} }, thoughtSignature: signature };
+      const text = { text: "history", thoughtSignature: signature };
+      applyThoughtSignatureSentinel({ contents: [{ role: "model", parts: [call, text] }] }, "gemini-4-argon");
+      expect(call.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+      expect(text).not.toHaveProperty("thoughtSignature");
+    },
+  );
+
+  it.each(["YWJj", "YWI", "YWI=", "YQ", "YQ==", "--__"])(
+    "preserves standard or URL-safe base64 with valid optional padding: %s",
+    (signature) => {
+      const part = { functionCall: { name: "read", args: {} }, thoughtSignature: signature };
+      applyThoughtSignatureSentinel({ contents: [{ role: "model", parts: [part] }] }, "gemini-4-argon");
+      expect(part.thoughtSignature).toBe(signature);
     },
   );
 

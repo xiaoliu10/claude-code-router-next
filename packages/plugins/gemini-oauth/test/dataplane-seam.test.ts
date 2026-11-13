@@ -219,6 +219,52 @@ describe("Gemini OAuth data plane through the plugin runtime", () => {
     expect(call.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
     expect(parts.some((part: any) => part.thoughtSignature !== undefined && !isTransportableSignature(part.thoughtSignature))).toBe(false);
   });
+  it.each([false, true])("routes client web_search with GLM tool history without built-in search or foreign signatures (stream=%s)", async (stream) => {
+    const model = "gemini-4-argon";
+    const h = await build({ Providers: [provider([model])], Router: {} });
+    stubDataService(h);
+    const sent: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: any) => {
+      const body = JSON.parse(init.body);
+      sent.push(body);
+      if (body.request.tools.some((tool: any) => tool.googleSearch)) {
+        return json({ error: { message: "Please enable tool_config.include_server_side_tool_invocations to use Built-in tools with Function calling." } }, 400);
+      }
+      const parts = body.request.contents.flatMap((turn: any) => turn.parts);
+      if (parts.some((part: any) => part.thoughtSignature === "a".repeat(24))) {
+        return json({ error: { message: "Corrupted thought signature." } }, 400);
+      }
+      return healthy();
+    }));
+    const schema = { type: "object", properties: { query: { type: "string" } }, required: ["query"] };
+    const response = await h.server.app.inject({ method: "POST", url: "/v1/messages", payload: {
+      model: "gemini-oauth," + model, stream, max_tokens: 64,
+      tools: [
+        { name: "web_search", description: "Search using the client.", input_schema: schema },
+        { name: "read", input_schema: { type: "object", properties: {} } },
+      ],
+      messages: [
+        { role: "user", content: "Search the documentation." },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "Searching", signature: "a".repeat(24) },
+          { type: "text", text: "Look up the docs." },
+          { type: "tool_use", id: "search-1", name: "web_search", input: { query: "documentation" } },
+        ] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "search-1", content: "Found docs." }] },
+      ],
+    } });
+    h.noTokens(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("healthy");
+    expect(sent).toHaveLength(1);
+    expect(sent[0].request.tools).toEqual([{ functionDeclarations: [
+      { name: "web_search", description: "Search using the client.", parameters: schema },
+      { name: "read", description: "", parameters: { type: "object", properties: {} } },
+    ] }]);
+    const parts = sent[0].request.contents.flatMap((turn: any) => turn.parts);
+    expect(parts.find((part: any) => part.functionCall)?.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+    expect(parts.find((part: any) => part.text === "Look up the docs.")).not.toHaveProperty("thoughtSignature");
+  });
   it("401 → 200 forces one refresh and makes exactly two fixed-origin requests", async () => {
     const h = await build(); const service = stubDataService(h);
     const f = upstreamSequence(() => json({ error: { message: "UNAUTHENTICATED" } }, 401));

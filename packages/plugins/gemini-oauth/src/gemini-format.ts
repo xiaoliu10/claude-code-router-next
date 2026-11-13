@@ -252,8 +252,12 @@ export function buildRequestBody(
   request: PluginUnifiedChatRequest
 ): Record<string, any> {
   const tools = [];
+  // A client-defined search function owns its schema and execution. Only the
+  // schema-less search marker represents Google's built-in grounding tool.
+  const isBuiltInSearch = (tool: NonNullable<PluginUnifiedChatRequest["tools"]>[number]) =>
+    tool.function.name === "web_search" && tool.function.parameters === undefined;
   const functionDeclarations = request.tools
-    ?.filter((tool) => tool.function.name !== "web_search")
+    ?.filter((tool) => !isBuiltInSearch(tool))
     ?.map((tool) => {
       return {
         name: tool.function.name,
@@ -268,9 +272,7 @@ export function buildRequestBody(
       })
     );
   }
-  const webSearch = request.tools?.find(
-    (tool) => tool.function.name === "web_search"
-  );
+  const webSearch = request.tools?.find(isBuiltInSearch);
   if (webSearch) {
     tools.push({
       googleSearch: {},

@@ -1326,25 +1326,29 @@ function eachTurnPart(body: Record<string, any>, fn: (part: any, turn: any) => v
  */
 function isBase64Transportable(value: string): boolean {
   if (!/^[A-Za-z0-9+/\-_]+={0,2}$/.test(value)) return false;
-  return value.replace(/=+$/, "").length % 4 !== 1;
+  const unpadded = value.replace(/=+$/, "");
+  const remainder = unpadded.length % 4;
+  const padding = value.length - unpadded.length;
+  return remainder !== 1 && (padding === 0 || padding === (4 - remainder) % 4);
+}
+
+/** Known non-Gemini markers are opaque IDs, even when they decode as base64. */
+function isForeignThoughtSignature(value: string): boolean {
+  return value.startsWith("ccr_") || value.startsWith("rs_") || /^[0-9a-f]{24}$/i.test(value);
 }
 
 /**
- * Cross-model histories carry function calls without a Gemini thought
- * signature, and replayed CCR markers carry signatures Google can never
- * accept (invalid base64). Repair per part:
- *   - missing/non-decodable signature on a functionCall → the compatibility
- *     sentinel, on every model including Gemini 3+/4 (upstream 400 otherwise);
- *   - non-decodable signature on any other part → the field is dropped
- *     (text/thought parts without signatures are always accepted);
- *   - decodable signatures (native Gemini, or foreign-but-valid base64)
- *     are preserved untouched so native continuations keep their state.
+ * Preserve native signatures, but repair missing, malformed or known foreign
+ * signatures before Google validates the history. GLM's 24-digit hex IDs are
+ * decodable base64 yet still produce "Corrupted thought signature" upstream.
+ * Function calls need the compatibility sentinel; other parts can omit the
+ * unusable signature without changing their text or tool results.
  */
 export function applyThoughtSignatureSentinel(body: Record<string, any>, _model: string): void {
   // The model argument preserves the existing call-site contract; the
   // compatibility sentinel now applies to unsigned calls across all models.
   const nonTransportable = (value: unknown): boolean =>
-    typeof value === "string" && value.length > 0 && !isBase64Transportable(value);
+    typeof value !== "string" || !isBase64Transportable(value) || isForeignThoughtSignature(value);
   eachTurnPart(body, (part) => {
     if (!part || typeof part !== "object") return;
     const signature = part.thoughtSignature;
@@ -1352,7 +1356,7 @@ export function applyThoughtSignatureSentinel(body: Record<string, any>, _model:
       if (!signature || nonTransportable(signature)) part.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
       return;
     }
-    if (signature && nonTransportable(signature)) delete part.thoughtSignature;
+    if (signature !== undefined && signature !== "" && nonTransportable(signature)) delete part.thoughtSignature;
   });
 }
 
