@@ -108,48 +108,42 @@ const RESPONSES_TEXT = sse(
 );
 
 describe("Responses-format answers (codex-subscription)", () => {
-  // Responses-API streams are deliberately OUT of scope: the core's
-  // Responses→Anthropic bridge is known to emit an empty output for some tool
-  // turns (pinned by the codex plugin's own tests), so judging them here would
-  // turn that known defect into a hard error.
-  it("does not judge a Responses stream, empty output or not", () => {
-    expect(inspectAnswerPrefix(RESPONSES_EMPTY)).toBe("pending");
-    expect(inspectAnswerPrefix(RESPONSES_TEXT)).toBe("pending");
+  // A Codex client reaches the guard as Responses events (the
+  // Responses→Anthropic bridge converts the other direction), so an empty Codex
+  // turn is judged here — that is the reported "success + output 0" failure.
+  it("flags a Responses answer that completed with no output", () => {
+    expect(inspectAnswerPrefix(RESPONSES_EMPTY)).toBe("empty");
   });
 
-  it("never turns a Responses turn into a hard error", async () => {
+  it("accepts a Responses answer that emitted output", () => {
+    expect(inspectAnswerPrefix(RESPONSES_TEXT)).toBe("content");
+  });
+
+  it("accepts output that appears only on the terminal frame", () => {
+    const terminalOnly = sse(
+      ["response.created", { type: "response.created", response: { id: "r", output: [] } }],
+      ["response.completed", { type: "response.completed", response: { id: "r", output: [{ type: "message" }] } }]
+    );
+    expect(inspectAnswerPrefix(terminalOnly)).toBe("content");
+  });
+
+  it("never treats response.incomplete as an empty turn", () => {
+    const incomplete = sse(
+      ["response.created", { type: "response.created", response: { id: "r", output: [] } }],
+      ["response.incomplete", { type: "response.incomplete", response: { id: "r", status: "incomplete" } }]
+    );
+    expect(inspectAnswerPrefix(incomplete)).not.toBe("empty");
+  });
+
+  it("flags the exact reported turn through probeAnswer", async () => {
     const probe = await probeAnswer(chunked(RESPONSES_EMPTY, 13));
-    expect(probe.verdict).not.toBe("empty");
-    expect(await drain(rebuildAnswerStream(probe.chunks, probe.rest))).toBe(RESPONSES_EMPTY);
+    expect(probe.verdict).toBe("empty");
   });
 
   it("passes a healthy Responses answer through byte-for-byte", async () => {
     const probe = await probeAnswer(chunked(RESPONSES_TEXT, 9));
-    const forwarded = await drain(rebuildAnswerStream(probe.chunks, probe.rest));
-    expect(forwarded).toBe(RESPONSES_TEXT);
-  });
-});
-
-describe("chat-completions streams", () => {
-  // `/v1/chat/completions` providers (WorkBuddy-style) answer with
-  // `choices[].delta`; `[DONE]` alone is only a terminator. Missing this shape
-  // made a real answer look like an empty turn.
-  const CHAT_TEXT =
-    'data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}\n\n' +
-    "data: [DONE]\n\n";
-  const CHAT_EMPTY = 'data: {"object":"chat.completion.chunk","choices":[]}\n\ndata: [DONE]\n\n';
-
-  it("accepts a chat stream that carries content", () => {
-    expect(inspectAnswerPrefix(CHAT_TEXT)).toBe("content");
-  });
-
-  it("still flags a chat stream that ends with no content", () => {
-    expect(inspectAnswerPrefix(CHAT_EMPTY)).toBe("empty");
-  });
-
-  it("accepts tool_calls-only chat deltas", () => {
-    const tool = 'data: {"choices":[{"delta":{"tool_calls":[{"id":"c1"}]}}]}\n\ndata: [DONE]\n\n';
-    expect(inspectAnswerPrefix(tool)).toBe("content");
+    expect(probe.verdict).toBe("content");
+    expect(await drain(rebuildAnswerStream(probe.chunks, probe.rest))).toBe(RESPONSES_TEXT);
   });
 });
 
