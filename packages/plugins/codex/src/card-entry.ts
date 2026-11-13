@@ -697,7 +697,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     // quota cooldown is parked — during a cooldown the user most needs the
     // burn percentages and the reset time, and the read-only usage endpoint
     // keeps working (the data-plane cooldown does not gate it).
-    const showAccountSurface = !loading && !!status && (connected || state === "cooldown");
+    // Account rows are read-only and reassuring in the error state too: a
+    // latched quota error must not look like "the account is gone".
+    const showAccountSurface = !loading && !!status && (connected || state === "cooldown" || state === "error");
     if (showAccountSurface && status) {
       const rows = styled("dl", "grid max-w-md grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs");
       const account = maskCodexAccountId(status.accountId) ?? t("unknown");
@@ -787,7 +789,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     // The redacted lastError is a stable code — render it translated for every
     // non-connected state so the surface explains itself; polluted values
     // collapse to the generic failure inside errorText().
-    if (!connected && status?.lastError) body.append(errorAlert(errorText(status.lastError)));
+    if (!connected && status?.lastError) body.append(errorAlert(errorText(status.lastErrorCode ?? status.lastError)));
     if (errorKey) body.append(errorAlert(errorText(errorKey)));
     if (reconcileFailed) body.append(errorAlert(t("errors.reconciliation_failed")));
 

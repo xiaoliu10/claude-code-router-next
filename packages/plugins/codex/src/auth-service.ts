@@ -443,8 +443,23 @@ export class CodexAuthService {
       return { status: "not_connected", providerName: CODEX_PROVIDER_NAME, models, modelCount: models.length, hiddenModels: [] };
     }
     const coolingUntil = this.latestCooldown(data);
+    // A NON-STICKY latch whose account cooldown window has passed is stale:
+    // the quota window it described is over, so reporting "error" would park
+    // the card in a scary dead state ("the account is gone") until the next
+    // successful request happens to clear it. Report connected; the next 429
+    // re-latches within one request. Sticky reauth (no cooldown) and latches
+    // without any cooldown window keep the error semantics. Staleness is
+    // ACCOUNT-WINDOW based: noteUpstreamError keeps the previous cooldownUntil
+    // when a new error carries no cooldownMs, so a fresh latch can inherit a
+    // (near-)expired window and be declared stale early — display-only, it
+    // self-heals on the next request or success.
+    const latch = account.lastError;
+    const latchStale = !!latch && latch.code !== "codex_reauth_required"
+      && typeof account.cooldownUntil === "number" && account.cooldownUntil <= now
+      && !(typeof account.rateLimitCooldownUntil === "number" && account.rateLimitCooldownUntil > now);
     let status: CodexStatus["status"] = "connected";
-    if (account.lastError) status = "error";
+    const latchActive = !!latch && !latchStale;
+    if (latchActive) status = "error";
     else if (typeof account.accessExp === "number" && account.accessExp <= now) status = "expired";
     return {
       status,
@@ -456,7 +471,10 @@ export class CodexAuthService {
       modelCount: models.length,
       hiddenModels: [...(data?.hiddenModels ?? [])],
       ...(coolingUntil ? { coolingUntil } : {}),
-      lastError: account.lastError ? CODEX_SAFE_MESSAGES[account.lastError.code] ?? null : null,
+      ...(latchActive ? {
+        lastError: CODEX_SAFE_MESSAGES[latch.code] ?? null,
+        ...(latch.code ? { lastErrorCode: latch.code } : {}),
+      } : { lastError: null }),
     };
   }
 

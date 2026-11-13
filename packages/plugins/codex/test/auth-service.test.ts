@@ -607,6 +607,64 @@ describe("models, usage, rate limits", () => {
     expect((await (service as any).store.load())!.account.lastError!.code).toBe("codex_usage_limit");
   });
 
+  it("an expired non-sticky cooldown latch is stale: status reports connected with no lastError", async () => {
+    const { service } = await connected();
+    await service.noteUpstreamError({
+      code: "codex_usage_limit", message: "x", httpStatus: 429, cooldownMs: 60_000,
+    });
+    expect((await service.getStatus()).status).toBe("error");
+    // Simulate the window passing (cooldownUntil now in the past), through
+    // saveData so the service's in-memory state updates like real writes.
+    const data = (await (service as any).store.load())!;
+    await (service as any).saveData({ ...data, account: { ...data.account, cooldownUntil: Date.now() - 1_000 } });
+    const fresh = await service.getStatus();
+    expect(fresh.status).toBe("connected");
+    expect(fresh.lastError).toBeNull();
+    expect(fresh.lastErrorCode).toBeUndefined();
+    // Account identity stays visible in every state.
+    expect(fresh.email).toContain("@");
+  });
+
+  it("sticky reauth stays an error even when an inherited cooldown has expired", async () => {
+    const { service } = await connected();
+    const data = (await (service as any).store.load())!;
+    await (service as any).saveData({
+      ...data,
+      account: { ...data.account, lastError: { code: "codex_reauth_required" }, cooldownUntil: Date.now() - 1_000 },
+    });
+    const status = await service.getStatus();
+    expect(status.status).toBe("error");
+    expect(status.lastErrorCode).toBe("codex_reauth_required");
+  });
+
+  it("an expired cooldownUntil with a FUTURE rateLimitCooldownUntil stays an error", async () => {
+    const { service } = await connected();
+    const data = (await (service as any).store.load())!;
+    await (service as any).saveData({
+      ...data,
+      account: {
+        ...data.account,
+        lastError: { code: "codex_usage_limit" },
+        cooldownUntil: Date.now() - 1_000,
+        rateLimitCooldownUntil: Date.now() + 60_000,
+      },
+    });
+    const status = await service.getStatus();
+    expect(status.status).toBe("error");
+    expect(status.coolingUntil).toBeGreaterThan(Date.now());
+  });
+
+  it("a latch whose cooldown has NOT passed keeps the error status and carries the code", async () => {
+    const { service } = await connected();
+    await service.noteUpstreamError({
+      code: "codex_usage_limit", message: "x", httpStatus: 429, cooldownMs: 60_000,
+    });
+    const status = await service.getStatus();
+    expect(status.status).toBe("error");
+    expect(status.lastError).toContain("usage limit");
+    expect(status.lastErrorCode).toBe("codex_usage_limit");
+  });
+
   it("disconnect removes the provider + credentials but leaves Router and user providers alone", async () => {
     const h = await connected({ config: {
       Providers: [{ name: CODEX_PROVIDER_NAME, api_key: CODEX_API_KEY }],

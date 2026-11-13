@@ -432,6 +432,27 @@ describe("self-contained Codex plugin card", () => {
     expect(h.lock).toBe(false);
   });
 
+  it("a latched quota error keeps the account visible and renders the translated code, not a generic failure", async () => {
+    const ERRORED = {
+      ...CONNECTED, status: "error" as const,
+      lastError: "This Codex account has reached its usage limit; wait for the window to reset.",
+      lastErrorCode: "codex_usage_limit",
+    };
+    const h = harness({ "/status": () => ERRORED });
+    await tick();
+    // Account identity stays visible in the error state — the latch must not
+    // read as "the account is gone".
+    expect(h.host.text()).toContain("user@example.test");
+    expect(h.host.text()).toContain("pro");
+    // The stable code maps to the translated reason, never the generic one.
+    expect(h.host.text()).toContain(en.errors.codex_usage_limit);
+    expect(h.host.text()).not.toContain(en.errors.request_failed);
+    // Unknown codes still collapse to the generic copy.
+    const h2 = harness({ "/status": () => ({ ...ERRORED, lastErrorCode: "codex_garbage" }) });
+    await tick();
+    expect(h2.host.text()).toContain(en.errors.request_failed);
+  });
+
   it("raw upstream exceptions and polluted error fields can never enter the rendered surface; no innerHTML anywhere", async () => {
     // Polluted status.lastError collapses to the generic copy; markup never appears.
     const bad = harness({
