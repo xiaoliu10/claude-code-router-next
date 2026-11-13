@@ -18,6 +18,7 @@
  * credential material.
  */
 import type { FastifyInstance } from "fastify";
+import { gt, valid } from "semver";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -47,10 +48,9 @@ export interface CatalogEntry {
   installed: boolean;
   installedVersion: string | null;
   /**
-   * Present only when `installed` and the versions differ: the client shows an
-   * update affordance for exactly these entries. Compares the npm `version`
-   * against the installed manifest version, so a downgrade is also surfaced
-   * rather than silently hidden.
+   * Present only when npm offers a newer valid semantic version than the
+   * installed manifest. Local preview builds and a stale search index must
+   * never turn the upgrade action into a downgrade.
    */
   updateAvailable?: boolean;
   /** True for a plugin installed locally that npm search did not return (unlisted,
@@ -182,12 +182,7 @@ export async function buildPluginCatalog(
         ...entry,
         installed,
         installedVersion: manifestVersion,
-        // Update affordance when the installed manifest version differs from
-        // the npm version. String inequality is deliberate: semver parsing here
-        // would be a second implementation of version ordering, and any
-        // difference — upgrade OR downgrade — is exactly what the client needs
-        // to surface.
-        ...(installed && manifestVersion !== null && manifestVersion !== entry.version
+        ...(installed && manifestVersion !== null && valid(manifestVersion) && valid(entry.version) && gt(entry.version, manifestVersion)
           ? { updateAvailable: true }
           : {}),
       };

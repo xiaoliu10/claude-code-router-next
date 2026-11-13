@@ -13,7 +13,7 @@ const coreRouter = ts.createSourceFile("router.ts", readFileSync(new URL("../../
 const resolver = coreRouter.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "findProviderModel")!;
 const resolverJs = ts.transpile(resolver.getText(coreRouter).replace(/^export /, ""));
 const findProviderModel = runInNewContext(`${resolverJs}; findProviderModel`) as (providers: unknown[], provider: string, model: string) => unknown;
-import { BUILDER_ID_PROFILE, CALLBACK_PORTS } from "../src/protocol";
+import { BUILDER_ID_PROFILE, CALLBACK_PORTS, kiroUsageToQuotaFigures } from "../src/protocol";
 
 const services: KiroAuthService[] = [], dirs: string[] = [];
 afterEach(async () => { services.splice(0).forEach(s => s.close()); await Promise.all(dirs.splice(0).map(d => rm(d, { recursive: true, force: true }))); });
@@ -276,10 +276,12 @@ describe("Kiro usage timestamp hardening", () => {
         bonuses: [
           { displayName: "", description: "Gift", status: "ACTIVE", currentUsage: 1, usageLimit: 50, expiresAt: 1e20 },
           { displayName: "Plain", status: "ACTIVE", currentUsage: 0, usageLimit: 10 },
+          { displayName: "Stale active bonus", status: "ACTIVE", currentUsage: 0, usageLimit: 99, expiresAt: 1_700_000_000 },
         ],
       }],
     }));
     const usage = await f.service.getUsage(); // must not throw
+    expect(usage.windows.find(w => w.name === "Stale active bonus")).toBeUndefined();
     const main = usage.windows.find(w => w.name === "Credits")!;
     expect(main.resetsAt).toBeUndefined();
     // Empty displayName falls back to description — never "" (which the card
@@ -292,5 +294,54 @@ describe("Kiro usage timestamp hardening", () => {
     expect(plain).toBeDefined();
     expect(plain.resetsAt).toBeUndefined();
     expect(plain.expiresAt).toBeUndefined();
+  });
+});
+
+describe("Kiro cooldown isolation & quota figures", () => {
+  it("never cools the account on content-filter refusals or generic 502s", async () => {
+    const f = await setup(); await login(f.service);
+    await f.service.noteUpstreamError({ code: "kiro_content_filtered", message: "kiro_content_filtered", httpStatus: 422 });
+    await f.service.noteUpstreamError({ code: "kiro_upstream_error", message: "kiro_upstream_error", httpStatus: 502 });
+    await f.service.noteUpstreamError({ code: "kiro_stream_truncated", message: "kiro_stream_truncated", httpStatus: 502 });
+    const acct = (await f.service.getStatus()).accounts[0];
+    expect(acct.coolingUntil).toBe(0);
+    expect(acct.needReauth).toBe(false);
+    await expect(f.service.ensureUsable()).resolves.toBeUndefined();
+  });
+
+  it("keeps read-only getUsage and syncModels working during a 429 cooldown (including token refresh) without prematurely clearing the cooldown", async () => {
+    const f = await setup(); await login(f.service);
+    await f.service.noteUpstreamError({ code: "kiro_rate_limited", message: "kiro_rate_limited", httpStatus: 429, cooldownMs: 300_000 });
+    await expect(f.service.getCredential()).rejects.toMatchObject({ code: "kiro_account_cooling" });
+    // Even when the access token also needs rotation while cooling, management reads still work.
+    f.expire();
+    // Re-latch at the advanced clock: f.expire() jumped ~58min, past the first 5min window.
+    await f.service.noteUpstreamError({ code: "kiro_rate_limited", message: "kiro_rate_limited", httpStatus: 429, cooldownMs: 300_000 });
+    const usage = await f.service.getUsage();
+    expect(usage.known).toBe(true);
+    expect(f.refreshCount()).toBe(1);
+    const synced = await f.service.syncModels();
+    expect(synced.success).toBe(true);
+    // Management reads must NOT wipe a real chat-plane 429 cooldown.
+    await expect(f.service.ensureUsable()).rejects.toMatchObject({ code: "kiro_account_cooling" });
+    f.time(1_700_000_000_000 + 3_500_000 + 300_001);
+    await expect(f.service.ensureUsable()).resolves.toBeUndefined();
+  });
+
+  it("preserves reauthentication requirements on the management lane", async () => {
+    const f = await setup(); await login(f.service);
+    await f.service.noteUpstreamError({ code: "kiro_reauth_required", message: "kiro_reauth_required", httpStatus: 401 });
+    expect((await f.service.getStatus()).accounts[0]).toMatchObject({ needReauth: true, coolingUntil: 1_700_000_000_000 + 3_600_000 });
+    await expect(f.service.getUsage()).rejects.toMatchObject({ code: "kiro_reauth_required" });
+  });
+
+  it("maps recurring and bonus credit windows into ProviderQuotaFigures", () => {
+    expect(kiroUsageToQuotaFigures({
+      known: true, stale: false,
+      windows: [
+        { name: "Credits", used: 1, amount: 4.72, limit: 500, unit: "credits", display: "4.72 / 500", resetsAt: "2026-12-01T00:00:00.000Z" },
+        { name: "Trial credits", used: 0, amount: 0, limit: 500, unit: "credits", display: "0 / 500", expiresAt: "2027-01-01T00:00:00.000Z" },
+      ],
+    })).toEqual({ usedBalance: 4.72, totalBalance: 1000, resetTime7d: "2026-12-01T00:00:00.000Z" });
   });
 });
