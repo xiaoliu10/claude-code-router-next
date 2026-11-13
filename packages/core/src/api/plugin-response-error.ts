@@ -1,4 +1,4 @@
-import type { ManagedRuntime, PluginClassifiedError } from "../provider-plugins/types";
+import type { ManagedRuntime, ManagedRequestContext, PluginClassifiedError } from "../provider-plugins/types";
 import { pluginErrorFrom } from "../provider-plugins/registry";
 
 /** Bounded, safe transport diagnostics for a send-level (status 0) failure. */
@@ -62,6 +62,7 @@ export async function pluginResponseError(
   body: unknown,
   systemText: string,
   transport?: PluginTransportFailure,
+  request?: ManagedRequestContext,
 ): Promise<Error & Record<string, any>> {
   let classified: PluginClassifiedError | null | undefined;
   try { classified = runtime.classifyError?.(status, body, systemText); } catch { /* safe fallback */ }
@@ -78,7 +79,7 @@ export async function pluginResponseError(
     httpStatus: status >= 400 && status <= 599 ? status : 502,
     retryable: status >= 500,
   };
-  try { await runtime.noteUpstreamError?.(info); } catch { /* bookkeeping cannot leak/mask the safe error */ }
+  try { await runtime.noteUpstreamError?.(info, request); } catch { /* bookkeeping cannot leak/mask the safe error */ }
   const error = pluginErrorFrom(runtime.name, info);
   error.isRateLimit = info.httpStatus === 429;
   // Transport classification for dispatch wrappers: status 0 marks a

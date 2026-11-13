@@ -14,6 +14,12 @@ A quota error from Gemini Argon must not park Hydrogen or Claude; each independe
 - `services/active-probe.ts:runManagedRecoveryProbe` groups all open models by provider, probes only the first, then recovers every sibling. That incorrectly assumes every subscription has one quota pool.
 - Plugin DOM card has no quota section; admin routes are local-guarded. Add a read-only, short-TTL shared quota snapshot route and render independent rows.
 
+## External primary evidence
+
+- Google collaborator response on `google-antigravity/antigravity-cli#1399` (2026-11-02): AI Pro has a distinct `GEMINI 4 ARGON` weekly group; Ultra may share the Gemini pool. Preserve upstream group names instead of assuming one pool layout across plans. Source: https://github.com/google-antigravity/antigravity-cli/issues/1399#issuecomment (issue comments obtained using `gh api`; also verified by web search).
+- CLIProxyAPI issue `#5842` describes positive Gemini buckets with exhausted `3p-5h`, supporting independent pool bookkeeping and reset-deadline preservation: https://github.com/router-for-me/CLIProxyAPI/issues/5842. This is first-party incident evidence, not a normative API contract.
+- Project decision: user confirmed independent Argon/Hydrogen/Claude pools for this account. Unknown future model families isolate conservatively; percentages alone never establish sharing.
+
 ## Implementation topology
 
 Multi-seam; exclusive ownership in isolated worktrees:
@@ -32,7 +38,7 @@ B. Add optional model context to the generic runtime seam, persist pool locks in
 
 ## Shared contracts (implementation target)
 
-Core optional context: `ManagedRequestContext { model?: string; provider?: LLMProvider }`. `ensureUsable(context?)`, `noteUpstreamError(info, context?)`, `probeAccountState(context?)`. Core passes the selected model at both dispatch gates and HTTP/hidden-error bookkeeping. `ManagedRuntime.modelScopedRecovery?: boolean` opts into independent per-model recovery (do not restore every sibling). Existing providers keep account-group recovery.
+Core optional context: `ManagedRequestContext { model?: string; provider?: LLMProvider; requestState?: object }`. A stable per-attempt requestState lets the plugin retain an account identity/epoch guard in a WeakMap, rejecting old-account late completions without giving credential details to core. `ensureUsable(context?)`, `noteUpstreamError(info, context?)`, `probeAccountState(context?)`. Core passes the selected model at both dispatch gates and HTTP/hidden-error bookkeeping. `ManagedRuntime.modelScopedRecovery?: boolean` opts into independent per-model recovery (do not restore every sibling). Existing providers keep account-group recovery.
 
 Pool resolution: known independent pools `gemini-4-argon`, `gemini-4-hydrogen`, `claude` (Claude variants share the Claude pool); effort variants normalize to their family; other unknown models isolate conservatively by normalized family, never infer sharing from equal percentages. Include alias/version normalization only with evidence. Account-level reauth/verification/identity errors stay account-scoped. Quota errors without a model must NOT invent an all-account quota lock; pre-upgrade quota locks cannot be reliably assigned and must not strand healthy pools.
 

@@ -117,6 +117,9 @@ export interface ManagedProbeInput {
 export interface ManagedRequestContext {
   model?: string;
   provider?: LLMProvider;
+  /** Stable per-attempt identity owned by the core. Plugins may attach private
+   * state through a WeakMap without sharing credentials with the host. */
+  requestState?: object;
 }
 
 /**
