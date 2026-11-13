@@ -36,6 +36,10 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
 > UA 版本核实修订（2026-11-10）：Code Assist 数据面按 UA 里的 hub **最低版本阈值**门控模型目录（非真实性校验——实测 99.99.99 也被接受）。同一 standard-tier 账号、同 token/project，仅换 UA：hub/2.9.1 返回缩减目录且无 Gemini 4，hub/2.26.0+ 返回完整目录含 gemini-4-argon；magpie issue #5679 独立复现（旧 hub→Argon 404，当前 hub→200）。默认值由 2.9.1 提升到官方 updater manifest 当时的 2.30.0。后续 Google 再次门控新模型时需手动提升此常量，或改为动态探测 manifest。
 
 > M1 核实修订：OAuth client 参考来源为 magpie `google.go/antigravityApp`，本实现通过以上环境变量配置；缺失时返回稳定的配置未就绪错误，不回显值。禁止字符串拆分/编码绕过 GitHub Push Protection。未来若提交被拦截的公开常量，须由维护者走 GitHub 官方审查/allow 流程。M1 提交后暂停，独立审查通过再进入 M2。
+>
+> 工具签名核实修订（2026-11-13）：Google 对 functionCall 所在 part 强制校验非空 `thoughtSignature`，且该字段是 proto TYPE_BYTES——非 base64 值（如 CCR 为非 Gemini 流式轮伪造的 `ccr_<ts>`/`rs_<hex>` 标记）回放时整请求 400 "Base64 decoding failed"（实测）。因此：所有模型（含 Gemini 3+）对 functionCall 缺失或不可 base64 解码的签名补 `skip_thought_signature_validator` 哨兵；其他 part 上不可解码的签名直接删除；原生 Gemini 签名保留；已知外部标记（`ccr_`、`rs_` 前缀及 GLM 的 24 位十六进制签名）也按不可用签名处理，因 base64 可解码不代表 Gemini 能验证其内容。实际会话重放中，GLM 签名触发 `Corrupted thought signature.`；修补后上游 200。实测 Argon/Hydrogen：缺失签名→哨兵 200、真值+哨兵混合 200、`ccr_` 值 400（修复后哨兵 200）。
+>
+> 搜索工具核实修订（2026-11-13）：客户端定义的 `web_search` 带参数 schema，必须作为同名 function declaration 传递，由客户端执行；仅无参数 schema 的搜索标记转为 Google `googleSearch`。实际会话原请求混合了误生成的 `googleSearch` 和其他 function declarations，上游返回 `Please enable tool_config.include_server_side_tool_invocations to use Built-in tools with Function calling.`。保留客户端工具定义后该错误消失；再修补 GLM 历史签名，同一份会话请求返回 200。
 
 - OAuth：授权码 + PKCE(S256)；code 换 token POST form（grant_type=authorization_code, client_id, client_secret, code_verifier, code, redirect_uri）。**登录回调服务器 30 分钟超时**（v1.0.3 起，原 10 分钟对真人密码/2FA 流程过紧）。
 - token 刷新：内存缓存按 refresh_token 键；有效期 >2min 复用；否则 grant_type=refresh_token 刷新；单飞（并发请求共享同一次刷新）；刷新失败→错误码 `gemini_oauth_reauth_required`。未返回 refresh_token 时保留原值；若返回替换值须安全持久化后更新缓存身份，不能假设永不轮换。
@@ -61,7 +65,7 @@ authParams response_type=code, access_type=offline, prompt=consent, state=<rand2
 - config.url = `{dataPlane}/v1internal:streamGenerateContent?alt=sse`；headers 只注入 `Authorization: Bearer <live access token>` 与 `User-Agent`（transformer 返回的 config.headers 会覆盖默认 Bearer，次序已验证 `routes.ts:1313-1319`）。
 - **transformer 不设 endPoint**（`workbuddy.transformer.ts:7-11` 同因：避免端点撞车）。
 - body 怪癖补丁（实现前必须 gh api 读 magpie `internal/gateway/codeassist.go` 对应行段，忠实移植 + 用其测试用例形状写单测）：
-  - L35-38 `skip_thought_signature_validator` 哨兵：非 Gemini 3 模型的 functionCall 补 thoughtSignature 哨兵；
+  - `skip_thought_signature_validator` 哨兵：所有模型（含 Gemini 3+）的 functionCall part 缺少或不可 base64 解码的 thoughtSignature 补兼容哨兵；其他 part 不可用签名删除；不可用包括格式错误及已知外部标记（`ccr_`、`rs_`、GLM 24 位十六进制），其余签名保留（在 magpie L35-38 的原始补丁基础上扩展）；
   - L417-462 functionResponse 与 functionCall 配平（未答补合成结果）；
   - L317-330 历史首/尾不得是 model turn 的修正；
   - L278-330 tools/generationConfig 细节；
