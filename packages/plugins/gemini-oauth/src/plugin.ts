@@ -47,7 +47,7 @@ import type {
 
 export const manifest = {
   name: "gemini-oauth",
-  version: "1.0.10",
+  version: "1.0.11",
   coreApi: "1",
   description: "Gemini OAuth (Antigravity) managed subscription provider: Code Assist data plane, browser OAuth login, model sync and admin routes.",
 };
