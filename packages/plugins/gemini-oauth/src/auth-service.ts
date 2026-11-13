@@ -608,6 +608,15 @@ export class GeminiOauthAuthService {
 
   // ----------------------------------------------------------------- status --
 
+  /** Cheap sticky-gate source for the per-request breakers: the account's
+   *  last error code straight from the loaded credential (no models rebuild,
+   *  no config-file read). Sticky codes are always reported by getStatus too,
+   *  so gate decisions are identical. */
+  async getAccountErrorCode(): Promise<string | null> {
+    const account = await this.ensureLoaded();
+    return account?.lastError?.code ?? null;
+  }
+
   async getStatus(): Promise<GeminiOauthStatusResult> {
     const account = await this.ensureLoaded();
     const { models, hiddenModels } = await this.managedModels();
@@ -1523,7 +1532,10 @@ export class GeminiOauthAuthService {
       const next: GeminiOauthCredentialData = { ...current, account, poolLocks };
       await this.store.save(next);
       this.account = account;
-      if (info.code !== "gemini_oauth_quota_exceeded") this.clearQuotaCache();
+      // Any written bookkeeping invalidates the cached quota snapshot — a pool
+      // park is exactly the event that makes the previous figures stale, and
+      // the fetch single-flight keeps the next read deduped.
+      this.clearQuotaCache();
       this.poolLocks = normalizeGeminiOauthPoolLocks(poolLocks) ?? {};
       this.hiddenModels = next.hiddenModels ?? [];
     }).catch(() => { /* Bookkeeping cannot break the response path. */ });

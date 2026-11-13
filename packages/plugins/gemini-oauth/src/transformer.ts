@@ -52,6 +52,7 @@ import {
   type GeminiOauthAuthServiceLike,
   type GeminiOauthErrorInfo,
   type GeminiOauthRequestIdentity,
+  geminiOauthStickyErrorCode,
 } from "./protocol";
 import type { PluginTransformer, PluginTransformerContext, PluginUnifiedChatRequest } from "./core-types";
 
@@ -254,8 +255,7 @@ export class GeminiOauthTransformer implements PluginTransformer {
       // different user action: quota/validation clears on its own, an expired
       // login never does. Say which one instead of a blanket "try later",
       // which for a dead token is advice that cannot work.
-      const status: any = await service.getStatus?.().catch(() => null);
-      const reauth = isStickyGeminiOauthError(status?.lastError?.code);
+      const reauth = isStickyGeminiOauthError(await geminiOauthStickyErrorCode(service));
       throw geminiOauthError({
         code: "gemini_oauth_account_cooling",
         message: reauth
@@ -265,8 +265,7 @@ export class GeminiOauthTransformer implements PluginTransformer {
         retryable: false,
       });
     }
-    const status = await service.getStatus?.().catch(() => null);
-    if (isStickyGeminiOauthError(status?.lastError?.code)) {
+    if (isStickyGeminiOauthError(await geminiOauthStickyErrorCode(service))) {
       throw geminiOauthError({ code: "gemini_oauth_reauth_required", message: "Gemini OAuth 登录态已失效，请重新授权登录。", httpStatus: 401, retryable: false });
     }
     const lock = await service.getPoolCooldown?.(request.model);

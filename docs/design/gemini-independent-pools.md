@@ -62,3 +62,22 @@ Admin/UI: `GET /api/gemini-oauth/quota` returns snapshot or null, same local gua
 ## Blind spots
 
 Upstream pool sharing must not be inferred from model labels alone beyond the user's explicitly confirmed Argon/Hydrogen/Claude separation. Detailed quota summary may expose broader groups; retain original group identity rather than fabricate individual weekly limits. External research and exact verification evidence to be added.
+
+## Follow-ups (from the integrated-diff review, 2026-11-13)
+
+- Core scopes model-level failure budgets by bare `statusCode === 429`
+  (`plugin-request-state.ts`). Safe today because the plugin's account gate
+  rejects siblings of an account-wide 429 class (`gemini_oauth_identity_blocked`)
+  before any network spend — pinned by the "account guard 403/401/429 survives
+  sibling success and quota refusal" test. A future runtime opting into
+  `modelScopedRecovery` without an equivalent account gate would retry every
+  sibling against one blocked account. Plan: let the classifier mark quota
+  errors explicitly (e.g. `info.modelScoped`) and gate `rememberPluginFailure`
+  on that flag instead of the bare status code. Deferred: contract change
+  across plugins, not required for this diff's behavior.
+- `geminiQuotaPoolName` (protocol.ts) is production-unused after snapshot
+  parsing switched to upstream `displayName` passthrough; kept as exported
+  API with its tests — remove in a later cleanup if no external consumer.
+- `quota-view.ts` intentionally duplicates the effort-suffix list from
+  protocol `EFFORT_WORDS` (the card chunk must stay free of the node-only
+  module); add a shared cross-check test if a new effort word is ever added.

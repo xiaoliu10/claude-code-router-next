@@ -259,6 +259,24 @@ export function isStickyGeminiOauthError(code: string | null | undefined): boole
   return code === "gemini_oauth_reauth_required";
 }
 
+/** Sticky-gate source for the per-request breakers. getStatus() rebuilds
+ *  models/hiddenModels through an uncached config-file read, and the gates run
+ *  on every request (twice from core, once from the transformer) — but the
+ *  sticky decision only needs the account's last error code, which getStatus
+ *  reports verbatim for sticky codes anyway. Prefer the cheap accessor; fall
+ *  back to getStatus for service shapes that predate it. */
+export async function geminiOauthStickyErrorCode(service: GeminiOauthAuthServiceLike): Promise<string | null> {
+  if (typeof service.getAccountErrorCode === "function") {
+    try {
+      return await service.getAccountErrorCode();
+    } catch {
+      return null;
+    }
+  }
+  const status = await service.getStatus?.().catch(() => null) as { lastError?: { code?: string | null } } | null | undefined;
+  return status?.lastError?.code ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // Error taxonomy (contract §1.6 — shared by service and transformer)
 // ---------------------------------------------------------------------------
@@ -1911,6 +1929,10 @@ export interface GeminiOauthAuthServiceLike {
   /** Account status snapshot (used by the recovery probe to report the parked
    *  window). Optional so older hosts keep working. */
   getStatus?(): Promise<any>;
+  /** Cheap per-request sticky-gate source: only the account's last error code
+   *  (no models rebuild). Optional so older service shapes fall back to
+   *  getStatus via geminiOauthStickyErrorCode. */
+  getAccountErrorCode?(): Promise<string | null>;
 }
 
 let geminiOauthRuntime: { authService?: GeminiOauthAuthServiceLike } | null = null;

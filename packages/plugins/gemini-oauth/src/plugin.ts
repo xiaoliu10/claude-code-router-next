@@ -37,6 +37,7 @@ import {
   type GeminiOauthErrorInfo,
   type GeminiOauthRequestIdentity,
   type GeminiOauthProviderQuota,
+  geminiOauthStickyErrorCode,
 } from "./protocol";
 import { geminiOauthPoolHasQuota } from "./quota-pools";
 import type {
@@ -121,8 +122,7 @@ async function activate(ctx: PluginContext): Promise<void> {
         // verification and risk-control all clear on their own, an expired login
         // never does. Reporting the generic diagnosis for a dead token tells the
         // user to wait for something that cannot recover.
-        const status: any = await svc.getStatus?.().catch(() => null);
-        const reauth = isStickyGeminiOauthError(status?.lastError?.code);
+        const reauth = isStickyGeminiOauthError(await geminiOauthStickyErrorCode(svc));
         throw geminiOauthError({
           code: "gemini_oauth_account_cooling",
           message: reauth
@@ -132,8 +132,7 @@ async function activate(ctx: PluginContext): Promise<void> {
           retryable: false,
         });
       }
-      const status = await svc.getStatus?.().catch(() => null);
-      if (isStickyGeminiOauthError(status?.lastError?.code)) {
+      if (isStickyGeminiOauthError(await geminiOauthStickyErrorCode(svc))) {
         throw geminiOauthError({ code: "gemini_oauth_reauth_required", message: "Gemini OAuth 登录态已失效，请重新授权登录。", httpStatus: 401, retryable: false });
       }
       const lock = context?.model ? await svc.getPoolCooldown?.(context.model) : null;

@@ -166,7 +166,7 @@ describe("independent quota pool locks", () => {
 });
 
 describe("shared service quota cache", () => {
-  it("single-flights concurrent reads, honors subscription dispatcher, caches through pool locks and TTL", async () => {
+  it("single-flights concurrent reads, honors subscription dispatcher, caches until TTL or a written pool lock", async () => {
     const gate = deferred<Response>();
     const fetchImpl = vi.fn(async (url: string, init: any) => {
       expect(init.dispatcher).toBe(h.dispatcher);
@@ -182,11 +182,14 @@ describe("shared service quota cache", () => {
     expect(snapshots[0]).toEqual({ models: { [ARGON]: { remaining: 0 } }, pools: [{ pool: "GEMINI 4 ARGON", window: "weekly", remaining: 0.3 }] });
     expect(snapshots[1]).toEqual(snapshots[0]);
     await h.service.noteUpstreamError(quotaError(), ARGON);
-    await h.service.getQuota();
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
-    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_001);
+    // A written pool lock invalidates the cached snapshot: the park is exactly
+    // the event that makes the pre-park figures stale (+2 = bucket + summary;
+    // the token stays cached).
     await h.service.getQuota();
     expect(fetchImpl).toHaveBeenCalledTimes(5);
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_001);
+    await h.service.getQuota();
+    expect(fetchImpl).toHaveBeenCalledTimes(7);
   });
 
   it("caches null failures and guards auth/verification parks without refreshing a token", async () => {
