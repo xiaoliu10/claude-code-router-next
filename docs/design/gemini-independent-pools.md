@@ -16,8 +16,8 @@ A quota error from Gemini Argon must not park Hydrogen or Claude; each independe
 
 ## External primary evidence
 
-- Google collaborator response on `google-antigravity/antigravity-cli#1399` (2026-11-02): AI Pro has a distinct `GEMINI 4 ARGON` weekly group; Ultra may share the Gemini pool. Preserve upstream group names instead of assuming one pool layout across plans. Source: https://github.com/google-antigravity/antigravity-cli/issues/1399#issuecomment (issue comments obtained using `gh api`; also verified by web search).
-- CLIProxyAPI issue `#5842` describes positive Gemini buckets with exhausted `3p-5h`, supporting independent pool bookkeeping and reset-deadline preservation: https://github.com/router-for-me/CLIProxyAPI/issues/5842. This is first-party incident evidence, not a normative API contract.
+- Google collaborator response on `google-antigravity/antigravity-cli#1399` (2026-11-02): AI Pro has a distinct `GEMINI 4 ARGON` weekly group; Ultra may share the Gemini pool. Preserve upstream group names instead of assuming one pool layout across plans. Source: https://github.com/google-antigravity/antigravity-cli/issues/1399#issuecomment-6591444376 (exact comment URL verified using `gh api`; also verified by web search).
+- CLIProxyAPI issue `#6643` describes concurrent older successes clearing a fresh quota cooldown: https://github.com/router-for-me/CLIProxyAPI/issues/6643. This supports preserving active quota locks across late successes. Issue `#5842` concerns trusted retry deadlines, not pool membership: https://github.com/router-for-me/CLIProxyAPI/issues/5842. These are first-party incident reports, not a normative API contract.
 - Project decision: user confirmed independent Argon/Hydrogen/Claude pools for this account. Unknown future model families isolate conservatively; percentages alone never establish sharing.
 
 ## Implementation topology
