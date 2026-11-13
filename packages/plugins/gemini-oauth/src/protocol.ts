@@ -1317,18 +1317,42 @@ function eachTurnPart(body: Record<string, any>, fn: (part: any, turn: any) => v
 }
 
 /**
- * Cross-model histories can contain function calls without a Gemini thought
- * signature. Use the compatibility sentinel for those calls on every model,
- * including Gemini 3+, which otherwise rejects the history with HTTP 400.
- * Preserve existing signatures so native Gemini continuations keep their state.
+ * True when the value can ride Google's TYPE_BYTES thought_signature field:
+ * base64 alphabet (standard or URL-safe, padding optional) with a length that
+ * can decode (the unpadded remainder is never 1). CCR's own synthesized
+ * markers for non-Gemini streaming turns — `ccr_<timestamp>`, `rs_<hex>` —
+ * are NOT decodable, and Google rejects the whole request with 400
+ * "Base64 decoding failed" when one is replayed inside the history.
+ */
+function isBase64Transportable(value: string): boolean {
+  if (!/^[A-Za-z0-9+/\-_]+={0,2}$/.test(value)) return false;
+  return value.replace(/=+$/, "").length % 4 !== 1;
+}
+
+/**
+ * Cross-model histories carry function calls without a Gemini thought
+ * signature, and replayed CCR markers carry signatures Google can never
+ * accept (invalid base64). Repair per part:
+ *   - missing/non-decodable signature on a functionCall → the compatibility
+ *     sentinel, on every model including Gemini 3+/4 (upstream 400 otherwise);
+ *   - non-decodable signature on any other part → the field is dropped
+ *     (text/thought parts without signatures are always accepted);
+ *   - decodable signatures (native Gemini, or foreign-but-valid base64)
+ *     are preserved untouched so native continuations keep their state.
  */
 export function applyThoughtSignatureSentinel(body: Record<string, any>, _model: string): void {
   // The model argument preserves the existing call-site contract; the
   // compatibility sentinel now applies to unsigned calls across all models.
+  const nonTransportable = (value: unknown): boolean =>
+    typeof value === "string" && value.length > 0 && !isBase64Transportable(value);
   eachTurnPart(body, (part) => {
-    if (part?.functionCall && !part.thoughtSignature) {
-      part.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
+    if (!part || typeof part !== "object") return;
+    const signature = part.thoughtSignature;
+    if (part.functionCall) {
+      if (!signature || nonTransportable(signature)) part.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
+      return;
     }
+    if (signature && nonTransportable(signature)) delete part.thoughtSignature;
   });
 }
 

@@ -355,22 +355,30 @@ describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", 
   });
 
   it.each(["gemini-3-flash", "gemini-4-argon", "gemini-4-hydrogen"])(
-    "preserves real signatures and repairs only unsigned calls for %s",
+    "preserves decodable signatures and repairs unsigned or non-base64 calls for %s",
     (model) => {
       const signed = { functionCall: { id: "c1", name: "t", args: {} }, thoughtSignature: "real-sig" };
       const unsigned = { functionCall: { id: "c2", name: "t", args: {} } };
       const emptySignature = { functionCall: { id: "c3", name: "t", args: {} }, thoughtSignature: "" };
+      const fabricatedCcr = { functionCall: { id: "c4", name: "t", args: {} }, thoughtSignature: "ccr_1794539565734" };
+      const fabricatedRs = { functionCall: { id: "c5", name: "t", args: {} }, thoughtSignature: "rs_045a9ed30cdae06a2537de87e6b27ceef678cd011d2167cf6d" };
       const text = { text: "tool calls follow", thoughtSignature: "text-sig" };
+      const poisonedText = { text: "carry fabricated marker", thoughtSignature: "ccr_1234567890123" };
+      const decodableForeignText = { text: "carry decodable marker", thoughtSignature: "EjRWeJq83vEi" };
       const response = { functionResponse: { id: "c2", name: "t", response: { result: "OK" } } };
       const body = { contents: [
-        { role: "model", parts: [text, signed, unsigned, emptySignature] },
+        { role: "model", parts: [text, signed, unsigned, emptySignature, fabricatedCcr, fabricatedRs, poisonedText, decodableForeignText] },
         { role: "user", parts: [response] },
       ] };
       applyThoughtSignatureSentinel(body, model);
       expect(signed.thoughtSignature).toBe("real-sig");
       expect(unsigned).toHaveProperty("thoughtSignature", SKIP_THOUGHT_SIGNATURE);
       expect(emptySignature.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+      expect(fabricatedCcr.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+      expect(fabricatedRs.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
       expect(text).toEqual({ text: "tool calls follow", thoughtSignature: "text-sig" });
+      expect(poisonedText).not.toHaveProperty("thoughtSignature");
+      expect(decodableForeignText).toEqual({ text: "carry decodable marker", thoughtSignature: "EjRWeJq83vEi" });
       expect(response).not.toHaveProperty("thoughtSignature");
       const repaired = structuredClone(body);
       applyThoughtSignatureSentinel(body, model);
@@ -393,6 +401,7 @@ describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", 
           { id: "c3", type: "function", function: { name: "get_value", arguments: "{}" } },
         ] },
         { role: "tool", tool_call_id: "c3", content: "third" },
+        { role: "assistant", content: "wrapped up", thinking: { content: "note", signature: "ccr_1794539565734" } },
       ] });
       const original = structuredClone(request);
       const { body } = await transformer().transformRequestIn(request, {});
@@ -400,6 +409,8 @@ describe("gemini-oauth body quirks (magpie codeassist.go, one test per patch)", 
       expect(calls.map((part: any) => [part.functionCall.id, part.thoughtSignature])).toEqual([
         ["c1", SKIP_THOUGHT_SIGNATURE], ["c2", SKIP_THOUGHT_SIGNATURE], ["c3", "real-sig"],
       ]);
+      const wrappedUp = body.request.contents.flatMap((turn: any) => turn.parts).find((part: any) => part.text === "wrapped up");
+      expect(wrappedUp).not.toHaveProperty("thoughtSignature");
       expect(request).toEqual(original);
     },
   );
