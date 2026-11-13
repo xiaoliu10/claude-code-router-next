@@ -513,6 +513,68 @@ export function transformRequestOut(
   return unifiedChatRequest;
 }
 
+function buildOpenAIUsage(usageMetadata: any) {
+  return {
+    completion_tokens: usageMetadata?.candidatesTokenCount || 0,
+    prompt_tokens: usageMetadata?.promptTokenCount || 0,
+    prompt_tokens_details: {
+      cached_tokens: usageMetadata?.cachedContentTokenCount || 0,
+    },
+    total_tokens: usageMetadata?.totalTokenCount || 0,
+    output_tokens_details: {
+      reasoning_tokens: usageMetadata?.thoughtsTokenCount || 0,
+    },
+  };
+}
+
+function buildGroundingAnnotations(candidate: any) {
+  if (!candidate?.groundingMetadata?.groundingChunks?.length) return undefined;
+  return candidate.groundingMetadata.groundingChunks.map(
+    (groundingChunk: any, index: number) => {
+      const support =
+        candidate?.groundingMetadata?.groundingSupports?.filter(
+          (item: any) => item.groundingChunkIndices?.includes(index)
+        );
+      return {
+        type: "url_citation",
+        url_citation: {
+          url: groundingChunk?.web?.uri || "",
+          title: groundingChunk?.web?.title || "",
+          content: support?.[0]?.segment?.text || "",
+          start_index: support?.[0]?.segment?.startIndex || 0,
+          end_index: support?.[0]?.segment?.endIndex || 0,
+        },
+      };
+    }
+  );
+}
+
+function buildTrailingMetadataChunk(chunk: any, candidate: any, contentIndex: number) {
+  const annotations = candidate ? buildGroundingAnnotations(candidate) : undefined;
+  const finishReason = candidate?.finishReason?.toLowerCase() || null;
+  return {
+    choices:
+      finishReason || annotations
+        ? [
+            {
+              delta: annotations ? { role: "assistant", annotations } : {},
+              finish_reason: finishReason,
+              index: contentIndex,
+              logprobs: null,
+            },
+          ]
+        : [],
+    created: parseInt(new Date().getTime() / 1000 + "", 10),
+    id: chunk.responseId || "",
+    model: chunk.modelVersion || "",
+    object: "chat.completion.chunk",
+    system_fingerprint: "fp_a49d71b8a1",
+    ...(chunk.usageMetadata
+      ? { usage: buildOpenAIUsage(chunk.usageMetadata) }
+      : {}),
+  };
+}
+
 export async function transformResponseOut(
   response: Response,
   providerName: string,
@@ -588,19 +650,7 @@ export async function transformResponseOut(
       created: parseInt(new Date().getTime() / 1000 + "", 10),
       model: jsonResponse.modelVersion,
       object: "chat.completion",
-      usage: {
-        completion_tokens:
-          jsonResponse.usageMetadata?.candidatesTokenCount || 0,
-        prompt_tokens: jsonResponse.usageMetadata?.promptTokenCount || 0,
-        prompt_tokens_details: {
-          cached_tokens:
-            jsonResponse.usageMetadata?.cachedContentTokenCount || 0,
-        },
-        total_tokens: jsonResponse.usageMetadata?.totalTokenCount || 0,
-        output_tokens_details: {
-          reasoning_tokens: jsonResponse.usageMetadata?.thoughtsTokenCount || 0,
-        },
-      },
+      usage: buildOpenAIUsage(jsonResponse.usageMetadata),
     };
     return new Response(JSON.stringify(res), {
       status: response.status,
@@ -634,13 +684,25 @@ export async function transformResponseOut(
               try {
                 const chunk = JSON.parse(chunkStr);
 
-                // Check if chunk has valid structure
+                // Check if chunk has valid structure; trailing usage-only frames
+                // may omit candidates while still carrying final usageMetadata.
                 if (!chunk.candidates || !chunk.candidates[0]) {
+                  if (chunk.usageMetadata) {
+                    controller.enqueue(
+                      encoder.encode(
+                        `data: ${JSON.stringify(
+                          buildTrailingMetadataChunk(chunk, undefined, contentIndex)
+                        )}\n\n`
+                      )
+                    );
+                    return;
+                  }
                   logger?.debug({ chunkStr }, `Invalid chunk structure`);
                   return;
                 }
 
                 const candidate = chunk.candidates[0];
+                let emittedTerminalOrUsage = false;
                 const parts = candidate.content?.parts || [];
 
                 parts
@@ -817,8 +879,17 @@ export async function transformResponseOut(
                 }
 
                 if (hasThinkingContent && textContent && !signatureSent) {
-                  if (chunk.modelVersion.includes("3")) {
+                  if (chunk.modelVersion?.includes("3")) {
                     pendingContent += textContent;
+                    if (chunk.usageMetadata) {
+                      controller.enqueue(
+                        encoder.encode(
+                          `data: ${JSON.stringify(
+                            buildTrailingMetadataChunk(chunk, candidate, contentIndex)
+                          )}\n\n`
+                        )
+                      );
+                    }
                     return;
                   } else {
                     const signatureChunk = {
@@ -871,48 +942,17 @@ export async function transformResponseOut(
                     model: chunk.modelVersion || "",
                     object: "chat.completion.chunk",
                     system_fingerprint: "fp_a49d71b8a1",
-                    usage: {
-                      completion_tokens:
-                        chunk.usageMetadata?.candidatesTokenCount || 0,
-                      prompt_tokens: chunk.usageMetadata?.promptTokenCount || 0,
-                      prompt_tokens_details: {
-                        cached_tokens:
-                          chunk.usageMetadata?.cachedContentTokenCount || 0,
-                      },
-                      total_tokens: chunk.usageMetadata?.totalTokenCount || 0,
-                      output_tokens_details: {
-                        reasoning_tokens:
-                          chunk.usageMetadata?.thoughtsTokenCount || 0,
-                      },
-                    },
+                    usage: buildOpenAIUsage(chunk.usageMetadata),
                   };
 
-                  if (candidate?.groundingMetadata?.groundingChunks?.length) {
-                    (res.choices[0].delta as any).annotations =
-                      candidate.groundingMetadata.groundingChunks.map(
-                        (groundingChunk: any, index: number) => {
-                          const support =
-                            candidate?.groundingMetadata?.groundingSupports?.filter(
-                              (item: any) =>
-                                item.groundingChunkIndices?.includes(index)
-                            );
-                          return {
-                            type: "url_citation",
-                            url_citation: {
-                              url: groundingChunk?.web?.uri || "",
-                              title: groundingChunk?.web?.title || "",
-                              content: support?.[0]?.segment?.text || "",
-                              start_index:
-                                support?.[0]?.segment?.startIndex || 0,
-                              end_index: support?.[0]?.segment?.endIndex || 0,
-                            },
-                          };
-                        }
-                      );
+                  const textAnnotations = buildGroundingAnnotations(candidate);
+                  if (textAnnotations) {
+                    (res.choices[0].delta as any).annotations = textAnnotations;
                   }
                   controller.enqueue(
                     encoder.encode(`data: ${JSON.stringify(res)}\n\n`)
                   );
+                  emittedTerminalOrUsage = true;
 
                   if (!contentSent && textContent) {
                     contentSent = true;
@@ -946,54 +986,40 @@ export async function transformResponseOut(
                       model: chunk.modelVersion || "",
                       object: "chat.completion.chunk",
                       system_fingerprint: "fp_a49d71b8a1",
-                      usage: {
-                        completion_tokens:
-                          chunk.usageMetadata?.candidatesTokenCount || 0,
-                        prompt_tokens:
-                          chunk.usageMetadata?.promptTokenCount || 0,
-                        prompt_tokens_details: {
-                          cached_tokens:
-                            chunk.usageMetadata?.cachedContentTokenCount || 0,
-                        },
-                        total_tokens: chunk.usageMetadata?.totalTokenCount || 0,
-                        output_tokens_details: {
-                          reasoning_tokens:
-                            chunk.usageMetadata?.thoughtsTokenCount || 0,
-                        },
-                      },
+                      usage: buildOpenAIUsage(chunk.usageMetadata),
                     };
 
-                    if (candidate?.groundingMetadata?.groundingChunks?.length) {
-                      (res.choices[0].delta as any).annotations =
-                        candidate.groundingMetadata.groundingChunks.map(
-                          (groundingChunk: any, index: number) => {
-                            const support =
-                              candidate?.groundingMetadata?.groundingSupports?.filter(
-                                (item: any) =>
-                                  item.groundingChunkIndices?.includes(index)
-                              );
-                            return {
-                              type: "url_citation",
-                              url_citation: {
-                                url: groundingChunk?.web?.uri || "",
-                                title: groundingChunk?.web?.title || "",
-                                content: support?.[0]?.segment?.text || "",
-                                start_index:
-                                  support?.[0]?.segment?.startIndex || 0,
-                                end_index: support?.[0]?.segment?.endIndex || 0,
-                              },
-                            };
-                          }
-                        );
+                    const toolAnnotations = buildGroundingAnnotations(candidate);
+                    if (toolAnnotations) {
+                      (res.choices[0].delta as any).annotations = toolAnnotations;
                     }
                     controller.enqueue(
                       encoder.encode(`data: ${JSON.stringify(res)}\n\n`)
                     );
+                    emittedTerminalOrUsage = true;
                   });
 
                   if (!contentSent && textContent) {
                     contentSent = true;
                   }
+                }
+
+                // Gemini commonly delivers the final finishReason and usageMetadata
+                // (including cachedContentTokenCount) on a trailing frame with an
+                // empty text part ({ text: "" }) and no functionCall.
+                if (
+                  !emittedTerminalOrUsage &&
+                  (candidate.finishReason ||
+                    chunk.usageMetadata ||
+                    candidate?.groundingMetadata?.groundingChunks?.length)
+                ) {
+                  controller.enqueue(
+                    encoder.encode(
+                      `data: ${JSON.stringify(
+                        buildTrailingMetadataChunk(chunk, candidate, contentIndex)
+                      )}\n\n`
+                    )
+                  );
                 }
               } catch (error: any) {
                 logger?.error(

@@ -217,6 +217,144 @@ describe("gemini-oauth SSE unwrap (contract §1.2)", () => {
     expect(texts.join("")).toContain("lo");
   });
 
+  it("emits trailing usageMetadata (including cachedContentTokenCount) and finish_reason on empty-text stop frames", async () => {
+    const upstream = sseResponse([
+      {
+        response: {
+          responseId: "resp-cache-1",
+          modelVersion: "gemini-4-argon-high",
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    functionCall: { id: "call-1", name: "read", args: { path: "a.ts" } },
+                    thoughtSignature: "c2lnMTIz",
+                  },
+                ],
+              },
+            },
+          ],
+          usageMetadata: { promptTokenCount: 88817, candidatesTokenCount: 23, totalTokenCount: 88840 },
+        },
+      },
+      {
+        response: {
+          responseId: "resp-cache-1",
+          modelVersion: "gemini-4-argon-high",
+          candidates: [{ finishReason: "STOP", content: { parts: [{ text: "" }] } }],
+          usageMetadata: {
+            promptTokenCount: 93116,
+            candidatesTokenCount: 29,
+            totalTokenCount: 93145,
+            cachedContentTokenCount: 91067,
+            thoughtsTokenCount: 46,
+          },
+        },
+      },
+    ]);
+    const res = await transformer().transformResponseOut(upstream, { geminiOauthClientStream: true } as any);
+    const chunks = await readSseData(res);
+    const tail = chunks.at(-1);
+    expect(tail.choices).toEqual([
+      { delta: {}, finish_reason: "stop", index: 2, logprobs: null },
+    ]);
+    expect(tail.usage).toEqual({
+      prompt_tokens: 93116,
+      completion_tokens: 29,
+      total_tokens: 93145,
+      prompt_tokens_details: { cached_tokens: 91067 },
+      output_tokens_details: { reasoning_tokens: 46 },
+    });
+  });
+
+  it("flushes buffered Gemini-3 content with usage frames inserted mid-stream before the signature frame", async () => {
+    // gemini-3 models buffer text until a thoughtSignature frame arrives; a
+    // usageMetadata frame can land in between and must not be dropped.
+    const upstream = sseResponse([
+      {
+        response: {
+          responseId: "resp-buffer-1",
+          modelVersion: "gemini-3-flash",
+          candidates: [
+            {
+              content: { parts: [{ text: "reasoning…", thought: true }, { text: "part" }] },
+              finishReason: null,
+            },
+          ],
+          usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 10, totalTokenCount: 1010, cachedContentTokenCount: 800 },
+        },
+      },
+      {
+        response: {
+          responseId: "resp-buffer-1",
+          modelVersion: "gemini-3-flash",
+          candidates: [{ content: { parts: [{ thoughtSignature: "sig-1" }] } }],
+        },
+      },
+      {
+        response: {
+          responseId: "resp-buffer-1",
+          modelVersion: "gemini-3-flash",
+          candidates: [{ finishReason: "STOP", content: { parts: [{ text: "" }] } }],
+          usageMetadata: { promptTokenCount: 1100, candidatesTokenCount: 12, totalTokenCount: 1112, cachedContentTokenCount: 900, thoughtsTokenCount: 4 },
+        },
+      },
+    ]);
+    const res = await transformer().transformResponseOut(upstream, { geminiOauthClientStream: true } as any);
+    const chunks = await readSseData(res);
+    const usageChunks = chunks.filter((c) => c.usage);
+    expect(usageChunks).toHaveLength(2);
+    expect(usageChunks[0].choices).toEqual([]);
+    expect(usageChunks[0].usage.prompt_tokens_details.cached_tokens).toBe(800);
+    const contents = chunks.map((c) => c.choices?.[0]?.delta?.content).filter(Boolean);
+    expect(contents.join("")).toBe("part");
+    const signatureChunks = chunks.filter((c) => c.choices?.[0]?.delta?.thinking?.signature === "sig-1");
+    expect(signatureChunks).toHaveLength(1);
+    const tail = chunks.at(-1);
+    expect(tail.usage.prompt_tokens_details.cached_tokens).toBe(900);
+    expect(tail.choices[0].finish_reason).toBe("stop");
+  });
+
+  it("emits trailing usageMetadata on text turns and candidates-less final usage frames", async () => {
+    const upstream = sseResponse([
+      {
+        response: {
+          responseId: "resp-cache-2",
+          modelVersion: "gemini-4-argon-high",
+          candidates: [{ content: { parts: [{ text: "OK" }] } }],
+          usageMetadata: { promptTokenCount: 88828, candidatesTokenCount: 1, totalTokenCount: 88829 },
+        },
+      },
+      {
+        response: {
+          responseId: "resp-cache-2",
+          modelVersion: "gemini-4-argon-high",
+          candidates: [{ finishReason: "STOP", content: { parts: [{ text: "" }] } }],
+        },
+      },
+      {
+        response: {
+          responseId: "resp-cache-2",
+          modelVersion: "gemini-4-argon-high",
+          usageMetadata: {
+            promptTokenCount: 93073,
+            candidatesTokenCount: 5,
+            totalTokenCount: 93078,
+            cachedContentTokenCount: 22207,
+          },
+        },
+      },
+    ]);
+    const res = await transformer().transformResponseOut(upstream, { geminiOauthClientStream: true } as any);
+    const chunks = await readSseData(res);
+    expect(chunks.map((c) => c.choices?.[0]?.delta?.content).filter(Boolean).join("")).toBe("OK");
+    expect(chunks.some((c) => c.choices?.[0]?.finish_reason === "stop" && !c.usage)).toBe(true);
+    const tail = chunks.at(-1);
+    expect(tail.choices).toEqual([]);
+    expect(tail.usage.prompt_tokens_details.cached_tokens).toBe(22207);
+  });
+
   it("throws a classified error when the first frame is an error envelope", async () => {
     const upstream = sseResponse([{ error: { message: "Resource has been exhausted" } }]);
     await expect(
