@@ -73,7 +73,7 @@ function makePackedPlugin(
   mkdirSync(inner, { recursive: true });
   writeFileSync(join(root, "package", "package.json"), JSON.stringify({
     name: `@scope/ccr-provider-${label}`,
-    version: "1.0.0",
+    version: opts.version ?? "1.0.0",
   }));
   writeFileSync(join(inner, "plugin.json"), JSON.stringify({
     name,
@@ -343,6 +343,36 @@ describe("installPluginFromArchive", () => {
     expect(JSON.parse(readFileSync(join(configDir, "plugins/fixture/plugin.json"), "utf8")).version).toBe("1.0.0");
     await installPluginFromArchive(v2, { configDir, force: true });
     expect(JSON.parse(readFileSync(join(configDir, "plugins/fixture/plugin.json"), "utf8")).version).toBe("2.0.0");
+  });
+
+  it("rejects a stale npm payload without replacing the working installation", async () => {
+    const { archive: good } = makePackedPlugin("current");
+    await installPluginFromArchive(good, { configDir });
+    const before = readFileSync(join(configDir, "plugins/fixture/plugin.json"), "utf8");
+    const { root, archive } = makePackedPlugin("stale");
+    writeFileSync(join(root, "package/package.json"), JSON.stringify({ name: "@scope/ccr-provider-stale", version: "1.0.1" }));
+    execFileSync("tar", ["-czf", archive, "-C", root, "package"]);
+    await expect(installPluginFromArchive(archive, { configDir, force: true })).rejects.toMatchObject({ code: "invalid_manifest" });
+    expect(readFileSync(join(configDir, "plugins/fixture/plugin.json"), "utf8")).toBe(before);
+    expect(readPluginRecords(configDir)).toEqual([{ name: "fixture", enabled: true }]);
+  });
+
+  it("rejects malformed or array package.json while allowing root-layout archives without package.json", async () => {
+    const badJson = makePackedPlugin("bad-json");
+    writeFileSync(join(badJson.root, "package/package.json"), "{not-json");
+    execFileSync("tar", ["-czf", badJson.archive, "-C", badJson.root, "package"]);
+    await expect(installPluginFromArchive(badJson.archive, { configDir })).rejects.toMatchObject({ code: "invalid_manifest" });
+
+    const arrayPkg = makePackedPlugin("array-pkg");
+    writeFileSync(join(arrayPkg.root, "package/package.json"), "[]");
+    execFileSync("tar", ["-czf", arrayPkg.archive, "-C", arrayPkg.root, "package"]);
+    await expect(installPluginFromArchive(arrayPkg.archive, { configDir })).rejects.toMatchObject({ code: "invalid_manifest" });
+
+    const rootLayout = makePackedPlugin("root-layout", { layout: "root" });
+    rmSync(join(rootLayout.root, "package/package.json"));
+    execFileSync("tar", ["-czf", rootLayout.archive, "-C", rootLayout.root, "package"]);
+    const { manifest: installed } = await installPluginFromArchive(rootLayout.archive, { configDir });
+    expect(installed.version).toBe("1.0.0");
   });
 
   it("rejects missing entry, bad name and bad coreApi payloads", async () => {

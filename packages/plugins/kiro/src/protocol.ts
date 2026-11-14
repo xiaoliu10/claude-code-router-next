@@ -1,4 +1,4 @@
-import type { PluginClassifiedError } from "./core-types";
+import type { PluginClassifiedError, ProviderQuotaFigures } from "./core-types";
 
 export const KIRO_PROVIDER = "kiro-subscription";
 export const KIRO_MARKER = "ccr-managed-kiro";
@@ -48,7 +48,15 @@ export function validStartUrl(value: unknown): value is string {
 export function kiroError(code: string, statusCode = 422): Error & { code: string; statusCode: number } {
   return Object.assign(new Error(code), { code, statusCode, nonRetryable: true, ...(code === "kiro_reauth_required" ? { gone: true } : {}) });
 }
-export const KIRO_ERROR_CODES = ["kiro_unauthorized", "kiro_login_invalid", "kiro_login_unknown", "kiro_login_expired", "kiro_login_busy", "kiro_callback_invalid", "kiro_callback_ports_busy", "kiro_login_cancelled", "kiro_login_failed", "kiro_not_connected", "kiro_reauth_required", "kiro_account_cooling", "kiro_persist_failed", "kiro_config_write_failed", "kiro_provider_name_conflict", "kiro_credential_invalid", "kiro_credential_unreadable", "kiro_raw_config_required", "kiro_upstream_error", "kiro_rate_limited", "kiro_request_failed", "kiro_model_unknown"] as const;
+export const KIRO_ERROR_CODES = ["kiro_unauthorized", "kiro_login_invalid", "kiro_login_unknown", "kiro_login_expired", "kiro_login_busy", "kiro_callback_invalid", "kiro_callback_ports_busy", "kiro_login_cancelled", "kiro_login_failed", "kiro_not_connected", "kiro_reauth_required", "kiro_account_cooling", "kiro_persist_failed", "kiro_config_write_failed", "kiro_provider_name_conflict", "kiro_credential_invalid", "kiro_credential_unreadable", "kiro_raw_config_required", "kiro_upstream_error", "kiro_rate_limited", "kiro_request_failed", "kiro_model_unknown", "kiro_content_filtered", "kiro_stream_truncated", "kiro_stream_invalid"] as const;
+/**
+ * Cooldowns are for ACCOUNT-level conditions only: rate limits, quota
+ * exhaustion and auth failures. Everything else (a conversation-level content
+ * refusal, a transient 502, a truncated stream) must not park the account, or
+ * one bad conversation blocks every other session plus the read-only
+ * management/quota lanes for the whole window.
+ */
+export const KIRO_COOLDOWN_CODES = new Set(["kiro_rate_limited", "kiro_reauth_required"]);
 // Config is a host-owned extensible JSON object; preserve unknown provider fields.
 type Config = Record<string, any>;
 export function isKiroManaged(p: Config | undefined): boolean {
@@ -78,3 +86,21 @@ export function classifyKiroError(status: number, _body?: unknown): PluginClassi
     ...([401, 403].includes(status) ? { cooldownMs: 3_600_000 } : status === 429 ? { cooldownMs: 300_000 } : {}) };
 }
 export function isKiroErrorEnvelope(body: unknown): boolean { return (body as { error?: { type?: string } })?.error?.type === "kiro_error"; }
+
+/**
+ * Map Kiro credit windows into the core quota-store shape for /api/providers/quota.
+ * Kiro accounts carry monthly recurring credits (and optional active bonuses) rather
+ * than a 5h rolling window or fiat currency wallet, so we aggregate active pools
+ * into the 7d rate-limit slot (no currency) with the primary pool's reset timestamp.
+ */
+export function kiroUsageToQuotaFigures(
+  usage: { known?: boolean; windows?: Array<{ amount: number; limit: number; resetsAt?: string; expiresAt?: string }> } | null | undefined
+): ProviderQuotaFigures | null {
+  if (!usage?.known) return null;
+  const windows = (usage.windows ?? []).filter(w => Number.isFinite(w.limit) && w.limit > 0 && Number.isFinite(w.amount) && w.amount >= 0);
+  if (!windows.length) return null;
+  const usedBalance = windows.reduce((sum, w) => sum + w.amount, 0);
+  const totalBalance = windows.reduce((sum, w) => sum + w.limit, 0);
+  const resetTime7d = windows.find(w => typeof w.resetsAt === "string")?.resetsAt ?? windows.find(w => typeof w.expiresAt === "string")?.expiresAt;
+  return { usedBalance, totalBalance, ...(resetTime7d ? { resetTime7d } : {}) };
+}

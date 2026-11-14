@@ -1,1 +1,1 @@
-export type { PluginContext, PluginHostCapabilities, ManagedRuntime, PluginClassifiedError } from "../../../core/src/provider-plugins/types";
+export type { PluginContext, PluginHostCapabilities, ManagedRuntime, PluginClassifiedError, ProviderQuotaFigures } from "../../../core/src/provider-plugins/types";

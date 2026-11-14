@@ -1,6 +1,6 @@
 {
   "name": "@wengine-ai/llms",
-  "version": "2.3.2429",
+  "version": "2.3.2431",
   "description": "A universal LLM API transformation server",
   "main": "dist/cjs/server.cjs",
   "module": "dist/esm/server.mjs",
@@ -49,8 +49,13 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",
     "@fastify/cors": "^11.0.1",
+    "@fastify/multipart": "^9.0.0",
+    "@fastify/static": "^8.2.0",
     "@google/genai": "^1.7.0",
     "@huggingface/tokenizers": "^0.0.6",
+    "@wengine-ai/claude-code-router-shared": "workspace:*",
+    "adm-zip": "^0.5.16",
+    "better-sqlite3": "^12.10.0",
     "dotenv": "^16.5.0",
     "fastify": "^5.4.0",
     "fastify-plugin": "^5.1.0",
@@ -59,23 +64,20 @@
     "jsonrepair": "^3.13.0",
     "lru-cache": "^11.2.2",
     "openai": "^5.6.0",
+    "rotating-file-stream": "^3.2.7",
+    "semver": "^7.8.6",
     "tiktoken": "^1.0.21",
     "undici": "^7.10.0",
-    "uuid": "^11.1.0",
-    "@fastify/multipart": "^9.0.0",
-    "@fastify/static": "^8.2.0",
-    "@wengine-ai/claude-code-router-shared": "workspace:*",
-    "adm-zip": "^0.5.16",
-    "better-sqlite3": "^12.10.0",
-    "rotating-file-stream": "^3.2.7"
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.0.15",
+    "@types/semver": "^7.8.0",
     "esbuild": "^0.25.1",
     "tsx": "^4.20.3",
     "typescript": "^5.8.2",
-    "vitest": "^4.1.9",
-    "@types/adm-zip": "^0.5.7",
-    "@types/better-sqlite3": "^7.6.13"
+    "vitest": "^4.1.9"
   }
 }

@@ -1048,6 +1048,18 @@ async function installPluginFromArchiveUnlocked(
       );
     }
     const { manifest } = validatePayload(payloadDir);
+    // npm package metadata and the installable manifest must identify the same
+    // release. A stale dist/ otherwise reports success while reinstalling an
+    // old version forever. Installed-layout archives may omit package metadata.
+    const packageFile = join(packageRoot, "package.json");
+    if (existsSync(packageFile)) {
+      let pkg: { version?: unknown };
+      try { pkg = JSON.parse(readFileSync(packageFile, "utf8")); }
+      catch { throw new PluginInstallError("invalid package.json", "invalid_manifest"); }
+      if (!pkg || typeof pkg !== "object" || Array.isArray(pkg) || (pkg.version !== undefined && pkg.version !== manifest.version)) {
+        throw new PluginInstallError("package.json version does not match plugin.json; rebuild the plugin package", "invalid_manifest");
+      }
+    }
     const target = stagePluginInstall(payloadDir, manifest, options.configDir, options.force ?? false, options.source);
     return { target, manifest };
   } finally {

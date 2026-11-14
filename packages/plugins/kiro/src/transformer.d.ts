@@ -25,6 +25,20 @@ export declare function kiroFrames(body: ReadableStream<Uint8Array>, cancelBus?:
     data: Json;
     exception: boolean;
 }>;
+/** Kiro signals a conversation-level refusal through metadataEvent.stopDetails. */
+export declare function kiroRefusalOf(metadata: Json): {
+    category: string;
+} | null;
+/**
+ * Classify a data-plane refusal: the model declined THIS conversation, the
+ * account itself is healthy. A per-conversation refusal must never park the
+ * account (no cooldown) — otherwise one filtered session blocks every other
+ * session AND the read-only management/quota lanes for the whole cooldown.
+ */
+export declare function kiroRefusalError(): Error & {
+    code: string;
+    statusCode: number;
+};
 export declare function kiroFailure(status: number, body?: Json): Error & {
     statusCode: number;
     code: string;

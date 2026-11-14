@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2431] - 2026-11-13
+
+### Fixed
+
+- **Kiro content-filter refusals no longer trigger account-wide cooldown or block quota reads** (`@wengine-ai/ccr-provider-kiro` 0.1.2): upstream `metadataEvent` refusals (`stopReason: "CONTENT_FILTERED"` / `stopDetails.refusal`) with no assistant text previously fell through to `kiro_stream_truncated` (502), which parked the entire account in a 5-minute cooldown and blocked `POST /api/kiro/usage` with `429 kiro_account_cooling`. Refusals are now classified as `kiro_content_filtered` (HTTP 422, `nonRetryable: true`), account cooldowns are restricted to account-level conditions (`kiro_rate_limited`, `kiro_reauth_required`, or explicit `cooldownMs`), read-only management lanes (`getUsage` / `syncModels`) remain usable during a 429 cooldown (including token refresh), and expired `ACTIVE` bonus windows are excluded.
+- **Kiro quota surfaced on the main Providers view** (`@wengine-ai/ccr-provider-kiro` 0.1.2): implemented `fetchQuota` on the Kiro managed runtime via `kiroUsageToQuotaFigures()`, reporting active credit pools into `/api/providers/quota`.
+- **Plugin upgrade loop and stale-dist package guard**: fixed why clicking "Upgrade" on Kiro kept reappearing after restart (`@wengine-ai/ccr-provider-kiro@0.1.1` shipped a stale `dist/plugin.json` declaring `0.1.0`). Catalog `updateAvailable` now uses `semver` (`gt(valid(published), valid(installed))`) so newer local builds never prompt a downgrade, archive installation rejects payloads whose `package.json` version mismatches `plugin.json`, and Kiro's build enforces version alignment before writing artifacts with `"prepack": "npm run build"`.
+- **`@wengine-ai/ccr-provider-kiro` 0.1.2**: ships the Kiro refusal, cooldown isolation, `fetchQuota`, and clean-dist fixes above (replacing the stale `0.1.1` tarball).
+
+## [2.3.2431] - 2026-11-13（中文）
+
+### 修复
+
+- **Kiro 内容过滤拒答不再触发全账号冷却或阻塞额度查询**（`@wengine-ai/ccr-provider-kiro` 0.1.2）：上游返回不带助手文本的 `metadataEvent` 拒答（`stopReason: "CONTENT_FILTERED"` / `stopDetails.refusal`）此前会落入 `kiro_stream_truncated`（502），导致整个账号被冷却 5 分钟并使 `POST /api/kiro/usage` 返回 `429 kiro_account_cooling`。现将空拒答流正确分类为 `kiro_content_filtered`（HTTP 422，`nonRetryable: true`），账号冷却仅限账号级状态（`kiro_rate_limited`、`kiro_reauth_required` 或显式 `cooldownMs`），只读管理通道（`getUsage` / `syncModels`）在 429 冷却期内仍可正常使用（含 token 刷新），并过滤已过期的 `ACTIVE` 赠送额度窗口。
+- **Kiro 额度接入主供应商列表**（`@wengine-ai/ccr-provider-kiro` 0.1.2）：为 Kiro 受管运行时实现 `fetchQuota` 与 `kiroUsageToQuotaFigures()`，将有效 credits 窗口上报至 `/api/providers/quota`。
+- **彻底解决插件「升级死循环」与陈旧产物防护**：定位并修复点击 Kiro「升级」重启后仍提示升级的问题（npm 上 `@wengine-ai/ccr-provider-kiro@0.1.1` 的压缩包内含陈旧的 `0.1.0` 清单）。目录页 `updateAvailable` 改用 `semver`（`gt(valid(published), valid(installed))`）避免本地较新版本被误提示降级；安装包校验在 `package.json` 与 `plugin.json` 版本不一致时直接拒绝覆盖；Kiro 构建脚本将版本一致校验前置到写出产物前并新增 `"prepack": "npm run build"`。
+- **`@wengine-ai/ccr-provider-kiro` 0.1.2**：随包发布上述 Kiro 拒答隔离、额度接入与干净构建修复（替代陈旧的 `0.1.1` 包）。
+
+## [2.3.2430] - 2026-11-13
+
+### Fixed
+
+- **Gemini OAuth long-conversation 400s** (`@wengine-ai/ccr-provider-gemini-oauth` 1.0.11): cross-provider tool history no longer fails validation. Function-call parts missing a thought signature now get the `skip_thought_signature_validator` sentinel (including Gemini 3/4 models, not only older ones); unusable signatures are rejected before they reach Google — fabricated `ccr_<ts>` markers, GLM 24-hex tokens and malformed base64 (bad padding/non-string) are stripped or replaced, while transportable native signatures pass through. A schema-bearing client `web_search` tool stays a client function declaration instead of being converted into Google built-in search, which previously raised "Please enable tool_config.include_server_side_tool_invocations". Live replay of the reported 111-message/39-tool session returns HTTP 200 on both streaming and non-streaming lanes.
+- **Gemini OAuth streaming cache usage restored** (`@wengine-ai/ccr-provider-gemini-oauth` 1.0.11): Code Assist delivers the final `usageMetadata` (including `cachedContentTokenCount`) and `finishReason` on a trailing frame whose only part is an empty text (`{ text: "" }`) with no function call. The Gemini-to-OpenAI conversion dropped the entire frame, so every streamed turn recorded `cache_read_input_tokens = 0` (gemini-4-argon: 0/236 rows) and lost final prompt/completion token counts and the stop reason. Trailing metadata-only chunks (including usage-only frames without candidates) are now emitted for both the plugin and the core/Vertex Gemini paths; buffered Gemini-3 content flushes correctly when a usage frame arrives before the signature frame. Live upstream replay now reports `cache_read_input_tokens = 91067` for a ~93k-token prompt; non-streaming aggregation was already correct and is unchanged. Google Code Assist reports no cache-creation field, so cache-write figures remain legitimately absent on this lane.
+- **`@wengine-ai/ccr-provider-gemini-oauth` 1.0.11**: ships the two Gemini fixes above.
+
+## [2.3.2430] - 2026-11-13（中文）
+
+### 修复
+
+- **Gemini OAuth 长会话 400 报错**（`@wengine-ai/ccr-provider-gemini-oauth` 1.0.11）：跨供应商工具调用历史不再触发校验失败。缺少 thought signature 的 functionCall part 统一补上 `skip_thought_signature_validator` 哨兵（Gemini 3/4 等全部模型，不再只覆盖旧模型）；不可用签名在发送给 Google 前被拦截——伪造的 `ccr_<ts>` 标记、GLM 的 24 位十六进制 token、非法 base64（错误 padding/非字符串）都会被剥离或替换，可传输的原生签名原样保留。带 schema 的客户端 `web_search` 工具保持为客户端函数声明，不再被转换成 Google 内置搜索（此前会报 "Please enable tool_config.include_server_side_tool_invocations"）。用户实际 111 条消息/39 个工具的失败会话重放，流式与非流式均返回 HTTP 200。
+- **Gemini OAuth 流式缓存统计恢复**（`@wengine-ai/ccr-provider-gemini-oauth` 1.0.11）：Code Assist 把最终 `usageMetadata`（含 `cachedContentTokenCount`）与 `finishReason` 放在收尾帧，该帧的 part 只有空文本（`{ text: "" }`）且无 functionCall。旧的 Gemini→OpenAI 转换会整帧丢弃，导致流式请求的 `cache_read_input_tokens` 恒为 0（gemini-4-argon 实测 236 条记录全部为 0），同时丢失最终 prompt/completion token 数与 stop reason。现在插件与 core/Vertex 两条 Gemini 链路都会补发仅含元数据的收尾 chunk（包括没有 candidates 的纯 usage 帧）；Gemini 3 缓冲内容在 usage 帧先于签名帧到达时也能正确 flush。真实上游重放 ~93k token 的提示词现已正确记录 `cache_read_input_tokens = 91067`；非流式聚合本就正确，行为不变。Code Assist 不返回缓存写入字段，因此该链路的缓存写统计为 0 属上游行为。
+- **`@wengine-ai/ccr-provider-gemini-oauth` 1.0.11**：随包发布以上两项 Gemini 修复。
+
 ## [2.3.2429] - 2026-11-12
 
 ### Added

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { PluginHostCapabilities, PluginClassifiedError } from "./core-types";
-import { KIRO_SITE, KIRO_PROVIDER, CALLBACK_PORTS, BUILDER_ID_START, BUILDER_ID_PROFILE, KIRO_REGIONS, KIRO_SCOPES, DEFAULT_REGION, authURL, refreshURL, managementURL, oidcURL, validRegion, validStartUrl, kiroError, isKiroManaged, lockKiroProvider, regionOf, isPermanentOAuthFailure } from "./protocol";
+import { KIRO_SITE, KIRO_PROVIDER, CALLBACK_PORTS, BUILDER_ID_START, BUILDER_ID_PROFILE, KIRO_REGIONS, KIRO_SCOPES, DEFAULT_REGION, authURL, refreshURL, managementURL, oidcURL, validRegion, validStartUrl, kiroError, isKiroManaged, lockKiroProvider, regionOf, isPermanentOAuthFailure, KIRO_COOLDOWN_CODES } from "./protocol";
 
 export type KiroLoginMethod = "portal" | "builderid" | "idc";
 export interface KiroCredential {
@@ -220,7 +220,7 @@ export class KiroAuthService {
         const bAmount = Number(b.currentUsageWithPrecision ?? b.currentUsage) || 0;
         const bLimit = Number(b.usageLimitWithPrecision ?? b.usageLimit) || 0;
         const expires = Number(b.expiresAt);
-        if (!(bLimit > 0)) continue;
+        if (!(bLimit > 0) || (expires > 0 && expires * 1000 <= this.now())) continue;
         const iso = expires > 0 ? this.epochIso(expires) : null;
         windows.push({ name: String(b.displayName || b.description || "Bonus"), used: bAmount / bLimit * 100, amount: bAmount, limit: bLimit, unit: "credits", display: `${bAmount} / ${bLimit}`, ...(iso ? { expiresAt: iso } : {}) });
       }
@@ -325,8 +325,24 @@ export class KiroAuthService {
   private select(id?: string) { const c = id ? this.saved.accounts.find(a => a.id === id || a.accountId === id) : this.saved.accounts.find(a => !a.needReauth && (a.coolingUntil ?? 0) <= this.now()) ?? this.saved.accounts[0]; if (!c) throw kiroError("kiro_not_connected", 409); return c; }
   async ensureUsable(account?: string) { await this.load(); const c = this.select(account); if (c.needReauth) throw kiroError("kiro_reauth_required", 401); if ((c.coolingUntil ?? 0) > this.now()) throw kiroError("kiro_account_cooling", 429); }
   async getCredential(account?: string): Promise<KiroCredential> { await this.ensureUsable(account); const c = this.select(account); return c.expires - this.now() > 120_000 ? { ...c } : this.forceTokenRefresh(c.id); }
-  async forceTokenRefresh(account?: string): Promise<KiroCredential> {
-    await this.ensureUsable(account); const c = this.select(account), existing = this.refreshes.get(c.id); if (existing) return existing;
+  /**
+   * Credential for READ-ONLY management lanes (quota, model sync). A data-plane
+   * cooldown must never block them: they are how the user inspects a parked
+   * account, and they spend no chat quota. Only a dead login (needReauth)
+   * still refuses — a refresh on an expired token cannot succeed.
+   */
+  private async managementCredential(account?: string): Promise<KiroCredential> {
+    await this.load(); const c = this.select(account);
+    if (c.needReauth) throw kiroError("kiro_reauth_required", 401);
+    return c.expires - this.now() > 120_000 ? { ...c } : this.refreshCredential(c.id, true);
+  }
+  forceTokenRefresh(account?: string): Promise<KiroCredential> {
+    return this.refreshCredential(account, false);
+  }
+  private async refreshCredential(account?: string, allowCooling = false): Promise<KiroCredential> {
+    if (allowCooling) { await this.load(); if (this.select(account).needReauth) throw kiroError("kiro_reauth_required", 401); }
+    else await this.ensureUsable(account);
+    const c = this.select(account), existing = this.refreshes.get(c.id); if (existing) return existing;
     const job = (async () => {
       try {
         if (!c.refresh) throw kiroError("kiro_reauth_required", 401);
@@ -357,10 +373,23 @@ export class KiroAuthService {
     const accounts = [...this.saved.accounts]; accounts[at] = merged;
     await this.persist({ ...this.saved, accounts });
   }
+  /**
+   * Latch account state. Cooldown is reserved for ACCOUNT-level conditions
+   * (rate limit, quota, auth): an explicit cooldownMs, or a code in the
+   * cooldown set. Conversation-level failures (content-filter refusals) and
+   * transient data-plane 502s must NOT park the account — one filtered
+   * conversation would otherwise block every other session AND the read-only
+   * quota/management lanes for the whole window (the 2026-11-13 incident).
+   */
   private markError(c: KiroCredential, info: { code: string; cooldownMs?: number }) { return this.exclusive(async () => {
     const at = this.saved.accounts.findIndex(a => a.id === c.id); if (at < 0) return;
     const current = this.saved.accounts[at], accounts = [...this.saved.accounts];
-    accounts[at] = { ...current, needReauth: info.code === "kiro_reauth_required" || current.needReauth, coolingUntil: this.now() + Math.min(info.cooldownMs ?? 300_000, 3_600_000) };
+    const reauth = info.code === "kiro_reauth_required";
+    const cooldownMs = info.cooldownMs ?? (KIRO_COOLDOWN_CODES.has(info.code) ? (reauth ? 3_600_000 : 300_000) : 0);
+    const coolingUntil = cooldownMs > 0 ? this.now() + Math.min(cooldownMs, 3_600_000) : current.coolingUntil ?? 0;
+    const nextNeedReauth = reauth || !!current.needReauth;
+    if (nextNeedReauth === !!current.needReauth && coolingUntil === (current.coolingUntil ?? 0)) return;
+    accounts[at] = { ...current, needReauth: nextNeedReauth, coolingUntil };
     await this.persist({ ...this.saved, accounts }); }); }
   async noteUpstreamError(info: PluginClassifiedError, account?: string) { await this.load(); try { await this.markError(this.select(account), info); } catch { /* Telemetry never breaks the response path. */ } }
   async getStatus() { await this.load(); return { connected: !!this.saved.accounts.length, status: this.saved.accounts.length ? "connected" : "disconnected", providerName: KIRO_PROVIDER,
@@ -372,12 +401,12 @@ export class KiroAuthService {
     accounts: this.saved.accounts.map(publicAccount), models: this.saved.models.filter(m => !this.saved.hiddenModels.includes(m.id)), hiddenModels: this.saved.hiddenModels, plan: this.saved.accounts[0]?.plan ?? null,
     usage: this.saved.accounts.map(c => ({ account: c.id, ...(this.usage.get(c.id) ?? { known: false, stale: true, windows: [] }) })) }; }
   async getUsage(account?: string) {
-    const c = await this.getCredential(account);
+    const c = await this.managementCredential(account);
     try { const l = await this.management(c, "Get-Usage-Limits", { resourceType: "CREDIT", isEmailRequired: "true" }); const usage = this.usageOf(l); this.usage.set(c.id, usage); return usage; }
     catch (e) { if ((e as { code?: string }).code === "kiro_reauth_required") await this.noteUpstreamError({ code: "kiro_reauth_required", message: "kiro_reauth_required", httpStatus: 401, cooldownMs: 3_600_000 }, c.id); throw e; }
   }
   async syncModels(account?: string) {
-    const c = await this.getCredential(account), models: KiroModelRecord[] = [], seen = new Set<string>(); let nextToken = "", defaultId = "";
+    const c = await this.managementCredential(account), models: KiroModelRecord[] = [], seen = new Set<string>(); let nextToken = "", defaultId = "";
     try {
       do { const p = await this.management(c, "List-Available-Models", nextToken ? { nextToken } : {}); defaultId ||= p.defaultModel?.modelId ?? "";
         for (const m of p.models ?? []) if (text(m.modelId, 256) && m.modelId && !models.some(v => v.id === m.modelId)) models.push({ id: m.modelId, key: m.modelId, name: String(m.modelName ?? m.modelId), context: Number(m.tokenLimits?.maxInputTokens) || 0, output: Number(m.tokenLimits?.maxOutputTokens) || 0, images: (m.supportedInputTypes ?? []).some((v: string) => v.toUpperCase() === "IMAGE") });

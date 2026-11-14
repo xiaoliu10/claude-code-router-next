@@ -294,6 +294,22 @@ describe("GET /api/plugins/catalog", () => {
     expect(res.json().plugins[0].localOnly).toBeUndefined();
   });
 
+  it.each([
+    ["0.1.2", "0.1.1"],
+    ["0.1.10", "0.1.9"],
+    ["1.0.0", "1.0.0-beta.1"],
+    ["dev", "1.0.0"],
+    ["1.0.0", "invalid"],
+  ])("does not offer a downgrade or invalid version comparison (%s vs %s)", async (installed, published) => {
+    await seedInstalled("preview", installed);
+    const registry = await startSearchStub({
+      "ccr-provider-plugin": [{ name: "preview", keywords: ["ccr-provider-plugin"], version: published }],
+    });
+    const res = await getLocal(buildApp(registry.url));
+    expect(res.json().plugins[0].installedVersion).toBe(installed);
+    expect(res.json().plugins[0].updateAvailable).toBeUndefined();
+  });
+
   it("does not flag updateAvailable when installed version equals npm version", async () => {
     await seedInstalled("same", "1.0.0");
     const registry = await startSearchStub({
