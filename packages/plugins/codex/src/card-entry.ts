@@ -663,6 +663,14 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const state = loading ? "loading" : loadFailed && !status ? "error" : codexStateKey(status);
     const connected = !loading && codexConnected(status);
     const canDisconnect = !!status && (status.status !== "not_connected" || status.models.length > 0);
+    // Sync models is a READ-ONLY management call (GET upstream model list):
+    // the backend never gates it on the data-plane cooldown, and an expired
+    // access token is refreshed on demand inside the same call. Keeping it
+    // enabled while cooling / latched / expired means users can still refresh
+    // the model list and even self-heal a stale card without a full re-login
+    // — previously the disabled button made every quota window look like a
+    // dropped login. Only a never-connected account has nothing to sync.
+    const canSync = !loading && !!status && status.status !== "not_connected";
     const busy = loading || action !== null;
     const disabled = busy || props.disabled;
     // Per-model busy flag for the chip X buttons (workbuddy parity).
@@ -844,7 +852,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const actions = styled("div", "flex shrink-0 flex-col gap-2 sm:w-[210px]");
     button(actions, action?.kind === "login" ? t("working") : connected || state === "needs_relogin" ? t("reconnect") : t("browser_login"),
       () => void run("login"), disabled, "primary", "h-8 w-full text-xs", plugIcon("mr-1 h-3.5 w-3.5"));
-    button(actions, t("sync"), () => void run("sync"), disabled || !connected, "outline", "h-8 w-full text-xs",
+    button(actions, t("sync"), () => void run("sync"), disabled || !canSync, "outline", "h-8 w-full text-xs",
       refreshCwIcon(`mr-1 h-3.5 w-3.5 ${action?.kind === "sync" ? "animate-spin" : ""}`));
     button(actions, t("disconnect"), () => { confirmDisconnect = true; render(); }, disabled || !canDisconnect, "outline", "h-8 w-full text-xs");
 

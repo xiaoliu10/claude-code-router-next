@@ -188,9 +188,47 @@ describe("self-contained Codex plugin card", () => {
     expect(h.host.text()).toContain(en.usage_primary.replace("{{window}}", "5 h"));
     expect(h.host.text()).toContain(en.usage_secondary.replace("{{window}}", "7 d"));
     expect(h.host.text().toLowerCase()).not.toContain("token");
-    // Mutating actions stay available but the sync path is the user's call;
-    // disconnect remains offered.
+    // Read-only model sync stays ENABLED during a cooldown: the backend does
+    // not gate the management lane on the data-plane cooldown, so the user can
+    // refresh the model list without re-login (a disabled button used to make
+    // every quota window look like a dropped login). Disconnect remains offered.
+    expect(h.host.button(en.sync).disabled).toBe(false);
+    h.host.click(en.sync);
+    await tick();
+    expect(h.callApi.mock.calls.some(([path]) => path === "/sync")).toBe(true);
     expect(h.host.button(en.disconnect)).toBeTruthy();
+  });
+
+  it("sync models stays enabled in the error and expired states but stays off when never connected", async () => {
+    const ERRORED = {
+      ...CONNECTED, status: "error" as const,
+      lastError: "The saved Codex sign-in was rejected; authorize again.",
+    };
+    const EXPIRED = { ...CONNECTED, status: "expired" as const };
+    {
+      const h = harness({ "/status": () => ERRORED, "/usage": () => USAGE });
+      await tick();
+      expect(h.host.button(en.sync).disabled).toBe(false);
+      h.unmountNow();
+    }
+    {
+      const h = harness({ "/status": () => EXPIRED, "/usage": () => USAGE });
+      await tick();
+      // Expired session: the sync call itself performs an on-demand refresh,
+      // so it must remain clickable — it can self-heal without a full login.
+      expect(h.host.button(en.sync).disabled).toBe(false);
+      h.host.click(en.sync);
+      await tick();
+      expect(h.callApi.mock.calls.some(([path]) => path === "/sync")).toBe(true);
+      h.unmountNow();
+    }
+    {
+      const h = harness({ "/status": () => NOT_CONNECTED });
+      await tick();
+      // Nothing to sync until an account exists.
+      expect(h.host.button(en.sync).disabled).toBe(true);
+      h.unmountNow();
+    }
   });
 
   it("a mount status read that fails once (deploy restart window) retries and recovers without the failure banner", async () => {

@@ -1140,6 +1140,35 @@ export class CodexAuthService {
     await this.getAccessToken();
   }
 
+  /**
+   * Background maintenance entry point for CodexTokenMaintenance.
+   *
+   * Renews ONLY when the 5-minute lead has elapsed — the exact gate used by
+   * getAccessToken — and reuses its single-flight refresh, so a healthy token
+   * costs no network and a background cycle overlapping a data-plane refresh
+   * shares the same grant. A disconnected service is a quiet no-op. The
+   * forced-refresh flag belongs to the 401 seam and is deliberately not
+   * consumed here.
+   *
+   * This never writes lastError/cooldown: account health is owned
+   * exclusively by the data plane. A rejected refresh (e.g.
+   * codex_reauth_required) propagates to the scheduler, which logs it without
+   * latching anything; the next real request or card status read surfaces the
+   * sticky reauth state through the normal channels.
+   */
+  async runTokenMaintenanceCycle(): Promise<{ refreshed: boolean }> {
+    const data = await this.ensureLoaded();
+    const account = data?.account;
+    if (!account) return { refreshed: false };
+    const fresh = typeof account.accessExp === "number" &&
+      account.accessExp - this.now > CODEX_REFRESH_LEAD_MS;
+    if (fresh) return { refreshed: false };
+    const before = account.accessToken;
+    await this.getAccessToken();
+    const after = (await this.ensureLoaded(true))?.account.accessToken;
+    return { refreshed: after !== before };
+  }
+
   async getAccountId(): Promise<string> {
     const data = await this.ensureLoaded();
     if (!data?.account) throw codexAdminError("codex_not_connected", 409);
