@@ -139,7 +139,8 @@ describe("real host controller × real card seam", () => {
     expect(seam.fetches).toEqual(["/plugins/gemini-oauth/card.js"]);
     expect(seam.host.children).toHaveLength(1);
     const cardEl = seam.host.children[0];
-    expect(seam.calls).toEqual(["/status"]);
+    // Connected mount adds the single read-only quota snapshot read.
+    expect(seam.calls).toEqual(["/status", "/quota"]);
     expect(cardEl.button(en.sync).disabled).toBe(false);
 
     // Open the consent dialog: it must survive disabled flips (same instance).
@@ -152,7 +153,7 @@ describe("real host controller × real card seam", () => {
     expect(cardEl.button(en.reconnect).disabled).toBe(true);
     expect(cardEl.text()).toContain(en.other_edit);
     expect(cardEl.text()).toContain(en.risk); // in-place re-render, not a remount
-    expect(seam.calls).toEqual(["/status"]); // no remount status read, nothing cancelled
+    expect(seam.calls).toEqual(["/status", "/quota"]); // no remount status read, nothing cancelled
     expect(seam.releases).toBe(0);
     expect(seam.imports).toBe(1);
 
@@ -241,9 +242,9 @@ describe("real host controller × real card seam", () => {
     await seam.controller.sync([cardEntry()], "en", seam.host);
     await tick();
     expect(seam.imports).toBe(1);
-    // The card issued its initial status read through the bridge with the
-    // plugin name attached (see callPluginApi in seamHarness).
-    expect(seam.calls).toEqual(["/status"]);
+    // The card issued its initial status and quota reads through the bridge with the
+    // plugin name attached (see callPluginApi in seamHarness), both read-only.
+    expect(seam.calls).toEqual(["/status", "/quota"]);
     expect(seam.blobs.length).toBe(1);
     seam.controller.dispose();
     expect(seam.revoked).toEqual(seam.blobs);

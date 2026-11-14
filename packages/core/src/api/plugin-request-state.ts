@@ -3,6 +3,8 @@ import type { ManagedRuntime } from "../provider-plugins/types";
 interface PluginAttemptBudget {
   refreshUsed: boolean;
   terminalError?: Error;
+  /** Opt-in quota failures stop only this dispatched model within the request. */
+  modelErrors?: Map<string, Error>;
 }
 interface PluginRequestState {
   budgets: Map<string, PluginAttemptBudget>;
@@ -12,9 +14,9 @@ interface PluginRequestState {
  * Budget key = runtime + managed provider name. One runtime may serve several
  * provider entries (e.g. a plugin exposing a CN and an international managed
  * provider with independent subscriptions/pools): their terminal failures and
- * 401-refresh budgets must stay independent, while every model of the SAME
- * provider still shares one budget so a terminal failure cannot be retried
- * through a sibling model of the same subscription.
+ * 401-refresh budgets must stay independent. Models of the same provider
+ * share the refresh budget and account failures. Opt-in independent pools
+ * retain model-specific 429 terminal errors without blocking sibling fallback.
  */
 function budgetKey(runtime: ManagedRuntime, provider?: { name?: string } | null): string {
   return `${runtime.name}|${provider?.name ?? ""}`;
@@ -37,14 +39,25 @@ export function pluginAttemptBudget(req: any, runtime: ManagedRuntime, provider?
 }
 
 /**
- * A classified nonretryable error stops this managed provider's models for the
- * rest of the request — never an unrelated provider that happens to share the
- * runtime (different subscription/credential pool).
+ * A classified nonretryable error stops this managed provider for the rest of
+ * the request. An independent-pool runtime scopes quota 429s to the model,
+ * while authentication failures and legacy providers remain account-scoped.
  */
-export function rememberPluginFailure(req: any, runtime: ManagedRuntime | undefined, error: any, provider?: { name?: string } | null): boolean {
+export function rememberPluginFailure(req: any, runtime: ManagedRuntime | undefined, error: any, provider?: { name?: string } | null, model?: string): boolean {
   if (!runtime || error?.nonRetryable !== true) return false;
   // Transformer-native errors may predate the generic host taxonomy marker.
   // Their owning runtime still defines the account boundary for this request.
-  pluginAttemptBudget(req, runtime, provider).terminalError = error;
+  const budget = pluginAttemptBudget(req, runtime, provider);
+  if (runtime.modelScopedRecovery && error?.statusCode === 429 && model) {
+    (budget.modelErrors ??= new Map()).set(model, error);
+  } else {
+    budget.terminalError = error;
+  }
   return true;
+}
+
+/** Authentication stays provider-wide; quota exhaustion may be model-scoped. */
+export function pluginTerminalFailure(req: any, runtime: ManagedRuntime, provider?: { name?: string } | null, model?: string): Error | undefined {
+  const budget = pluginAttemptBudget(req, runtime, provider);
+  return budget.terminalError ?? (model ? budget.modelErrors?.get(model) : undefined);
 }

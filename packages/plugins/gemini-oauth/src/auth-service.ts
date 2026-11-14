@@ -62,7 +62,11 @@ import {
   fetchAvailableModelVariants,
   fetchAvailableModels,
   fetchUserEmail,
-  geminiOauthError,
+  fetchGeminiOauthQuota,
+  type GeminiOauthQuotaSnapshot,
+  type GeminiOauthRequestIdentity,
+  GEMINI_OAUTH_QUOTA_COOLDOWN_MS,
+  isGeminiOauthBreakerCode,
   invalidateGeminiOauthAccessToken,
   isGeminiOauthConfigured,
   isManagedGeminiOauthConfigProvider,
@@ -76,6 +80,10 @@ import {
   type GeminiOauthFetch,
   type GeminiOauthModelInfo,
 } from "./protocol";
+
+import { geminiOauthQuotaPool, normalizeGeminiOauthPoolLocks, pruneGeminiOauthPoolLocks } from "./quota-pools";
+
+const GEMINI_OAUTH_QUOTA_CACHE_TTL_MS = 60_000;
 
 export const CREDENTIAL_FILE = "gemini-oauth-credentials.json";
 const MAX_CREDENTIAL_BYTES = 256 * 1024;
@@ -108,6 +116,8 @@ export interface GeminiOauthCredentialData {
   account: GeminiOauthAccount;
   rawModelIds?: string[];
   hiddenModels?: string[];
+  /** Independent quota parks; account identity/verification stays in account. */
+  poolLocks?: Record<string, number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +301,8 @@ export function normalizeGeminiOauthData(raw: any): GeminiOauthCredentialData {
   };
   if (rawModelIds) data.rawModelIds = rawModelIds;
   if (hiddenModels?.length) data.hiddenModels = hiddenModels;
+  const poolLocks = normalizeGeminiOauthPoolLocks(raw.poolLocks);
+  if (poolLocks) data.poolLocks = poolLocks;
   return data;
 }
 
@@ -515,6 +527,11 @@ export class GeminiOauthAuthService {
   /** Persisted hide preference (UI model ids). Always mirrors the 0600 file. */
   private hiddenModels: string[] = [];
   private loaded = false;
+  private loadFlight: Promise<GeminiOauthAccount | null> | null = null;
+  private poolLocks: Record<string, number> = {};
+  private quotaGeneration = 0;
+  private quotaCache: { epoch: number; account: string; expiresAt: number; value: GeminiOauthQuotaSnapshot | null } | null = null;
+  private quotaFlight: { epoch: number; account: string; promise: Promise<GeminiOauthQuotaSnapshot | null> } | null = null;
   /** Data-plane access-token refresh single-flight bridge (keyed refresh token). */
   private refreshFlight: { key: string; promise: Promise<string> } | null = null;
 
@@ -547,12 +564,21 @@ export class GeminiOauthAuthService {
 
   private async ensureLoaded(force = false): Promise<GeminiOauthAccount | null> {
     if (this.loaded && !force) return this.account;
-    const data = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
-    this.account = data?.account ?? null;
-    this.rawModelIds = data?.rawModelIds ?? [];
-    this.hiddenModels = data?.hiddenModels ?? [];
-    this.loaded = true;
-    return this.account;
+    if (this.loadFlight && !force) return this.loadFlight;
+    const flight = (async () => {
+      const data = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
+      const nextAccount = data?.account ?? null;
+      if (this.accountIdentity(this.account) !== this.accountIdentity(nextAccount)) this.clearQuotaCache();
+      this.account = nextAccount;
+      this.poolLocks = data?.poolLocks ?? {};
+      this.rawModelIds = data?.rawModelIds ?? [];
+      this.hiddenModels = data?.hiddenModels ?? [];
+      this.loaded = true;
+      return this.account;
+    })();
+    this.loadFlight = flight;
+    try { return await flight; }
+    finally { if (this.loadFlight === flight) this.loadFlight = null; }
   }
 
   /**
@@ -570,13 +596,26 @@ export class GeminiOauthAuthService {
     if (ids.length) data.rawModelIds = ids;
     const hidden = hiddenModels ?? this.hiddenModels;
     if (hidden.length) data.hiddenModels = hidden;
+    const changedIdentity = this.accountIdentity(account) !== this.accountIdentity(this.account);
+    if (!changedIdentity && Object.keys(this.poolLocks).length) data.poolLocks = pruneGeminiOauthPoolLocks(this.poolLocks, Date.now());
     await this.store.save(data);
+    if (changedIdentity) this.clearQuotaCache();
+    this.poolLocks = data.poolLocks ?? {};
     this.account = account;
     this.rawModelIds = ids.length ? ids : this.rawModelIds;
     this.hiddenModels = hidden;
   }
 
   // ----------------------------------------------------------------- status --
+
+  /** Cheap sticky-gate source for the per-request breakers: the account's
+   *  last error code straight from the loaded credential (no models rebuild,
+   *  no config-file read). Sticky codes are always reported by getStatus too,
+   *  so gate decisions are identical. */
+  async getAccountErrorCode(): Promise<string | null> {
+    const account = await this.ensureLoaded();
+    return account?.lastError?.code ?? null;
+  }
 
   async getStatus(): Promise<GeminiOauthStatusResult> {
     const account = await this.ensureLoaded();
@@ -734,7 +773,7 @@ export class GeminiOauthAuthService {
       try {
         this.handleCallback(req, res, job);
       } catch {
-        try { res.statusCode = 500; res.end(); } catch {}
+        try { res.statusCode = 500; res.end(); } catch { /* best-effort failure response; never mask the original error */ }
       }
     });
 
@@ -956,6 +995,8 @@ export class GeminiOauthAuthService {
       return this.failLogin(job, "gemini_oauth_login_persist_failed");
     }
 
+    this.epoch++;
+    this.clearQuotaCache();
     // The new refresh identity is now the only one future refreshes may use.
     clearGeminiOauthTokenCaches(this.tokenState);
     job.result = { status: "success", email };
@@ -1012,6 +1053,7 @@ export class GeminiOauthAuthService {
     if (!account) {
       throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
     }
+    const identity = await this.captureRequestIdentity();
     const accessToken = await this.getAccessToken();
     let raw: GeminiOauthModelInfo[];
     try {
@@ -1043,6 +1085,8 @@ export class GeminiOauthAuthService {
     const rawIds = raw.map((m) => m.id);
 
     return this.enqueueMutation(async () => {
+      const current = await this.store.load();
+      if (!current || !this.matchesIdentity(identity, current.account)) throw geminiOauthAdminError("gemini_oauth_not_connected", 409);
       const config = await this.readConfig();
       const provider = this.findManaged(config);
       const currentModels: string[] = Array.isArray(provider?.models)
@@ -1060,10 +1104,10 @@ export class GeminiOauthAuthService {
       const cleaned = clearGeminiOauthRouterRefs(config.Router ?? {}, dropped, firstVisible);
       const previousConfig = structuredClone(config);
       try {
-        await this.writeAccount({ ...account, lastError: null, cooldownUntil: null }, rawIds, hidden);
+        await this.writeAccount({ ...current.account, lastError: null, cooldownUntil: null }, rawIds, hidden);
         await this.upsertManagedProvider(visible, { router: cleaned.clearedRefs.length ? cleaned.router : undefined });
       } catch {
-        try { await this.options.host.writeConfig(previousConfig); await this.options.host.reloadRuntime(previousConfig); } catch {}
+        try { await this.options.host.writeConfig(previousConfig); await this.options.host.reloadRuntime(previousConfig); } catch { /* best-effort rollback; surface the original sync failure below */ }
         return { ok: false, modelsCount: currentModels.length, clearedRefs: [], error: "gemini_oauth_models_fetch_failed" } as GeminiOauthSyncResult;
       }
       return { ok: true, modelsCount: visible.length, clearedRefs: cleaned.clearedRefs };
@@ -1206,6 +1250,7 @@ export class GeminiOauthAuthService {
   // -------------------------------------------------------------- disconnect --
 
   async disconnect(): Promise<GeminiOauthDisconnectResult> {
+    this.clearQuotaCache();
     const job = this.pending;
     if (job) {
       this.epoch++;
@@ -1243,7 +1288,7 @@ export class GeminiOauthAuthService {
         try {
           await this.options.host.writeConfig(config);
         } catch {
-          try { await this.options.host.writeConfig(previousConfig); await this.options.host.reloadRuntime(previousConfig); } catch {}
+          try { await this.options.host.writeConfig(previousConfig); await this.options.host.reloadRuntime(previousConfig); } catch { /* best-effort rollback; the original write failure is rethrown below */ }
           throw geminiOauthAdminError("gemini_oauth_config_write_failed", 500);
         }
         removedModelRefs.push(...cleaned.removedRefs);
@@ -1254,6 +1299,7 @@ export class GeminiOauthAuthService {
       // Credential file last: a failed provider write leaves the account intact.
       await this.store.delete().catch(() => {});
       this.account = null;
+      this.poolLocks = {};
       this.rawModelIds = [];
       this.hiddenModels = [];
       this.loaded = false;
@@ -1315,7 +1361,7 @@ export class GeminiOauthAuthService {
             message: error.message ?? "Gemini OAuth 登录态已失效，请重新授权登录。",
             httpStatus: 401,
             cooldownMs,
-          });
+          }, undefined, { epoch, account: this.accountIdentity(account) });
         } catch {
           // Bookkeeping must never mask the original failure.
         }
@@ -1374,59 +1420,149 @@ export class GeminiOauthAuthService {
     return antigravityWireModel(raw, requested, effort);
   }
 
-  async isAccountCooling(): Promise<boolean> {
+  private accountIdentity(account: GeminiOauthAccount | null): string {
+    return account ? JSON.stringify([account.email, account.importedAt, account.projectId]) : "";
+  }
+
+  async captureRequestIdentity(): Promise<GeminiOauthRequestIdentity> {
+    const epoch = this.epoch;
     const account = await this.ensureLoaded();
+    return { epoch, account: this.accountIdentity(account) };
+  }
+
+  async isRequestIdentityCurrent(identity: GeminiOauthRequestIdentity): Promise<boolean> {
+    const account = await this.ensureLoaded();
+    return this.matchesIdentity(identity, account);
+  }
+
+  private matchesIdentity(identity: GeminiOauthRequestIdentity, account: GeminiOauthAccount | null): boolean {
+    return identity.epoch === this.epoch && identity.account === this.accountIdentity(account);
+  }
+
+  async isAccountCooling(model?: string): Promise<boolean> {
+    const account = await this.ensureLoaded();
+    // Old quota-only parks have no attributable model. Known siblings must
+    // not inherit that account-wide lock after upgrading.
+    if (model && account?.lastError?.code === "gemini_oauth_quota_exceeded") return false;
     return !!account?.cooldownUntil && account.cooldownUntil > Date.now();
   }
 
-  /**
-   * Record a classified data-plane error: stable code + cooldown, never raw
-   * text. Shares the single mutation queue; the write spreads the current file
-   * contents so the hide preference is never lost by error bookkeeping.
-   */
-  noteUpstreamError(info: GeminiOauthErrorInfo): Promise<void> {
-    return this.enqueueMutation(async () => {
-      const current = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
-      if (!current) return; // disconnected meanwhile — nothing to record
-      const account = { ...current.account };
-      account.lastError = {
-        code: info.code,
-        ...(info.validationUrl ? { validationUrl: info.validationUrl } : {}),
-      };
-      account.cooldownUntil = info.cooldownMs ? Date.now() + info.cooldownMs : null;
-      const next: GeminiOauthCredentialData = { ...current, account };
-      await this.store.save(next);
-      this.account = account;
-      this.hiddenModels = next.hiddenModels ?? [];
-    }).catch(() => {
-      // Bookkeeping must never break the response path.
-    });
+  async getPoolCooldown(model: string): Promise<{ pool: string; until: number } | null> {
+    await this.ensureLoaded();
+    const pool = geminiOauthQuotaPool(model);
+    const until = this.poolLocks[pool];
+    return pool && until > Date.now() ? { pool, until } : null;
   }
 
-  /**
-   * Clear a latched TRANSIENT error marker after a confirmed-successful
-   * exchange: lastError/cooldownUntil describe a problem waiting (or a user
-   * action) was supposed to fix, and a request that just succeeded proves it
-   * fixed. A sticky (reauth) marker stays — waiting cannot fix it and one good
-   * request cannot prove the login healthy again, so only the fresh-login flow
-   * clears it. Serialized on the mutation queue like every account write;
-   * silently ignored when disconnected or on a write failure (bookkeeping
-   * never breaks the response path).
-   */
-  async noteRequestSuccess(): Promise<void> {
+  private clearQuotaCache(): void {
+    this.quotaGeneration++;
+    this.quotaCache = null;
+    this.quotaFlight = null;
+  }
+
+  /** Shared advisory read for the runtime and admin route. Null is cached too. */
+  async getQuota(): Promise<GeminiOauthQuotaSnapshot | null> {
+    const identity = await this.captureRequestIdentity();
+    if (!this.matchesIdentity(identity, this.account)) return null;
+    const now = Date.now();
+    const account = this.account;
+    const globallyParked = account && account.lastError?.code !== "gemini_oauth_quota_exceeded" &&
+      (isStickyGeminiOauthError(account.lastError?.code) || (!!account.cooldownUntil && account.cooldownUntil > now));
+    if (globallyParked) return null;
+    if (this.quotaCache?.epoch === identity.epoch && this.quotaCache.account === identity.account && this.quotaCache.expiresAt > now) return this.quotaCache.value;
+    if (this.quotaFlight?.epoch === identity.epoch && this.quotaFlight.account === identity.account) return this.quotaFlight.promise;
+    const generation = this.quotaGeneration;
+    const promise = (async () => {
+      let value: GeminiOauthQuotaSnapshot | null = null;
+      try {
+        const account = this.account;
+        const legacyQuota = account?.lastError?.code === "gemini_oauth_quota_exceeded";
+        if (account && !isStickyGeminiOauthError(account.lastError?.code) &&
+            (legacyQuota || !account.cooldownUntil || account.cooldownUntil <= Date.now())) {
+          const accessToken = await this.getAccessToken();
+          if (!this.matchesIdentity(identity, this.account)) return null;
+          const snapshot = await fetchGeminiOauthQuota({ accessToken, project: account.projectId, fetchImpl: (url, init) => this.directFetch(url, init) });
+          if (Object.keys(snapshot.models).length || snapshot.pools.length) value = snapshot;
+        }
+      } catch { /* Advisory failure; null is cached to bound polling traffic. */ }
+      if (!this.matchesIdentity(identity, this.account) || generation !== this.quotaGeneration) return null;
+      this.quotaCache = { ...identity, expiresAt: Date.now() + GEMINI_OAUTH_QUOTA_CACHE_TTL_MS, value };
+      return value;
+    })();
+    const flight = { ...identity, promise };
+    this.quotaFlight = flight;
+    try { return await promise; }
+    finally { if (this.quotaFlight === flight) this.quotaFlight = null; }
+  }
+
+  /** Capture before joining the mutation queue; stale replies cannot affect a
+   *  replacement login, even if the file is replaced while waiting to write. */
+  async noteUpstreamError(info: GeminiOauthErrorInfo, model?: string, requestIdentity?: GeminiOauthRequestIdentity): Promise<void> {
+    if (isGeminiOauthBreakerCode(info.code)) return;
+    const identity = requestIdentity ?? await this.captureRequestIdentity();
     await this.enqueueMutation(async () => {
       const current = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
-      if (!current) return; // disconnected meanwhile — nothing to clear
-      if (!current.account.lastError && !current.account.cooldownUntil) return; // no marker latched
-      if (isStickyGeminiOauthError(current.account.lastError?.code)) return; // only a re-login clears it
-      const account: GeminiOauthAccount = { ...current.account, lastError: null, cooldownUntil: null };
-      const next: GeminiOauthCredentialData = { ...current, account };
+      if (!current || !this.matchesIdentity(identity, current.account)) return;
+      const now = Date.now();
+      const account = { ...current.account };
+      const poolLocks = pruneGeminiOauthPoolLocks(current.poolLocks ?? {}, now);
+      const accountProtected = isStickyGeminiOauthError(account.lastError?.code) ||
+        (account.lastError?.code !== "gemini_oauth_quota_exceeded" && !!account.cooldownUntil && account.cooldownUntil > now);
+      if (info.code === "gemini_oauth_quota_exceeded") {
+        const pool = geminiOauthQuotaPool(model);
+        if (pool) {
+          const duration = typeof info.cooldownMs === "number" && Number.isFinite(info.cooldownMs) && info.cooldownMs > 0
+            ? info.cooldownMs : GEMINI_OAUTH_QUOTA_COOLDOWN_MS;
+          poolLocks[pool] = Math.max(poolLocks[pool] ?? 0, now + duration);
+        }
+        // No model means no attributable quota lock: never invent an
+        // account-wide park, and skip the write when nothing would change.
+        if (accountProtected) {
+          if (!pool) return;
+        } else if (account.lastError || account.cooldownUntil) {
+          account.lastError = null;
+          account.cooldownUntil = null;
+        } else if (!pool) {
+          return;
+        }
+      } else if (!accountProtected || isStickyGeminiOauthError(info.code)) {
+        account.lastError = { code: info.code, ...(info.validationUrl ? { validationUrl: info.validationUrl } : {}) };
+        account.cooldownUntil = info.cooldownMs ? now + info.cooldownMs : null;
+      }
+      const next: GeminiOauthCredentialData = { ...current, account, poolLocks };
       await this.store.save(next);
       this.account = account;
+      // Any written bookkeeping invalidates the cached quota snapshot — a pool
+      // park is exactly the event that makes the previous figures stale, and
+      // the fetch single-flight keeps the next read deduped.
+      this.clearQuotaCache();
+      this.poolLocks = normalizeGeminiOauthPoolLocks(poolLocks) ?? {};
       this.hiddenModels = next.hiddenModels ?? [];
-    }).catch(() => {
-      // Bookkeeping must never break the response path.
-    });
+    }).catch(() => { /* Bookkeeping cannot break the response path. */ });
+  }
+
+  /** A success never clears an active quota lock, including a newer same-pool
+   *  refusal while an older request finishes. Account guards also survive. */
+  async noteRequestSuccess(model?: string, requestIdentity?: GeminiOauthRequestIdentity): Promise<void> {
+    const identity = requestIdentity ?? await this.captureRequestIdentity();
+    await this.enqueueMutation(async () => {
+      const current = await this.store.load().catch((): GeminiOauthCredentialData | null => null);
+      if (!current || !this.matchesIdentity(identity, current.account)) return;
+      const account = { ...current.account };
+      const now = Date.now();
+      const protectedAccount = isStickyGeminiOauthError(account.lastError?.code) ||
+        (account.lastError?.code !== "gemini_oauth_quota_exceeded" && !!account.cooldownUntil && account.cooldownUntil > now);
+      if (protectedAccount) return;
+      const poolLocks = pruneGeminiOauthPoolLocks(current.poolLocks ?? {}, now);
+      if (!account.lastError && !account.cooldownUntil && Object.keys(poolLocks).length === Object.keys(current.poolLocks ?? {}).length) return;
+      account.lastError = null;
+      account.cooldownUntil = null;
+      const next: GeminiOauthCredentialData = { ...current, account, poolLocks };
+      await this.store.save(next);
+      this.account = account;
+      this.poolLocks = poolLocks;
+      this.hiddenModels = next.hiddenModels ?? [];
+    }).catch(() => { /* Bookkeeping cannot break the response path. */ });
   }
 
   // ------------------------------------------------------- config mutation ---

@@ -835,8 +835,8 @@ export class ActiveProbeService {
     const openKeys = healthStore.getFailPoolModels();
     if (openKeys.length === 0) return;
 
-    // One probe per provider: a subscription shares an account-level limit, so
-    // probing every model separately would burn quota for the same answer.
+    // Default to one account probe. Runtimes with independent model pools
+    // opt into separate checks so one healthy sibling cannot recover another.
     const byProvider = new Map<string, string[]>();
     for (const key of openKeys) {
       const [providerName, ...modelParts] = key.split(",");
@@ -855,30 +855,33 @@ export class ActiveProbeService {
       const runtime = this.resolveManagedRuntime(provider);
       if (!runtime) continue;
 
-      const model = modelNames[0]!;
-      const state = healthStore.getState(providerName, model);
-      if (!state || state.status !== "open") continue;
-      // An active quota lock belongs to the plugin's cooldown machinery;
-      // probing it would defeat the lock.
-      if (state.rateLimitUntil && Date.now() < state.rateLimitUntil) continue;
-      // Gate on the last probe ATTEMPT only. The old gate also included
-      // lastFailureTime, but half-open real requests keep refreshing it while
-      // the circuit is open — so with any traffic cadence shorter than the
-      // interval the recovery probe was postponed indefinitely and a model the
-      // network had already healed stayed circuit-open all day (2026-11-02
-      // codex outage). recordProbeAttempt stamps lastProbeTime on every actual
-      // attempt, so this still spaces retries by the full interval.
-      if (Date.now() - (state.lastProbeTime ?? 0) < this.config.quotaProbeIntervalMinutes * 60_000) continue;
+      const groups = runtime.modelScopedRecovery ? modelNames.map(model => [model]) : [modelNames];
+      for (const group of groups) {
+        const model = group[0]!;
+        const state = healthStore.getState(providerName, model);
+        if (!state || state.status !== "open") continue;
+        // An active quota lock belongs to the plugin's cooldown machinery;
+        // probing it would defeat the lock.
+        if (state.rateLimitUntil && Date.now() < state.rateLimitUntil) continue;
+        // Gate on the last probe ATTEMPT only. The old gate also included
+        // lastFailureTime, but half-open real requests keep refreshing it while
+        // the circuit is open — so with any traffic cadence shorter than the
+        // interval the recovery probe was postponed indefinitely and a model the
+        // network had already healed stayed circuit-open all day (2026-11-02
+        // codex outage). recordProbeAttempt stamps lastProbeTime on every actual
+        // attempt, so this still spaces retries by the full interval.
+        if (Date.now() - (state.lastProbeTime ?? 0) < this.config.quotaProbeIntervalMinutes * 60_000) continue;
 
-      // Level 1 — account state. A parked or over-quota account must not spend a
-      // network call, and network health says nothing about a parked account, so
-      // this runs first and vetoes the expensive check.
-      const accountUsable = await this.probeManagedAccountState(providerName, runtime, provider, model, modelNames, healthStore);
-      if (!accountUsable) continue;
+        // Level 1 — account state. A parked or over-quota account must not spend a
+        // network call, and network health says nothing about a parked account, so
+        // this runs first and vetoes the expensive check.
+        const accountUsable = await this.probeManagedAccountState(providerName, runtime, provider, model, group, healthStore);
+        if (!accountUsable) continue;
 
-      // Level 2 — liveness. Account state alone is not proof: the network, proxy
-      // or upstream may be down while the account is perfectly fine.
-      await this.probeManagedLiveness(providerName, runtime, provider, model, modelNames, healthStore);
+        // Level 2 — liveness. Account state alone is not proof: the network, proxy
+        // or upstream may be down while the account is perfectly fine.
+        await this.probeManagedLiveness(providerName, runtime, provider, model, group, healthStore);
+      }
     }
   }
 
@@ -900,7 +903,7 @@ export class ActiveProbeService {
   ): Promise<boolean> {
     try {
       if (typeof runtime.probeAccountState === "function") {
-        const verdict = await runtime.probeAccountState();
+        const verdict = await runtime.probeAccountState({ model, provider });
         if (verdict && verdict.available === false) {
           healthStore.recordProbeAttempt?.(providerName, model);
           // Honour the reset epoch the plugin reported, so the next check waits
@@ -918,7 +921,7 @@ export class ActiveProbeService {
       // Fallback: ensureUsable() is exactly the circuit breaker every real
       // request runs first, so plugins that only implement it behave the same.
       if (typeof runtime.ensureUsable === "function") {
-        await runtime.ensureUsable();
+        await runtime.ensureUsable({ model, provider });
       }
       return true;
     } catch (error: any) {

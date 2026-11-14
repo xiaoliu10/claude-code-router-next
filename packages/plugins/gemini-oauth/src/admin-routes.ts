@@ -130,6 +130,28 @@ export function registerGeminiOauthAdminRoutes(app: FastifyInstance, deps: Gemin
     }
   });
 
+  /**
+   * Read-only quota snapshot for the card's independent-pools surface. It
+   * never mutates config and never takes the management lease: the service's
+   * own short-TTL single-flight cache (auth/identity guarded) backs it. The
+   * snapshot passes through verbatim (`null` when the account has no usable
+   * quota); the card structurally validates it. `getQuota` is optional on the
+   * service so an older service build keeps working with a quiet `null`.
+   */
+  app.get("/api/gemini-oauth/quota", async (req: any, reply: any) => {
+    try {
+      assertLocalGeminiOauthRequest(req);
+      const service = deps.getService();
+      if (!service) return geminiOauthFailure(reply, "gemini_oauth_not_configured", 503);
+      const getQuota = (service as { getQuota?: () => Promise<unknown> }).getQuota;
+      if (typeof getQuota !== "function") return null;
+      const snapshot = await getQuota.call(service);
+      return snapshot ?? null;
+    } catch (error: any) {
+      return geminiOauthRouteError(error, reply, "quota", "gemini_oauth_quota_failed");
+    }
+  });
+
   app.post("/api/gemini-oauth/login/start", async (req: any, reply: any) => {
     try {
       assertLocalGeminiOauthRequest(req);

@@ -60,10 +60,31 @@ describe("fetchGeminiOauthQuota", () => {
       "claude-sonnet-4-6": { remaining: 0.9 },
     });
     expect(quota.pools).toEqual([
-      { pool: "Gemini", window: "5h", remaining: 0.25, resetAt: "2026-10-26T09:00:00.000Z" },
-      { pool: "Gemini", window: "weekly", remaining: 0.8, resetAt: "2026-11-02T00:00:00.000Z" },
-      { pool: "Claude & GPT", window: "5h", remaining: 0.55 },
-      { pool: "Claude & GPT", window: "weekly", remaining: 0.95 },
+      { pool: "Gemini Models", window: "5h", remaining: 0.25, resetAt: "2026-10-26T09:00:00.000Z" },
+      { pool: "Gemini Models", window: "weekly", remaining: 0.8, resetAt: "2026-11-02T00:00:00.000Z" },
+      { pool: "Claude and GPT models", window: "5h", remaining: 0.55 },
+      { pool: "Claude and GPT models", window: "weekly", remaining: 0.95 },
+    ]);
+  });
+
+  it("treats null/empty/non-numeric fractions as missing, not zero, and keeps original group names", async () => {
+    const { impl } = upstream({
+      retrieveUserQuota: { buckets: [
+        { modelId: "gemini-4-argon", remainingFraction: null },
+        { modelId: "gemini-4-argon-high", remainingFraction: "" },
+        { modelId: "gemini-4-hydrogen", remainingFraction: "0.4" },
+        { modelId: "gemini-4-hydrogen-low", remainingFraction: false },
+        { modelId: "bad-fraction", remainingFraction: 1.5 },
+      ] },
+      retrieveUserQuotaSummary: { groups: [
+        { displayName: "Gemini Models", buckets: [{ window: "5h", remainingFraction: null }] },
+        { displayName: "GEMINI 4 ARGON", buckets: [{ window: "weekly", remainingFraction: "0.2" }] },
+      ] },
+    });
+    const quota = await fetchGeminiOauthQuota({ accessToken: "t", project: "p", fetchImpl: impl });
+    expect(quota.models).toEqual({ "gemini-4-hydrogen": { remaining: 0.4 } });
+    expect(quota.pools).toEqual([
+      { pool: "GEMINI 4 ARGON", window: "weekly", remaining: 0.2 },
     ]);
   });
 

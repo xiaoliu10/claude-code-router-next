@@ -9,7 +9,7 @@ import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
 import { type PluginRegistry, pluginErrorFrom } from "../provider-plugins/registry";
-import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "./plugin-request-state";
+import { ensurePluginRequestState, pluginAttemptBudget, pluginTerminalFailure, rememberPluginFailure } from "./plugin-request-state";
 import { pluginResponseError, describeTransportFailure } from "./plugin-response-error";
 import {
   isDebugLogEnabled,
@@ -416,7 +416,7 @@ async function handleTransformerEndpoint(
     // budget through rememberPluginFailure — the generic seam semantics that
     // replaced the per-provider inline checks); generic transient errors
     // (5xx/empty stream/network) keep one retry.
-    const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error, provider);
+    const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error, provider, body.model);
     if (!terminalPluginFailure && !(req as any).__retryAttempted) {
       (req as any).__retryAttempted = true;
       try {
@@ -772,7 +772,7 @@ async function handleFallback(
       // Provider-scoped: one runtime may own several independent managed
       // providers (e.g. per-site subscriptions); a terminal failure of one
       // site's provider must never skip another site's fallback entry.
-      if (fallbackRuntime && pluginAttemptBudget(req, fallbackRuntime, { name: fbProviderName }).terminalError) continue;
+      if (fallbackRuntime && pluginTerminalFailure(req, fallbackRuntime, { name: fbProviderName }, fbModel)) continue;
       let fallbackError: any;
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
@@ -892,7 +892,7 @@ async function handleFallback(
           fallbackError = error;
           // A classified nonRetryable plugin failure never restarts its
           // account-pool attempt budget on a fallback retry.
-          if (rememberPluginFailure(req, fallbackRuntime, error, { name: fbProviderName })) break;
+          if (rememberPluginFailure(req, fallbackRuntime, error, { name: fbProviderName }, fbModel)) break;
           if (attempt === 1) {
             req.log.warn(`Fallback model ${fbProviderName},${fbModel} failed, retrying once: ${error.message}`);
             continue;
@@ -944,14 +944,15 @@ async function processRequestTransformers(
       !context.pluginRegistry.getManagedRuntimeFor(provider)) {
     throw createApiError("Provider plugin missing or disabled; install and enable its provider plugin.", 503, "plugin_missing");
   }
+  const managedRequest = { model: body.model, provider, requestState: {} };
   const runtime = context.pluginRegistry.getManagedRuntimeFor(provider);
   if (runtime) {
     // Keyed by (runtime, provider): a terminal on one managed subscription
     // must not short-circuit a sibling provider served by the same runtime.
-    const terminal = pluginAttemptBudget(context.req, runtime, provider).terminalError;
+    const terminal = pluginTerminalFailure(context.req, runtime, provider, body.model);
     if (terminal) throw terminal;
     // Run before any transformer can refresh credentials or contact upstream.
-    await runtime.ensureUsable?.();
+    await runtime.ensureUsable?.(managedRequest);
   }
   // Deep clone the request body to preserve original messages for caching
   // and to ensure thinking blocks are not lost when switching between models
@@ -980,7 +981,8 @@ async function processRequestTransformers(
     }
   }
 
-  let config: any = {};
+  // Preserve the dispatched catalog model before a transformer builds a wire envelope.
+  let config: any = { __ccrManagedRequest: managedRequest };
   let bypass = false;
 
   // Check if transformers should be bypassed (passthrough mode)
@@ -1000,7 +1002,7 @@ async function processRequestTransformers(
     const transformOut = await transformer.transformRequestOut(requestBody);
     if (transformOut.body) {
       requestBody = transformOut.body;
-      config = transformOut.config || {};
+      config = { ...config, ...transformOut.config };
     } else {
       requestBody = transformOut;
     }
@@ -1215,7 +1217,7 @@ async function sendProviderAttempt(
   const pluginRuntime = fastify.pluginRegistry.getManagedRuntimeFor(provider);
   if (pluginRuntime) {
     // Circuit breaker before any network touch — including token refresh.
-    await pluginRuntime.ensureUsable?.();
+    await pluginRuntime.ensureUsable?.(config.__ccrManagedRequest ??= { model: requestBody?.model, provider, requestState: {} });
     await pluginRuntime.lockUpstream?.(config, provider);
   }
   const url = config.url || new URL(provider.baseUrl);
@@ -1287,6 +1289,7 @@ async function sendProviderAttempt(
     });
   }
 
+  const managedRequest = config.__ccrManagedRequest;
   let response: Response;
   const dispatchUpstream = () => sendUnifiedRequest(
     url,
@@ -1302,7 +1305,7 @@ async function sendProviderAttempt(
   try {
     response = await dispatchUpstream();
   } catch (sendError: any) {
-    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), describeTransportFailure(sendError));
+    if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), describeTransportFailure(sendError), managedRequest);
     throw sendError;
   }
 
@@ -1329,7 +1332,7 @@ async function sendProviderAttempt(
   if (!response.ok) {
     let errorText: string;
     try { errorText = await response.text(); } catch (readError) {
-      if (pluginRuntime) throw await pluginResponseError(pluginRuntime, response.status, undefined, geminiSystemText(requestBody));
+      if (pluginRuntime) throw await pluginResponseError(pluginRuntime, response.status, undefined, geminiSystemText(requestBody), undefined, managedRequest);
       throw readError;
     }
     // Installed plugin runtimes classify first: the taxonomy belongs to the
@@ -1338,7 +1341,7 @@ async function sendProviderAttempt(
     // upstream envelope must never reach the log stream, and a subscription
     // token must never be recoverable from an error message.
     if (pluginRuntime) {
-      const error = await pluginResponseError(pluginRuntime, response.status, errorText, geminiSystemText(requestBody));
+      const error = await pluginResponseError(pluginRuntime, response.status, errorText, geminiSystemText(requestBody), undefined, managedRequest);
       fastify.log.error(`[provider_response_error] Plugin(${pluginRuntime.name}) status=${response.status} code=${error.code}`);
       throw error;
     }
@@ -1392,7 +1395,7 @@ async function sendProviderAttempt(
         // returned) so rotation still happens; this only catches bodies a
         // wrapper already returned.
         if (pluginRuntime?.isErrorEnvelope?.(bodyJson)) {
-          throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody));
+          throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody), undefined, managedRequest);
         }
         // Check if the response contains an error object
         if (bodyJson && typeof bodyJson === 'object' && bodyJson.error) {
@@ -1406,7 +1409,7 @@ async function sendProviderAttempt(
             // same taxonomy, same noteUpstreamError bookkeeping, thrown through
             // the shared seam so fallback engages.
             if (pluginRuntime) {
-              throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody));
+              throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody), undefined, managedRequest);
             }
             fastify.log.error(
               `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
@@ -1429,7 +1432,7 @@ async function sendProviderAttempt(
           if (e?.pluginClassified === true) throw e;
           // Includes malformed/empty JSON, HTML interception and body read
           // errors. Nothing below may log or forward rawBody for a plugin.
-          throw await pluginResponseError(pluginRuntime, response.status, undefined, geminiSystemText(requestBody));
+          throw await pluginResponseError(pluginRuntime, response.status, undefined, geminiSystemText(requestBody), undefined, managedRequest);
         }
         // Empty or malformed JSON body on HTTP 200 — the provider returned an
         // invalid response. Throw to trigger fallback instead of forwarding

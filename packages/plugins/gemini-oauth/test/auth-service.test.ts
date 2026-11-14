@@ -265,11 +265,13 @@ describe("Gemini OAuth error bookkeeping and disconnect", () => {
   it("cooling is false initially, true until expiry, and automatically false afterwards", async () => {
     const h = await harness(); await h.store.save(credential());
     expect(await h.service.isAccountCooling()).toBe(false);
-    await h.service.noteUpstreamError(classifyGeminiOauthError({ status: 429 }));
-    expect(await h.service.isAccountCooling()).toBe(true);
-    const until = (await h.store.load())!.account.cooldownUntil!;
+    await h.service.noteUpstreamError(classifyGeminiOauthError({ status: 429 }), "gemini-4-argon-high");
+    expect(await h.service.isAccountCooling()).toBe(false);
+    expect(await h.service.getPoolCooldown("gemini-4-argon-low")).not.toBeNull();
+    const until = (await h.store.load())!.poolLocks!["gemini-4-argon"];
     vi.spyOn(Date, "now").mockReturnValue(until + 1);
     expect(await h.service.isAccountCooling()).toBe(false);
+    expect(await h.service.getPoolCooldown("gemini-4-argon")).toBeNull();
     expect(await h.service.getStatus()).toMatchObject({ lastError: null, cooldownUntil: null });
   });
   it("a 401 parks the account, so the recovery probe stops spending real requests on it", async () => {
@@ -316,8 +318,15 @@ describe("Gemini OAuth error bookkeeping and disconnect", () => {
     const h = await harness(); await h.store.save(credential());
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    // Hold the refresh in flight so the disconnect lands mid-call.
+    // Signal the moment the flight reaches the network seam: getAccessToken()
+    // captures its epoch synchronously just before the refresh (and its fetch)
+    // starts, so this barrier makes "epoch captured before disconnect"
+    // deterministic — a fixed setTimeout raced under parallel-suite load and
+    // let the flight capture the NEW epoch after the disconnect.
+    let enteredFetch: (() => void) | undefined;
+    const fetchEntered = new Promise<void>((resolve) => { enteredFetch = resolve; });
     h.options.fetch = (async () => {
+      enteredFetch!();
       await gate;
       return new Response(JSON.stringify({ error: "invalid_grant" }), {
         status: 400, headers: { "content-type": "application/json" },
@@ -326,7 +335,7 @@ describe("Gemini OAuth error bookkeeping and disconnect", () => {
     const service = new GeminiOauthAuthService(h.options);
 
     const flight = service.getAccessToken().catch((error) => error);
-    await new Promise((resolve) => setTimeout(resolve, 5)); // let the call reach the network seam
+    await fetchEntered;
     await service.disconnect();
     await h.store.save(credential()); // a fresh account is authorized meanwhile
     release!();

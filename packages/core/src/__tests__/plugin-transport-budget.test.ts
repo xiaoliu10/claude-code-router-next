@@ -3,7 +3,7 @@ import Server from "../server";
 import type { PluginRegistry } from "../provider-plugins/registry";
 import { getHealthStore } from "../services/provider-health";
 import type { ManagedRuntime } from "../provider-plugins/types";
-import { ensurePluginRequestState, pluginAttemptBudget, rememberPluginFailure } from "../api/plugin-request-state";
+import { ensurePluginRequestState, pluginAttemptBudget, pluginTerminalFailure, rememberPluginFailure } from "../api/plugin-request-state";
 import { pluginResponseError } from "../api/plugin-response-error";
 
 const closed: Array<Server> = [];
@@ -58,6 +58,50 @@ describe("plugin response confidentiality and request-wide account budget", () =
     const error = Object.assign(new Error("reauth"), { nonRetryable: true });
     expect(rememberPluginFailure(first, rt, error)).toBe(true);
     expect(pluginAttemptBudget(second, rt)).toMatchObject({ refreshUsed: true, terminalError: error });
+  });
+
+  it("model-scoped quota errors preserve sibling fallback and the shared refresh budget", () => {
+    const req: any = {}; const rt = { ...runtime(), modelScopedRecovery: true };
+    const provider = { name: "sub" };
+    pluginAttemptBudget(req, rt, provider).refreshUsed = true;
+    const quotaError = Object.assign(new Error("quota"), { statusCode: 429, nonRetryable: true });
+    expect(rememberPluginFailure(req, rt, quotaError, provider, "m")).toBe(true);
+    expect(pluginTerminalFailure(req, rt, provider, "m")).toBe(quotaError);
+    expect(pluginTerminalFailure(req, rt, provider, "other")).toBeUndefined();
+    expect(pluginAttemptBudget(req, rt, provider).refreshUsed).toBe(true);
+    const reauth = Object.assign(new Error("reauth"), { statusCode: 401, nonRetryable: true });
+    rememberPluginFailure(req, rt, reauth, provider, "m");
+    expect(pluginTerminalFailure(req, rt, provider, "other")).toBe(reauth);
+  });
+
+  it("fallback within an independent provider reaches its healthy sibling after HTTP429", async () => {
+    const rt = { ...runtime(), modelScopedRecovery: true };
+    rt.classifyError = (status: number) => ({ code: "fake_quota", message: "quota", httpStatus: status, retryable: false });
+    const ensureUsable = vi.fn(async (_ctx: any) => {});
+    const noteUpstreamError = vi.fn(async (_info: any, _ctx: any) => {});
+    Object.assign(rt, { ensureUsable, noteUpstreamError });
+    const server = await host(rt, true);
+    vi.spyOn(getHealthStore(), "isAvailable").mockReturnValue(true);
+    const sent: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: any) => {
+      const body = JSON.parse(init.body); sent.push(body.model);
+      return body.model === "m" ? json({ error: "quota" }, 429) : json({
+        id: "reply", object: "chat.completion", model: "other",
+        choices: [{ index: 0, message: { role: "assistant", content: "healthy sibling" }, finish_reason: "stop" }],
+      });
+    }));
+    const response = await send(server, "sub,m");
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("healthy sibling");
+    expect(sent).toEqual(["m", "other"]);
+    const context = noteUpstreamError.mock.calls[0][1];
+    expect(context.model).toBe("m");
+    expect(context.requestState).toBeTruthy();
+    const gates = ensureUsable.mock.calls.map(([ctx]) => ctx);
+    expect(gates.filter(ctx => ctx.model === "m")).toHaveLength(2);
+    expect(gates[0]).toBe(gates[1]);
+    expect(context).toBe(gates[0]);
+    expect(gates.find(ctx => ctx.model === "other")?.requestState).not.toBe(context.requestState);
   });
 
   it("an ordinary primary falling back to repeated plugin 401 uses exactly 2 sends and 1 refresh", async () => {

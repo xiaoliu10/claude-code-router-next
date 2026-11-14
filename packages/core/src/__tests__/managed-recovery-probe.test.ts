@@ -63,6 +63,36 @@ describe("managed recovery probe", () => {
     expect(dispatchRequest).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps independent model pools parked while probing healthy siblings", async () => {
+    openCircuit("s1"); openCircuit("s2");
+    const until = Date.now() + 600_000;
+    const probeAccountState = vi.fn(async ({ model }: any) => model === "s1"
+      ? { available: false, parkedUntil: until, reason: "pool_cooling" }
+      : { available: true });
+    const probeLiveness = vi.fn(async (_input: any) => new Response("{}"));
+    const runtime = { name: "sub", modelScopedRecovery: true, probeAccountState, probeLiveness };
+    const service = new ActiveProbeService(() => [managedProvider as any],
+      { quotaProbeIntervalMinutes: 10 }, undefined, undefined, undefined, () => runtime);
+    await service.runManagedRecoveryProbe();
+    expect(probeAccountState.mock.calls.map(([ctx]) => ctx.model)).toEqual(["s1", "s2"]);
+    expect(probeLiveness).toHaveBeenCalledTimes(1);
+    expect(probeLiveness.mock.calls[0][0].model).toBe("s2");
+    expect(getHealthStore().getState("sub", "s1")?.status).toBe("open");
+    expect(getHealthStore().isAvailable("sub", "s2")).toBe(true);
+  });
+
+  it("a healthy first pool does not recover a failed sibling probe", async () => {
+    openCircuit("s1"); openCircuit("s2");
+    const probeLiveness = vi.fn(async ({ model }: any) => new Response("{}", { status: model === "s1" ? 200 : 503 }));
+    const service = new ActiveProbeService(() => [managedProvider as any],
+      { quotaProbeIntervalMinutes: 10 }, undefined, undefined, undefined,
+      () => ({ name: "sub", modelScopedRecovery: true, probeAccountState: async () => ({ available: true }), probeLiveness }));
+    await service.runManagedRecoveryProbe();
+    expect(probeLiveness).toHaveBeenCalledTimes(2);
+    expect(getHealthStore().isAvailable("sub", "s1")).toBe(true);
+    expect(getHealthStore().getState("sub", "s2")?.status).toBe("open");
+  });
+
   it("probes immediately despite a fresh failure — the gate ignores lastFailureTime", async () => {
     // 2026-11-02 codex outage: the old gate (max(lastFailureTime, lastProbeTime))
     // let every half-open real-request failure push the recovery probe out, so a

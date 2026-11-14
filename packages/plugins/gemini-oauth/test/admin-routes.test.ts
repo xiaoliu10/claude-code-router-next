@@ -88,7 +88,7 @@ async function build(config: any = { Providers: [provider(), ordinary], Router: 
   await server.registerNamespace("/"); await server.app.ready();
   const noTokens = (body: string) => { expect(body).not.toContain(ACCESS); expect(body).not.toContain(REFRESH); };
   const request = async (path: string, payload?: any, extra: any = {}) => {
-    const response = await server.app.inject({ method: path === "/status" ? "GET" : "POST",
+    const response = await server.app.inject({ method: path === "/status" || path === "/quota" ? "GET" : "POST",
       url: `http://localhost:3456/api/gemini-oauth${path}`, ...(payload === undefined ? {} : { payload }), ...extra });
     noTokens(response.body); return response;
   };
@@ -226,7 +226,7 @@ describe("Gemini OAuth six admin routes: exact UI fields and no credentials", ()
 });
 
 describe("Gemini OAuth local guard and generic config protection", () => {
-  it.each(["/status", "/login/start", "/login/poll", "/login/cancel", "/sync", "/disconnect"])("%s refuses non-loopback and hostile Origins", async path => {
+  it.each(["/status", "/quota", "/login/start", "/login/poll", "/login/cancel", "/sync", "/disconnect"])("%s refuses non-loopback and hostile Origins", async path => {
     const h = await build();
     for (const extra of [{ remoteAddress: "203.0.113.7", headers: { origin: "http://localhost:3456", host: "localhost:3456" } },
       { remoteAddress: "127.0.0.1", headers: { origin: "https://attacker.invalid", host: "localhost:3456" } }]) {
@@ -368,6 +368,82 @@ describe("Gemini OAuth model hide/restore admin seam", () => {
     expect(h.config()).toEqual(before);
     expect((await h.store.load())!.hiddenModels).toBeUndefined();
     expect((await h.request("/status")).json()).toMatchObject({ models: ["gemini-3-flash", "gemini-3-pro"], hiddenModels: [] });
+  });
+});
+
+describe("Gemini OAuth read-only GET /quota route", () => {
+  const quotaGet = (h: Awaited<ReturnType<typeof build>>, extra: any = {}) =>
+    h.server.app.inject({ method: "GET", url: "http://localhost:3456/api/gemini-oauth/quota", ...extra });
+
+  it("passes the service snapshot through verbatim with no credential material", async () => {
+    const h = await build();
+    const snapshot = {
+      models: {
+        "gemini-4-argon": { remaining: 0, resetAt: "2026-11-20T18:00:00.000Z" },
+        "gemini-4-hydrogen": { remaining: 0.7 },
+      },
+      pools: [
+        { pool: "Gemini", window: "5h", remaining: 0 },
+        { pool: "Gemini", window: "weekly", remaining: 0.8, resetAt: "2026-11-27T00:00:00.000Z" },
+      ],
+    };
+    // getQuota is the backend seam (not present on this service build yet), so
+    // it is assigned rather than spied on; the route tolerates its absence too.
+    const getQuota = vi.fn(async () => snapshot);
+    (h.service as any).getQuota = getQuota;
+    const response = await quotaGet(h);
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(snapshot);
+    expect(getQuota).toHaveBeenCalledTimes(1);
+    h.noTokens(response.body);
+  });
+
+  it("returns JSON null when the service has no usable quota (never a zeroed snapshot)", async () => {
+    const h = await build();
+    (h.service as any).getQuota = vi.fn(async () => null);
+    const response = await quotaGet(h);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toBe("null");
+  });
+
+  it("an older service without getQuota degrades to a quiet null instead of failing", async () => {
+    const h = await build();
+    // Stage the legacy shape explicitly: the service now implements getQuota,
+    // so an older host must be simulated, not assumed. Assignment (not delete)
+    // also shadows a prototype method.
+    (h.service as any).getQuota = undefined;
+    expect(typeof (h.service as any).getQuota).toBe("undefined");
+    const response = await quotaGet(h);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toBe("null");
+  });
+
+  it("collapses a service failure into the established envelope without leaking its message", async () => {
+    const h = await build();
+    (h.service as any).getQuota = vi.fn(async () => { throw new Error(`${ACCESS} disk failure`); });
+    const response = await quotaGet(h);
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ ok: false, success: false, error: "gemini_oauth_quota_failed" });
+    h.noTokens(response.body);
+  });
+
+  it("keeps the same loopback socket guard as every other admin route", async () => {
+    const h = await build();
+    const getQuota = vi.fn(async () => null);
+    (h.service as any).getQuota = getQuota;
+    for (const extra of [
+      { remoteAddress: "203.0.113.7", headers: { origin: "http://localhost:3456", host: "localhost:3456" } },
+      { remoteAddress: "127.0.0.1", headers: { origin: "https://attacker.example.test", host: "localhost:3456" } },
+    ]) {
+      const response = await quotaGet(h, extra);
+      expect(response.statusCode).toBe(403);
+      expect(response.json()).toEqual({ ok: false, success: false, error: "gemini_oauth_unauthorized" });
+    }
+    expect(getQuota).not.toHaveBeenCalled();
+    // Originless loopback CLI requests still reach the service.
+    const allowed = await quotaGet(h, { remoteAddress: "127.0.0.1" });
+    expect(allowed.statusCode).toBe(200);
+    expect(getQuota).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -9,6 +9,18 @@ import {
 } from "../../../ui/src/utils/gemini-oauth";
 import { createGeminiOauthLogin } from "../../../ui/src/utils/gemini-oauth-login";
 import { geminiOauthLocales } from "./locales";
+import {
+  buildQuotaModelRows, buildQuotaPoolRows, formatQuotaPercent, parseQuotaSnapshot,
+  type QuotaSnapshotView,
+} from "./quota-view";
+
+/**
+ * Account-identity key for quota invalidation. A quota snapshot is only valid
+ * for the exact connected account it was fetched under; any change (login as a
+ * different user, disconnect) drops the previous snapshot before a new read.
+ */
+const quotaIdentityKey = (value: GeminiOauthStatusResponse | null): string =>
+  value?.connected === true ? `${value.kind ?? ""}|${value.email ?? ""}|${value.project ?? ""}` : "";
 
 /**
  * Exact `gemini-oauth,<model>` references a hide reported as removed from
@@ -152,6 +164,12 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   let consentOpen = false, consentAck = false, confirmDisconnect = false;
   let pending: { kind: "login" | "sync" | "disconnect" | "hide" | "restore"; argument: string | null } | null = null;
   let actionGeneration = 0;
+  // Quota reads use their OWN generation, deliberately separate from the
+  // mutation actionGeneration: a background read completing can never clear a
+  // login/sync/disconnect action's state or the management lease it holds.
+  let quota: QuotaSnapshotView | null = null;
+  let quotaLoading = false;
+  let quotaReadGeneration = 0;
   let login: GeminiOauthLoginStartResponse | null = null;
   let session: ReturnType<typeof createGeminiOauthLogin> | null = null;
   let consentGranted = false;
@@ -278,8 +296,45 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     return alert;
   };
   const readStatus = async () => {
+    const previousIdentity = quotaIdentityKey(status);
     const next = await props.callApi<GeminiOauthStatusResponse>("/status", { timeoutMs: 10_000 });
-    if (alive) { status = next; loadFailed = false; }
+    if (alive) {
+      status = next; loadFailed = false;
+      // A login or disconnect changes the account: a snapshot fetched for the
+      // old identity must never linger. Bump the read token so any in-flight
+      // quota response is dropped, then read once for the new account.
+      const nextIdentity = quotaIdentityKey(next);
+      if (nextIdentity !== previousIdentity) {
+        quotaReadGeneration += 1;
+        quota = null;
+        quotaLoading = false;
+        if (nextIdentity) void readQuota();
+      }
+    }
+  };
+  /**
+   * Read-only quota fetch on its OWN generation token. It never acquires the
+   * management lease, never sends a chat/mutation request and is fully
+   * independent of actionGeneration, so a background read can never clear an
+   * action lock. A response whose generation is stale (new login, disconnect,
+   * unmount) is dropped instead of overwriting the current account's surface.
+   * Errors, `null` and malformed payloads degrade to a quiet unavailable
+   * state — never zero usage or a full allowance, and raw errors never render.
+   */
+  const readQuota = async () => {
+    if (!alive || status?.connected !== true) return;
+    const generation = ++quotaReadGeneration;
+    quotaLoading = true; render();
+    try {
+      const payload = await props.callApi<unknown>("/quota", { method: "GET", timeoutMs: 10_000 });
+      if (!alive || generation !== quotaReadGeneration) return;
+      quota = parseQuotaSnapshot(payload);
+    } catch {
+      if (!alive || generation !== quotaReadGeneration) return;
+      quota = null; // older hosts without the route, auth/network failure: unavailable
+    } finally {
+      if (alive && generation === quotaReadGeneration) { quotaLoading = false; render(); }
+    }
   };
   /**
    * Post-commit tail shared by every mutation: reconcile the host config draft,
@@ -325,6 +380,12 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     busy = true; props.onBusy?.(true); errorKey = null; toast = null; reconcileFailed = false;
     pending = { kind, argument: argument ?? null };
     const generation = ++actionGeneration;
+    // Login/disconnect can switch the account identity: drop the current
+    // snapshot immediately so an old-account figure can never linger while
+    // the action is in flight, and invalidate any late background response.
+    if (kind === "login" || kind === "disconnect") {
+      quotaReadGeneration += 1; quota = null; quotaLoading = false;
+    }
     render();
     try {
       if (kind === "login") {
@@ -395,6 +456,13 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       if (actionGeneration === generation) pending = null;
       endBusy(); session = null; login = null; consentGranted = false;
       consentOpen = false; consentAck = false;
+      // A failed/cancelled re-authorization on the SAME account cleared the
+      // surface at action start without changing identity; settle's identity
+      // guard therefore did not re-read. Refill once, still read-only and
+      // still off the management lease.
+      if (alive && (kind === "login" || kind === "disconnect") && status?.connected === true && quota === null && !quotaLoading) {
+        void readQuota();
+      }
       if (alive) render();
     }
   };
@@ -441,6 +509,76 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     panel.append(header, body, footer, close);
     el.append(overlay, panel);
     return { panel, body, footer };
+  };
+  /** Compact localized reset instant; the view layer already proved the ISO
+   *  string parses and is still in the future. */
+  const formatQuotaReset = (iso: string): string => {
+    try {
+      return new Date(iso).toLocaleString(locale === "zh" ? "zh-CN" : undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    } catch {
+      return "";
+    }
+  };
+  /**
+   * Independent-pools quota surface. Per-model buckets (no invented window
+   * label) and the upstream grouped 5h/weekly windows are rendered as two
+   * clearly separated groups so a broad weekly total can never be read as an
+   * individual model's limit. Every value is textContent from the validated
+   * view; unavailable data renders as the quiet unavailable line, never zero.
+   */
+  const renderQuotaSection = (parent: HTMLElement, connected: boolean, controlsDisabled: boolean) => {
+    if (!connected) return;
+    const section = styled("section", "max-w-md space-y-2 rounded-xl border border-white/5 bg-white/[0.03] p-3");
+    section.setAttribute("aria-busy", String(quotaLoading));
+    const heading = styled("div", "flex items-center justify-between gap-2");
+    heading.append(styled("h4", "text-xs font-bold tracking-tight text-foreground", t("quota.title")));
+    button(heading, t("quota.refresh"), () => { void readQuota(); }, controlsDisabled || quotaLoading, "outline", "h-7 px-2 text-[11px]", refreshCwIcon("mr-1 h-3 w-3"));
+    section.append(heading);
+    const hasFigures = quota !== null && (Object.keys(quota.models).length > 0 || quota.pools.length > 0);
+    if (!hasFigures) {
+      section.append(styled("p", "text-[11px] text-muted-foreground/70", quotaLoading ? t("status.loading") : t("quota.unavailable")));
+      parent.append(section);
+      return;
+    }
+    const snapshot = quota!;
+    const modelRows = buildQuotaModelRows(snapshot);
+    if (modelRows.length > 0) {
+      const group = styled("div", "space-y-1");
+      group.append(styled("p", "text-[11px] font-semibold text-muted-foreground", t("quota.model_buckets")));
+      const list = styled("ul", "space-y-1");
+      for (const row of modelRows) {
+        const item = styled("li", "flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]");
+        badge(item, t(`quota.identity.${row.identity}`), "outline", row.identity === "other" ? "" : "border-primary/30 text-primary");
+        item.append(styled("span", "break-all font-mono text-foreground", row.family));
+        if (row.variants.length > 1) {
+          item.append(styled("span", "text-muted-foreground/60", t("quota.variants", { count: row.variants.length })));
+        }
+        item.append(styled("span", `ml-auto font-semibold ${row.remaining <= 0 ? "text-red-500" : "text-foreground"}`, row.remaining <= 0 ? t("quota.exhausted") : formatQuotaPercent(row.remaining)));
+        if (row.resetAt) item.append(styled("span", "w-full text-[10px] text-muted-foreground/70", t("quota.reset_at", { time: formatQuotaReset(row.resetAt) })));
+        list.append(item);
+      }
+      group.append(list);
+      group.append(styled("p", "text-[10px] leading-relaxed text-muted-foreground/60", t("quota.model_note")));
+      section.append(group);
+    }
+    const poolRows = buildQuotaPoolRows(snapshot);
+    if (poolRows.length > 0) {
+      const group = styled("div", "space-y-1");
+      group.append(styled("p", "text-[11px] font-semibold text-muted-foreground", t("quota.grouped_windows")));
+      const list = styled("ul", "space-y-1");
+      for (const row of poolRows) {
+        const item = styled("li", "flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]");
+        item.append(styled("span", "break-all text-foreground", row.pool));
+        badge(item, row.window, "secondary");
+        item.append(styled("span", `ml-auto font-semibold ${row.remaining <= 0 ? "text-red-500" : "text-foreground"}`, row.remaining <= 0 ? t("quota.exhausted") : formatQuotaPercent(row.remaining)));
+        if (row.resetAt) item.append(styled("span", "w-full text-[10px] text-muted-foreground/70", t("quota.reset_at", { time: formatQuotaReset(row.resetAt) })));
+        list.append(item);
+      }
+      group.append(list);
+      group.append(styled("p", "text-[10px] leading-relaxed text-muted-foreground/60", t("quota.pool_note")));
+      section.append(group);
+    }
+    parent.append(section);
   };
   const render = () => {
     if (!alive) return;
@@ -519,6 +657,8 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       button(details, t("restore_all"), () => { void run("restore"); }, disabled || (pending !== null && pending.kind === "restore"), "outline", "mt-2 h-7 px-2 text-[11px]");
       bodyCol.append(details);
     }
+    // Independent quota pools: read-only surface with its own refresh control.
+    renderQuotaSection(bodyCol, connected, disabled);
     for (const code of [geminiOauthStatusErrorKey(status), errorKey]) {
       if (code) bodyCol.append(errorAlert(t(`errors.${code}`) || t("errors.request_failed")));
     }
@@ -584,6 +724,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   };
   mounted.set(el, () => {
     alive = false; consentGranted = false; consentOpen = false; confirmDisconnect = false;
+    // Drop any in-flight quota response: a disposed/replaced card must never
+    // paint another account's snapshot back into the DOM.
+    quotaReadGeneration += 1; quotaLoading = false; quota = null;
     unsubscribeHost?.(); unsubscribeHost = null;
     void session?.cancel().catch(() => {});
     // Visual disposal only. The shared management lease deliberately stays held

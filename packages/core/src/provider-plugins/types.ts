@@ -113,6 +113,15 @@ export interface ManagedProbeInput {
   config: any;
 }
 
+/** Optional request identity for model-scoped subscription limits. */
+export interface ManagedRequestContext {
+  model?: string;
+  provider?: LLMProvider;
+  /** Stable per-attempt identity owned by the core. Plugins may attach private
+   * state through a WeakMap without sharing credentials with the host. */
+  requestState?: object;
+}
+
 /**
  * Managed-subscription semantics for one provider family. Everything the data
  * plane needs to talk to a subscription upstream without the core knowing it:
@@ -123,7 +132,10 @@ export interface ManagedRuntime {
   name: string;
   isManaged(provider: LLMProvider): boolean;
   /** Circuit breaker before any network touch (Gemini lesson: must run BEFORE token refresh). */
-  ensureUsable?(): Promise<void>;
+  ensureUsable?(context?: ManagedRequestContext): Promise<void>;
+  /** Opt into independent recovery per model; a successful sibling probe
+   * must not recover a different quota pool. Omitted preserves account probes. */
+  modelScopedRecovery?: boolean;
   /** Lock the upstream: mutate config.url / redirect / dispatcher. Runs once per attempt. */
   lockUpstream?(config: any, provider: LLMProvider): Promise<void>;
   /**
@@ -147,7 +159,7 @@ export interface ManagedRuntime {
    */
   classifyError?(status: number, body: unknown, systemText: string): PluginClassifiedError | null;
   /** Persist a classified error (cooldown, lastError). Must never throw into the response path. */
-  noteUpstreamError?(info: PluginClassifiedError): Promise<void>;
+  noteUpstreamError?(info: PluginClassifiedError, context?: ManagedRequestContext): Promise<void>;
   /**
    * Generic HTTP-200 hidden-error-envelope detector. When present, the core
    * runs it against every parsed JSON 200 body and throws through the shared
@@ -182,7 +194,7 @@ export interface ManagedRuntime {
    * every real request already performs — so plugins that only implement the
    * circuit breaker still work.
    */
-  probeAccountState?(): Promise<ManagedProbeVerdict>;
+  probeAccountState?(context?: ManagedRequestContext): Promise<ManagedProbeVerdict>;
   /**
    * Optional runtime-owned liveness probe (level 2).
    *
