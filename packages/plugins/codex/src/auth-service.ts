@@ -1164,9 +1164,11 @@ export class CodexAuthService {
       account.accessExp - this.now > CODEX_REFRESH_LEAD_MS;
     if (fresh) return { refreshed: false };
     const before = account.accessToken;
+    // getAccessToken's refresh path persists through saveData(), which updates
+    // the in-memory identity synchronously — compare against it instead of a
+    // forced disk re-read just to compute the boolean.
     await this.getAccessToken();
-    const after = (await this.ensureLoaded(true))?.account.accessToken;
-    return { refreshed: after !== before };
+    return { refreshed: this.data?.account.accessToken !== before };
   }
 
   async getAccountId(): Promise<string> {

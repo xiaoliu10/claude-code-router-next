@@ -119,3 +119,25 @@ export class CodexTokenMaintenance {
     }
   }
 }
+
+/**
+ * Module-level owner for the single live maintenance loop.
+ *
+ * coreApi=1 has no deactivate/dispose hook, and the production registry
+ * already rejects a duplicate activation, so double activation is unreachable
+ * today. The singleton nevertheless makes a future hot reload / same-process
+ * reinstall safe: the previous activation's loop (holding a stale service
+ * closure) is stopped instead of two unref'ed 30-minute timers running side by
+ * side. Same constraint and pattern as qoder's module-level owners Map.
+ */
+let currentMaintenance: CodexTokenMaintenance | undefined;
+
+export function replaceCodexTokenMaintenance(next: CodexTokenMaintenance): void {
+  if (currentMaintenance && currentMaintenance !== next) currentMaintenance.stop();
+  currentMaintenance = next;
+}
+
+/** Test seam: drop the module-level owner without touching a running loop. */
+export function resetCodexTokenMaintenanceForTests(): void {
+  currentMaintenance = undefined;
+}

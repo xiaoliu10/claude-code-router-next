@@ -29,7 +29,7 @@ import { createCodexManagedRuntime } from "./managed-runtime";
 import { registerCodexAdminRoutes } from "./admin-routes";
 import { codexLocales } from "./locales";
 import { protectCodexConfig } from "./protocol";
-import { CodexTokenMaintenance } from "./token-maintenance";
+import { CodexTokenMaintenance, replaceCodexTokenMaintenance } from "./token-maintenance";
 import type { PluginContext } from "./core-types";
 
 export const manifest = {
@@ -84,6 +84,7 @@ async function activate(ctx: PluginContext): Promise<void> {
     { warn: (message) => ctx.log.warn(message), info: (message) => ctx.log.info(message) },
   );
   maintenance.start();
+  replaceCodexTokenMaintenance(maintenance);
 
   ctx.registerTransformer(ActivatedCodexTransformer as unknown as new () => any);
   ctx.registerManagedRuntime(runtime);

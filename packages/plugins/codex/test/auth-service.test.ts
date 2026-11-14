@@ -564,6 +564,33 @@ describe("token refresh", () => {
       const { service } = await harness();
       await expect(service.runTokenMaintenanceCycle()).resolves.toEqual({ refreshed: false });
     });
+
+    it("shares the data-plane single-flight: a concurrent maintenance cycle and getAccessToken issue one token POST", async () => {
+      const h = await connected({ accessSecs: 240 }); // inside the 5-minute lead
+      const impl = (h.service as any).options.fetchImpl;
+      const tokenPosts = () =>
+        impl.mock.calls.filter((c: any[]) => String(c[0]).endsWith("/oauth/token")).length;
+      const before = tokenPosts();
+      const [maintenance, direct] = await Promise.all([
+        h.service.runTokenMaintenanceCycle(),
+        h.service.getAccessToken(),
+      ]);
+      expect(maintenance).toEqual({ refreshed: true });
+      expect(direct).toMatch(/^ey/);
+      expect(tokenPosts() - before).toBe(1); // one shared grant, not two
+    });
+
+    it("does not consume the 401 seam's forced-refresh flag while the token is healthy", async () => {
+      const h = await connected(); // default 1h token, well outside the lead
+      const impl = (h.service as any).options.fetchImpl;
+      const before = impl.mock.calls.length;
+      (h.service as any).forceRefreshRequested = true;
+      const result = await h.service.runTokenMaintenanceCycle();
+      expect(result).toEqual({ refreshed: false });
+      expect(impl.mock.calls.length).toBe(before); // healthy token: zero network
+      // The flag survives for the 401 seam's own forced re-send.
+      expect((h.service as any).forceRefreshRequested).toBe(true);
+    });
   });
 });
 

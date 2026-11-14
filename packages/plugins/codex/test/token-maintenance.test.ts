@@ -3,11 +3,13 @@ import {
   CodexTokenMaintenance,
   CODEX_TOKEN_MAINTENANCE_INITIAL_MS,
   CODEX_TOKEN_MAINTENANCE_INTERVAL_MS,
+  replaceCodexTokenMaintenance,
+  resetCodexTokenMaintenanceForTests,
 } from "../src/token-maintenance";
 
 /** Deterministic timer harness: records every armed delay and fires manually. */
 function fakeTimers() {
-  const handles: Array<{ cb: () => void; fired: boolean }> = [];
+  const handles: Array<{ cb: () => void; fired: boolean; unref: ReturnType<typeof vi.fn> }> = [];
   const delays: number[] = [];
   const setTimer = vi.fn((cb: () => void, delayMs: number) => {
     const handle = { cb, fired: false, unref: vi.fn() };
@@ -16,14 +18,16 @@ function fakeTimers() {
     return handle as unknown as NodeJS.Timeout;
   });
   const clearTimer = vi.fn((handle: NodeJS.Timeout) => {
-    const entry = handle as unknown as { fired: boolean };
-    entry.fired = true; // cleared handles must never fire
+    (handle as unknown as { fired: boolean }).fired = true; // cleared handles are marked dead
   });
   return {
     setTimer,
     clearTimer,
     delays,
+    handles,
     pending: () => handles.filter((h) => !h.fired),
+    /** Fire a handle even when it was cleared — the stale-callback boundary. */
+    fire: async (handle: { cb: () => void }) => { await handle.cb(); },
     fireLast: async () => {
       const pending = handles.filter((h) => !h.fired);
       const last = pending.at(-1);
@@ -78,18 +82,20 @@ describe("CodexTokenMaintenance", () => {
     m.stop();
   });
 
-  it("stop() prevents a pending timer from running and a later tick from re-arming", async () => {
+  it("stop() prevents a pending timer from running and a stale post-clear callback is swallowed", async () => {
     const t = fakeTimers();
     const cycle = vi.fn(async () => ({ refreshed: false }));
     const m = new CodexTokenMaintenance(cycle, logSafe(), { setTimer: t.setTimer, clearTimer: t.clearTimer });
     m.start();
-    const firstHandle = t.setTimer.mock.results[0].value;
+    const armed = t.handles[0];
     m.stop();
-    expect(t.clearTimer).toHaveBeenCalledWith(firstHandle);
-    // Even if a stale callback somehow ran after stop, the generation gate swallows it.
-    await t.fireLast().catch(() => {});
+    expect(t.clearTimer).toHaveBeenCalledWith(armed);
+    // Platform quirk: the cleared timer's callback still fires. The running +
+    // generation gate must swallow it — no cycle execution and no re-arm.
+    await t.fire(armed);
     expect(cycle).not.toHaveBeenCalled();
     expect(t.pending()).toHaveLength(0);
+    expect(t.setTimer).toHaveBeenCalledTimes(1); // never re-armed by the stale tick
   });
 
   it("start() is restart-safe: the previous generation's timers never fire", async () => {
@@ -97,12 +103,33 @@ describe("CodexTokenMaintenance", () => {
     const cycle = vi.fn(async () => ({ refreshed: false }));
     const m = new CodexTokenMaintenance(cycle, logSafe(), { setTimer: t.setTimer, clearTimer: t.clearTimer });
     m.start();
+    const first = t.handles[0];
     m.stop();
     m.start();
     expect(t.setTimer).toHaveBeenCalledTimes(2);
     expect(t.clearTimer).toHaveBeenCalledOnce();
+    // The old generation's handle firing late must do nothing.
+    await t.fire(first);
+    expect(cycle).not.toHaveBeenCalled();
+    // Only the live (new generation) callback runs the cycle.
     await t.fireLast();
-    expect(cycle).toHaveBeenCalledOnce(); // only the new generation's callback is live
+    expect(cycle).toHaveBeenCalledOnce();
+  });
+
+  it("replaceCodexTokenMaintenance stops the previous owner's loop", () => {
+    resetCodexTokenMaintenanceForTests();
+    const t = fakeTimers();
+    const make = () => new CodexTokenMaintenance(vi.fn(async () => ({ refreshed: false })), logSafe(),
+      { setTimer: t.setTimer, clearTimer: t.clearTimer });
+    const first = make();
+    const second = make();
+    first.start();
+    replaceCodexTokenMaintenance(first);
+    second.start();
+    replaceCodexTokenMaintenance(second);
+    expect(first.isRunning).toBe(false); // hot-reload replacement stops the stale loop
+    expect(second.isRunning).toBe(true);
+    resetCodexTokenMaintenanceForTests();
   });
 
   it("defaults to the global timer implementation and unref when no seams are injected", () => {
