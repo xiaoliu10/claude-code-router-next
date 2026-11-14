@@ -24,6 +24,8 @@ Ordinary config contains the identifier `ccr-managed-codex`, **not a credential*
 
 The runtime pins requests to `https://chatgpt.com/backend-api/codex/responses`, rejects redirects, uses the host direct dispatcher, strips client auth/session headers, and injects its live access token/account. The transformer chain is `['openai-responses', 'codex']`. A rejected access token receives one forced refresh and one re-dispatch; rotated refresh tokens are persisted before use.
 
+A background maintenance loop (first cycle one minute after activation, then every 30 minutes, timers `unref`ed) proactively renews the access token while it is inside the 5-minute expiry lead, reusing the same single-flight refresh as the data plane. A healthy token costs no network, and a maintenance failure is logged without latching account health — only the data plane writes `lastError`/cooldown. The **Sync models** management call is read-only and stays available during a quota cooldown or an expired-token window (the call refreshes on demand), so refreshing the model list never requires a full re-login.
+
 Quota observations come from headers, bounded SSE observation and the explicit usage endpoint. A quota failure parks the account until its reported reset. No model table, WebSocket, zstd, account pool or CLI credential import is included.
 
 ## Supported path and known limitations

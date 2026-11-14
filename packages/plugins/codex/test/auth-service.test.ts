@@ -526,6 +526,72 @@ describe("token refresh", () => {
     const { service } = await harness();
     await expect(service.getAccessToken()).rejects.toMatchObject({ code: "codex_not_connected" });
   });
+
+  describe("runTokenMaintenanceCycle", () => {
+    it("is a network-free no-op while the access token is healthy", async () => {
+      const h = await connected(); // default access token: 1h, well outside the lead
+      const impl = (h.service as any).options.fetchImpl;
+      const before = impl.mock.calls.length;
+      const result = await h.service.runTokenMaintenanceCycle();
+      expect(result).toEqual({ refreshed: false });
+      expect(impl.mock.calls.length).toBe(before);
+    });
+
+    it("refreshes inside the lead window and reports the rotation", async () => {
+      const h = await connected({ accessSecs: 240 });
+      const persistedBefore = (await h.store.load())!;
+      const result = await h.service.runTokenMaintenanceCycle();
+      expect(result).toEqual({ refreshed: true });
+      const persistedAfter = (await h.store.load())!;
+      expect(persistedAfter.account.accessToken).not.toBe(persistedBefore.account.accessToken);
+      expect(persistedAfter.account.refreshToken).toBe("rt-rotated");
+      // Maintenance never latches account health.
+      expect(persistedAfter.account.lastError).toBeNull();
+      expect(persistedAfter.account.cooldownUntil).toBeNull();
+    });
+
+    it("propagates a rejected refresh without writing any health latch", async () => {
+      const h = await connected({ refreshStatus: 400, accessSecs: 240 });
+      await expect(h.service.runTokenMaintenanceCycle())
+        .rejects.toMatchObject({ code: "codex_reauth_required" });
+      const persisted = (await h.store.load())!;
+      expect(persisted.account.lastError).toBeNull();
+      expect(persisted.account.cooldownUntil).toBeNull();
+      expect(persisted.account.refreshToken).toBe("rt-1");
+    });
+
+    it("is a quiet no-op when no account is connected", async () => {
+      const { service } = await harness();
+      await expect(service.runTokenMaintenanceCycle()).resolves.toEqual({ refreshed: false });
+    });
+
+    it("shares the data-plane single-flight: a concurrent maintenance cycle and getAccessToken issue one token POST", async () => {
+      const h = await connected({ accessSecs: 240 }); // inside the 5-minute lead
+      const impl = (h.service as any).options.fetchImpl;
+      const tokenPosts = () =>
+        impl.mock.calls.filter((c: any[]) => String(c[0]).endsWith("/oauth/token")).length;
+      const before = tokenPosts();
+      const [maintenance, direct] = await Promise.all([
+        h.service.runTokenMaintenanceCycle(),
+        h.service.getAccessToken(),
+      ]);
+      expect(maintenance).toEqual({ refreshed: true });
+      expect(direct).toMatch(/^ey/);
+      expect(tokenPosts() - before).toBe(1); // one shared grant, not two
+    });
+
+    it("does not consume the 401 seam's forced-refresh flag while the token is healthy", async () => {
+      const h = await connected(); // default 1h token, well outside the lead
+      const impl = (h.service as any).options.fetchImpl;
+      const before = impl.mock.calls.length;
+      (h.service as any).forceRefreshRequested = true;
+      const result = await h.service.runTokenMaintenanceCycle();
+      expect(result).toEqual({ refreshed: false });
+      expect(impl.mock.calls.length).toBe(before); // healthy token: zero network
+      // The flag survives for the 401 seam's own forced re-send.
+      expect((h.service as any).forceRefreshRequested).toBe(true);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
