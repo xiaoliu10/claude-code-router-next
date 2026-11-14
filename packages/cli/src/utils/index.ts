@@ -17,7 +17,8 @@ import { getServer } from "@wengine-ai/llms";
 import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
 import { checkForUpdates, performUpdate } from "./update";
 import { version } from "../../package.json";
-import { spawn } from "child_process";
+import { exec, spawn } from "child_process";
+import { promisify } from "util";
 import {cleanupPidFile, isServiceRunning} from "./processCheck";
 
 // Function to interpolate environment variables in config values
@@ -223,8 +224,6 @@ export const run = async (args: string[] = []) => {
   }
   const server = await getServer();
   const app = server.app;
-  // Save the PID of the background process
-  writeFileSync(PID_FILE, process.pid.toString());
 
   app.post('/api/update/perform', async () => {
     return await performUpdate();
@@ -245,9 +244,66 @@ export const run = async (args: string[] = []) => {
     return { success: true, message: "Service restart initiated" }
   });
 
-  // await server.start() to ensure it starts successfully and keep process alive
-  await server.start();
+  // await server.start() to ensure it starts successfully and keep process alive.
+  // The PID file is written only AFTER a successful bind: a start that dies on
+  // EADDRINUSE must not leave its own corpse PID behind overwriting the record
+  // of the genuine listener (the root cause of the stale-PID restart loop).
+  try {
+    await server.start();
+    writeFileSync(PID_FILE, process.pid.toString());
+  } catch (startError) {
+    cleanupPidFile();
+    throw startError;
+  }
 }
+
+/**
+ * Find the PID actually LISTENING on the service port, so a stale PID file can
+ * never leave the real server running behind `ccr restart`'s back. The stale
+ * state happens when a previous start crashed on EADDRINUSE after writing its
+ * own PID (crash order: write PID → bind port), overwriting the record of the
+ * genuine listener — after that every restart killed nothing, spawned a new
+ * loser, and the loop kept the OLD version serving forever (the 2026-11-14
+ * "page update always fails" incident).
+ */
+const findListenerPids = async (): Promise<number[]> => {
+  try {
+    const config = await readConfigFile();
+    const port = Number(config.PORT) || 3456;
+    const { stdout } = await execPromise(`lsof -tiTCP:${port} -sTCP:LISTEN -n -P`, { timeout: 5000 });
+    const pids = [...new Set(stdout.split("\n").map(s => parseInt(s.trim(), 10)).filter(Number.isFinite))];
+    return pids;
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * Only a process that actually IS this CLI may be killed by the port fallback:
+ * an unrelated dev server that happens to hold the configured port must be
+ * left alone (the respawn then fails loudly with EADDRINUSE, as before).
+ */
+const isCcrListener = async (pid: number): Promise<boolean> => {
+  try {
+    const { stdout } = await execPromise(`ps -p ${pid} -o command=`, { timeout: 5000 });
+    return /claude-code-router|ccr.*cli\.js/i.test(stdout);
+  } catch {
+    return false;
+  }
+};
+
+/** Wait until no CCR listener holds the port (or nothing does at all). */
+const waitForPortRelease = async (pids: number[], timeoutMs = 8000): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const listeners = await findListenerPids();
+    if (!listeners.some(p => pids.includes(p))) return true;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return !(await findListenerPids()).some(p => pids.includes(p));
+};
+
+const execPromise = promisify(exec);
 
 export const restartService = async () => {
   // Take a durable pre-restart backup of the current config before stopping
@@ -263,10 +319,14 @@ export const restartService = async () => {
     console.warn("Failed to create pre-restart config backup:", backupError);
   }
 
-  // Stop the service if it's running
+  // Stop the service. The PID file is the fast path, but it can be stale
+  // (see findListenerPid): when killing it does not free the port, fall back to
+  // the REAL port listener so the respawn below cannot die on EADDRINUSE.
+  let stoppedPid: number | null = null;
   try {
     const pid = parseInt(readFileSync(PID_FILE, "utf-8"));
     process.kill(pid);
+    stoppedPid = pid;
     cleanupPidFile();
     if (existsSync(REFERENCE_COUNT_FILE)) {
       try {
@@ -276,10 +336,36 @@ export const restartService = async () => {
       }
     }
     console.log("claude code router service has been stopped.");
-  } catch (e) {
+  } catch {
     console.log("Service was not running or failed to stop.");
     cleanupPidFile();
   }
+
+  // Port still held after the PID-file kill? Kill the actual CCR listener(s) —
+  // identity-checked so an unrelated process holding the port is never touched.
+  const listeners = await findListenerPids();
+  const ccrListeners: number[] = [];
+  for (const pid of listeners) {
+    if (pid === stoppedPid) continue; // already signalled via the PID file path
+    if (!(await isCcrListener(pid))) {
+      console.log(`Port held by PID ${pid}, which is not CCR; leaving it alone.`);
+      continue;
+    }
+    console.log(`Port still held by CCR PID ${pid} (stale PID file); stopping the real listener.`);
+    try { process.kill(pid); ccrListeners.push(pid); } catch { /* already gone */ }
+  }
+  if (ccrListeners.length) stoppedPid = ccrListeners[ccrListeners.length - 1];
+
+  // Never respawn onto a busy port: wait for release, SIGKILL as last resort.
+  if (stoppedPid !== null && !(await waitForPortRelease(ccrListeners.length ? ccrListeners : [stoppedPid]))) {
+    const stubborn = (await findListenerPids()).filter(p => ccrListeners.includes(p));
+    if (stubborn.length) {
+      console.warn(`Port still held after 8s; sending SIGKILL to PIDs ${stubborn.join(", ")}.`);
+      for (const pid of stubborn) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+      await waitForPortRelease(stubborn, 3000);
+    }
+  }
+  cleanupPidFile();
 
   // Start the service again in the background
   console.log("Starting claude code router service...");
