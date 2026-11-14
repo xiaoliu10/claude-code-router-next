@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2432] - 2026-11-14
+
+### Added
+
+- **Gemini OAuth independent quota pools (Argon / Hydrogen / Claude)** (`@wengine-ai/ccr-provider-gemini-oauth` 1.0.13): the provider card now shows per-model-family pools separately instead of one aggregate, so an exhausted Argon pool is visible even while the weekly aggregate reads 71%. Quota views, card copy (EN/ZH) and cache invalidation on pool locks ship in the same plugin; plugin transport budget and managed recovery-probe bookkeeping hardened in core.
+
+### Fixed
+
+- **`ccr restart` now stops the real port listener when the PID file is stale**: the UI update flow installs the new package, then spawns detached `ccr restart` — but restart trusted the PID file alone, and a stale file (a previous crashed start wrote its own PID before failing to bind) meant nothing was killed, the respawn died on `EADDRINUSE`, and the old version kept serving forever — the page update appeared to keep failing. Restart now falls back to the actual `LISTEN` holder on the configured port (identity-checked so an unrelated process is never touched), waits for release before respawning, and the PID file is written only after a successful bind so a failed start can no longer poison it.
+
+## [2.3.2432] - 2026-11-14（中文）
+
+### 新增
+
+- **Gemini OAuth 独立配额池（Argon / Hydrogen / Claude）**（`@wengine-ai/ccr-provider-gemini-oauth` 1.0.13）：供应商卡片按模型家族分池展示配额，不再只显示汇总值——Argon 池耗尽时一眼可见，而周汇总还有 71%。配额视图、卡片中英文案、池锁定时的缓存失效随包发布；core 侧同时加固插件传输预算与托管恢复探针记账。
+
+### 修复
+
+- **PID 文件失效时 `ccr restart` 现在会停掉真实占用端口的进程**：页面更新流程先全局安装新包，再拉起 `ccr restart`——但重启只信 PID 文件，文件失效时（上一次崩溃的启动在 bind 前写入了自身 PID）什么都杀不掉，respawn 撞上 `EADDRINUSE`，旧版本永远在线——表现为页面更新一直失败。现在重启会兜底找到配置端口上真实的 `LISTEN` 进程（带 CCR 身份校验，绝不误杀无关进程），等待端口释放后再启动；PID 文件只在 bind 成功后写入，启动失败不再污染。
+
 ## [2.3.2431] - 2026-11-13
 
 ### Fixed

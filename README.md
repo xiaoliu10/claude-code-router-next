@@ -93,6 +93,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2432** | <ul><li>**Gemini 独立配额池（Argon / Hydrogen / Claude，插件 1.0.13）**：供应商卡片按模型家族分池展示配额，不再只看汇总——Argon 池耗尽一眼可见（此前周汇总 71% 却 429 的迷惑场景消除）。</li><li>**PID 文件失效时 restart 兜底杀真实监听进程**：修「页面更新一直失败」——PID 文件残留尸体 PID 时什么都杀不掉、respawn 撞 EADDRINUSE 旧版本永远在线；现在带 CCR 身份校验的端口兜底 + 等待端口释放 + PID 文件 bind 成功后才写入。</li></ul> |
 | **v2.3.2431** | <ul><li>**Kiro 拒答不再误冷却且额度恢复（插件 0.1.2）**：上游 `CONTENT_FILTERED` / `REASONING_EXTRACTION` 空拒答流正确分类为 `kiro_content_filtered`（422），不再误判截断 502 并冷却全账号 5 分钟；只读额度/模型同步在 429 冷却期仍可用，并实现 `fetchQuota` 在主供应商列表展示 Kiro credits 额度，过滤过期 bonus 窗口。</li><li>**插件升级死循环修复与防呆守卫**：定位 `kiro@0.1.1` npm 包内含陈旧 `0.1.0` 清单导致反复提示升级；目录页改用 `semver` 比较防止本地较新版本被降级提示，安装器拦截 `package.json` 与 `plugin.json` 版本不一致的压缩包，Kiro 增加 `prepack` 自动构建与前置守卫。</li></ul> |
 | **v2.3.2430** | <ul><li>**Gemini OAuth 长会话 400 修复（插件 1.0.11）**：无签名的工具调用历史补哨兵、伪造/非法/外部（GLM 24位 hex）签名在发送前拦截；带 schema 的客户端 `web_search` 不再被误转成 Google 内置搜索。111 条消息/39 个工具的失败会话重放流式与非流式均 200。</li><li>**Gemini 流式缓存命中统计恢复（插件 1.0.11）**：收尾空文本帧携带的 `cachedContentTokenCount` 与 `finishReason` 不再被整帧丢弃，流式请求的缓存命中/最终 token 数/stop reason 正确记录（实测 ~93k token 提示词缓存命中 91067，此前恒为 0）。</li></ul> |
 | **v2.3.2429** | <ul><li>**Codex 手动用量重置**：卡片展示赠送的重置次数（来自上游），确认弹窗是唯一消耗入口；同步锁拒绝并发重复点击，重试复用幂等键，丢失响应不双花；kiro 0.1.1 随包发布。</li><li>**Gemini 传输与配额修复**：省略 Content-Type 时识别 Code Assist SSE；配额走共享管线；恢复后不再残留失败横幅。</li><li>**精确模型路由修复**：供应商显式暴露的模型 id 短路家族路由，Gemini 的 Claude 模型可按名称直达。</li><li>**Codex 掉登录修复**：剥离 Responses input 中的 thinking 字段（上游 400 根因）；成功输出清除错误残留。</li></ul> |
@@ -102,7 +103,6 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 | **v2.3.2425** | <ul><li>**供应商拖动排序**：卡片可拖动重排，顺序立即写入配置；拖拽按稳定行 ID 定位，搜索过滤下依然正确，无 name 的供应商也能拖。</li><li>**grok 与 cursor 卡片对齐家族样式**：统一按钮词汇、尺寸、图标与 destructive 变体，七张供应商卡片外观一致。</li></ul> |
 | **v2.3.2424** | <ul><li>**新增 Kiro 订阅 provider 插件**：Kiro 门户 / AWS Builder ID / IAM Identity Center 三种 OAuth 登录，运行时区域由 profile ARN 推导，多账号卡片与配额管理。</li><li>**估算用量溯源**：用量库新增 <code>usage_estimated</code> 列（v3 加法式迁移），估算值不再被当作精确计量展示，也不参与缓存读推断。</li></ul> |
 | **v2.3.2423** | <ul><li>**新增 Grok、Cursor 订阅 provider 插件**：Grok 走官方 CLI 设备码登录；Cursor 支持浏览器 / cursor-agent CLI / API Key 登录（订阅代理下自动降为 HTTP/1），均含模型管理与用量卡片。</li><li>**Responses 流按客户端格式转换**：修复原生 Responses 帧直接给 Chat/Anthropic 客户端造成的空回合；短回合第三段模型不再显示 unknown；终帧内联答案不再丢失。</li><li>**Qoder / WorkBuddy 中国站每日自动签到/领取积分**（启动抖动、失败当日有界重试），手动按钮保留。</li></ul> |
-| **v2.3.2422** | <ul><li>**send 级插件失败不再误报**：插件 fetch 在拿到 HTTP 状态前失败（本地代理拒连/DNS/TLS/超时）时，此前只报笼统的"invalid upstream response"；status 0 的发送失败现在归类为 <code>plugin_network_error</code>，附带上界受控、严格消毒的传输诊断（cause 链错误码 + host:port）。</li><li>**恢复探活不再被失败时间饿死**：受托恢复门控改用 lastProbeTime 判定，失败刷新 lastFailureTime 不再推迟探活，熔断可正常自愈。</li><li>**首页失败横幅显示最后失败时间**：过期红条与持续故障一眼可分。</li><li>**仓库对齐已发运状态**：合并堆积 PR #95-#100（workspace 根 private 守卫、codex 1.0.10 缓存键锚定、qoder 0.3.x 签到与卡片统一），插件版本对齐 codex 1.0.10 / qoder 0.3.3。</li></ul> |
 
 > 仅保留最近 10 个版本，更早版本的发布摘要见 [CHANGELOG-archive.md](./CHANGELOG-archive.md)，完整详细变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
