@@ -610,7 +610,11 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     ? moduleDir
     : existsSync(join(moduleDir, "..", "index.html"))
       ? join(moduleDir, "..")
-      : join(moduleDir, "..", "dist");
+      : existsSync(join(moduleDir, "..", "dist", "index.html"))
+        ? join(moduleDir, "..", "dist")
+        : existsSync(join(moduleDir, "..", "..", "dist", "index.html"))
+          ? join(moduleDir, "..", "..", "dist")
+          : join(moduleDir, "..", "dist");
   _app.register(fastifyStatic, {
     root: bundledUiRoot,
     prefix: "/ui/",
@@ -621,6 +625,13 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     // old bundle was still mounted. Always revalidate instead: unchanged
     // files still answer 304 via ETag, so the cost is one conditional
     // request per page load.
+    //
+    // cacheControl:false is REQUIRED: without it @fastify/send emits its own
+    // `Cache-Control: public, max-age=<maxAge>` AFTER setHeaders ran, and
+    // fastify's stream sender then overwrites our header with it (verified:
+    // the response degraded to `public, max-age=0`). With it, our no-cache
+    // stands and the ETag-based 304 revalidation below still works.
+    cacheControl: false,
     setHeaders: (_res, _pathName) => {
       _res.setHeader("Cache-Control", "no-cache");
     },
