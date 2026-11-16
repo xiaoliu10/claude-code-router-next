@@ -614,7 +614,16 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
   _app.register(fastifyStatic, {
     root: bundledUiRoot,
     prefix: "/ui/",
-    maxAge: "1h",
+    // The UI ships as a SINGLE self-contained index.html: all JS/CSS are
+    // inlined (~4MB), so the HTML itself is the whole app. A max-age here let
+    // browsers keep running a stale UI for up to an hour after an upgrade —
+    // new features (e.g. model-list drag reorder) appeared missing while the
+    // old bundle was still mounted. Always revalidate instead: unchanged
+    // files still answer 304 via ETag, so the cost is one conditional
+    // request per page load.
+    setHeaders: (_res, _pathName) => {
+      _res.setHeader("Cache-Control", "no-cache");
+    },
   });
 
   // Redirect /ui to /ui/ for proper static file serving
