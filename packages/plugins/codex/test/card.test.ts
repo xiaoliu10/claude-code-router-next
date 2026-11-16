@@ -199,6 +199,21 @@ describe("self-contained Codex plugin card", () => {
     expect(h.host.button(en.disconnect)).toBeTruthy();
   });
 
+  it("manual quota refresh updates the plan and removes a recovered cooldown immediately", async () => {
+    let recovered = false;
+    const h = harness({
+      "/status": () => recovered ? { ...CONNECTED, plan: "prolite" } : { ...CONNECTED, coolingUntil: Date.now() + 86400000 },
+      "/usage": () => USAGE,
+    });
+    await tick();
+    expect(h.host.text()).toContain(en.status.cooldown);
+    recovered = true;
+    h.host.click(en.refresh_usage);
+    await tick();
+    expect(h.host.text()).not.toContain(en.status.cooldown);
+    expect(h.host.text()).toContain("prolite");
+  });
+
   it("sync models stays enabled in the error and expired states but stays off when never connected", async () => {
     const ERRORED = {
       ...CONNECTED, status: "error" as const,

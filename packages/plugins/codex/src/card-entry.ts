@@ -400,6 +400,10 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       const parsed = parseCodexUsage(raw);
       rememberCodexUsage(parsed);
       if (alive && generation === id) showUsage(parsed, parsed ? Date.now() : null);
+      if (parsed && !background) {
+        const fresh = await readStatus().catch(() => null);
+        if (fresh && alive && generation === id) status = fresh;
+      }
     } catch {
       // A failed read is non-critical: never cached, rendered as a quiet note.
       if (alive && generation === id) showUsage(null, null);
