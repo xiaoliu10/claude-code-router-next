@@ -214,6 +214,12 @@ export interface LLMProvider {
    * back to the legacy cs-data.qianwenai.com endpoint on failure.
    */
   quotaSecToken?: string;
+  /** Optional Volcengine account Access Key ID for the Ark Coding Plan usage
+   *  OpenAPI (control plane, AK/SK auth only — the inference apiKey cannot query it) */
+  quotaAccessKey?: string;
+  /** Optional Volcengine account Secret Access Key paired with quotaAccessKey.
+   *  Never projected into desktop DTOs, logs, or error messages. */
+  quotaSecretKey?: string;
   transformer?: {
     [key: string]: {
       use?: Transformer[];
