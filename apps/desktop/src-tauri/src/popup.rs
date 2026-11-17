@@ -1,4 +1,4 @@
-//! The local quota webview is the only window allowed to invoke desktop commands.
+//! Native commands are restricted to the two trusted local control-center views.
 use crate::{
     quota::{QuotaService, QuotaSnapshot},
     tray,
@@ -20,13 +20,13 @@ pub fn trusted_url(url: &reqwest::Url) -> bool {
     url.as_str() == format!("{origin}/quota.html")
 }
 fn allowed(label: &str, url: &reqwest::Url) -> bool {
-    label == LABEL && trusted_url(url)
+    matches!(label, "quota" | "main") && trusted_url(url)
 }
 pub(crate) fn guard(window: &WebviewWindow) -> Result<(), String> {
     if window.url().is_ok_and(|url| allowed(window.label(), &url)) {
         Ok(())
     } else {
-        Err("This command is restricted to the local quota panel".into())
+        Err("This command is restricted to local desktop views".into())
     }
 }
 pub fn install(app: &tauri::AppHandle) -> tauri::Result<()> {
@@ -99,6 +99,9 @@ pub async fn quota_snapshot(
 #[tauri::command]
 pub fn quota_hide(window: WebviewWindow) -> Result<(), String> {
     guard(&window)?;
+    if window.label() != LABEL {
+        return Ok(());
+    }
     window
         .hide()
         .map_err(|_| "Could not hide quota panel".into())
@@ -106,7 +109,9 @@ pub fn quota_hide(window: WebviewWindow) -> Result<(), String> {
 #[tauri::command]
 pub fn quota_open_ui(window: WebviewWindow) -> Result<(), String> {
     guard(&window)?;
-    let _ = window.hide();
+    if window.label() == LABEL {
+        let _ = window.hide();
+    }
     tray::open_window(window.app_handle());
     Ok(())
 }
@@ -128,7 +133,8 @@ mod tests {
             "tauri://localhost/quota.html"
         };
         assert!(allowed("quota", &local.parse().unwrap()));
-        assert!(!allowed("main", &local.parse().unwrap()));
+        assert!(allowed("main", &local.parse().unwrap()));
+        assert!(!allowed("other", &local.parse().unwrap()));
         for url in [
             "http://127.0.0.1:3456/ui/",
             "https://tauri.localhost/quota.html",
@@ -138,6 +144,7 @@ mod tests {
             "tauri://localhost/quota.html#x",
         ] {
             assert!(!allowed("quota", &url.parse().unwrap()), "{url}");
+            assert!(!allowed("main", &url.parse().unwrap()), "{url}");
         }
     }
     #[test]
