@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-quota-snapshot"
+description = "Enables the quota_snapshot command without any pre-configured scope."
+commands.allow = ["quota_snapshot"]
+
+[[permission]]
+identifier = "deny-quota-snapshot"
+description = "Denies the quota_snapshot command without any pre-configured scope."
+commands.deny = ["quota_snapshot"]

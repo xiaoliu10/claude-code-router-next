@@ -11,8 +11,9 @@
   "app": {
     "windows": [],
     "security": {
-      "csp": "default-src 'self'; script-src 'none'; connect-src 'none'; img-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'none'"
-    }
+      "csp": "default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'none'; object-src 'none'"
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

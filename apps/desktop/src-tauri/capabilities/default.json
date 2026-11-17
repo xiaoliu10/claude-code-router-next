@@ -1,7 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "No native permissions, including for the external CCR web UI",
-  "windows": [],
-  "permissions": []
+  "identifier": "quota",
+  "description": "Only the trusted local quota panel can invoke the four narrow desktop commands",
+  "windows": [
+    "quota"
+  ],
+  "permissions": [
+    "allow-quota-snapshot",
+    "allow-quota-hide",
+    "allow-quota-open-ui",
+    "allow-quota-quit"
+  ]
 }

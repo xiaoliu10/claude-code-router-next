@@ -11,7 +11,7 @@ use std::sync::{
 };
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -289,7 +289,18 @@ pub fn install_offline(app: &tauri::AppHandle, error: String) -> Result<(), Stri
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&initial)
         .tooltip("CCR — configuration error; relaunch after fixing settings")
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                rect,
+                ..
+            } = event
+            {
+                crate::popup::show(tray.app_handle(), rect);
+            }
+        })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "quit" => app.exit(0),
             "open-ui" | "refresh" => open_window(app),
@@ -334,7 +345,18 @@ impl Controller {
         let mut builder = TrayIconBuilder::with_id(TRAY_ID)
             .menu(&initial)
             .tooltip("CCR — connecting")
-            .show_menu_on_left_click(true)
+            .show_menu_on_left_click(false)
+            .on_tray_icon_event(|tray, event| {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    rect,
+                    ..
+                } = event
+                {
+                    crate::popup::show(tray.app_handle(), rect);
+                }
+            })
             .on_menu_event(move |app, event| {
                 let id = event.id.as_ref();
                 match id {

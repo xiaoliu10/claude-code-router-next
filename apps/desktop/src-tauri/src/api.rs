@@ -110,12 +110,57 @@ impl AdminClient {
             .map_err(|_| format!("GET {path} returned invalid JSON"))
     }
 
-    async fn config(&self) -> Result<Value, String> {
+    pub(crate) async fn config(&self) -> Result<Value, String> {
         let config = self.get_json("/api/config").await?;
         if !config.is_object() {
             return Err("GET /api/config returned invalid configuration".into());
         }
         Ok(config)
+    }
+
+    /// Only fixed read-only adapter routes call this helper. Never return response bodies as errors.
+    pub(crate) async fn quota_json(
+        &self,
+        method: Method,
+        path: &'static str,
+        body: Option<&Value>,
+    ) -> Result<Value, crate::quota::SourceError> {
+        use crate::quota::SourceError;
+        let mut request = self
+            .client
+            .request(method, format!("{}{path}", self.base_url));
+        if let Some(key) = &self.api_key {
+            request = request.header("X-API-Key", key);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let mut response = request.send().await.map_err(|_| SourceError::Unavailable)?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| SourceError::Unavailable)?
+        {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(SourceError::Unavailable);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| SourceError::Unavailable)?;
+        if !status.is_success() {
+            return Err(match value.get("error").and_then(Value::as_str) {
+                Some(
+                    "codex_reauth_required"
+                    | "kiro_reauth_required"
+                    | "gemini_oauth_reauth_required",
+                ) => SourceError::Reauth,
+                Some("kiro_account_cooling") => SourceError::Cooling,
+                _ => SourceError::Unavailable,
+            });
+        }
+        Ok(value)
     }
 
     pub async fn health(&self) -> bool {

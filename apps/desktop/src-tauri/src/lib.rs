@@ -1,5 +1,7 @@
 mod api;
 mod lifecycle;
+mod popup;
+mod quota;
 mod settings;
 mod tray;
 
@@ -14,7 +16,14 @@ pub fn run() {
             let handle = app.clone();
             let _ = app.run_on_main_thread(move || tray::open_window(&handle));
         }))
+        .invoke_handler(tauri::generate_handler![
+            popup::quota_snapshot,
+            popup::quota_hide,
+            popup::quota_open_ui,
+            popup::quota_quit
+        ])
         .setup(|app| {
+            popup::install(app.handle())?;
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("Claude Code Router")
                 .inner_size(1200.0, 800.0)
@@ -25,11 +34,13 @@ pub fn run() {
                 api::AdminClient::new(settings.clone()).map(|client| (settings, client))
             }) {
                 Ok((settings, client)) => {
+                    app.manage(quota::QuotaService::new(Some(client.clone())));
                     let controller = tray::Controller::install(app.handle(), settings, client)?;
                     app.manage(Arc::clone(&controller));
                     controller.start();
                 }
                 Err(e) => {
+                    app.manage(quota::QuotaService::new(None));
                     eprintln!("Invalid CCR connection settings: {e}");
                     tray::install_offline(app.handle(), e.clone())?;
                     if let Some(window) = app.get_webview_window("main") {
@@ -42,6 +53,19 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == popup::LABEL {
+                match event {
+                    tauri::WindowEvent::Focused(false) => {
+                        let _ = window.hide();
+                    }
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.app_handle().tray_by_id("ccr-tray").is_some() && window.hide().is_ok() {
                     if let Some(controller) =
