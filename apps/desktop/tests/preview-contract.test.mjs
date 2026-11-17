@@ -26,7 +26,7 @@ const ROUTE_ENTRY_KEYS = ["scope", "field", "target", "fallback"]
 const USAGE_KEYS = [
   "period", "totalRequests", "successCount", "errorCount",
   "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "estimatedCount",
-  "byProvider", "byDay", "updatedAt",
+  "byModel", "byProvider", "byDay", "updatedAt",
 ]
 const USAGE_ROW_KEYS = ["name", "requests", "inputTokens", "outputTokens"]
 const CLIENT_KEYS = ["id", "name", "enabled", "managed", "exists", "activeModel", "modelAlias"]
@@ -74,7 +74,12 @@ function assertUsageSnapshot(u, period, label) {
   }
   assert.ok(Array.isArray(u.byProvider), `${label}: byProvider array`)
   assert.ok(Array.isArray(u.byDay), `${label}: byDay array`)
-  for (const row of [...u.byProvider, ...u.byDay]) {
+  assert.ok(Array.isArray(u.byModel) && u.byModel.length > 0, `${label}: byModel populated`);
+  for (const row of u.byModel) {
+    assert.equal(typeof row.cacheReadTokens, "number");
+    assert.equal(typeof row.cacheWriteTokens, "number");
+  }
+  for (const row of [...u.byModel, ...u.byProvider, ...u.byDay]) {
     for (const k of USAGE_ROW_KEYS) assert.ok(k in row, `${label}: row missing ${k}`)
   }
   assert.equal(typeof u.updatedAt, "number")

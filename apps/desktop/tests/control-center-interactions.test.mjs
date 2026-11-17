@@ -155,6 +155,24 @@ test('interaction: fallback add fires once, keyboard add, move/remove and explic
   assert.deepEqual(Array.from(h.calls.find(c => c.cmd === 'routing_save').args.change.fallback), ['alpha,two']);
 });
 
+test('interaction: usage totals and per-model cache preserve exact counts across periods', async () => {
+  const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250,
+    byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }], updatedAt: 1 }) });
+  await flush(); h.id('tab-usage').click(); await flush();
+  const body = h.id('usage-body');
+  const total = body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens'));
+  assert.match(total.textContent, /1.25M/);
+  assert.equal(total.querySelector('.usage-num').title, '1,250,000');
+  const models = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按模型'));
+  assert.ok(models.textContent.includes('缓存（读 / 写）'));
+  assert.ok(models.textContent.includes('8M / 1.25K'));
+  assert.ok(models.textContent.includes('0 / 0'));
+  assert.equal(models.querySelectorAll('img').length, 0);
+  assert.ok(models.querySelectorAll('td').some(n => n.title === '缓存读 8,000,000 / 缓存写 1,250'));
+  h.id('usage-periods').children[1].click(); await flush();
+  assert.match(body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens')).textContent, /2.25M/);
+});
+
 test('interaction: restore is local confirmation then single individual IPC; usage uses safe text', async () => {
   const h = harness(); await flush(); h.id('tab-clients').click(); await flush();
   const list = h.id('clients-list');

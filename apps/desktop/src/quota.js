@@ -541,7 +541,7 @@
 
 
   // ---- Usage tab ---------------------------------------------------------
-  // usage_snapshot({period:'today'|'7d'|'30d'}) -> totals + byProvider/byDay.
+  // usage_snapshot({period:'today'|'7d'|'30d'}) -> totals + byModel/byProvider/byDay.
   // Numbers come from the server summary only; no currency/cost is shown.
 
   function usageRow(x) {
@@ -551,6 +551,8 @@
       requests: toNum(o.requests),
       inputTokens: toNum(o.inputTokens),
       outputTokens: toNum(o.outputTokens),
+      cacheReadTokens: toNum(o.cacheReadTokens),
+      cacheWriteTokens: toNum(o.cacheWriteTokens),
     };
   }
   function normalizeUsageSnapshot(r) {
@@ -565,6 +567,7 @@
       cacheReadTokens: toNum(s.cacheReadTokens),
       cacheWriteTokens: toNum(s.cacheWriteTokens),
       estimatedCount: toNum(s.estimatedCount),
+      byModel: Array.isArray(s.byModel) ? s.byModel.map(usageRow) : [],
       byProvider: Array.isArray(s.byProvider) ? s.byProvider.map(usageRow) : [],
       byDay: Array.isArray(s.byDay) ? s.byDay.map(usageRow) : [],
       updatedAt: toNum(s.updatedAt),
@@ -863,12 +866,14 @@
           { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000 },
           { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500 },
         ],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
         byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 }],
         updatedAt: Date.now() - 3000,
       },
       '7d': {
         period: '7d', totalRequests: 902, successCount: 890, errorCount: 12,
         inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
         byProvider: [
           { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000 },
           { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000 },
@@ -883,6 +888,7 @@
       '30d': {
         period: '30d', totalRequests: 4120, successCount: 4044, errorCount: 76,
         inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
         byProvider: [
           { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000 },
           { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000 },
@@ -1605,6 +1611,10 @@
       grid.appendChild(usageNumCell('请求', formatInt(u.totalRequests)));
       grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
       grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
+      var totalTokens = u.inputTokens === null || u.outputTokens === null ? null : u.inputTokens + u.outputTokens;
+      var totalCell = usageNumCell('总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
+      totalCell.title = '已记录输入 + 输出；缓存独立展示，不重复相加';
+      grid.appendChild(totalCell);
       grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
       grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
       grid.appendChild(usageNumCell('缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
@@ -1612,6 +1622,14 @@
       grid.appendChild(usageNumCell('估算条目', formatInt(u.estimatedCount)));
       totals.appendChild(grid);
       body.appendChild(totals);
+      totals.appendChild(noteEl('总 tokens = 已记录输入 + 输出；缓存读写独立展示。'));
+      body.appendChild(usageTable('按模型', ['模型', '请求', '输入', '输出', '缓存（读 / 写）'], u.byModel.map(function (m) {
+        return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
+          { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
+          { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
+          { text: (formatCompact(m.cacheReadTokens) || '—') + ' / ' + (formatCompact(m.cacheWriteTokens) || '—'),
+            title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') }];
+      }), 1));
       body.appendChild(usageTable('按提供方', ['提供方', '请求', '输入', '输出'], u.byProvider.map(function (p) {
         return [{ text: p.name }, { text: formatInt(p.requests) || '—' }, { text: formatCompact(p.inputTokens) || '—', title: formatInt(p.inputTokens) }, { text: formatCompact(p.outputTokens) || '—', title: formatInt(p.outputTokens) }];
       }), 1));
