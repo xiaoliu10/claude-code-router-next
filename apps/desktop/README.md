@@ -53,6 +53,14 @@ node --test apps/desktop/tests/runtime-staging.test.mjs   # 脚本纯函数测�
 
 用量中的 token 数统一显示为 K/M/B，最多两位小数；悬停保留完整数量。
 
+## Coding Plan 用量凭证
+
+额度页中 `api_base_url` 命中 `ark.cn-beijing.volces.com` 且路径含 `/api/coding/` 的提供方（与 core 火山 Coding Plan adapter 同一条件）会显示「用量凭证」按钮；未配置时卡片提示「未配置 AK/SK，无法查询套餐用量」。内联面板提供两个 password 输入（AccessKey ID / Secret AccessKey），已保存的凭证不回显：留空保存=不修改，「清除凭证」显式清空。
+
+- `quota_credentials_status()` → `{providers:[{name,configured:boolean}]}`，仅含匹配提供方；configured=两字段均非空。
+- `quota_credentials_save({name,accessKey?,secretKey?})` → 同结构。缺省字段=不修改，空字符串=清除该字段；走共享写锁：GET /api/config → 按 name 只改 `quotaAccessKey`/`quotaSecretKey` → POST /api/config → GET readback 校验。无实际变更时不 POST。
+- 红线：AK/SK 只写入本地网关配置，绝不进入 IPC DTO、日志或错误信息；命令同样受 `popup::guard`（main/quota label + 精确本地 URL）与 capability 限制。
+
 ## service 命令
 
 Rust 命令通过共享 `popup::guard` 验证 main/quota 窗口及精确本地 URL：
