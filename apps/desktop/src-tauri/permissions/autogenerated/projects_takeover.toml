@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-projects-takeover"
+description = "Enables the projects_takeover command without any pre-configured scope."
+commands.allow = ["projects_takeover"]
+
+[[permission]]
+identifier = "deny-projects-takeover"
+description = "Denies the projects_takeover command without any pre-configured scope."
+commands.deny = ["projects_takeover"]
