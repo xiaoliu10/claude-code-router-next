@@ -334,7 +334,8 @@
         if (openName === name) savedFlash = { name: name, at: Date.now(), cleared: cleared };
         emit();
         // The card's usage snapshot is stale once credentials change; refresh it
-        // (best-effort, stale-data semantics and 3s attempt dedupe live in the quota controller).
+        // (best-effort: the Rust quota service applies the 3s attempt dedupe, while this
+        // controller's loading flag collapses concurrent in-flight refreshes).
         try { onSaved(name); } catch { /* rendering-only hook */ }
       }, function (err) {
         if (my !== epoch) return;

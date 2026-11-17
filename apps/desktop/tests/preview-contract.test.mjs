@@ -275,8 +275,11 @@ test("preview: quota_credentials_status/save follow the {name, configured} contr
   assertStatus(cleared, "after clear")
   assert.equal(cleared.providers.find((p) => p.name === volc.name).configured, false)
 
-  // Error wording mirrors credentials.rs ERR_NOT_FOUND in both preview and production.
-  await assert.rejects(previewCall(invoke, "quota_credentials_save", { name: "unknown", accessKey: "x" }), /no longer configured/)
+  // Error wording mirrors credentials.rs ERR_NOT_FOUND exactly in both preview and production.
+  await assert.rejects(
+    previewCall(invoke, "quota_credentials_save", { name: "unknown", accessKey: "x" }),
+    /^Error: Coding Plan provider is no longer configured; refresh the panel$/
+  )
 })
 
 test("preview: unknown commands resolve null (never fabricate responses)", async () => {
