@@ -1623,12 +1623,14 @@
       totals.appendChild(grid);
       body.appendChild(totals);
       totals.appendChild(noteEl('总 tokens = 已记录输入 + 输出；缓存读写独立展示。'));
-      body.appendChild(usageTable('按模型', ['模型', '请求', '输入', '输出', '缓存（读 / 写）'], u.byModel.map(function (m) {
+      body.appendChild(usageTable('按模型', ['模型', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens'], u.byModel.map(function (m) {
+        var modelTotal = m.inputTokens === null || m.outputTokens === null ? null : m.inputTokens + m.outputTokens;
         return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
           { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
           { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
           { text: (formatCompact(m.cacheReadTokens) || '—') + ' / ' + (formatCompact(m.cacheWriteTokens) || '—'),
-            title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') }];
+            title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') },
+          { text: formatCompact(modelTotal) || '—', title: formatInt(modelTotal) }];
       }), 1));
       body.appendChild(usageTable('按提供方', ['提供方', '请求', '输入', '输出'], u.byProvider.map(function (p) {
         return [{ text: p.name }, { text: formatInt(p.requests) || '—' }, { text: formatCompact(p.inputTokens) || '—', title: formatInt(p.inputTokens) }, { text: formatCompact(p.outputTokens) || '—', title: formatInt(p.outputTokens) }];

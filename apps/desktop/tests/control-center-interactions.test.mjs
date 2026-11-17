@@ -157,7 +157,7 @@ test('interaction: fallback add fires once, keyboard add, move/remove and explic
 
 test('interaction: usage totals and per-model cache preserve exact counts across periods', async () => {
   const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250,
-    byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }], updatedAt: 1 }) });
+    byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-input', outputTokens: 100 }], updatedAt: 1 }) });
   await flush(); h.id('tab-usage').click(); await flush();
   const body = h.id('usage-body');
   const total = body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens'));
@@ -165,6 +165,12 @@ test('interaction: usage totals and per-model cache preserve exact counts across
   assert.equal(total.querySelector('.usage-num').title, '1,250,000');
   const models = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按模型'));
   assert.ok(models.textContent.includes('缓存（读 / 写）'));
+  assert.equal(models.querySelectorAll('th').at(-1).textContent, '总 tokens');
+  const modelRows = models.querySelectorAll('tbody')[0].children;
+  assert.equal(modelRows[0].children.at(-1).textContent, '1.25M');
+  assert.equal(modelRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(modelRows[1].children.at(-1).textContent, '0');
+  assert.equal(modelRows[2].children.at(-1).textContent, '—');
   assert.ok(models.textContent.includes('8M / 1.25K'));
   assert.ok(models.textContent.includes('0 / 0'));
   assert.equal(models.querySelectorAll('img').length, 0);
