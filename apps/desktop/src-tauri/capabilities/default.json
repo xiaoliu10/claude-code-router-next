@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "quota",
-  "description": "Only the trusted local quota panel can invoke the four narrow desktop commands",
+  "description": "Only the trusted local control panel can invoke narrowly scoped desktop commands",
   "windows": [
     "quota"
   ],
@@ -9,6 +9,14 @@
     "allow-quota-snapshot",
     "allow-quota-hide",
     "allow-quota-open-ui",
-    "allow-quota-quit"
+    "allow-quota-quit",
+    "allow-routing-snapshot",
+    "allow-routing-save",
+    "allow-routing-flags",
+    "allow-usage-snapshot",
+    "allow-clients-snapshot",
+    "allow-clients-update",
+    "allow-service-snapshot",
+    "allow-service-action"
   ]
 }

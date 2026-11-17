@@ -22,7 +22,7 @@ pub fn trusted_url(url: &reqwest::Url) -> bool {
 fn allowed(label: &str, url: &reqwest::Url) -> bool {
     label == LABEL && trusted_url(url)
 }
-fn guard(window: &WebviewWindow) -> Result<(), String> {
+pub(crate) fn guard(window: &WebviewWindow) -> Result<(), String> {
     if window.url().is_ok_and(|url| allowed(window.label(), &url)) {
         Ok(())
     } else {
@@ -31,7 +31,7 @@ fn guard(window: &WebviewWindow) -> Result<(), String> {
 }
 pub fn install(app: &tauri::AppHandle) -> tauri::Result<()> {
     WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("quota.html".into()))
-        .title("CCR 配额")
+        .title("CCR 控制中心")
         .inner_size(WIDTH, HEIGHT)
         .visible(false)
         .decorations(false)
@@ -113,7 +113,7 @@ pub fn quota_open_ui(window: WebviewWindow) -> Result<(), String> {
 #[tauri::command]
 pub fn quota_quit(window: WebviewWindow) -> Result<(), String> {
     guard(&window)?;
-    // Desktop exit hook only stops polling/reaps an exited launcher. No gateway shutdown.
+    // The exit hook shuts down only a gateway owned by this desktop.
     window.app_handle().exit(0);
     Ok(())
 }

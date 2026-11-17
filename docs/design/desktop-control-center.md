@@ -41,6 +41,7 @@ All commands require the trusted quota window guard. Errors are fixed safe messa
 - `service_snapshot()` -> `{mode:'owned'|'external'|'stopped'|'starting'|'error',running:boolean,message:string}`.
 - `service_action({action:'start'|'stop'})` -> same service state. Stop only owned Child; external mode disabled in UI and rejected natively.
 - Existing quota commands remain compatible. `quota_quit` exits the desktop; lifecycle exit cleanup stops only owned service.
+- Owned child sets `CCR_DESKTOP_MANAGED=1`. CLI routes `/api/restart` and `/api/update/perform` return a safe 409 without spawning global CLI/updating global packages. `/api/update/check` reports desktop management with no CLI upgrade offer. Plugin activation can use the panel stop/start controls. Portable runtime includes npm for plugin installation; the app itself is upgraded by replacing its bundle.
 
 ## UI and validation
 
