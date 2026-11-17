@@ -78,6 +78,7 @@ test('projects failed save retains all drafts and scopes errors to the original 
   assert.equal(c.state().actionError.id, 'a'); assert.equal(c.state().selectedId, 'b');
   assert.equal(c.state().isRouterDirty('a'), true);
   assert.doesNotMatch(c.state().actionError.message, /sensitive|APIKEY/);
+  assert.equal(c.state().actionError.stale, false);
 });
 
 test('projects restore global sends exactly empty router only after explicit Save', async () => {
@@ -139,7 +140,25 @@ test('projects unchanged disabled choices roundtrip; changed choices and unsafe 
   assert.equal(c.save('b'), true); assert.equal(calls[1].args.change.router.default, 'old,disabled');
   calls[1].reject(new Error('offline')); await flush();
   c.setTarget('b', 'root', 'default', 'new,unavailable'); assert.equal(c.save('b'), false);
-  assert.equal(c.addAlias('b', '__proto__', 'alpha,one').ok, false);
+  for (const alias of ['__proto__', 'a,b', '中文', 'a'.repeat(65)]) {
+    assert.equal(c.addAlias('b', alias, 'alpha,one').ok, false);
+  }
+});
+
+test('projects empty custom readback adopts inheritance without dropping hidden fields or newer edits', async () => {
+  for (const [inherits, editDuringSave] of [[true, false], [false, false], [true, true]]) {
+    const { c, calls } = await setup();
+    c.setTarget('b', 'root', 'default', ''); c.removeFamily('b', 'sonnet');
+    assert.equal(c.save('b'), true);
+    assert.deepEqual(calls[1].args.change.router, {});
+    assert.equal(calls[1].args.change.useGlobal, false);
+    if (editDuringSave) c.setTarget('b', 'root', 'think', 'alpha,one');
+    const response = snapshot(); response.projects[1] = { ...response.projects[1], router: {}, useGlobal: inherits, revision: 'b2' };
+    calls[1].resolve(response); await flush();
+    assert.equal(c.state().isClean('b'), !editDuringSave);
+    if (editDuringSave) assert.equal(c.state().effectiveRouter('b').think, 'alpha,one');
+    else assert.equal(c.state().snapshot.projects[1].useGlobal, inherits);
+  }
 });
 
 test('projects pending mutation blocks refresh and duplicate writes', async () => {

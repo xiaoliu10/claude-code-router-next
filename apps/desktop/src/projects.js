@@ -46,6 +46,11 @@
     for (var i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
     return true;
   }
+  function validAlias(alias) {
+    return !!alias && alias.length <= 64 && /^[\x20-\x7e]+$/.test(alias) && !/[,|]/.test(alias)
+      && ['__proto__', 'constructor', 'prototype'].indexOf(alias) === -1;
+  }
+  var ALIAS_ERROR = '别名须为 1–64 个英文字符，不能包含逗号、竖线或保留名称';
   function isAbsolutePath(path) {
     var s = String(path == null ? '' : path);
     return s.charAt(0) === '/' || /^[A-Za-z]:[\\/]/.test(s) || /^\\\\[^\\]/.test(s);
@@ -279,7 +284,7 @@
     for (i = 0; i < aliases.length; i++) {
       var alias = aliases[i];
       var isNew = !(base.models && Object.prototype.hasOwnProperty.call(base.models, alias));
-      if (isNew && (!alias || /[|\x00-\x1f]/.test(alias) || ['__proto__', 'constructor', 'prototype'].indexOf(alias) !== -1)) return { ok: false, message: '别名不能为空或包含 |' };
+      if (isNew && !validAlias(alias)) return { ok: false, message: ALIAS_ERROR };
       err = checkTarget(projected.models[alias], base.models ? base.models[alias] : undefined);
       if (err) return { ok: false, message: '别名 ' + boundText(alias) + ' ' + err };
     }
@@ -347,7 +352,10 @@
     function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
     function clearFlash(id) { if (savedFlash && savedFlash.id === id) savedFlash = null; }
     function clearError(id) { if (actionError && actionError.id === id) actionError = null; }
-    function isStaleError(err) { return /修改|过期|stale|revision/i.test(errorMessage(err)); }
+    function isStaleError(err) {
+      var raw = typeof err === 'string' ? err : err && typeof err.message === 'string' ? err.message : '';
+      return /修改|过期|stale|revision/i.test(raw);
+    }
 
     // Refresh never rebases dirty drafts onto a newer revision. Only an
     // acknowledged mutation for that same project advances its draft revision.
@@ -571,7 +579,7 @@
     function addAlias(id, name, target) {
       var alias = String(name == null ? '' : name).trim();
       if (!alias) return { ok: false, message: '请输入模型别名' };
-      if (/[|\x00-\x1f]/.test(alias) || ['__proto__', 'constructor', 'prototype'].indexOf(alias) !== -1) return { ok: false, message: '别名包含不支持的字符或名称' };
+      if (!validAlias(alias)) return { ok: false, message: ALIAS_ERROR };
       var t = String(target == null ? '' : target).trim();
       if (!t) return { ok: false, message: '请输入目标 提供方,模型' };
       var r = editRouter(id);
@@ -649,6 +657,15 @@
         pending = null;
         var currentDraft = drafts.get(id);
         if (change.useGlobal && currentDraft && currentDraft.useGlobal) currentDraft.router = null;
+        // Only the server knows whether unexposed fields remain after clearing
+        // all visible fields. Adopt inheritance only for an unchanged empty
+        // submitted draft; never discard edits typed while the save ran.
+        var savedProject = resp && Array.isArray(resp.projects) && resp.projects.find(function (x) { return x.id === id; });
+        if (!change.useGlobal && Object.keys(change.router).length === 0 && savedProject && savedProject.useGlobal
+          && currentDraft && !currentDraft.useGlobal && routerEq(saveProjection(currentDraft.router || {}, true), change.router)) {
+          currentDraft.useGlobal = true;
+          currentDraft.router = null;
+        }
         adopt(resp, id);
         if (!isRouterDirty(id)) savedFlash = { id: id, kind: 'save', at: Date.now(), path: p.path };
         emit();

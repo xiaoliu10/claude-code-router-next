@@ -310,6 +310,7 @@ impl ProjectsService {
                 &available_targets(&config),
             )?
         };
+        let expected_global = router.is_empty();
         let path = format!("/api/projects/{}", encode_query(&change.id));
         let body = json!({ "Router": router });
         let saved = client
@@ -325,11 +326,8 @@ impl ProjectsService {
         let view = find_project(&entries, &change.id)
             .and_then(|entry| project_view(entry, &config))
             .ok_or_else(|| ERR_SAVE_NOT_CONFIRMED.to_string())?;
-        let confirmed = if change.use_global {
-            view.use_global
-        } else {
-            !view.use_global && view.router == draft
-        };
+        let confirmed =
+            view.use_global == expected_global && (change.use_global || view.router == draft);
         if !confirmed {
             return Err(ERR_SAVE_NOT_CONFIRMED.into());
         }
@@ -1359,6 +1357,36 @@ mod tests {
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 5);
         assert_eq!(posted_router(&requests[2]), json!({}));
+    }
+
+    #[tokio::test]
+    async fn clearing_visible_fields_confirms_actual_inheritance_and_preserves_hidden_fields() {
+        for hidden in [false, true] {
+            let cfg = config();
+            let mut raw = json!({"default": "alpha,one"});
+            let mut expected = json!({});
+            if hidden {
+                raw["customRule"] = json!({"keep": true});
+                expected["customRule"] = json!({"keep": true});
+            }
+            let entry = entry_with_router(raw);
+            let after = entry_with_router(expected.clone());
+            let mock = Mock::new(vec![
+                response(cfg.clone()),
+                response(projects_response(vec![entry.clone()])),
+                response(json!({"success": true})),
+                response(cfg.clone()),
+                response(projects_response(vec![after])),
+            ]);
+            let service = ProjectsService::new(Some(mock.client()));
+            let snapshot = service
+                .save(change_for(&entry, &cfg, false, ProjectRouter::default()))
+                .await
+                .unwrap();
+            assert_eq!(snapshot.projects[0].use_global, !hidden);
+            assert_eq!(snapshot.projects[0].router, ProjectRouter::default());
+            assert_eq!(posted_router(&mock.finish().await[2]), expected);
+        }
     }
 
     #[tokio::test]
