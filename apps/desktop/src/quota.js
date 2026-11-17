@@ -863,11 +863,11 @@
         period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
         inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
         byProvider: [
-          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000 },
-          { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500 },
+          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
+          { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
         ],
         byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
-        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 }],
+        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
         updatedAt: Date.now() - 3000,
       },
       '7d': {
@@ -875,13 +875,13 @@
         inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
         byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000 },
-          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000 },
+          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
+          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000 },
-          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000 },
+          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
         ],
         updatedAt: Date.now() - 3000,
       },
@@ -890,12 +890,12 @@
         inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
         byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000 },
-          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000 },
+          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
+          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000 },
+          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
         ],
         updatedAt: Date.now() - 3000,
       },
@@ -1623,21 +1623,19 @@
       totals.appendChild(grid);
       body.appendChild(totals);
       totals.appendChild(noteEl('总 tokens = 已记录输入 + 输出；缓存读写独立展示。'));
-      body.appendChild(usageTable('按模型', ['模型', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens'], u.byModel.map(function (m) {
-        var modelTotal = m.inputTokens === null || m.outputTokens === null ? null : m.inputTokens + m.outputTokens;
+      function tokenRow(m) {
+        var rowTotal = m.inputTokens === null || m.outputTokens === null ? null : m.inputTokens + m.outputTokens;
         return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
           { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
           { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
           { text: (formatCompact(m.cacheReadTokens) || '—') + ' / ' + (formatCompact(m.cacheWriteTokens) || '—'),
             title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') },
-          { text: formatCompact(modelTotal) || '—', title: formatInt(modelTotal) }];
-      }), 1));
-      body.appendChild(usageTable('按提供方', ['提供方', '请求', '输入', '输出'], u.byProvider.map(function (p) {
-        return [{ text: p.name }, { text: formatInt(p.requests) || '—' }, { text: formatCompact(p.inputTokens) || '—', title: formatInt(p.inputTokens) }, { text: formatCompact(p.outputTokens) || '—', title: formatInt(p.outputTokens) }];
-      }), 1));
-      body.appendChild(usageTable('按日期', ['日期', '请求', '输入', '输出'], u.byDay.map(function (d) {
-        return [{ text: d.name }, { text: formatInt(d.requests) || '—' }, { text: formatCompact(d.inputTokens) || '—', title: formatInt(d.inputTokens) }, { text: formatCompact(d.outputTokens) || '—', title: formatInt(d.outputTokens) }];
-      }), 1));
+          { text: formatCompact(rowTotal) || '—', title: formatInt(rowTotal) }];
+      }
+      var tokenHeaders = ['请求', '输入', '输出', '缓存（读 / 写）', '总 tokens'];
+      body.appendChild(usageTable('按模型', ['模型'].concat(tokenHeaders), u.byModel.map(tokenRow), 1));
+      body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
+      body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
     }
 
     // ---- clients tab ------------------------------------------------------

@@ -155,9 +155,11 @@ test('interaction: fallback add fires once, keyboard add, move/remove and explic
   assert.deepEqual(Array.from(h.calls.find(c => c.cmd === 'routing_save').args.change.fallback), ['alpha,two']);
 });
 
-test('interaction: usage totals and per-model cache preserve exact counts across periods', async () => {
+test('interaction: usage totals and model/provider/date cache preserve exact counts across periods', async () => {
   const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250,
-    byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-input', outputTokens: 100 }], updatedAt: 1 }) });
+    byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-input', outputTokens: 100 }],
+    byProvider: [{ name: '<img src=provider>', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-output', inputTokens: 100 }],
+    byDay: [{ name: '2026-11-17', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: '2026-11-16', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: '2026-11-15', outputTokens: 100 }], updatedAt: 1 }) });
   await flush(); h.id('tab-usage').click(); await flush();
   const body = h.id('usage-body');
   const total = body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens'));
@@ -175,8 +177,35 @@ test('interaction: usage totals and per-model cache preserve exact counts across
   assert.ok(models.textContent.includes('0 / 0'));
   assert.equal(models.querySelectorAll('img').length, 0);
   assert.ok(models.querySelectorAll('td').some(n => n.title === '缓存读 8,000,000 / 缓存写 1,250'));
+  const providers = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按提供方'));
+  assert.deepEqual(providers.querySelectorAll('th').map(n => n.textContent), ['提供方', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens']);
+  const providerRows = providers.querySelectorAll('tbody')[0].children;
+  assert.equal(providerRows[0].children.at(-1).textContent, '1.25M');
+  assert.equal(providerRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(providerRows[0].children[4].textContent, '8M / 1.25K');
+  assert.equal(providerRows[0].children[4].title, '缓存读 8,000,000 / 缓存写 1,250');
+  assert.equal(providerRows[1].children.at(-1).textContent, '0');
+  assert.equal(providerRows[1].children[4].textContent, '0 / 0');
+  assert.equal(providerRows[2].children.at(-1).textContent, '—');
+  assert.equal(providerRows[2].children[4].textContent, '— / —');
+  assert.equal(providers.querySelectorAll('img').length, 0);
+  const days = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
+  assert.deepEqual(days.querySelectorAll('th').map(n => n.textContent), ['日期', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens']);
+  const dayRows = days.querySelectorAll('tbody')[0].children;
+  assert.equal(dayRows[0].children.at(-1).textContent, '1.25M');
+  assert.equal(dayRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(dayRows[0].children[4].textContent, '8M / 1.25K');
+  assert.equal(dayRows[0].children[4].title, '缓存读 8,000,000 / 缓存写 1,250');
+  assert.equal(dayRows[1].children.at(-1).textContent, '0');
+  assert.equal(dayRows[1].children[4].textContent, '0 / 0');
+  assert.equal(dayRows[2].children.at(-1).textContent, '—');
+  assert.equal(dayRows[2].children[4].textContent, '— / —');
   h.id('usage-periods').children[1].click(); await flush();
   assert.match(body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens')).textContent, /2.25M/);
+  const refreshedProviders = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按提供方'));
+  assert.equal(refreshedProviders.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '2.25M');
+  const refreshedDays = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
+  assert.equal(refreshedDays.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '2.25M');
 });
 
 test('interaction: restore is local confirmation then single individual IPC; usage uses safe text', async () => {

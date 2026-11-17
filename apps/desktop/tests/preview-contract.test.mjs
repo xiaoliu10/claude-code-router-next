@@ -75,9 +75,9 @@ function assertUsageSnapshot(u, period, label) {
   assert.ok(Array.isArray(u.byProvider), `${label}: byProvider array`)
   assert.ok(Array.isArray(u.byDay), `${label}: byDay array`)
   assert.ok(Array.isArray(u.byModel) && u.byModel.length > 0, `${label}: byModel populated`);
-  for (const row of u.byModel) {
-    assert.equal(typeof row.cacheReadTokens, "number");
-    assert.equal(typeof row.cacheWriteTokens, "number");
+  for (const row of [...u.byModel, ...u.byProvider, ...u.byDay]) {
+    assert.equal(typeof row.cacheReadTokens, "number", `${label}: cache read numeric`);
+    assert.equal(typeof row.cacheWriteTokens, "number", `${label}: cache write numeric`);
   }
   for (const row of [...u.byModel, ...u.byProvider, ...u.byDay]) {
     for (const k of USAGE_ROW_KEYS) assert.ok(k in row, `${label}: row missing ${k}`)
