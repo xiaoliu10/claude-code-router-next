@@ -99,9 +99,24 @@ test('credentials controller: clear requires configured and sends empty strings;
   assert.equal(c.state().openName, null, 'a provider removed by a later status closes its panel');
 });
 
+test('credentials controller: successful save and clear invoke the onSaved refresh hook', async () => {
+  const ipc = fakeInvoke();
+  const saved = [];
+  const c = Q.createCredentialsController({ invoke: ipc.fn, onSaved: n => saved.push(n) });
+  c.refresh(); await flush();
+  ipc.resolve(0, status([{ name: 'volc', configured: false }])); await flush();
+  c.open('volc');
+  c.save('volc', { accessKey: 'AK', secretKey: 'SK' });
+  ipc.resolve(1, status([{ name: 'volc', configured: true }])); await flush();
+  c.clear('volc');
+  ipc.resolve(2, status([{ name: 'volc', configured: false }])); await flush();
+  assert.deepEqual(saved, ['volc', 'volc']);
+});
+
 test('credentials controller: failed save keeps the panel open and surfaces the error', async () => {
   const ipc = fakeInvoke();
-  const c = Q.createCredentialsController({ invoke: ipc.fn });
+  const saved = [];
+  const c = Q.createCredentialsController({ invoke: ipc.fn, onSaved: n => saved.push(n) });
   c.refresh(); await flush();
   ipc.resolve(0, status([{ name: 'volc', configured: false }])); await flush();
   c.open('volc');
@@ -111,6 +126,7 @@ test('credentials controller: failed save keeps the panel open and surfaces the 
   assert.equal(c.state().saveError, '网关离线');
   assert.equal(c.state().savedFlash, null);
   assert.equal(c.state().saving, false);
+  assert.deepEqual(saved, [], 'failed save must not trigger the refresh hook');
 });
 
 // ---------------- DOM interactions ----------------
@@ -229,7 +245,7 @@ test('credentials interaction: clear sends empty strings and restores the unconf
 });
 
 test('credentials interaction: failed save keeps the panel open with typed values and the error', async () => {
-  const { h, card } = await start(false, VOLC, { quota_credentials_save: () => Promise.reject(new Error('网关连接不可用')) });
+  const { card } = await start(false, VOLC, { quota_credentials_save: () => Promise.reject(new Error('网关连接不可用')) });
   buttonOf(card, 'data-creds-open').click(); await flush();
   const [ak, sk] = inputsOf(card);
   ak.value = 'AK123'; sk.value = 'SK456';

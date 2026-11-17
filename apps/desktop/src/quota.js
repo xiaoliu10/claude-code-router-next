@@ -259,6 +259,8 @@
   function createCredentialsController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createCredentialsController: 需要 invoke 函数');
+    // Best-effort usage refresh after credentials change; ownership stays with the quota controller.
+    var onSaved = options && typeof options.onSaved === 'function' ? options.onSaved : function () {};
     var status = null, loading = false, error = null;
     var openName = null, saving = false, saveError = null, savedFlash = null;
     var epoch = 0;
@@ -331,6 +333,9 @@
         adopt(r);
         if (openName === name) savedFlash = { name: name, at: Date.now(), cleared: cleared };
         emit();
+        // The card's usage snapshot is stale once credentials change; refresh it
+        // (best-effort, stale-data semantics and 3s attempt dedupe live in the quota controller).
+        try { onSaved(name); } catch { /* rendering-only hook */ }
       }, function (err) {
         if (my !== epoch) return;
         saving = false;
@@ -1131,7 +1136,8 @@
       if (cmd === 'quota_credentials_save') {
         var credEntry = null;
         for (var k = 0; k < credentials.providers.length; k++) if (credentials.providers[k].name === a.name) { credEntry = credentials.providers[k]; break; }
-        if (!credEntry) return Promise.reject(new Error('Coding Plan 提供方不存在，请刷新面板'));
+        // Keep wording identical to credentials.rs ERR_NOT_FOUND so preview and production match.
+        if (!credEntry) return Promise.reject(new Error('Coding Plan provider is no longer configured; refresh the panel'));
         if (typeof a.accessKey === 'string') credentialKeys.accessKey = a.accessKey.trim();
         if (typeof a.secretKey === 'string') credentialKeys.secretKey = a.secretKey.trim();
         credEntry.configured = !!(credentialKeys.accessKey && credentialKeys.secretKey);
@@ -1340,7 +1346,10 @@
       ? function (cmd, args) { return tauri.core.invoke(cmd, args); }
       : mode === 'preview' ? createPreviewInvoke() : null;
     var controller = mode === 'missing' ? null : createController({ invoke: invoke });
-    var credentialsCtrl = mode === 'missing' ? null : createCredentialsController({ invoke: invoke });
+    var credentialsCtrl = mode === 'missing' ? null : createCredentialsController({
+      invoke: invoke,
+      onSaved: function (name) { if (controller) controller.refreshProvider(name); },
+    });
     var routingCtrl = mode === 'missing' ? null : createRoutingController({ invoke: invoke });
     var usageCtrl = mode === 'missing' ? null : createUsageController({ invoke: invoke });
     var clientsCtrl = mode === 'missing' ? null : createClientsController({ invoke: invoke });
