@@ -176,9 +176,9 @@ function run(executable, args, options = {}) {
   });
   if (result.status !== 0) {
     fail(
-      `${executable} ${args.join(" ")} failed (${result.status}): ${
-        result.stderr ?? result.stdout ?? ""
-      }`.slice(0, 400),
+      `${path.basename(executable)} failed (${result.status}): ${
+        (result.stderr || result.stdout || "").slice(-1800)
+      }`,
     );
   }
   return result;
@@ -320,7 +320,13 @@ function requireCliDist() {
 
 async function main() {
   const inputs = requireCliDist();
+  const placeholderPath = path.join(runtimeDir, "README.md");
+  const placeholder = fs.existsSync(placeholderPath) ? fs.readFileSync(placeholderPath) : null;
   await fs.promises.rm(runtimeDir, { recursive: true, force: true });
+  if (placeholder) {
+    await fs.promises.mkdir(runtimeDir, { recursive: true });
+    fs.writeFileSync(placeholderPath, placeholder);
+  }
   await fs.promises.mkdir(cacheDir, { recursive: true });
 
   // 1) Portable Node distribution (copying a Homebrew node is nonportable).
@@ -435,6 +441,11 @@ async function main() {
     `const {LRUCache} = require(${JSON.stringify(path.join(serviceDir, "node_modules", "lru-cache"))});` +
       "const cache = new LRUCache({max: 1}); cache.set('k', 'v'); if (cache.get('k') !== 'v') throw new Error('lru failed');",
   ]);
+  if (process.platform === "darwin") {
+    const nativeAddon = path.join(serviceDir, "node_modules", "better-sqlite3", "build", "Release", "better_sqlite3.node");
+    const { portable, offending } = classifyDylibDeps(run("otool", ["-L", nativeAddon]).stdout);
+    if (!portable) fail("Native SQLite addon is not portable: " + offending.join(", "));
+  }
   const npmVersion = run(path.join(runtimeDir, "bin", "npm"), ["--version"], {
     env: {
       ...process.env,

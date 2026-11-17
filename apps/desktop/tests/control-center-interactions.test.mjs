@@ -127,7 +127,7 @@ test('interaction: typing, focus, explicit refresh and tab switch preserve draft
   const input = h.id('routing-body').querySelector('.route-input');
   input.focus(); input.value = 'alpha,two'; input.setSelectionRange(5, 5); input.fire('input');
   const before = h.calls.length; h.focusWindow(); await flush();
-  assert.equal(h.calls.length, before, 'focus on routing never refetches');
+  assert.deepEqual(h.calls.slice(before).map(c => c.cmd), ['service_snapshot'], 'focus refreshes service state without refetching route drafts');
   h.id('routing-refresh').click(); await flush();
   assert.equal(h.id('routing-body').querySelector('.route-input'), input, 'refresh keeps input node');
   assert.equal(input.value, 'alpha,two');

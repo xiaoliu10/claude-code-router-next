@@ -13,9 +13,11 @@ impl ConnectionSettings {
     pub fn from_environment() -> Result<Self, String> {
         let resolver = |name: &str| std::env::var(name).ok();
         let path = config_path(&resolver)?;
-        let text = match fs::read_to_string(path) {
+        let text = match fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".into(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                initialize_config(&path, &resolver)?
+            }
             Err(_) => return Err("Could not read local CCR configuration".into()),
         };
         Self::from_config_text(&text, &resolver)
@@ -59,6 +61,55 @@ impl ConnectionSettings {
         })
     }
 }
+fn initialize_config<F: Fn(&str) -> Option<String>>(
+    path: &std::path::Path,
+    resolver: &F,
+) -> Result<String, String> {
+    use std::io::Write;
+    let settings = ConnectionSettings::from_config_text("{}", resolver)?;
+    let port: u16 = settings
+        .base_url
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let api_key = match resolver("CCR_DESKTOP_API_KEY") {
+        Some(key) => key,
+        None => generate_local_api_key()?,
+    };
+    let text = serde_json::to_string_pretty(&serde_json::json!({
+        "PORT": port, "HOST": "127.0.0.1", "APIKEY": api_key,
+        "Providers": [], "Router": {}, "Clients": {}
+    }))
+    .map_err(|_| "Could not initialize desktop configuration".to_string())?;
+    fs::create_dir_all(path.parent().ok_or("Invalid configuration directory")?)
+        .map_err(|_| "Could not create desktop configuration directory".to_string())?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(text.as_bytes())
+                .map_err(|_| "Could not initialize desktop configuration".to_string())?;
+            Ok(text)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => fs::read_to_string(path)
+            .map_err(|_| "Could not read local CCR configuration".to_string()),
+        Err(_) => Err("Could not initialize desktop configuration".into()),
+    }
+}
+
+fn generate_local_api_key() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|_| "Could not generate a local API key".to_string())?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn config_path<F: Fn(&str) -> Option<String>>(resolver: &F) -> Result<PathBuf, String> {
     let nonempty = |name| resolver(name).filter(|value| !value.is_empty());
     let directory = match nonempty("CCR_CONFIG_DIR") {
@@ -119,6 +170,48 @@ mod tests {
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| value.to_string())
         }
+    }
+
+    #[test]
+    fn first_launch_initializes_private_config_without_overwriting_existing() {
+        let dir = std::env::temp_dir().join(format!("ccr-first-launch-{}", std::process::id()));
+        let file = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+        let text = initialize_config(&file, &env(&[("CCR_DESKTOP_PORT", "51234")])).unwrap();
+        let cfg: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(cfg["PORT"], 51234);
+        assert_eq!(cfg["HOST"], "127.0.0.1");
+        let key = cfg["APIKEY"].as_str().unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(cfg["Clients"].as_object().unwrap().is_empty());
+        fs::write(&file, "{PORT:5001}").unwrap();
+        assert_eq!(initialize_config(&file, &env(&[])).unwrap(), "{PORT:5001}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn first_launch_preserves_explicit_empty_key_override() {
+        let dir = std::env::temp_dir().join(format!("ccr-empty-key-{}", std::process::id()));
+        let file = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+        let resolver = env(&[("CCR_DESKTOP_API_KEY", "")]);
+        let text = initialize_config(&file, &resolver).unwrap();
+        let cfg: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(cfg["APIKEY"], "");
+        assert!(ConnectionSettings::from_config_text(&text, &resolver)
+            .unwrap()
+            .api_key
+            .is_none());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

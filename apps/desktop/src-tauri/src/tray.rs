@@ -72,6 +72,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn stop_slot(slot: &Mutex<Option<Child>>) -> Option<bool> {
+    let mut guard = lock(slot);
+    let result = lifecycle::stop_owned_gateway(guard.as_mut()?);
+    guard.take();
+    Some(result)
+}
+
 /// Quit wording reflects ownership: only an owned gateway is stopped on exit.
 fn quit_label(owned: bool) -> &'static str {
     if owned {
@@ -567,6 +574,7 @@ impl Controller {
             self.reached_ready.store(true, Ordering::SeqCst);
             *lock(&self.service_error) = None;
         } else if !self.stopped.load(Ordering::SeqCst) {
+            eprintln!("Desktop gateway startup: {}", startup.message);
             *lock(&self.service_error) = Some(startup.message.clone());
         }
         startup
@@ -629,15 +637,15 @@ impl Controller {
     }
 
     async fn action_stop(self: &Arc<Self>) -> Result<ServiceState, String> {
-        let taken = lock(&self.launcher).take();
-        let Some(mut child) = taken else {
-            // Fixed safe message; also covers attach-only and already-reaped states.
-            return Err("Only a gateway started by this desktop can be stopped here. External services must be stopped by their own owner.".into());
-        };
-        let stopped_cleanly =
-            tauri::async_runtime::spawn_blocking(move || lifecycle::stop_owned_gateway(&mut child))
-                .await
-                .map_err(|e| e.to_string())?;
+        let slot = Arc::clone(&self.launcher);
+        let stopped_cleanly = tauri::async_runtime::spawn_blocking(move || {
+            // Keep the child in its shared ownership slot until termination
+            // completes. Quit waits on this same mutex, including during kill.
+            stop_slot(&slot)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Only a gateway started by this desktop can be stopped here. External services must be stopped by their own owner.".to_string())?;
         self.update(|v| {
             v.status = if stopped_cleanly {
                 "Gateway stopped".into()
@@ -853,6 +861,9 @@ mod tests {
                 }
                 Err(_) => OwnedGateway::None,
             };
+            if let Some(mut child) = slot.get_mut().unwrap().take() {
+                lifecycle::stop_owned_gateway(&mut child);
+            }
             owned
         };
         assert_eq!(controller_state(true, false), OwnedGateway::Live);
@@ -860,6 +871,31 @@ mod tests {
         assert_eq!(controller_state(false, true), OwnedGateway::Exited);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn quit_waits_for_explicit_stop_to_finish_reaping() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .spawn()
+            .unwrap();
+        let slot = Arc::new(Mutex::new(Some(child)));
+        let worker_slot = Arc::clone(&slot);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut guard = lock(&worker_slot);
+            ready_tx.send(()).unwrap();
+            assert!(lifecycle::stop_owned_gateway(guard.as_mut().unwrap()));
+            guard.take();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        // This is quit's exact ownership observation. It must wait for the
+        // explicit stop worker to terminate and reap the child, not see None.
+        assert!(lock(&slot).take().is_none());
+        worker.join().unwrap();
+        assert_eq!(stop_slot(&slot), None);
+    }
+
     #[test]
     fn managed_env_marker_name_is_stable() {
         assert_eq!(MANAGED_ENV, "CCR_DESKTOP_MANAGED");

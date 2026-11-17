@@ -30,7 +30,7 @@ runtime/
 
 entry 职责（`runtime-src/entry.ts`）：绑定**成功后**才恢复既有 enabled 客户端集成（shared 包现成逻辑 + `readConfigFileRaw`/`writeConfigFile` 原样写回 + 启动时 sync takeovers；空选择不写盘；失败只记 id 不假报成功）；SIGTERM 优雅关闭仅在已 bind 时反方向恢复（stop 阶段不做 takeover sync）；串行化 enable/disable 防并发写配置。启动失败以非零退出如实上报。
 
-**禁止 installed-ccr fallback**：缺 runtime staging 是显式错误（提示准备命令）；开发模式下若外部网关已在运行仍可正常 attach（attach 先于 bundle 检查）。HOME/CCR_CONFIG_DIR 完全跟随用户环境，**不打包、不写入任何用户配置/凭据/插件/数据库**；测试一律隔离 HOME + 隔离 CCR_CONFIG_DIR + 临时端口（绝不占用 3456）。
+**禁止 installed-ccr fallback**：缺 runtime staging 是显式错误（提示准备命令）；开发模式下若外部网关已在运行仍可正常 attach（attach 先于 bundle 检查）。HOME/CCR_CONFIG_DIR 跟随用户环境。首次启动以独占创建、0600 权限初始化本地配置和随机管理 API key（显式空 key override 保留）；已有配置不覆盖。**bundle 不包含用户配置、凭据、插件或数据库**；测试一律隔离 HOME + 隔离 CCR_CONFIG_DIR + 临时端口（绝不占用 3456）。
 
 ## 脚本
 
@@ -38,21 +38,22 @@ entry 职责（`runtime-src/entry.ts`）：绑定**成功后**才恢复既有 en
 pnpm build:shared && pnpm build:core                      # entry 依赖 core/shared dist
 node apps/desktop/scripts/prepare-runtime.mjs             # 确定性 staging（校验 node 版本/架构/ABI/npm）
 node apps/desktop/scripts/smoke-bundled-runtime.mjs       # 隔离冒烟（临时 HOME/config、临时端口、SIGTERM 优雅退出）
+node apps/desktop/scripts/verify-runtime-lifecycle.mjs    # 环境占位符、活跃连接退出、绑定失败恢复验证
 node apps/desktop/scripts/build-standalone.mjs            # 产出 .app 并把 runtime 复制进 Contents/Resources
 node --test apps/desktop/tests/runtime-staging.test.mjs   # 脚本纯函数测试
 ```
 
-`prepare-runtime.mjs`：便携 Node 发行版固定 `v26.4.0`（与本仓库 better-sqlite3 ABI 匹配；本地 Homebrew node 因 `/opt/homebrew` dylib 依赖被判 nonportable，禁止拷贝）；下载经 SHASUMS256.txt 校验；`--node-tarball` 本地包 SHA 不符即拒绝；otool 依赖解析只允许 `/usr/lib`；递归拷贝 native 依赖树并剥离外链 symlink；端到端 SQLite ABI require 校验；`MANIFEST.json` 双次运行字节一致。缓存目录 `apps/desktop/.runtime-cache/` 在 staging 之外。
+`prepare-runtime.mjs`：便携 Node 发行版固定 `v26.4.0`（与本仓库 better-sqlite3 ABI 匹配；本地 Homebrew node 因 `/opt/homebrew` dylib 依赖被判 nonportable，禁止拷贝）；下载经 SHASUMS256.txt 校验；`--node-tarball` 本地包 SHA 不符即拒绝；otool 同时检查 Node 和 SQLite native addon，仅允许系统 dylib/framework；递归拷贝 native 依赖树并剥离外链 symlink；端到端 SQLite ABI require 校验；`MANIFEST.json` 双次运行字节一致。缓存目录 `apps/desktop/.runtime-cache/` 在 staging 之外。
 
 `build-standalone.mjs`：先普通 `cargo tauri build --bundles app --no-sign`（tauri.conf.json 无 resources，CI 无需二进制），再把 `runtime/` 结构化复制进 `.app/Contents/Resources/runtime`（本版 tauri resources 会把目录树打平，故不走 bundle.resources），构建后断言必备文件存在且无配置泄漏。CI/无 staging 时产出 shell-only 产物并明确告警（运行时显式缺 bundle 错误，不会 fallback）。
 
-## service 命令（父代理接线）
+## service 命令
 
-Rust 命令已导出并自守护（窗口 label + 精确本地 URL，规则与 quota 命令一致；如需与 popup 复用守护可由父代理把 `popup::guard` 改 pub 去重）：
+Rust 命令通过共享 `popup::guard` 验证 main/quota 窗口及精确本地 URL：
 
 - `service_snapshot()` → `{mode:'owned'|'external'|'stopped'|'starting'|'error',running:boolean,message:string}`（camelCase 键 `mode/running/message`）。
 - `service_action({action:'start'|'stop'})` → 同结构。stop 仅作用于 owned child；external/attach 状态原生拒绝（固定安全文案）。UI 中 external 的 start/stop 应禁用。
-- 已注册进 `lib.rs` `invoke_handler`。要给窗口放行还需：`build.rs` `AppManifest::new().commands(&[...])` 增加 `"service_snapshot","service_action"`，并在 `capabilities/default.json` 的两个窗口里加 `allow-service-snapshot`/`allow-service-action`（cargo build 会生成对应 permission toml）。
+- handler、build manifest 与 capability 已接线；远程页面不能调用这些命令。启动超时会终止并回收 owned child，允许重新启动。
 
 ## 安装前提与环境
 
@@ -85,10 +86,12 @@ macOS 输出：`apps/desktop/src-tauri/target/release/bundle/macos/CCR Desktop.a
 ### 本次实际验证（2026-11-17）
 
 - macOS arm64 / Rust 1.99.0 / tauri-cli 2.12.2 / staging Node v26.4.0 + npm 11.17.0。
-- `cargo test`（48 passed）、`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 全绿。新增测试覆盖：fake child 终止/已退出不再 signal/SIGTERM trap 先于 kill（ready marker 防竞态）、cancel-in-lock spawn 协议、occupied/unhealthy 不启动、取消启动、缺 bundle 显式错误、service DTO 全模式、bundle 检测与 PATH 前置。
+- `cargo test`（73 passed）、`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 全绿。新增测试覆盖：fake child 终止/已退出不再 signal/SIGTERM trap 先于 kill（ready marker 防竞态）、cancel-in-lock spawn 协议、occupied/unhealthy 不启动、取消启动、缺 bundle 显式错误、service DTO 全模式、bundle 检测与 PATH 前置。
 - `prepare-runtime.mjs` 成功 staging（MANIFEST 两次运行 diff 为空；sqlite ABI roundtrip 通过；`otool -L` staged node 无 `/opt/homebrew` 依赖；`npm --version` 用隔离 HOME + 仅 runtime PATH 验证）。
 - `smoke-bundled-runtime.mjs` 通过：隔离 HOME/CCR_CONFIG_DIR + fixture provider 强制 127.0.0.1 + 鉴权绑定，临时端口（≠3456）；health/config 200；`/api/restart`、`/api/update/perform` 409；`/api/update/check` desktopManaged；`/ui/` 404（无打包 Web UI）；SIGTERM 退出码 0 且端口释放。
 - `build-standalone.mjs` 产出未签名 `.app`（182 MB，含完整 runtime；bundle 内断言必备文件 + 无 config.json/logs 泄漏）。entry bundle 约 17MB（core 运行时打包），node 发行版约 120MB，native deps 约 20MB。
-- 未触碰 live CCR、真实 HOME/client 配置；所有验证均隔离。
+- 77 项 Node UI/staging 测试通过。真实 App 使用隔离 HOME/config、临时端口和 `PATH=/usr/bin:/bin`；四页签 IPC、owned start/stop、main close 释放端口、external attach 后退出保留服务均通过。验收构建仅改 bundle identifier，避开已有桌面单实例；正式产物恢复标准 identifier。
+- 客户端环境占位符与原配置保持、活跃 HTTP 请求时先恢复客户端再关闭连接、绑定失败不恢复客户端均通过；冲突的继承 `SERVICE_PORT` 不影响 fixture 隔离。
+- 未重启或修改 live CCR、真实 HOME/client 配置；所有验证均隔离。
 
 **限制**：`.app` 未签名/未公证；`prepare-runtime` 的便携 Node 下载需要网络（可用 `--node-tarball` 本地包，SHA 仍强制）；跨平台（Windows/Linux）runtime 布局与打包未实现；桌面与网页端共享同一份用户 config，非原子并发写仍需避免（服务端保存带自动备份）。

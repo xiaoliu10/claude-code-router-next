@@ -138,12 +138,7 @@ fn prepend_dirs(
 ) -> Result<OsString, String> {
     let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
     dirs.extend(std::env::split_paths(inherited));
-    dirs.extend([
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-    ]);
+    dirs.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
     std::env::join_paths(dirs).map_err(|e| e.to_string())
 }
 
@@ -294,6 +289,13 @@ fn spawn_gateway(
         return Err("Port became occupied; not starting another gateway".into());
     }
     let path = bundled_path(bundle, &std::env::var_os("PATH").unwrap_or_default())?;
+    let mut guard = lock(slot);
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    if guard.is_some() {
+        return Err("Gateway already owns the launch slot".into());
+    }
     let mut child = spawn_with(&bundle.node(), &[bundle.entry().into_os_string()])
         .env("PATH", path)
         .env(MANAGED_ENV, "1")
@@ -302,7 +304,6 @@ fn spawn_gateway(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Could not launch bundled gateway: {e}"))?;
-    let mut guard = lock(slot);
     if cancel.load(Ordering::SeqCst) {
         // Quit won the race; stop the just-spawned child now (graceful, then
         // bounded kill) and publish nothing.
@@ -466,7 +467,7 @@ pub async fn connect_or_launch(
             // Success requires the owned child to still be alive AND health to
             // answer. A child that died while another service took the port is
             // external, not owned.
-            exited = poll_exited(&launcher_slot);
+            exited |= poll_exited(&launcher_slot);
         }
         if client.health().await {
             return if exited {
@@ -483,9 +484,19 @@ pub async fn connect_or_launch(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let slot = Arc::clone(&launcher_slot);
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = lock(&slot);
+        if let Some(child) = guard.as_mut() {
+            stop_owned_gateway(child);
+        }
+        guard.take();
+    })
+    .await;
     Startup {
         ready: false,
-        message: "Gateway did not become ready. Use Refresh after starting ccr manually.".into(),
+        message: "Gateway did not become ready. Check the desktop service status and retry Start."
+            .into(),
     }
 }
 
@@ -586,21 +597,7 @@ pub async fn service_state_probe(
 // ---------------------------------------------------------------------------
 
 fn service_window_guard(window: &tauri::WebviewWindow) -> Result<(), String> {
-    let origin = if cfg!(windows) {
-        "http://tauri.localhost"
-    } else {
-        "tauri://localhost"
-    };
-    let label_ok = window.label() == crate::popup::LABEL;
-    let url_ok = window
-        .url()
-        .ok()
-        .is_some_and(|url| url.as_str() == format!("{origin}/quota.html"));
-    if label_ok && url_ok {
-        Ok(())
-    } else {
-        Err("This command is restricted to the local quota panel".into())
-    }
+    crate::popup::guard(window)
 }
 
 #[tauri::command]

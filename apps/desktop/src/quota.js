@@ -1863,6 +1863,13 @@
       serviceCtrl.subscribe(renderService);
       renderService(serviceCtrl.state());
       serviceCtrl.refresh();
+      // Startup finishes asynchronously after the first paint. Keep the local
+      // service controls current without reloading route drafts or other tabs.
+      if (typeof window.setInterval === 'function') {
+        window.setInterval(function () {
+          if (document.visibilityState !== 'hidden') serviceCtrl.refresh();
+        }, 3000);
+      }
     } else renderService({ service: null, loading: false, pending: null, error: null });
     if (routingCtrl) {
       routingCtrl.subscribe(renderRouting);
@@ -1882,10 +1889,10 @@
     window.addEventListener('keydown', function (event) {
       if (event.key === 'Escape') safeCommand('quota_hide');
     });
-    // Focus-triggered refresh stays quota-only: returning focus (e.g. after a
-    // native select popup closes) must never wipe routing/usage/clients state
-    // or discard in-progress edits.
+    // Focus refreshes service status and quota data only; route drafts and
+    // usage/client state must survive native select popups and tab changes.
     window.addEventListener('focus', function () {
+      if (serviceCtrl) serviceCtrl.refresh();
       if (activeTab === 'quota' && controller) controller.refreshAll();
     });
   }

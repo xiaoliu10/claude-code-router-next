@@ -23,8 +23,7 @@ const runtimeDir = path.join(desktopDir, "runtime");
 const FORBIDDEN_PORT = 3456;
 
 function fail(message) {
-  console.error(`smoke-bundled-runtime: ${message}`);
-  process.exit(1);
+  throw new Error(`smoke-bundled-runtime: ${message}`);
 }
 
 function request(port, requestPath, headers = {}, method = "GET") {
@@ -95,10 +94,12 @@ async function main() {
       HOME: home,
       CCR_CONFIG_DIR: configDir,
       CCR_DESKTOP_MANAGED: "1",
+      SERVICE_PORT: String(port),
       PATH: `${path.join(runtimeDir, "bin")}:${runtimeDir}:/usr/bin:/bin`,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  try {
   let output = "";
   child.stdout.on("data", (chunk) => (output += chunk));
   child.stderr.on("data", (chunk) => (output += chunk));
@@ -156,7 +157,7 @@ async function main() {
   }
   if (!portReleased) fail("port was not released after shutdown");
 
-  fs.rmSync(fixture, { recursive: true, force: true });
+
   console.log(
     JSON.stringify({
       ok: true,
@@ -165,6 +166,19 @@ async function main() {
       checks: ["health", "config", "restart-409", "update-409", "desktopManaged", "ui-404", "graceful-sigterm", "port-released"],
     }),
   );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
+        child.once("exit", () => { clearTimeout(timer); resolve(); });
+        child.kill("SIGTERM");
+      });
+    }
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
 }
 
-main().catch((error) => fail(error?.stack ?? String(error)));
+main().catch((error) => {
+  console.error(error?.stack ?? String(error));
+  process.exitCode = 1;
+});

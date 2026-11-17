@@ -9,11 +9,11 @@
  *
  * Client integration lifecycle (mirrors the CLI start/stop semantics):
  * - After the server successfully BINDS, restore the client integrations the
-   * user previously enabled (shared logic only; never auto-enables clients the
-   * user did not select). Uses `readConfigFileRaw` so environment placeholders
-   * are never interpolated back into config.json, and `writeConfigFile` keeps
-   * its forced history snapshot.
- * - Restore-on-stop runs only when a bind actually succeeded, is serialized
+ *   user previously enabled (shared logic only; never auto-enables clients the
+ *   user did not select). Uses `readConfigFileRaw` so environment placeholders
+ *   are never interpolated back into config.json, and `writeConfigFile` keeps
+ *   its forced history snapshot.
+ * - Restore-on-stop runs before connection draining when a bind succeeded, is serialized
  *   with the start-phase apply, and does not re-run project takeover sync (the
  *   CLI stop path only disables + writes; a sync could re-takeover projects).
  * - Startup failure exits non-zero so the desktop reports the gateway as not
@@ -66,11 +66,27 @@ async function applyClientSelections(
   syncTakeovers: boolean,
 ): Promise<boolean> {
   const config = await readConfigFileRaw();
-  const result = apply(config);
+  // Resolve only connection fields used by the client adapters. Keep all raw
+  // placeholders in the persisted router/provider configuration unchanged.
+  const resolved = { ...config };
+  for (const field of ["PORT", "APIKEY"]) {
+    const value = config[field];
+    if (typeof value === "string") {
+      resolved[field] = value.replace(/\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/g,
+        (match: string, braced: string, plain: string) => process.env[braced || plain] || match);
+    }
+  }
+  if (process.env.SERVICE_PORT) resolved.PORT = process.env.SERVICE_PORT;
+  const result = apply(resolved);
   if (result.results.length === 0) {
     return false;
   }
-  await writeConfigFile(result.config);
+  const persisted = { ...result.config };
+  for (const field of ["PORT", "APIKEY"]) {
+    if (Object.hasOwn(config, field)) persisted[field] = config[field];
+    else delete persisted[field];
+  }
+  await writeConfigFile(persisted);
   const failures = result.results.filter((item) => !item.success);
   for (const failure of failures) {
     console.error(`desktop service: client integration ${action} failed (${failure.id})`);
@@ -104,45 +120,39 @@ async function main(): Promise<void> {
     return run;
   };
 
-  // Runs inside the core's graceful close. The bind gate guarantees a failed
-  // startup (listen error closes the app without ever binding) never disables
-  // the user's real client integrations.
-  server.app.addHook("onClose", async () => {
-    if (!bindSucceeded || shuttingDown) {
-      return;
-    }
+  // preClose runs before Fastify drains active requests. Restore clients
+  // first, then close owned HTTP streams so draining cannot exceed the native
+  // shutdown deadline. A failed listen never restores or disables clients.
+  server.app.addHook("preClose", async () => {
+    if (shuttingDown) return;
     shuttingDown = true;
+    if (bindSucceeded) {
+      await serializeApply(async () => {
+        try {
+          await applyClientSelections(disableConfiguredClients, "disable", false);
+        } catch {
+          console.error("desktop service: client integration restore failed during shutdown");
+        }
+      });
+      server.app.server.closeAllConnections();
+    }
+  });
+
+  // onListen establishes the bind gate before the start promise can race a
+  // signal. Both start and stop writes go through the same serialization chain.
+  server.app.addHook("onListen", async () => {
+    bindSucceeded = true;
+    if (shuttingDown) return;
     await serializeApply(async () => {
       try {
-        await applyClientSelections(disableConfiguredClients, "disable", false);
+        const applied = await applyClientSelections(enableConfiguredClients, "enable", true);
+        if (applied) console.log("desktop service: enabled client integrations restored");
       } catch {
-        console.error("desktop service: client integration restore failed during shutdown");
+        console.error("desktop service: client integration restore on start failed");
       }
     });
   });
-
   await server.start();
-  bindSucceeded = true;
-  if (shuttingDown) {
-    // Shutdown began while binding; skip the start-phase apply entirely.
-    return;
-  }
-  await serializeApply(async () => {
-    try {
-      const applied = await applyClientSelections(
-        enableConfiguredClients,
-        "enable",
-        true,
-      );
-      if (applied) {
-        console.log("desktop service: enabled client integrations restored");
-      }
-    } catch {
-      // The router is already serving; a failed apply must not kill it, but it
-      // must also never be reported as a success.
-      console.error("desktop service: client integration restore on start failed");
-    }
-  });
 }
 
 main().catch((error: unknown) => {
