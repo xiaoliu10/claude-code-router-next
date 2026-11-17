@@ -58,12 +58,7 @@ impl ConnectionSettings {
             api_key: (!api_key.is_empty()).then_some(api_key),
         })
     }
-
-    pub fn ui_url(&self) -> String {
-        format!("{}/ui/", self.base_url)
-    }
 }
-
 fn config_path<F: Fn(&str) -> Option<String>>(resolver: &F) -> Result<PathBuf, String> {
     let nonempty = |name| resolver(name).filter(|value| !value.is_empty());
     let directory = match nonempty("CCR_CONFIG_DIR") {
@@ -130,7 +125,6 @@ mod tests {
     fn defaults_and_json5_config() {
         let settings = ConnectionSettings::from_config_text("{}", &env(&[])).unwrap();
         assert_eq!(settings.base_url, "http://127.0.0.1:3456");
-        assert_eq!(settings.ui_url(), "http://127.0.0.1:3456/ui/");
         assert!(settings.api_key.is_none());
         let settings = ConnectionSettings::from_config_text(
             "// comment\n{PORT: 4001, APIKEY: '${SECRET}', HOST: 'remote.example',}",

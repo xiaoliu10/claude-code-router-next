@@ -1,10 +1,11 @@
 use crate::{
     api::{AdminClient, TraySnapshot},
-    lifecycle,
+    lifecycle::{self, OwnedGateway, RuntimeBundle, ServiceAction, ServiceState},
     settings::ConnectionSettings,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::process::Child;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -19,6 +20,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 const TRAY_ID: &str = "ccr-tray";
 const MAX_PROVIDERS: usize = 15;
 const MAX_MODELS: usize = 12;
+/// Upper bound for waiting out a startup race during shutdown. The child is
+/// published to shared state synchronously right after spawn, so this only
+/// covers the spawn itself, not the readiness wait.
+const SHUTDOWN_RACE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone)]
 struct View {
@@ -26,6 +31,7 @@ struct View {
     status: String,
     online: bool,
     switching: bool,
+    owned: bool,
     revision: u64,
 }
 
@@ -33,16 +39,28 @@ pub struct Controller {
     app: tauri::AppHandle,
     client: AdminClient,
     settings: ConnectionSettings,
+    /// Staged embedded runtime; the desktop never launches an installed `ccr`.
+    bundle: Option<RuntimeBundle>,
     operation: AsyncMutex<()>,
     view: Mutex<View>,
     epoch: AtomicU64,
     switching: AtomicBool,
-    stopped: AtomicBool,
+    /// Quit/exit signal; also cancels the startup readiness wait promptly.
+    stopped: Arc<AtomicBool>,
+    /// True while a start attempt is between spawn and readiness answer.
+    starting: AtomicBool,
+    /// Set once the owned gateway answered health at least once this run.
+    reached_ready: AtomicBool,
+    /// Set when the start attempt finished (spawn published or failed).
+    startup_settled: AtomicBool,
+    /// Message of the last failed explicit start attempt; drives mode `error`.
+    service_error: Mutex<Option<String>>,
     loaded: AtomicBool,
     wake: Notify,
-    launcher: Mutex<Option<std::process::Child>>,
-    // Set when the user manually hides the window; recovery never re-shows it.
-    user_hidden: AtomicBool,
+    /// Single owner of record for the desktop-owned gateway child. The child is
+    /// published here synchronously right after spawn so quit racing startup
+    /// can always find and clean it.
+    launcher: Arc<Mutex<Option<Child>>>,
     // Signature of the last tray menu actually applied, to avoid rebuilding
     // an identical NSMenu every 30s poll.
     applied: Mutex<Option<u64>>,
@@ -54,10 +72,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub fn open_window(app: &tauri::AppHandle) {
-    if let Some(controller) = app.try_state::<Arc<Controller>>() {
-        controller.user_hidden.store(false, Ordering::SeqCst);
+/// Quit wording reflects ownership: only an owned gateway is stopped on exit.
+fn quit_label(owned: bool) -> &'static str {
+    if owned {
+        "Quit Desktop (stops the gateway it started)"
+    } else {
+        "Quit Desktop (gateway stays running)"
     }
+}
+
+pub fn open_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
@@ -106,6 +130,7 @@ fn view_hash(view: &View) -> u64 {
     view.status.hash(&mut hasher);
     view.online.hash(&mut hasher);
     view.switching.hash(&mut hasher);
+    view.owned.hash(&mut hasher);
     match &view.snapshot {
         Some(snapshot) => {
             1u8.hash(&mut hasher);
@@ -179,7 +204,7 @@ fn menu(app: &tauri::AppHandle, view: &View) -> tauri::Result<Menu<tauri::Wry>> 
             menu.append(&MenuItem::with_id(
                 app,
                 "quota-more",
-                "More quota details in Web UI",
+                "More quota details in Control Center",
                 false,
                 None::<&str>,
             )?)?;
@@ -235,7 +260,7 @@ fn menu(app: &tauri::AppHandle, view: &View) -> tauri::Result<Menu<tauri::Wry>> 
                 submenu.append(&MenuItem::with_id(
                     app,
                     format!("more-{index}"),
-                    "More in Web UI…",
+                    "More in Control Center…",
                     true,
                     None::<&str>,
                 )?)?;
@@ -246,7 +271,7 @@ fn menu(app: &tauri::AppHandle, view: &View) -> tauri::Result<Menu<tauri::Wry>> 
             menu.append(&MenuItem::with_id(
                 app,
                 "more-all",
-                "More in Web UI…",
+                "More in Control Center…",
                 true,
                 None::<&str>,
             )?)?;
@@ -263,14 +288,14 @@ fn menu(app: &tauri::AppHandle, view: &View) -> tauri::Result<Menu<tauri::Wry>> 
     menu.append(&MenuItem::with_id(
         app,
         "open-ui",
-        "Open CCR UI",
+        "Open Control Center",
         true,
         None::<&str>,
     )?)?;
     menu.append(&MenuItem::with_id(
         app,
         "quit",
-        "Quit Desktop (gateway stays running)",
+        quit_label(view.owned),
         true,
         None::<&str>,
     )?)?;
@@ -283,6 +308,7 @@ pub fn install_offline(app: &tauri::AppHandle, error: String) -> Result<(), Stri
         status: format!("Configuration error: {error}"),
         online: false,
         switching: false,
+        owned: false,
         revision: 0,
     };
     let initial = menu(app, &view).map_err(|e| e.to_string())?;
@@ -318,26 +344,32 @@ impl Controller {
         app: &tauri::AppHandle,
         settings: ConnectionSettings,
         client: AdminClient,
+        bundle: Option<RuntimeBundle>,
     ) -> Result<Arc<Self>, String> {
         let controller = Arc::new(Self {
             app: app.clone(),
             settings,
             client,
+            bundle,
             operation: AsyncMutex::new(()),
             view: Mutex::new(View {
                 snapshot: None,
                 status: "Connecting to CCR…".into(),
                 online: false,
                 switching: false,
+                owned: false,
                 revision: 0,
             }),
             epoch: AtomicU64::new(0),
             switching: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
+            stopped: Arc::new(AtomicBool::new(false)),
+            starting: AtomicBool::new(false),
+            reached_ready: AtomicBool::new(false),
+            startup_settled: AtomicBool::new(true),
+            service_error: Mutex::new(None),
             loaded: AtomicBool::new(false),
             wake: Notify::new(),
-            launcher: Mutex::new(None),
-            user_hidden: AtomicBool::new(false),
+            launcher: Arc::new(Mutex::new(None)),
             applied: Mutex::new(None),
         });
         let initial = menu(app, &lock(&controller.view)).map_err(|e| e.to_string())?;
@@ -390,9 +422,16 @@ impl Controller {
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
+        // Ownership is part of the view (quit wording); derived outside the view
+        // lock so no second mutex is held while rendering.
+        let owned = matches!(
+            self.owned_gateway_state(),
+            OwnedGateway::Live | OwnedGateway::Starting
+        );
         let view = {
             let mut view = lock(&self.view);
             change(&mut view);
+            view.owned = owned;
             view.revision += 1;
             view.clone()
         };
@@ -443,48 +482,51 @@ impl Controller {
         });
     }
 
+    /// The main window is the local control center (quota.html); showing it is
+    /// purely local — the desktop never navigates to a remote Web UI.
     fn show_ready(self: &Arc<Self>) {
         if self.loaded.swap(true, Ordering::SeqCst) {
             return;
         }
-        let url = self.settings.ui_url();
         let app = self.app.clone();
-        let controller = Arc::clone(self);
-        let _ = self.app.run_on_main_thread(move || {
-            if let Some(window) = app.get_webview_window("main") {
-                if let Ok(url) = url.parse() {
-                    let _ = window.navigate(url);
-                }
-                // Navigate to the live UI, but never steal the window back once the
-                // user has manually hidden it.
-                if !controller.user_hidden.load(Ordering::SeqCst) {
-                    let _ = window.show();
-                }
-            }
-        });
+        let _ = self.app.run_on_main_thread(move || open_window(&app));
     }
 
-    pub fn mark_user_hidden(&self) {
-        self.user_hidden.store(true, Ordering::SeqCst);
+    /// Liveness of the desktop-owned child, derived from the shared launcher
+    /// slot. A reaped exited child keeps the Exited observation for the caller.
+    fn owned_gateway_state(&self) -> OwnedGateway {
+        let mut slot = lock(&self.launcher);
+        match slot.as_mut() {
+            None => OwnedGateway::None,
+            Some(child) => match child.try_wait() {
+                Ok(Some(_)) => {
+                    *slot = None;
+                    OwnedGateway::Exited
+                }
+                Ok(None) => {
+                    if self.reached_ready.load(Ordering::SeqCst) {
+                        OwnedGateway::Live
+                    } else {
+                        OwnedGateway::Starting
+                    }
+                }
+                Err(_) => OwnedGateway::None,
+            },
+        }
     }
 
     pub fn start(self: &Arc<Self>) {
         let controller = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            {
-                let _operation = controller.operation.lock().await;
-                let startup =
-                    lifecycle::connect_or_launch(&controller.client, &controller.settings).await;
-                *lock(&controller.launcher) = startup.launcher;
-                controller.update(|v| {
-                    v.status = startup.message;
-                });
-                if startup.ready {
-                    controller.show_ready();
-                } else {
-                    let app = controller.app.clone();
-                    let _ = controller.app.run_on_main_thread(move || open_window(&app));
-                }
+            let startup = controller.startup_once().await;
+            controller.update(|v| {
+                v.status = startup.message.clone();
+            });
+            if startup.ready {
+                controller.show_ready();
+            } else {
+                let app = controller.app.clone();
+                let _ = controller.app.run_on_main_thread(move || open_window(&app));
             }
             controller.refresh().await;
             loop {
@@ -501,6 +543,44 @@ impl Controller {
         });
     }
 
+    /// One start attempt. Holds the operation lock so a start and a routing
+    /// switch never interleave; stop/shutdown deliberately does not take this
+    /// lock so quitting can never be blocked by a startup in flight.
+    async fn startup_once(self: &Arc<Self>) -> lifecycle::Startup {
+        let _operation = self.operation.lock().await;
+        self.starting.store(true, Ordering::SeqCst);
+        self.startup_settled.store(false, Ordering::SeqCst);
+        let Some(bundle) = self.bundle.clone() else {
+            self.starting.store(false, Ordering::SeqCst);
+            self.startup_settled.store(true, Ordering::SeqCst);
+            *lock(&self.service_error) = Some(
+                "Desktop runtime bundle is missing. Run: node apps/desktop/scripts/prepare-runtime.mjs"
+                    .into(),
+            );
+            return lifecycle::Startup {
+                ready: false,
+                message: "Desktop runtime bundle is missing".into(),
+            };
+        };
+        let startup = lifecycle::connect_or_launch(
+            &self.client,
+            &self.settings,
+            Arc::clone(&self.stopped),
+            Arc::clone(&self.launcher),
+            bundle,
+        )
+        .await;
+        self.starting.store(false, Ordering::SeqCst);
+        self.startup_settled.store(true, Ordering::SeqCst);
+        if startup.ready {
+            self.reached_ready.store(true, Ordering::SeqCst);
+            *lock(&self.service_error) = None;
+        } else if !self.stopped.load(Ordering::SeqCst) {
+            *lock(&self.service_error) = Some(startup.message.clone());
+        }
+        startup
+    }
+
     fn reap(&self) {
         let mut child = lock(&self.launcher);
         if let Some(launcher) = child.as_mut() {
@@ -510,11 +590,96 @@ impl Controller {
         }
     }
 
+    /// Quit/exit path. Stops only the desktop-owned gateway: SIGTERM, bounded
+    /// wait, then kill (lifecycle::stop_owned_gateway). An external gateway —
+    /// including an attach to a launchd service — is never touched. Safe to
+    /// call multiple times; synchronous so RunEvent::Exit can rely on it.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.wake.notify_one();
-        // Only reap an exited launcher. The detached/shared gateway survives.
-        self.reap();
+        let deadline = std::time::Instant::now() + SHUTDOWN_RACE_WAIT;
+        loop {
+            let child = lock(&self.launcher).take();
+            if let Some(mut child) = child {
+                lifecycle::stop_owned_gateway(&mut child);
+                return;
+            }
+            // A startup in flight publishes the child synchronously at spawn;
+            // wait until the attempt settles so the race cannot orphan it.
+            if self.startup_settled.load(Ordering::SeqCst) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("Gateway startup did not settle during shutdown; giving up stop");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// Service state for the control center header. No lock is held across the
+    /// health probe, so stop/shutdown can never be blocked by a snapshot.
+    pub async fn service_snapshot(self: &Arc<Self>) -> ServiceState {
+        let owned = self.owned_gateway_state();
+        let error = lock(&self.service_error).clone();
+        lifecycle::service_state_probe(&self.client, owned, error).await
+    }
+
+    /// Explicit start/stop from the control center. Stop only ever touches the
+    /// owned child; external gateways are rejected with a fixed safe message.
+    pub async fn service_action(
+        self: &Arc<Self>,
+        action: ServiceAction,
+    ) -> Result<ServiceState, String> {
+        match action {
+            ServiceAction::Stop => self.action_stop().await,
+            ServiceAction::Start => self.action_start().await,
+        }
+    }
+
+    async fn action_stop(self: &Arc<Self>) -> Result<ServiceState, String> {
+        let taken = lock(&self.launcher).take();
+        let Some(mut child) = taken else {
+            // Fixed safe message; also covers attach-only and already-reaped states.
+            return Err("Only a gateway started by this desktop can be stopped here. External services must be stopped by their own owner.".into());
+        };
+        let stopped_cleanly =
+            tauri::async_runtime::spawn_blocking(move || lifecycle::stop_owned_gateway(&mut child))
+                .await
+                .map_err(|e| e.to_string())?;
+        self.update(|v| {
+            v.status = if stopped_cleanly {
+                "Gateway stopped".into()
+            } else {
+                "Gateway stop did not complete cleanly".into()
+            };
+        });
+        *lock(&self.service_error) = None;
+        self.refresh().await;
+        Ok(self.service_snapshot().await)
+    }
+
+    async fn action_start(self: &Arc<Self>) -> Result<ServiceState, String> {
+        match self.owned_gateway_state() {
+            OwnedGateway::Live | OwnedGateway::Starting => {
+                return Ok(self.service_snapshot().await)
+            }
+            _ => {}
+        }
+        // Explicit start never claims a gateway that is already running without
+        // this desktop; spawning a second one would only lose the port race.
+        if self.client.health().await {
+            return Err("A gateway is already running but was not started by this desktop. Stop it with its own tooling first.".into());
+        }
+        *lock(&self.service_error) = None;
+        let startup = self.startup_once().await;
+        self.update(|v| {
+            v.status = startup.message.clone();
+        });
+        if startup.ready {
+            self.show_ready();
+        }
+        Ok(self.service_snapshot().await)
     }
 
     async fn refresh(self: &Arc<Self>) {
@@ -542,6 +707,8 @@ impl Controller {
         }
         match snapshot {
             Ok(snapshot) => {
+                self.reached_ready.store(true, Ordering::SeqCst);
+                *lock(&self.service_error) = None;
                 self.update(|v| {
                     if self.epoch.load(Ordering::SeqCst) != epoch {
                         return;
@@ -607,6 +774,27 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::MANAGED_ENV;
+
+    /// Fake "gateway" child for ownership tests; no network, no config access.
+    fn fake_child(dir: &std::path::Path) -> Child {
+        let script = dir.join("sleepy.sh");
+        std::fs::write(&script, "#!/bin/sh\nwhile :; do sleep 0.5; done\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::process::Command::new(&script)
+            .arg("ignored-start")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ccr-tray-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
     #[test]
     fn payload_stays_bound_to_original_target() {
         let id = action_id("provider-汉字", "model,colon:!");
@@ -626,5 +814,63 @@ mod tests {
         let models = bounded_indices(13, MAX_MODELS, Some(12));
         assert_eq!(models.len(), 13);
         assert_eq!(bounded_indices(0, MAX_MODELS, None), Vec::<usize>::new());
+    }
+    #[test]
+    fn quit_wording_reflects_ownership() {
+        assert!(quit_label(true).contains("stops the gateway it started"));
+        assert!(quit_label(false).contains("gateway stays running"));
+    }
+    #[test]
+    fn shutdown_disposes_only_the_owned_child_in_the_slot() {
+        let dir = temp_dir("shutdown");
+        let slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(fake_child(&dir))));
+        let stopped = AtomicBool::new(true);
+        let settled = AtomicBool::new(true);
+        // Mirrors Controller::stop's dispose step without a Tauri app handle.
+        stopped.store(true, Ordering::SeqCst);
+        let child = lock(&slot).take();
+        if let Some(mut child) = child {
+            assert!(lifecycle::stop_owned_gateway(&mut child));
+        }
+        assert!(settled.load(Ordering::SeqCst));
+        assert!(lock(&slot).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn owned_state_classifies_live_starting_and_exited() {
+        let dir = temp_dir("states");
+        let controller_state = |reached_ready: bool, exited_script: bool| {
+            let child = fake_child(&dir);
+            let mut slot: Mutex<Option<Child>> = Mutex::new(Some(child));
+            if exited_script {
+                if let Some(c) = slot.get_mut().unwrap() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+            let owned = match slot.get_mut().unwrap().as_mut().unwrap().try_wait() {
+                Ok(Some(_)) => {
+                    *slot.get_mut().unwrap() = None;
+                    OwnedGateway::Exited
+                }
+                Ok(None) => {
+                    if reached_ready {
+                        OwnedGateway::Live
+                    } else {
+                        OwnedGateway::Starting
+                    }
+                }
+                Err(_) => OwnedGateway::None,
+            };
+            owned
+        };
+        assert_eq!(controller_state(true, false), OwnedGateway::Live);
+        assert_eq!(controller_state(false, false), OwnedGateway::Starting);
+        assert_eq!(controller_state(false, true), OwnedGateway::Exited);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn managed_env_marker_name_is_stable() {
+        assert_eq!(MANAGED_ENV, "CCR_DESKTOP_MANAGED");
     }
 }
