@@ -1,4 +1,5 @@
 mod api;
+mod control;
 mod lifecycle;
 mod popup;
 mod quota;
@@ -20,7 +21,13 @@ pub fn run() {
             popup::quota_snapshot,
             popup::quota_hide,
             popup::quota_open_ui,
-            popup::quota_quit
+            popup::quota_quit,
+            control::routing_snapshot,
+            control::routing_save,
+            control::routing_flags,
+            control::usage_snapshot,
+            control::clients_snapshot,
+            control::clients_update
         ])
         .setup(|app| {
             popup::install(app.handle())?;
@@ -35,12 +42,14 @@ pub fn run() {
             }) {
                 Ok((settings, client)) => {
                     app.manage(quota::QuotaService::new(Some(client.clone())));
+                    app.manage(control::ControlService::new(Some(client.clone())));
                     let controller = tray::Controller::install(app.handle(), settings, client)?;
                     app.manage(Arc::clone(&controller));
                     controller.start();
                 }
                 Err(e) => {
                     app.manage(quota::QuotaService::new(None));
+                    app.manage(control::ControlService::new(None));
                     eprintln!("Invalid CCR connection settings: {e}");
                     tray::install_offline(app.handle(), e.clone())?;
                     if let Some(window) = app.get_webview_window("main") {

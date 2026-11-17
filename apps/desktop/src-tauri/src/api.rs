@@ -2,7 +2,8 @@
 use crate::settings::ConnectionSettings;
 use reqwest::{header::HeaderValue, redirect::Policy, Client, Method};
 use serde_json::{json, Value};
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::sync::{Mutex, MutexGuard};
 
 #[derive(Clone, Debug, PartialEq, Hash)]
 pub struct TrayProvider {
@@ -25,6 +26,7 @@ pub struct AdminClient {
     client: Client,
     base_url: String,
     api_key: Option<HeaderValue>,
+    writes: Arc<Mutex<()>>,
 }
 
 impl AdminClient {
@@ -58,7 +60,12 @@ impl AdminClient {
             client,
             base_url: settings.base_url,
             api_key,
+            writes: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub(crate) async fn write_guard(&self) -> MutexGuard<'_, ()> {
+        self.writes.lock().await
     }
 
     async fn request(
@@ -236,6 +243,7 @@ impl AdminClient {
         if provider.trim().is_empty() || provider.contains(',') || model.trim().is_empty() {
             return Err("Invalid default model selection".into());
         }
+        let _write = self.write_guard().await;
         // Never use a snapshot/cached config to write credentials or resurrect removed models.
         let mut config = self.config().await?;
         if !providers(&config)
@@ -552,6 +560,20 @@ mod tests {
         net::TcpStream,
         thread,
     };
+
+    #[tokio::test]
+    async fn cloned_clients_share_the_write_gate() {
+        let client = AdminClient::new(ConnectionSettings {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: None,
+        })
+        .unwrap();
+        let sibling = client.clone();
+        let held = client.write_guard().await;
+        assert!(sibling.writes.try_lock().is_err());
+        drop(held);
+        assert!(sibling.writes.try_lock().is_ok());
+    }
 
     #[tokio::test]
     async fn mock_finish_keeps_reactor_running() {

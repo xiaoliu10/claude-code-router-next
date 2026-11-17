@@ -4,17 +4,16 @@
 //! Projections are narrow and typed: raw configuration, credentials, and
 //! upstream error bodies never cross IPC. Writes fetch a fresh config, apply
 //! validated mutations, post, and verify by readback — a stale UI draft can
-//! never blind-overwrite newer state, and desktop writes are serialized.
+//! rejects stale snapshots; desktop writers share one lock. External full-config
+//! writers still require server-side concurrency support for atomic protection.
 
 use crate::api::AdminClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
-use std::sync::Arc;
 use tauri::WebviewWindow;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
 
 /// Families accepted in `Router.families` (shared MODEL_FAMILIES).
 const FAMILIES: [&str; 3] = ["opus", "sonnet", "haiku"];
@@ -75,11 +74,12 @@ pub struct RoutingProvider {
 }
 
 #[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutingSnapshot {
     pub providers: Vec<RoutingProvider>,
     pub routes: Vec<RoutingRoute>,
-    pub familyRouting: bool,
-    pub fallbackEnabled: bool,
+    pub family_routing: bool,
+    pub fallback_enabled: bool,
     /// Non-reversible change-detection digest of the raw config. Not decodable
     /// back into configuration; used only for stale-draft rejection.
     pub revision: String,
@@ -146,16 +146,11 @@ pub struct RoutingChange {
 
 pub struct ControlService {
     client: Option<AdminClient>,
-    /// Serializes all desktop-initiated config writes; reads stay unguarded.
-    writes: Arc<Mutex<()>>,
 }
 
 impl ControlService {
     pub fn new(client: Option<AdminClient>) -> Self {
-        Self {
-            client,
-            writes: Arc::new(Mutex::new(())),
-        }
+        Self { client }
     }
 
     fn client(&self) -> Result<&AdminClient, String> {
@@ -167,9 +162,12 @@ impl ControlService {
         Ok(routing_snapshot_from(&config))
     }
 
-    pub(crate) async fn routing_save(&self, change: RoutingChange) -> Result<RoutingSnapshot, String> {
-        let _write = self.writes.lock().await;
+    pub(crate) async fn routing_save(
+        &self,
+        change: RoutingChange,
+    ) -> Result<RoutingSnapshot, String> {
         let client = self.client()?;
+        let _write = client.write_guard().await;
         // Always mutate the freshest config; the UI draft's revision must match
         // it or the whole write is rejected before touching the gateway.
         let mut config = client.config().await?;
@@ -190,31 +188,27 @@ impl ControlService {
         family_routing: bool,
         fallback_enabled: bool,
     ) -> Result<RoutingSnapshot, String> {
-        let _write = self.writes.lock().await;
         let client = self.client()?;
+        let _write = client.write_guard().await;
         let mut config = client.config().await?;
         if revision != revision_of(&config) {
             return Err(ERR_STALE.into());
         }
         let router = router_mut(&mut config)?;
         router.insert("enableFamilyRouting".into(), Value::Bool(family_routing));
-        // Fallbacks have no dedicated on-disk switch in the gateway: the map's
-        // presence is the switch. Disabling removes the root map (same
-        // semantics as the settings UI); enabling without entries is a
-        // validated no-op — entries are created by routing_save only.
-        let mut expected = vec![ExpectedMutation {
-            pointer: "/Router/enableFamilyRouting".into(),
-            value: Some(Value::Bool(family_routing)),
-        }];
-        if !fallback_enabled {
-            if let Some(root) = config.as_object_mut() {
-                root.remove("fallback");
-            }
-            expected.push(ExpectedMutation {
-                pointer: "/fallback".into(),
-                value: None,
-            });
-        }
+        // The engine gates both family and global fallbacks with this flag.
+        // Toggling it must preserve the configured fallback lists and order.
+        router.insert("enableFallback".into(), Value::Bool(fallback_enabled));
+        let expected = [
+            ExpectedMutation {
+                pointer: "/Router/enableFamilyRouting".into(),
+                value: Some(Value::Bool(family_routing)),
+            },
+            ExpectedMutation {
+                pointer: "/Router/enableFallback".into(),
+                value: Some(Value::Bool(fallback_enabled)),
+            },
+        ];
         let verified = client.post_config_and_readback(&config).await?;
         if !expected.iter().all(|check| check.matches(&verified)) {
             return Err(ERR_SAVE_NOT_CONFIRMED.into());
@@ -254,12 +248,16 @@ impl ControlService {
         }
     }
 
-    pub(crate) async fn clients_update(&self, id: &str, action: &str) -> Result<ClientSnapshot, String> {
+    pub(crate) async fn clients_update(
+        &self,
+        id: &str,
+        action: &str,
+    ) -> Result<ClientSnapshot, String> {
         if !CLIENT_IDS.contains(&id) || !CLIENT_ACTIONS.contains(&action) {
             return Err(ERR_CLIENT_INPUT.into());
         }
-        let _write = self.writes.lock().await;
         let client = self.client()?;
+        let _write = client.write_guard().await;
         // The mutation response embeds the raw config; it is parsed but never
         // surfaced — only projected statuses and the boolean outcomes survive.
         let path = format!("/api/clients/{id}/{action}");
@@ -273,7 +271,10 @@ impl ControlService {
             .unwrap_or(false);
         // Top-level success includes project takeover sync: the client itself
         // may have updated fine while the sync failed. Keep that distinction.
-        let top_success = mutation.get("success").and_then(Value::as_bool).unwrap_or(false);
+        let top_success = mutation
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (clients, refresh_ok) = match client.get_json("/api/clients").await {
             Ok(response) => (project_clients(&response).clients, true),
             // Fall back to the statuses embedded in the mutation response.
@@ -302,7 +303,7 @@ impl ControlService {
 // ============================== Tauri commands ==============================
 
 #[tauri::command]
-pub async fn control_routing_snapshot(
+pub async fn routing_snapshot(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
 ) -> Result<RoutingSnapshot, String> {
@@ -311,7 +312,7 @@ pub async fn control_routing_snapshot(
 }
 
 #[tauri::command]
-pub async fn control_routing_save(
+pub async fn routing_save(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
     change: RoutingChange,
@@ -321,7 +322,7 @@ pub async fn control_routing_save(
 }
 
 #[tauri::command]
-pub async fn control_routing_flags(
+pub async fn routing_flags(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
     revision: String,
@@ -335,7 +336,7 @@ pub async fn control_routing_flags(
 }
 
 #[tauri::command]
-pub async fn control_usage_snapshot(
+pub async fn usage_snapshot(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
     period: String,
@@ -345,7 +346,7 @@ pub async fn control_usage_snapshot(
 }
 
 #[tauri::command]
-pub async fn control_clients_snapshot(
+pub async fn clients_snapshot(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
 ) -> Result<ClientSnapshot, String> {
@@ -354,7 +355,7 @@ pub async fn control_clients_snapshot(
 }
 
 #[tauri::command]
-pub async fn control_clients_update(
+pub async fn clients_update(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
     id: String,
@@ -428,23 +429,18 @@ fn routing_snapshot_from(config: &Value) -> RoutingSnapshot {
             routes.push(RoutingRoute {
                 scope: "models".into(),
                 field: alias.clone(),
-                target: target.as_str().filter(|t| !t.trim().is_empty()).map(str::to_owned),
+                target: target
+                    .as_str()
+                    .filter(|t| !t.trim().is_empty())
+                    .map(str::to_owned),
                 fallback: Vec::new(),
             });
         }
     }
-    // The root fallback map's presence with at least one non-empty entry is
-    // the gateway's effective fallback switch.
-    let fallback_enabled = config
-        .get("fallback")
-        .and_then(Value::as_object)
-        .is_some_and(|fallback| {
-            fallback.values().any(|value| {
-                value
-                    .as_array()
-                    .is_some_and(|list| list.iter().any(|entry| !entry.as_str().unwrap_or("").trim().is_empty()))
-            })
-        });
+    let fallback_enabled = router
+        .and_then(|router| router.get("enableFallback"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     RoutingSnapshot {
         providers: crate::api::providers(config)
             .into_iter()
@@ -454,11 +450,11 @@ fn routing_snapshot_from(config: &Value) -> RoutingSnapshot {
             })
             .collect(),
         routes,
-        familyRouting: router
+        family_routing: router
             .and_then(|router| router.get("enableFamilyRouting"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        fallbackEnabled: fallback_enabled,
+        fallback_enabled,
         revision: revision_of(config),
     }
 }
@@ -533,10 +529,32 @@ fn valid_alias(alias: &str) -> bool {
     !alias.is_empty()
         && alias.len() <= MAX_ALIAS_LENGTH
         && !alias.contains(',')
-        && alias.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        && alias
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
 }
 
-fn apply_change(config: &mut Value, change: &RoutingChange) -> Result<Vec<ExpectedMutation>, String> {
+fn clear_fallback_field(parent: &mut Map<String, Value>, field: &str) -> Result<(), String> {
+    if let Some(value) = parent.get_mut("fallback") {
+        let map = value
+            .as_object_mut()
+            .ok_or_else(|| ERR_SAVE_NOT_CONFIRMED.to_string())?;
+        map.remove(field);
+        if map.is_empty() {
+            parent.remove("fallback");
+        }
+    }
+    Ok(())
+}
+
+fn pointer_part(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn apply_change(
+    config: &mut Value,
+    change: &RoutingChange,
+) -> Result<Vec<ExpectedMutation>, String> {
     let field = change.field.trim();
     let target = normalize_target(&change.target);
     let fallback = normalized_fallback(change);
@@ -574,7 +592,7 @@ fn apply_change(config: &mut Value, change: &RoutingChange) -> Result<Vec<Expect
             if let Some(entries) = &fallback {
                 let root = config.as_object_mut().expect("validated config object");
                 if entries.is_empty() {
-                    root.remove("fallback");
+                    clear_fallback_field(root, field)?;
                 } else {
                     root.entry("fallback")
                         .or_insert_with(|| json!({}))
@@ -591,7 +609,9 @@ fn apply_change(config: &mut Value, change: &RoutingChange) -> Result<Vec<Expect
                 expected.push(ExpectedMutation {
                     pointer: format!("/fallback/{field}"),
                     // Empty list clears the scenario entry entirely.
-                    value: fallback.filter(|entries| !entries.is_empty()).map(|entries| json!(entries)),
+                    value: fallback
+                        .filter(|entries| !entries.is_empty())
+                        .map(|entries| json!(entries)),
                 });
             }
             Ok(expected)
@@ -621,7 +641,7 @@ fn apply_change(config: &mut Value, change: &RoutingChange) -> Result<Vec<Expect
                 }
             }
             Ok(vec![ExpectedMutation {
-                pointer: format!("/Router/models/{field}"),
+                pointer: format!("/Router/models/{}", pointer_part(field)),
                 value: target.map(Value::String),
             }])
         }
@@ -652,7 +672,7 @@ fn apply_change(config: &mut Value, change: &RoutingChange) -> Result<Vec<Expect
             }
             if let Some(entries) = &fallback {
                 if entries.is_empty() {
-                    family_config.remove("fallback");
+                    clear_fallback_field(family_config, field)?;
                 } else {
                     family_config
                         .entry("fallback")
@@ -669,7 +689,9 @@ fn apply_change(config: &mut Value, change: &RoutingChange) -> Result<Vec<Expect
             if fallback.is_some() {
                 expected.push(ExpectedMutation {
                     pointer: format!("/Router/families/{family}/fallback/{field}"),
-                    value: fallback.filter(|entries| !entries.is_empty()).map(|entries| json!(entries)),
+                    value: fallback
+                        .filter(|entries| !entries.is_empty())
+                        .map(|entries| json!(entries)),
                 });
             }
             Ok(expected)
@@ -694,10 +716,8 @@ fn local_utc_offset() -> time::UtcOffset {
         return time::UtcOffset::UTC;
     }
     let sign = if bytes[0] == b'-' { -1 } else { 1 };
-    let (Ok(hours), Ok(minutes)) = (
-        trimmed[1..3].parse::<i8>(),
-        trimmed[3..5].parse::<i8>(),
-    ) else {
+    let (Ok(hours), Ok(minutes)) = (trimmed[1..3].parse::<i8>(), trimmed[3..5].parse::<i8>())
+    else {
         return time::UtcOffset::UTC;
     };
     // Real offsets stay within ±14h; anything else is a malformed probe.
@@ -815,16 +835,25 @@ fn project_clients(response: &Value) -> ClientSnapshot {
             let Some(id) = entry
                 .get("id")
                 .and_then(Value::as_str)
-                .filter(|id| CLIENT_IDS.contains(&id))
+                .filter(|id| CLIENT_IDS.contains(id))
             else {
                 continue;
             };
             clients.push(ClientView {
                 id: id.into(),
                 name: projected_text(entry.get("name")).unwrap_or_else(|| id.to_string()),
-                enabled: entry.get("enabled").and_then(Value::as_bool).unwrap_or(false),
-                managed: entry.get("managed").and_then(Value::as_bool).unwrap_or(false),
-                exists: entry.get("exists").and_then(Value::as_bool).unwrap_or(false),
+                enabled: entry
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                managed: entry
+                    .get("managed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                exists: entry
+                    .get("exists")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 active_model: projected_text(entry.get("activeModel")),
                 model_alias: projected_text(entry.get("modelAlias")),
             });
@@ -884,19 +913,28 @@ mod tests {
         let snapshot = routing_snapshot_from(&config());
         assert_eq!(snapshot.providers.len(), 1);
         assert_eq!(snapshot.providers[0].name, "alpha");
-        assert!(snapshot.familyRouting);
+        assert!(snapshot.family_routing);
         // Disabled providers stay valid as fallback owners server-side, so the
         // list is projected verbatim even though beta is filtered elsewhere.
         assert_eq!(
             route(&snapshot, "global", "default").fallback,
             ["alpha,two", "beta,three"]
         );
-        assert_eq!(route(&snapshot, "global", "default").target.as_deref(), Some("alpha,one"));
+        assert_eq!(
+            route(&snapshot, "global", "default").target.as_deref(),
+            Some("alpha,one")
+        );
         assert_eq!(route(&snapshot, "global", "webSearch").target, None);
-        assert_eq!(route(&snapshot, "opus", "think").target.as_deref(), Some("alpha,two"));
+        assert_eq!(
+            route(&snapshot, "opus", "think").target.as_deref(),
+            Some("alpha,two")
+        );
         assert_eq!(route(&snapshot, "opus", "think").fallback, ["alpha,one"]);
         assert_eq!(route(&snapshot, "sonnet", "default").target, None);
-        assert_eq!(route(&snapshot, "models", "fast").target.as_deref(), Some("alpha,two"));
+        assert_eq!(
+            route(&snapshot, "models", "fast").target.as_deref(),
+            Some("alpha,two")
+        );
         assert!(snapshot.revision.starts_with("rev-"));
         assert_eq!(snapshot.revision, revision_of(&config()));
     }
@@ -908,6 +946,69 @@ mod tests {
         for secret in ["$SECRET", "api_key", "$UPSTREAM", "$ADMIN", "unknown"] {
             assert!(!rendered.contains(secret), "leaked {secret}");
         }
+    }
+
+    #[test]
+    fn clearing_one_fallback_preserves_other_scenarios() {
+        for scope in ["global", "opus"] {
+            let mut cfg = config();
+            let base = if scope == "global" {
+                "/fallback"
+            } else {
+                "/Router/families/opus/fallback"
+            };
+            let map = cfg.pointer_mut(base).unwrap().as_object_mut().unwrap();
+            map.insert("image".into(), json!(["alpha,one"]));
+            map.insert("think".into(), json!(["alpha,two"]));
+            let expected = apply_change(
+                &mut cfg,
+                &RoutingChange {
+                    revision: String::new(),
+                    scope: scope.into(),
+                    field: "think".into(),
+                    target: None,
+                    fallback: Some(vec![]),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                cfg.pointer(&format!("{base}/image")),
+                Some(&json!(["alpha,one"]))
+            );
+            assert!(cfg.pointer(&format!("{base}/think")).is_none());
+            assert!(expected.iter().all(|check| check.matches(&cfg)));
+        }
+    }
+
+    #[test]
+    fn aliases_with_pointer_characters_verify_the_actual_key() {
+        let mut cfg = config();
+        let checks = apply_change(
+            &mut cfg,
+            &RoutingChange {
+                revision: String::new(),
+                scope: "models".into(),
+                field: "custom/fast~v2".into(),
+                target: Some("alpha,one".into()),
+                fallback: None,
+            },
+        )
+        .unwrap();
+        assert!(checks.iter().all(|check| check.matches(&cfg)));
+        assert_eq!(
+            cfg["Router"]["models"]["custom/fast~v2"],
+            json!("alpha,one")
+        );
+    }
+
+    #[test]
+    fn fallback_switch_follows_engine_flag_not_list_presence() {
+        let mut cfg = config();
+        assert!(!routing_snapshot_from(&cfg).fallback_enabled);
+        cfg["Router"]["enableFallback"] = json!(true);
+        assert!(routing_snapshot_from(&cfg).fallback_enabled);
+        cfg.as_object_mut().unwrap().remove("fallback");
+        assert!(routing_snapshot_from(&cfg).fallback_enabled);
     }
 
     #[test]
@@ -977,7 +1078,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(route(&snapshot, "opus", "webSearch").fallback, ["alpha,one"]);
+        assert_eq!(
+            route(&snapshot, "opus", "webSearch").fallback,
+            ["alpha,one"]
+        );
         assert_eq!(snapshot.revision, revision_of(&expected));
         assert_eq!(mock.finish().await.len(), 3);
     }
@@ -1084,9 +1188,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(route(&snapshot, "opus", "think").target, None);
-        assert_eq!(route(&snapshot, "opus", "think").fallback, Vec::<String>::new());
+        assert_eq!(
+            route(&snapshot, "opus", "think").fallback,
+            Vec::<String>::new()
+        );
         // Unrelated scopes (the models alias) survive untouched.
-        assert_eq!(route(&snapshot, "models", "fast").target.as_deref(), Some("alpha,two"));
+        assert_eq!(
+            route(&snapshot, "models", "fast").target.as_deref(),
+            Some("alpha,two")
+        );
         assert_eq!(snapshot.revision, revision_of(&after_post));
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 3);
@@ -1097,13 +1207,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flags_toggle_family_routing_and_remove_fallback_map() {
+    async fn flags_toggle_engine_switches_without_removing_fallback_map() {
         let original = config();
         let mut expected = original.clone();
         expected["Router"]["enableFamilyRouting"] = json!(false);
-        if let Some(root) = expected.as_object_mut() {
-            root.remove("fallback");
-        }
+        expected["Router"]["enableFallback"] = json!(false);
         let mock = Mock::new(vec![
             response(original.clone()),
             response(json!({ "success": true })),
@@ -1114,14 +1222,25 @@ mod tests {
             .routing_flags(revision_of(&original), false, false)
             .await
             .unwrap();
-        assert!(!snapshot.familyRouting);
-        assert!(!snapshot.fallbackEnabled);
+        assert!(!snapshot.family_routing);
+        assert!(!snapshot.fallback_enabled);
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 3);
         let posted: Value =
             serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(posted.get("fallback"), None);
-        assert_eq!(posted.pointer("/Router/enableFamilyRouting"), Some(&json!(false)));
+        assert_eq!(posted.get("fallback"), original.get("fallback"));
+        assert_eq!(
+            posted.pointer("/Router/families"),
+            original.pointer("/Router/families")
+        );
+        assert_eq!(
+            posted.pointer("/Router/enableFallback"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            posted.pointer("/Router/enableFamilyRouting"),
+            Some(&json!(false))
+        );
 
         // Stale revision: config fetched, nothing posted.
         let mock = Mock::new(vec![response(original.clone())]);
@@ -1186,7 +1305,9 @@ mod tests {
             usage_snapshot_from(&json!([]), "today").unwrap_err(),
             ERR_USAGE
         );
-        let snapshot = usage_snapshot_from(&json!({"totalRequests": "leak", "errorCount": -5}), "today").unwrap();
+        let snapshot =
+            usage_snapshot_from(&json!({"totalRequests": "leak", "errorCount": -5}), "today")
+                .unwrap();
         assert_eq!(snapshot.total_requests, 0);
         assert_eq!(snapshot.error_count, 0);
     }
@@ -1238,11 +1359,20 @@ mod tests {
         assert!(snapshot.success);
         assert!(snapshot.message.is_none());
         assert_eq!(snapshot.clients.len(), 3);
-        assert_eq!(snapshot.clients[0].active_model.as_deref(), Some("alpha,one"));
+        assert_eq!(
+            snapshot.clients[0].active_model.as_deref(),
+            Some("alpha,one")
+        );
         assert_eq!(snapshot.clients[0].model_alias.as_deref(), Some("fast"));
         assert!(!snapshot.clients[1].enabled);
         let rendered = serialized(&snapshot);
-        for secret in ["configPath", "details", "LEAK_SECRET", "$SECRET", "evilClient"] {
+        for secret in [
+            "configPath",
+            "details",
+            "LEAK_SECRET",
+            "$SECRET",
+            "evilClient",
+        ] {
             assert!(!rendered.contains(secret), "leaked {secret}");
         }
 
@@ -1338,7 +1468,10 @@ mod tests {
     async fn offline_service_reports_fixed_safe_errors() {
         let service = ControlService::new(None);
         assert_eq!(service.routing_snapshot().await.unwrap_err(), ERR_OFFLINE);
-        assert_eq!(service.usage_snapshot("today").await.unwrap_err(), ERR_OFFLINE);
+        assert_eq!(
+            service.usage_snapshot("today").await.unwrap_err(),
+            ERR_OFFLINE
+        );
         assert!(!service.clients_snapshot().await.success);
     }
 
