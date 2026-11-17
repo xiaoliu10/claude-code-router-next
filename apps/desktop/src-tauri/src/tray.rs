@@ -550,24 +550,15 @@ impl Controller {
         let _operation = self.operation.lock().await;
         self.starting.store(true, Ordering::SeqCst);
         self.startup_settled.store(false, Ordering::SeqCst);
-        let Some(bundle) = self.bundle.clone() else {
-            self.starting.store(false, Ordering::SeqCst);
-            self.startup_settled.store(true, Ordering::SeqCst);
-            *lock(&self.service_error) = Some(
-                "Desktop runtime bundle is missing. Run: node apps/desktop/scripts/prepare-runtime.mjs"
-                    .into(),
-            );
-            return lifecycle::Startup {
-                ready: false,
-                message: "Desktop runtime bundle is missing".into(),
-            };
-        };
+        // connect_or_launch attaches to a reachable gateway first; only an
+        // actual spawn requires the bundle (explicit prepare error, never an
+        // installed-CCR fallback).
         let startup = lifecycle::connect_or_launch(
             &self.client,
             &self.settings,
             Arc::clone(&self.stopped),
             Arc::clone(&self.launcher),
-            bundle,
+            self.bundle.clone(),
         )
         .await;
         self.starting.store(false, Ordering::SeqCst);

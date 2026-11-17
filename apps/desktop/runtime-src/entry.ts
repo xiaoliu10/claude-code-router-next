@@ -7,15 +7,17 @@
  * Node/npm/ccr install, and never registers the CLI's self-update/restart
  * routes. The standalone CLI keeps its own entry and behavior unchanged.
  *
- * Responsibilities beyond a plain `getServer().start()`:
- * - Client integration hook: after the server successfully binds, restore the
- *   client integrations the user previously enabled (shared logic only; never
- *   auto-enables clients the user did not select). Uses `readConfigFileRaw` so
- *   environment placeholders are never interpolated back into config.json,
- *   and `writeConfigFile` keeps its forced history snapshot.
- * - Restore hook: on SIGINT/SIGTERM the same integrations are restored before
- *   the core's own graceful close finishes, mirroring the CLI stop semantics
- *   without touching global `ccr stop`.
+ * Client integration lifecycle (mirrors the CLI start/stop semantics):
+ * - After the server successfully BINDS, restore the client integrations the
+   * user previously enabled (shared logic only; never auto-enables clients the
+   * user did not select). Uses `readConfigFileRaw` so environment placeholders
+   * are never interpolated back into config.json, and `writeConfigFile` keeps
+   * its forced history snapshot.
+ * - Restore-on-stop runs only when a bind actually succeeded, is serialized
+ *   with the start-phase apply, and does not re-run project takeover sync (the
+ *   CLI stop path only disables + writes; a sync could re-takeover projects).
+ * - Startup failure exits non-zero so the desktop reports the gateway as not
+ *   ready instead of pretending it is.
  * - Desktop-managed route masking: `/api/restart` and `/api/update/perform`
  *   answer 409 and `/api/update/check` reports the desktop-managed state so a
  *   Web UI caller cannot replace or self-update the desktop-owned process.
@@ -31,6 +33,7 @@ import {
   syncGlobalProjectTakeovers,
 } from "@wengine-ai/claude-code-router-shared";
 
+type RawConfig = Record<string, unknown>;
 type AnyServer = { app: any; start: () => Promise<void> };
 
 /** Fixed, non-sensitive messages; never echo config or credentials. */
@@ -49,61 +52,97 @@ function registerDesktopManagedRoutes(app: any): void {
   app.get("/api/update/check", async () => UPDATE_CHECK);
 }
 
-type RawConfig = Record<string, unknown>;
-
+/**
+ * Applies one client selection phase against the raw config. An empty enabled
+ * selection writes nothing. Only ids are logged on failure — never error
+ * payloads, which could carry local paths or config fragments.
+ */
 async function applyClientSelections(
-  apply: (config: RawConfig) => { config: RawConfig },
+  apply: (config: RawConfig) => {
+    results: { id: string; success: boolean }[];
+    config: RawConfig;
+  },
   action: string,
-): Promise<void> {
-  // Raw config: never write environment-interpolated values back to disk.
+  syncTakeovers: boolean,
+): Promise<boolean> {
   const config = await readConfigFileRaw();
   const result = apply(config);
-  await writeConfigFile(result.config);
-  try {
-    const sync = await syncGlobalProjectTakeovers(result.config);
-    if (sync.failed.length > 0) {
-      for (const failure of sync.failed) {
-        console.error(`desktop service: ${action} takeover sync failed (${failure.id})`);
-      }
-    }
-  } catch {
-    // Takeover sync is best-effort; the router keeps working without it.
+  if (result.results.length === 0) {
+    return false;
   }
-}
-
-async function restoreClientSelectionsOnStart(): Promise<void> {
-  await applyClientSelections(enableConfiguredClients, "enable");
-}
-
-async function restoreClientSelectionsOnStop(): Promise<void> {
-  await applyClientSelections(disableConfiguredClients, "disable");
+  await writeConfigFile(result.config);
+  const failures = result.results.filter((item) => !item.success);
+  for (const failure of failures) {
+    console.error(`desktop service: client integration ${action} failed (${failure.id})`);
+  }
+  if (syncTakeovers) {
+    try {
+      const sync = await syncGlobalProjectTakeovers(result.config);
+      for (const failed of sync.failed) {
+        console.error(`desktop service: ${action} takeover sync failed (${failed.id})`);
+      }
+    } catch {
+      // Takeover sync is best-effort; the router keeps working without it.
+    }
+  }
+  return failures.length === 0;
 }
 
 async function main(): Promise<void> {
   const server = (await getServer()) as AnyServer;
   registerDesktopManagedRoutes(server.app);
 
+  // Lifecycle state: applies are serialized through one chain so the start
+  // phase and the shutdown phase can never write config concurrently, and the
+  // shutdown phase waits for any in-flight start apply before restoring.
   let shuttingDown = false;
-  // Runs inside the core's graceful close (registered before listen, so the
-  // hook is not frozen out), restoring client integrations before exit.
+  let bindSucceeded = false;
+  let applying: Promise<void> = Promise.resolve();
+  const serializeApply = (phase: () => Promise<void>): Promise<void> => {
+    const run = applying.then(phase, phase);
+    applying = run.catch(() => {});
+    return run;
+  };
+
+  // Runs inside the core's graceful close. The bind gate guarantees a failed
+  // startup (listen error closes the app without ever binding) never disables
+  // the user's real client integrations.
   server.app.addHook("onClose", async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    try {
-      await restoreClientSelectionsOnStop();
-    } catch {
-      console.error("desktop service: client integration restore failed during shutdown");
+    if (!bindSucceeded || shuttingDown) {
+      return;
     }
+    shuttingDown = true;
+    await serializeApply(async () => {
+      try {
+        await applyClientSelections(disableConfiguredClients, "disable", false);
+      } catch {
+        console.error("desktop service: client integration restore failed during shutdown");
+      }
+    });
   });
 
   await server.start();
-  // Only after a successful bind may the desktop touch client integrations.
-  // A failed startup exits non-zero without writing any client config.
-  try {
-    await restoreClientSelectionsOnStart();
-  } catch {
-    console.error("desktop service: client integration restore on start failed");
+  bindSucceeded = true;
+  if (shuttingDown) {
+    // Shutdown began while binding; skip the start-phase apply entirely.
+    return;
   }
+  await serializeApply(async () => {
+    try {
+      const applied = await applyClientSelections(
+        enableConfiguredClients,
+        "enable",
+        true,
+      );
+      if (applied) {
+        console.log("desktop service: enabled client integrations restored");
+      }
+    } catch {
+      // The router is already serving; a failed apply must not kill it, but it
+      // must also never be reported as a success.
+      console.error("desktop service: client integration restore on start failed");
+    }
+  });
 }
 
 main().catch((error: unknown) => {

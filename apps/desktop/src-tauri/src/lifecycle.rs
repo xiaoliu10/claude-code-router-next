@@ -275,11 +275,17 @@ fn config_text_matches<F: Fn(&str) -> Option<String>>(
 /// single owner of record so an exit racing startup can still clean it up.
 /// The launch injects `CCR_DESKTOP_MANAGED=1` and preserves the user's HOME,
 /// CCR_CONFIG_DIR, and inherited environment; no config is packaged or written.
+/// Spawns the bundled gateway and publishes-or-disposes the child atomically
+/// under the slot mutex: the cancel check happens while holding the lock, so a
+/// concurrent `stop()` observation is ordered against the spawn. Returns
+/// whether the child was published. A spawn that observes cancel stops its own
+/// child and publishes nothing — the shutdown path can never miss it.
 fn spawn_gateway(
     addr: SocketAddr,
     bundle: &RuntimeBundle,
     slot: &Mutex<Option<Child>>,
-) -> Result<(), String> {
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
     if !config_matches(addr) {
         return Err("Cannot safely auto-start: endpoint does not match a known local CCR config. Configure CCR first.".into());
     }
@@ -288,7 +294,7 @@ fn spawn_gateway(
         return Err("Port became occupied; not starting another gateway".into());
     }
     let path = bundled_path(bundle, &std::env::var_os("PATH").unwrap_or_default())?;
-    let child = spawn_with(&bundle.node(), &[bundle.entry().into_os_string()])
+    let mut child = spawn_with(&bundle.node(), &[bundle.entry().into_os_string()])
         .env("PATH", path)
         .env(MANAGED_ENV, "1")
         .stdin(Stdio::null())
@@ -296,9 +302,26 @@ fn spawn_gateway(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Could not launch bundled gateway: {e}"))?;
-    // Publish the owned child before any await so quit racing startup can find it.
-    store_child(slot, child);
-    Ok(())
+    let mut guard = lock(slot);
+    if cancel.load(Ordering::SeqCst) {
+        // Quit won the race; stop the just-spawned child now (graceful, then
+        // bounded kill) and publish nothing.
+        drop(guard);
+        stop_owned_gateway(&mut child);
+        return Ok(false);
+    }
+    if guard.is_none() {
+        // Publish the owned child while still holding the lock: any concurrent
+        // stop() observation is ordered against this publish.
+        *guard = Some(child);
+        Ok(true)
+    } else {
+        // A previous live child owns the slot; never drop it silently.
+        drop(guard);
+        let _ = child.kill();
+        let _ = child.wait();
+        Err("Gateway already owns the launch slot".into())
+    }
 }
 
 /// Builds the gateway command with explicit program/args so tests can drive
@@ -307,14 +330,6 @@ fn spawn_with(program: &Path, args: &[OsString]) -> Command {
     let mut command = Command::new(program);
     command.args(args);
     command
-}
-
-fn store_child(slot: &Mutex<Option<Child>>, child: Child) {
-    let mut slot = lock(slot);
-    // Replace only if empty; a previous live child must never be silently dropped.
-    if slot.is_none() {
-        *slot = Some(child);
-    }
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -370,7 +385,7 @@ pub async fn connect_or_launch(
     settings: &ConnectionSettings,
     cancel: Arc<AtomicBool>,
     launcher_slot: Arc<Mutex<Option<Child>>>,
-    bundle: RuntimeBundle,
+    bundle: Option<RuntimeBundle>,
 ) -> Startup {
     if client.health().await {
         return Startup {
@@ -404,17 +419,28 @@ pub async fn connect_or_launch(
             }
         }
     };
+    let Some(bundle) = bundle else {
+        // Attach-only paths above already ran; reaching here means a spawn is
+        // required, and the desktop has no installed-CCR fallback.
+        return Startup {
+            ready: false,
+            message: "Desktop runtime bundle is missing. Run: node apps/desktop/scripts/prepare-runtime.mjs".into(),
+        };
+    };
     let slot = Arc::clone(&launcher_slot);
+    let spawn_cancel = Arc::clone(&cancel);
     let result = tauri::async_runtime::spawn_blocking(move || match probe_port(addr) {
-        PortState::Refused => spawn_gateway(addr, &bundle, &slot),
+        PortState::Refused => spawn_gateway(addr, &bundle, &slot, &spawn_cancel),
         PortState::Occupied => {
             Err("API unavailable on an occupied port. No process was stopped or replaced.".into())
         }
         PortState::Unknown => Err("Port status unknown; not starting a gateway.".into()),
     })
     .await;
+    // Ok(false) = spawn observed a cancel and stopped its own child atomically
+    // under the slot lock; treat it like an early shutdown.
     let spawned = match result {
-        Ok(Ok(())) => true,
+        Ok(Ok(published)) => published,
         Ok(Err(message)) => {
             return Startup {
                 ready: false,
@@ -648,7 +674,7 @@ mod tests {
             &settings,
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&slot),
-            fake_bundle(),
+            Some(fake_bundle()),
         )
         .await;
         worker.join().unwrap();
@@ -667,6 +693,13 @@ mod tests {
         assert!(!startup.ready);
         assert!(lock(&slot).is_none());
         assert!(startup.message.contains("occupied port"));
+    }
+    fn store_child(slot: &Mutex<Option<Child>>, child: Child) {
+        let mut slot = lock(slot);
+        // Replace only if empty; a previous live child must never be silently dropped.
+        if slot.is_none() {
+            *slot = Some(child);
+        }
     }
     /// A bundle layout fixture for paths that never reach the spawn itself.
     fn fake_bundle() -> RuntimeBundle {
@@ -722,10 +755,45 @@ mod tests {
         let client = crate::api::AdminClient::new(settings.clone()).unwrap();
         let slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let cancel = Arc::new(AtomicBool::new(true));
-        let startup =
-            connect_or_launch(&client, &settings, cancel, Arc::clone(&slot), fake_bundle()).await;
+        let startup = connect_or_launch(
+            &client,
+            &settings,
+            cancel,
+            Arc::clone(&slot),
+            Some(fake_bundle()),
+        )
+        .await;
         worker.join().unwrap();
         assert!(!startup.ready);
+        assert!(lock(&slot).is_none());
+    }
+    #[tokio::test]
+    async fn missing_bundle_errors_only_when_spawn_is_required() {
+        // Refused port: attach fails, so the missing bundle must surface the
+        // explicit prepare error — never an installed-CLI fallback.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let settings = ConnectionSettings {
+            base_url: format!("http://{addr}"),
+            api_key: None,
+        };
+        let client = crate::api::AdminClient::new(settings.clone()).unwrap();
+        let slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let startup = connect_or_launch(
+            &client,
+            &settings,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&slot),
+            None,
+        )
+        .await;
+        assert!(!startup.ready);
+        assert!(
+            startup.message.contains("runtime bundle is missing"),
+            "{}",
+            startup.message
+        );
         assert!(lock(&slot).is_none());
     }
     #[test]
@@ -900,11 +968,7 @@ mod tests {
         assert!(!state.running);
         let state = owned(OwnedGateway::None, true, None);
         assert_eq!(state.mode, ServiceMode::External);
-        let state = owned(
-            OwnedGateway::None,
-            false,
-            Some("Cannot safely auto-start"),
-        );
+        let state = owned(OwnedGateway::None, false, Some("Cannot safely auto-start"));
         assert_eq!(state.mode, ServiceMode::Error);
         assert!(!state.running);
         assert_eq!(state.message, "Cannot safely auto-start");
