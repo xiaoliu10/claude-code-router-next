@@ -836,6 +836,7 @@
   // browsable outside Tauri. Never used when window.__TAURI__ is present.
 
   function createPreviewInvoke() {
+    var projectsPreview = typeof ProjectsUI !== 'undefined' ? ProjectsUI.createPreviewProjects() : null;
     var rev = 1;
     var routing = {
       providers: [
@@ -934,6 +935,7 @@
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
+      if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
       if (cmd === 'quota_snapshot') {
         return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
       }
@@ -1119,7 +1121,7 @@
   }
 
   function boot() {
-    var previewWanted = typeof location !== 'undefined' && /[?&]preview=1/.test(location.search);
+    var previewWanted = typeof location !== 'undefined' && /(?:^|[?&])preview=1(?:&|$)/.test(location.search);
     if (detectTauri() || previewWanted) { run(detectTauri(), previewWanted); return; }
 
     var tries = 0;
@@ -1177,6 +1179,8 @@
       clientsMsg: document.getElementById('clients-msg'),
       clientsList: document.getElementById('clients-list'),
     };
+    var projectsCtrl = mode === 'missing' ? null : ProjectsUI.createProjectsController({ invoke: invoke });
+    ProjectsUI.mount(document, projectsCtrl);
     var cards = new Map();
 
     function safeCommand(cmd) {
@@ -1762,7 +1766,7 @@
 
     // ---- tabs -------------------------------------------------------------
 
-    var TAB_IDS = ['quota', 'routing', 'usage', 'clients'];
+    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects'];
     var tabButtons = {};
     var panels = {};
     TAB_IDS.forEach(function (id) {
@@ -1778,6 +1782,7 @@
       if (name === 'routing') routingCtrl.refresh();
       if (name === 'usage') usageCtrl.refresh();
       if (name === 'clients') clientsCtrl.refresh();
+      if (name === 'projects') projectsCtrl.refresh();
     }
 
     function selectTab(name) {

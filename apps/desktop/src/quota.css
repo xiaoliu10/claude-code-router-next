@@ -286,3 +286,24 @@ body {
 .alias-add { display: flex; flex-wrap: wrap; gap: 5px; padding: 6px 14px; }
 .client-title { min-width: 0; }
 .service-bar .status { white-space: normal; overflow-wrap: anywhere; }
+
+/* Projects reuse the compact control-center cards and orange save affordance. */
+.projects-picker { display: flex; align-items: center; gap: 8px; padding: 0 14px 8px; min-width: 0; }
+.projects-picker label { flex: none; font-size: 12px; color: var(--text-2); }
+.projects-picker select { width: 0; text-overflow: ellipsis; }
+#projects-body { overflow-x: hidden; }
+#projects-body > * { flex-shrink: 0; min-width: 0; }
+#projects-body .route-input { width: 100%; max-width: 100%; }
+.project-note { margin: 5px 0 8px; font-size: 11.5px; color: var(--text-2); overflow-wrap: anywhere; }
+.project-actions, .project-flags, .project-scopes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.project-flags { gap: 10px 14px; margin-bottom: 10px; }
+.project-setting { display: flex; align-items: center; gap: 8px; }
+.project-settings { display: grid; gap: 10px; }
+.project-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 11.5px; color: var(--text-2); margin-bottom: 6px; }
+.project-routes { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.project-routes .route > .route-input { margin-top: 6px; margin-bottom: 6px; }
+#projects-body .route-name, #projects-body .card-name { overflow-wrap: anywhere; }
+@media (min-width: 720px) {
+  .project-routes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .project-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
