@@ -268,6 +268,9 @@ export interface ConfigProvider {
   quota_token?: string;
   /** Optional sec_token for the Aliyun Bailian console official quota API (efm-fe 3.5.613 format) */
   quota_sec_token?: string;
+  /** Control-plane credentials for Volcengine Coding Plan quota probes. */
+  quotaAccessKey?: string;
+  quotaSecretKey?: string;
   transformer: {
     use?: string[] | Array<any>[];
   } & {

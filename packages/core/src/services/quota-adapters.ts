@@ -15,6 +15,7 @@ export interface ProviderQuotaResult {
 }
 
 export interface QuotaAdapter {
+  readonly usesVolcengineCredentials?: boolean;
   queryQuota(
     provider: LLMProvider,
     timeoutMs: number,
@@ -1154,6 +1155,8 @@ function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | nul
 }
 
 class VolcengineCodingPlanQuotaAdapter extends BaseQuotaAdapter {
+  readonly usesVolcengineCredentials = true;
+
   async queryQuota(
     provider: LLMProvider,
     timeoutMs: number,
