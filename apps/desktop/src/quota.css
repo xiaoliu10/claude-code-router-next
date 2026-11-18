@@ -247,6 +247,42 @@ body {
 .usage-table tr:last-child td { border-bottom: none; }
 .usage-table td.num, .usage-table th.num { text-align: right; }
 
+/* Usage charts: pure CSS divs, no libraries. Per-bar sizes are written via
+   CSSOM from quota.js because the CSP (style-src 'self') forbids inline
+   style attributes. Flex + min-width:0 keeps 440px free of horizontal
+   overflow; details live in title tooltips. */
+.usage-bars { display: flex; align-items: stretch; gap: 2px; height: 96px; min-width: 0; }
+/* Explicit height so the bar's percentage height resolves against the column. */
+.usage-bar-col { flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: flex-end; }
+.usage-bar { width: 100%; min-height: 4%; background: var(--accent); border-radius: 2px 2px 0 0; opacity: 0.85; }
+.usage-bar:hover { opacity: 1; }
+.usage-chart-axis { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 10.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.usage-hbar { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.usage-hbar-row { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 11px; }
+.usage-hbar-name { flex: 0 1 auto; min-width: 0; max-width: 38%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.usage-hbar-track { flex: 1 1 0; min-width: 0; height: 10px; background: var(--meter-track); border-radius: 999px; overflow: hidden; }
+.usage-hbar-fill { height: 100%; background: var(--accent); border-radius: 999px; }
+.usage-hbar-total { flex: none; min-width: 48px; text-align: right; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+/* Usage records: compact paged table; the wide table scrolls inside its own
+   container so the narrow panel never overflows horizontally. */
+.records-card { min-width: 0; }
+.records-pager { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-2); }
+.records-pager .btn { padding: 1px 8px; font-size: 11.5px; }
+.records-info { font-variant-numeric: tabular-nums; }
+.records-scroll { overflow-x: auto; min-width: 0; }
+.records-scroll::-webkit-scrollbar { height: 8px; }
+.records-scroll::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.14); border-radius: 999px; }
+.records-scroll::-webkit-scrollbar-track { background: transparent; }
+.records-table { width: 100%; min-width: 780px; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+.records-table th { text-align: left; font-weight: 500; color: var(--text-3); padding: 2px 4px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.records-table td { padding: 2px 4px; color: var(--text-2); border-bottom: 1px solid rgba(0, 0, 0, 0.04); white-space: nowrap; }
+.records-table tr:last-child td { border-bottom: none; }
+.records-table td.num, .records-table th.num { text-align: right; }
+.records-table td.cell-truncate { max-width: 170px; overflow: hidden; text-overflow: ellipsis; }
+.record-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); vertical-align: middle; }
+.record-dot[data-tone="error"] { background: var(--danger); }
+
 
 /* Clients tab */
 .client { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05); }

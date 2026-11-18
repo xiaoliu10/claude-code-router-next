@@ -28,6 +28,7 @@ pub fn run() {
             control::routing_save,
             control::routing_flags,
             control::usage_snapshot,
+            control::usage_records,
             control::clients_snapshot,
             control::clients_update,
             projects::projects_snapshot,

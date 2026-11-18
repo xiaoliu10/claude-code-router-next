@@ -86,6 +86,61 @@ pub fn show(app: &tauri::AppHandle, rect: tauri::Rect) {
     }
     let _ = window.show();
     let _ = window.set_focus();
+    spawn_dismiss_watch(app.clone());
+}
+
+/// Blur-based dismissal relies on `WindowEvent::Focused(false)`, which macOS
+/// only fires if the panel actually became key. Activation can be silently
+/// declined (set_focus is best-effort), leaving a permanently stuck panel —
+/// so a watchdog polls focus while visible: once focus has been observed,
+/// losing it hides the panel; if focus never lands, one re-focus is attempted
+/// and a still-unfocused panel is dismissed on its own (it cannot receive Esc
+/// or clicks-outside anyway). Idempotent with the Focused(false) handler.
+fn spawn_dismiss_watch(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let shown = std::time::Instant::now();
+        let mut focused_seen = false;
+        let mut refocused = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let Some(window) = app.get_webview_window(LABEL) else {
+                return;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                return;
+            }
+            if window.is_focused().unwrap_or(false) {
+                focused_seen = true;
+                continue;
+            }
+            if focused_seen {
+                // Grace for transient focus flickers (native select popups on
+                // macOS briefly defocus the webview); hide only once the loss
+                // has held across a recheck (~1.5 ticks).
+                std::thread::sleep(std::time::Duration::from_millis(450));
+                let still = window.is_focused().unwrap_or(false);
+                if !still {
+                    let _ = window.hide();
+                }
+                return;
+            }
+            // One re-focus attempt after 4s without any observed focus; if it
+            // lands, the poll keeps watching (poll-based dismissal stays live
+            // even when the Focused event path is dead) — the panel hides on
+            // the first real focus loss below.
+            if !refocused && shown.elapsed() >= std::time::Duration::from_millis(4000) {
+                refocused = true;
+                let _ = window.set_focus();
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                if window.is_focused().unwrap_or(false) {
+                    focused_seen = true;
+                } else {
+                    let _ = window.hide();
+                    return;
+                }
+            }
+        }
+    });
 }
 #[tauri::command]
 pub async fn quota_snapshot(

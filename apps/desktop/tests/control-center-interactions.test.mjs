@@ -14,6 +14,8 @@ class Element {
     this.children = []; this.parentNode = null; this.attrs = {}; this.dataset = {};
     this.listeners = {}; this._text = ''; this.value = ''; this.hidden = false;
     this.disabled = false; this.selectionStart = 0; this.selectionEnd = 0;
+    // CSSOM write target: quota.js sets chart bar sizes via el.style (CSP-safe).
+    this.style = {};
     this.classList = { toggle: (name, on) => {
       const classes = new Set(this.className.split(/\s+/).filter(Boolean));
       if (on) classes.add(name); else classes.delete(name);
@@ -100,6 +102,7 @@ export function harness(overrides = {}) {
     clients_snapshot: () => structuredClone(clients),
     clients_update: () => ({ ...clients, clients: [{ ...clients.clients[0], enabled: false, managed: false }] }),
     usage_snapshot: args => ({ period: args.period, totalRequests: 12, successCount: 10, errorCount: 2, inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, estimatedCount: 1, byProvider: [{ name: '<img src=x>', requests: 12, inputTokens: 100, outputTokens: 50 }], byDay: [], updatedAt: 1 }),
+    usage_records: args => ({ period: args.period || 'today', page: args.page || 1, pageSize: args.pageSize || 20, total: 0, records: [] }),
     ...overrides,
   };
   const win = { __TAURI__: { core: { invoke(cmd, args) {
@@ -163,14 +166,14 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   await flush(); h.id('tab-usage').click(); await flush();
   const body = h.id('usage-body');
   const total = body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens'));
-  assert.match(total.textContent, /1.25M/);
-  assert.equal(total.querySelector('.usage-num').title, '1,250,000');
+  assert.match(total.textContent, /9.25M/);
+  assert.equal(total.querySelector('.usage-num').title, '9,251,250');
   const models = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按模型'));
   assert.ok(models.textContent.includes('缓存（读 / 写）'));
   assert.equal(models.querySelectorAll('th').at(-1).textContent, '总 tokens');
   const modelRows = models.querySelectorAll('tbody')[0].children;
-  assert.equal(modelRows[0].children.at(-1).textContent, '1.25M');
-  assert.equal(modelRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(modelRows[0].children.at(-1).textContent, '9.25M');
+  assert.equal(modelRows[0].children.at(-1).title, '9,251,250');
   assert.equal(modelRows[1].children.at(-1).textContent, '0');
   assert.equal(modelRows[2].children.at(-1).textContent, '—');
   assert.ok(models.textContent.includes('8M / 1.25K'));
@@ -180,8 +183,8 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   const providers = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按提供方'));
   assert.deepEqual(providers.querySelectorAll('th').map(n => n.textContent), ['提供方', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens']);
   const providerRows = providers.querySelectorAll('tbody')[0].children;
-  assert.equal(providerRows[0].children.at(-1).textContent, '1.25M');
-  assert.equal(providerRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(providerRows[0].children.at(-1).textContent, '9.25M');
+  assert.equal(providerRows[0].children.at(-1).title, '9,251,250');
   assert.equal(providerRows[0].children[4].textContent, '8M / 1.25K');
   assert.equal(providerRows[0].children[4].title, '缓存读 8,000,000 / 缓存写 1,250');
   assert.equal(providerRows[1].children.at(-1).textContent, '0');
@@ -192,8 +195,8 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   const days = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
   assert.deepEqual(days.querySelectorAll('th').map(n => n.textContent), ['日期', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens']);
   const dayRows = days.querySelectorAll('tbody')[0].children;
-  assert.equal(dayRows[0].children.at(-1).textContent, '1.25M');
-  assert.equal(dayRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(dayRows[0].children.at(-1).textContent, '9.25M');
+  assert.equal(dayRows[0].children.at(-1).title, '9,251,250');
   assert.equal(dayRows[0].children[4].textContent, '8M / 1.25K');
   assert.equal(dayRows[0].children[4].title, '缓存读 8,000,000 / 缓存写 1,250');
   assert.equal(dayRows[1].children.at(-1).textContent, '0');
@@ -201,11 +204,11 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   assert.equal(dayRows[2].children.at(-1).textContent, '—');
   assert.equal(dayRows[2].children[4].textContent, '— / —');
   h.id('usage-periods').children[1].click(); await flush();
-  assert.match(body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens')).textContent, /2.25M/);
+  assert.match(body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens')).textContent, /10.25M/);
   const refreshedProviders = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按提供方'));
-  assert.equal(refreshedProviders.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '2.25M');
+  assert.equal(refreshedProviders.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '10.25M');
   const refreshedDays = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
-  assert.equal(refreshedDays.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '2.25M');
+  assert.equal(refreshedDays.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '10.25M');
 });
 
 test('interaction: restore is local confirmation then single individual IPC; usage uses safe text', async () => {
@@ -223,4 +226,194 @@ test('interaction: restore is local confirmation then single individual IPC; usa
   assert.equal(h.id('usage-body').querySelectorAll('img').length, 0);
   h.id('usage-periods').children[1].click(); await flush();
   assert.equal(h.calls.filter(c => c.cmd === 'usage_snapshot').at(-1).args.period, '7d');
+});
+
+const recordFixture = (i, extra = {}) => ({
+  timestamp: '2026-11-17T09:05:03Z', provider: '<img src=x onerror=alert(1)>',
+  model: '<b>bold</b>-model', originalModel: null, upstreamModel: null,
+  clientType: 'claude-code', scenarioType: 'default',
+  inputTokens: 10 + i, outputTokens: 5 + i, cacheReadTokens: 0, cacheWriteTokens: 0,
+  ttftMs: 300 + i, tokensPerSecond: 12.5, durationMs: 1500 + i,
+  status: 'success', usageEstimated: false, errorMessage: null,
+  // Never projected by the real backend; the render must not echo them.
+  responseBody: 'SECRET-BODY', sessionId: 'session-1',
+  ...extra,
+});
+
+function recordsHarness() {
+  const all = Array.from({ length: 45 }, (_, i) => recordFixture(i,
+    i === 2 ? { status: 'error', errorMessage: '上游提供方返回 429', ttftMs: null, tokensPerSecond: null } : {},
+  ));
+  all[3].usageEstimated = true;
+  return harness({ usage_records: args => {
+    const page = Math.max(1, args.page || 1);
+    const size = Math.min(50, Math.max(1, args.pageSize || 20));
+    const start = (page - 1) * size;
+    return { period: args.period, page, pageSize: size, total: all.length, records: all.slice(start, start + size) };
+  } });
+}
+
+function recordsCard(body) { return body.querySelectorAll('.records-card').at(-1); }
+const plain = (v) => JSON.parse(JSON.stringify(v));
+
+async function openUsage(h) { await flush(); h.id('tab-usage').click(); await flush(); }
+
+test('interaction: records pager walks pages, resets on period switch, shows page/total info', async () => {
+  const h = recordsHarness(); await openUsage(h);
+  const body = h.id('usage-body');
+  const card = recordsCard(body);
+  assert.ok(card, 'records card renders inside usage-body');
+  const info = card.querySelector('.records-info');
+  const prev = card.querySelectorAll('.btn')[0];
+  const next = card.querySelectorAll('.btn')[1];
+  assert.match(info.textContent, /第 1 \/ 3 页 · 共 45 条/);
+  assert.equal(prev.disabled, true, 'prev disabled on the first page');
+  assert.equal(next.disabled, false);
+  assert.equal(card.querySelectorAll('tbody')[0].children.length, 20);
+  next.click(); await flush();
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'today', page: 2, pageSize: 20 });
+  const card2 = recordsCard(body);
+  assert.match(card2.querySelector('.records-info').textContent, /第 2 \/ 3 页/);
+  assert.equal(card2.querySelectorAll('tbody')[0].children.length, 20);
+  assert.equal(card2.querySelectorAll('.btn')[0].disabled, false, 'prev re-enabled on page 2');
+  card2.querySelectorAll('.btn')[1].click(); await flush();
+  const card3 = recordsCard(body);
+  assert.match(card3.querySelector('.records-info').textContent, /第 3 \/ 3 页/);
+  assert.equal(card3.querySelectorAll('tbody')[0].children.length, 5);
+  assert.equal(card3.querySelectorAll('.btn')[1].disabled, true, 'next disabled on the last page');
+  card3.querySelectorAll('.btn')[1].click(); await flush();
+  assert.equal(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args.page, 3, 'next on the last page never hits IPC');
+  card3.querySelectorAll('.btn')[0].click(); await flush();
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'today', page: 2, pageSize: 20 });
+  // Period switch resets to page 1 for both summary and records.
+  h.id('usage-periods').children[1].click(); await flush();
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: '7d', page: 1, pageSize: 20 });
+  assert.match(recordsCard(body).querySelector('.records-info').textContent, /第 1 \/ 3 页 · 共 45 条/);
+});
+
+test('interaction: records table never echoes responseBody/sessionId and keeps XSS as text', async () => {
+  const h = recordsHarness(); await openUsage(h);
+  const body = h.id('usage-body');
+  const text = body.textContent;
+  assert.equal(text.includes('SECRET-BODY'), false, 'responseBody never renders');
+  assert.equal(text.includes('session-1'), false, 'sessionId never renders');
+  assert.ok(text.includes('<img src=x onerror=alert(1)>'), 'provider renders as escaped text');
+  assert.ok(text.includes('<b>bold</b>-model'), 'model renders as escaped text');
+  assert.equal(body.querySelectorAll('img').length, 0);
+  assert.equal(body.querySelectorAll('b').length, 0);
+  // Error record: red dot with the message only as tooltip, not as text.
+  const rows = recordsCard(body).querySelectorAll('tbody')[0].children;
+  const statusCells = rows.map(r => r.children.at(-1));
+  const errorCell = statusCells.find(td => td.querySelector('.record-dot').getAttribute('data-tone') === 'error');
+  assert.ok(errorCell, 'an error record is present on page 1');
+  assert.equal(errorCell.title, '上游提供方返回 429');
+  assert.equal(errorCell.textContent.includes('上游提供方返回 429'), false, 'error message stays a tooltip');
+  const successCell = statusCells.find(td => td.querySelector('.record-dot').getAttribute('data-tone') === 'ok');
+  assert.equal(successCell.title, '成功');
+  // Estimated record: ≈ prefix on the input and output cells (exact value in title).
+  const estimatedRow = rows.find(r => r.children[4].textContent.startsWith('≈'));
+  assert.ok(estimatedRow, 'estimated row carries the ≈ prefix');
+  assert.equal(estimatedRow.children[5].textContent.startsWith('≈'), true);
+  assert.ok(estimatedRow.children[4].title.match(/^\d/), 'exact token count lives in the tooltip');
+  // Model chain column: originalModel/routed model chain in text, full chain as title.
+  const modelCell = rows[0].children[2];
+  assert.equal(modelCell.className.includes('cell-truncate'), true);
+  assert.equal(modelCell.title, '<b>bold</b>-model');
+});
+
+test('interaction: records empty period shows the shared empty note and disables both pager buttons', async () => {
+  const h = harness({ usage_records: args => ({ period: args.period, page: args.page || 1, pageSize: args.pageSize || 20, total: 0, records: [] }) });
+  await openUsage(h);
+  const card = recordsCard(h.id('usage-body'));
+  assert.match(card.textContent, /该周期暂无调用记录/);
+  assert.match(card.querySelector('.records-info').textContent, /第 1 \/ 1 页 · 共 0 条/);
+  const buttons = card.querySelectorAll('.btn');
+  assert.equal(buttons[0].disabled, true);
+  assert.equal(buttons[1].disabled, true);
+});
+
+test('interaction: records error surfaces a failed note while the usage summary stays intact', async () => {
+  const h = harness({ usage_records: () => Promise.reject(new Error('网关超时')) });
+  await openUsage(h);
+  const card = recordsCard(h.id('usage-body'));
+  const note = card.querySelector('.note');
+  assert.match(note.textContent, /调用记录读取失败：网关超时/);
+  assert.equal(note.getAttribute('data-tone'), 'error');
+  const buttons = card.querySelectorAll('.btn');
+  assert.equal(buttons[0].disabled, true);
+  assert.equal(buttons[1].disabled, true);
+  assert.match(h.id('usage-body').textContent, /汇总 · 今天/, 'summary rendering unaffected by records failure');
+});
+
+test('interaction: summary gains ttft/speed/success cells and css charts sort, floor and cap at 10', async () => {
+  const models = Array.from({ length: 12 }, (_, i) => ({
+    name: 'model-' + i, requests: i + 1,
+    inputTokens: i === 11 ? 5000 : i * 100, outputTokens: i === 11 ? 1000 : i * 10,
+    cacheReadTokens: 7, cacheWriteTokens: 3,
+  }));
+  const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 10, successCount: 8, errorCount: 2,
+    avgTtftMs: 812, avgTokensPerSecond: 33.42,
+    inputTokens: 1000, outputTokens: 500, cacheReadTokens: 0, cacheWriteTokens: 0, estimatedCount: 0,
+    byModel: models,
+    byProvider: [],
+    byDay: [
+      { name: '2026-11-18', requests: 1, inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      { name: '2026-11-16', requests: 1, inputTokens: 900, outputTokens: 400, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      { name: '2026-11-17', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    ], updatedAt: 1 }) });
+  await openUsage(h);
+  const body = h.id('usage-body');
+  const numCell = label => body.querySelectorAll('.usage-cell').find(n => n.textContent.includes(label)).querySelector('.usage-num');
+  assert.equal(numCell('成功率').textContent, '80.0%');
+  assert.equal(numCell('平均 TTFT').textContent, '812ms');
+  assert.equal(numCell('生成速度').textContent, '33.4 t/s');
+  // Cards order: summary → charts → detail tables → records.
+  const titles = body.querySelectorAll('.usage-card').map(c => c.querySelector('.usage-title').textContent);
+  assert.deepEqual(titles.slice(0, 6), ['汇总 · 今天', '每日用量（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
+  // Daily chart: ascending dates, max day 100%, zero day floored at 4%.
+  const dayCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
+  const bars = dayCard.querySelectorAll('.usage-bar');
+  assert.equal(bars.length, 3);
+  assert.ok(bars[0].title.startsWith('2026-11-16'), 'bars ordered by date ascending');
+  assert.equal(bars[0].style.height, '100%');
+  assert.equal(bars[0].title.includes('输入 900（900）'), true);
+  assert.ok(bars[0].title.includes('总量 1.3K（1,300）'));
+  assert.equal(bars[1].title.startsWith('2026-11-17'), true);
+  assert.equal(bars[1].style.height, '4%', 'zero-token days floor at the minimum height');
+  assert.equal(bars[2].title.startsWith('2026-11-18'), true);
+  assert.equal(bars[2].style.height, '12%', 'smaller days scale relative to the max');
+  assert.ok(dayCard.querySelector('.usage-chart-axis').textContent.includes('2026-11-16'));
+  assert.ok(dayCard.querySelector('.usage-chart-axis').textContent.includes('2026-11-18'));
+  // Model chart: ranked by effective (cache-aware) input+output desc, capped at 10, exact values in title.
+  const modelCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('模型 Top 10'));
+  const rows = modelCard.querySelectorAll('.usage-hbar-row');
+  assert.equal(rows.length, 10);
+  assert.ok(rows[0].textContent.includes('model-11'), 'largest total ranks first');
+  assert.ok(rows[1].textContent.includes('model-10'));
+  assert.ok(!rows.some(r => r.textContent.includes('model-0')), 'smallest models are cut by the top-10 cap');
+  assert.equal(rows[0].querySelector('.usage-hbar-fill').style.width, '100%');
+  assert.ok(rows[0].querySelector('.usage-hbar-name').title.includes('请求 12 · 输入 5,000 · 输出 1,000 · 缓存读 7 / 缓存写 3'));
+  assert.ok(rows[0].querySelector('.usage-hbar-total').textContent.includes('6.01K'), 'model-11 effective total 6010');
+  // Structural safeguards against horizontal overflow at 440px (visual check in preview browser).
+  assert.ok(dayCard.querySelector('.usage-bars'));
+  assert.ok(recordsCard(body).querySelector('.records-scroll'));
+});
+
+test('interaction: charts and records fall back to the shared empty note when a period has no data', async () => {
+  const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 0, successCount: 0, errorCount: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estimatedCount: 0,
+    avgTtftMs: null, avgTokensPerSecond: null,
+    byModel: [], byProvider: [], byDay: [], updatedAt: 1 }) });
+  await openUsage(h);
+  const body = h.id('usage-body');
+  const cards = body.querySelectorAll('.usage-card');
+  const titledCard = (label) => cards.find(c => { const t = c.querySelector('.usage-title'); return t && t.textContent.includes(label); });
+  const dayCard = titledCard('每日用量');
+  const modelCard = titledCard('模型 Top 10');
+  assert.ok(dayCard && dayCard.textContent.includes('该周期暂无调用记录'), 'daily chart renders the shared empty note');
+  assert.ok(modelCard && modelCard.textContent.includes('该周期暂无调用记录'), 'model chart renders the shared empty note');
+  const numCell = label => body.querySelectorAll('.usage-cell').find(n => n.textContent.includes(label)).querySelector('.usage-num');
+  assert.equal(numCell('成功率').textContent, '—', 'total=0 keeps the success rate unset');
+  assert.equal(numCell('平均 TTFT').textContent, '—');
+  assert.equal(numCell('生成速度').textContent, '—');
 });

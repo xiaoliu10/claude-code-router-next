@@ -30,6 +30,26 @@
     }
     return formatInt(n);
   }
+  // Friendly millisecond durations for TTFT/latency cells: 820ms / 1.2s / 2.5m.
+  function formatMs(ms) {
+    var n = toNum(ms);
+    if (n === null) return null;
+    if (n < 1000) return Math.round(n) + 'ms';
+    if (n < 60000) return (n / 1000).toFixed(1) + 's';
+    return (n / 60000).toFixed(1) + 'm';
+  }
+  // Generation speed in tokens per second with one decimal: 35.7 t/s.
+  function formatSpeed(tokensPerSecond) {
+    var n = toNum(tokensPerSecond);
+    if (n === null) return null;
+    return n.toFixed(1) + ' t/s';
+  }
+  // Success rate to one decimal; null while there are no requests to divide by.
+  function formatSuccessRate(successCount, totalRequests) {
+    var s = toNum(successCount), t = toNum(totalRequests);
+    if (s === null || t === null || t <= 0) return null;
+    return ((s / t) * 100).toFixed(1) + '%';
+  }
   function formatClock(ms) {
     var n = toNum(ms);
     if (n === null) return null;
@@ -705,6 +725,8 @@
       cacheReadTokens: toNum(s.cacheReadTokens),
       cacheWriteTokens: toNum(s.cacheWriteTokens),
       estimatedCount: toNum(s.estimatedCount),
+      avgTtftMs: toNum(s.avgTtftMs),
+      avgTokensPerSecond: toNum(s.avgTokensPerSecond),
       byModel: Array.isArray(s.byModel) ? s.byModel.map(usageRow) : [],
       byProvider: Array.isArray(s.byProvider) ? s.byProvider.map(usageRow) : [],
       byDay: Array.isArray(s.byDay) ? s.byDay.map(usageRow) : [],
@@ -749,6 +771,153 @@
       subscribe: subscribe, state: state,
       setPeriod: function (p) { if (p !== period) load(p); },
       refresh: function () { load(period); },
+    };
+  }
+
+
+  // ---- Usage records -----------------------------------------------------
+  // usage_records({period:'today'|'7d'|'30d',page,pageSize}) -> paged,
+  // whitelisted projections of individual calls. The server never sends
+  // responseBody/sessionId/keys; normalizeRecord re-enforces that whitelist
+  // on the client before anything renders.
+
+  var RECORDS_PAGE_SIZE = 20;
+  var CLIENT_LABELS = { 'claude-code': 'Claude Code', 'zcode': 'ZCode', codex: 'Codex', pi: 'Pi', 'qwen-code': 'Qwen Code', opencode: 'OpenCode', api: 'API' };
+  function clientLabel(type) {
+    var t = toStr(type);
+    return t ? (CLIENT_LABELS[t] || t) : '未知';
+  }
+  function normalizeRecord(r) {
+    var o = r && typeof r === 'object' ? r : {};
+    return {
+      timestamp: toStr(o.timestamp),
+      provider: toStr(o.provider) || '—',
+      model: toStr(o.model) || '—',
+      originalModel: toStr(o.originalModel),
+      upstreamModel: toStr(o.upstreamModel),
+      clientType: toStr(o.clientType),
+      scenarioType: toStr(o.scenarioType) || 'default',
+      inputTokens: toNum(o.inputTokens),
+      outputTokens: toNum(o.outputTokens),
+      cacheReadTokens: toNum(o.cacheReadTokens),
+      cacheWriteTokens: toNum(o.cacheWriteTokens),
+      ttftMs: toNum(o.ttftMs),
+      tokensPerSecond: toNum(o.tokensPerSecond),
+      durationMs: toNum(o.durationMs),
+      status: o.status === 'error' ? 'error' : 'success',
+      usageEstimated: o.usageEstimated === true,
+      errorMessage: toStr(o.errorMessage),
+    };
+  }
+  function normalizeRecordsPage(r) {
+    var s = r && typeof r === 'object' ? r : {};
+    return {
+      period: toStr(s.period),
+      page: toNum(s.page),
+      pageSize: toNum(s.pageSize),
+      total: toNum(s.total),
+      records: Array.isArray(s.records) ? s.records.map(normalizeRecord) : [],
+    };
+  }
+  // Model column shows the routing chain originalModel → model → upstreamModel;
+  // adjacent identical legs collapse so an unchanged route doesn't read as a
+  // "m → m" hop (mirrors the Web usage table).
+  function modelChain(r) {
+    var o = r && typeof r === 'object' ? r : {};
+    var model = toStr(o.model) || '—';
+    var legs = [toStr(o.originalModel) || model, model];
+    var upstream = toStr(o.upstreamModel);
+    if (upstream && upstream !== model) legs.push(upstream);
+    var out = [];
+    for (var i = 0; i < legs.length; i++) {
+      if (out.length && out[out.length - 1] === legs[i]) continue;
+      out.push(legs[i]);
+    }
+    return out.join(' → ');
+  }
+  // byModel arrives sorted by request count; charts rank by total tokens.
+  // Effective input mirrors the Web UsageStats heuristic (computeEffectiveInputTokens):
+  // some upstreams report inputTokens inclusive of cache read/write (then input
+  // ~= cache sum within a tolerance), others report net input. Never double-count.
+  function effectiveInputTokens(input, cacheRead, cacheWrite) {
+    if (input === null) return null;
+    var cacheTotal = (toNum(cacheRead) || 0) + (toNum(cacheWrite) || 0);
+    if (cacheTotal <= 0) return input;
+    var tolerance = Math.max(500, input * 0.02);
+    return Math.abs(input - cacheTotal) <= tolerance ? input : input + cacheTotal;
+  }
+  function rowTotalTokens(row) {
+    var input = effectiveInputTokens(row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens);
+    if (input === null || row.outputTokens === null) return null;
+    return input + row.outputTokens;
+  }
+
+  function topModelsByTotal(rows, limit) {
+    var list = (Array.isArray(rows) ? rows : []).slice();
+    list.sort(function (a, b) {
+      var ta = rowTotalTokens(a) || 0;
+      var tb = rowTotalTokens(b) || 0;
+      return tb - ta;
+    });
+    return typeof limit === 'number' ? list.slice(0, limit) : list;
+  }
+
+  function createRecordsController(options) {
+    var invoke = options && options.invoke;
+    if (typeof invoke !== 'function') throw new TypeError('createRecordsController: 需要 invoke 函数');
+    var period = 'today', page = 1, pageSize = RECORDS_PAGE_SIZE;
+    var data = null, loading = false, error = null;
+    var epoch = 0;
+    var listeners = new Set();
+
+    function state() {
+      var total = data ? data.total : null;
+      return {
+        period: period, page: page, pageSize: pageSize,
+        data: data, loading: loading, error: error,
+        total: total,
+        totalPages: total === null ? null : Math.max(1, Math.ceil(total / pageSize)),
+        canPrev: page > 1,
+        canNext: total !== null && page * pageSize < total,
+      };
+    }
+    function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
+    function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
+
+    function load() {
+      loading = true;
+      error = null;
+      emit();
+      var my = ++epoch;
+      invoke('usage_records', { period: period, page: page, pageSize: pageSize }).then(function (r) {
+        if (my !== epoch) return;
+        data = normalizeRecordsPage(r);
+        loading = false;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        loading = false;
+        error = errorMessage(err);
+        emit();
+      });
+    }
+
+    return {
+      subscribe: subscribe, state: state,
+      setPeriod: function (p) {
+        if (USAGE_PERIODS.indexOf(p) === -1 || p === period) return;
+        period = p;
+        page = 1; // a new period always starts from the first page
+        load();
+      },
+      prev: function () { if (page <= 1) return; page -= 1; load(); },
+      next: function () {
+        var total = data ? data.total : null;
+        if (total === null || page * pageSize >= total) return;
+        page += 1;
+        load();
+      },
+      refresh: load,
     };
   }
 
@@ -1000,6 +1169,7 @@
       today: {
         period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
         inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
+        avgTtftMs: 842, avgTokensPerSecond: 36.2,
         byProvider: [
           { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
           { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
@@ -1011,6 +1181,7 @@
       '7d': {
         period: '7d', totalRequests: 902, successCount: 890, errorCount: 12,
         inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
+        avgTtftMs: 905, avgTokensPerSecond: 33.8,
         byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
         byProvider: [
           { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
@@ -1020,12 +1191,17 @@
           { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
           { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
           { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
+          { name: '2026-11-14', requests: 132, inputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
+          { name: '2026-11-13', requests: 147, inputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
+          { name: '2026-11-12', requests: 101, inputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
+          { name: '2026-11-11', requests: 99, inputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
         ],
         updatedAt: Date.now() - 3000,
       },
       '30d': {
         period: '30d', totalRequests: 4120, successCount: 4044, errorCount: 76,
         inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
+        avgTtftMs: 878, avgTokensPerSecond: 34.9,
         byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
         byProvider: [
           { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
@@ -1054,6 +1230,50 @@
     // never carries them, mirroring the Rust projection.
     var credentials = { providers: [{ name: '火山agent plan', configured: false }] };
     var credentialKeys = { accessKey: '', secretKey: '' };
+
+    // Deterministic record fixtures spanning several pages (45/132/260 items)
+    // with one stable error record and one estimated record on the first page.
+    var RECORD_PROVIDERS = ['alpha.example.com', 'beta.example.com'];
+    var RECORD_CLIENTS = ['claude-code', 'codex', 'pi'];
+    var RECORD_CHAINS = [
+      { original: null, model: 'claude-sonnet-4-5', upstream: null },
+      { original: 'claude-opus-4-5', model: 'glm-5', upstream: 'glm-5-air' },
+      { original: 'gpt-5-codex', model: 'gpt-5-codex', upstream: null },
+    ];
+    var RECORD_COUNTS = { today: 45, '7d': 132, '30d': 260 };
+    function previewRecords(period) {
+      var n = RECORD_COUNTS[period] || 45;
+      var records = [];
+      for (var i = 0; i < n; i++) {
+        var chain = RECORD_CHAINS[i % RECORD_CHAINS.length];
+        var failed = i === 4; // stable error record on the first page
+        records.push({
+          timestamp: new Date(Date.now() - i * 240000).toISOString(),
+          provider: RECORD_PROVIDERS[i % RECORD_PROVIDERS.length],
+          model: chain.model,
+          originalModel: chain.original,
+          upstreamModel: chain.upstream,
+          clientType: RECORD_CLIENTS[i % RECORD_CLIENTS.length],
+          scenarioType: i % 4 === 0 ? 'background' : 'default',
+          inputTokens: 1200 + (i % 7) * 350,
+          outputTokens: 300 + (i % 5) * 120,
+          cacheReadTokens: (i % 3) * 900,
+          cacheWriteTokens: (i % 2) * 400,
+          ttftMs: failed ? null : 420 + (i % 6) * 95,
+          tokensPerSecond: failed ? null : 18 + (i % 5) * 4.5,
+          durationMs: 1800 + (i % 9) * 700,
+          status: failed ? 'error' : 'success',
+          usageEstimated: i === 8, // stable estimated record on the first page
+          errorMessage: failed ? '上游提供方返回 429，重试 3 次后仍失败' : null,
+        });
+      }
+      return records;
+    }
+    var recordsCache = null;
+    function recordsFor(period) {
+      if (!recordsCache) recordsCache = { today: previewRecords('today'), '7d': previewRecords('7d'), '30d': previewRecords('30d') };
+      return recordsCache[period] || recordsCache.today;
+    }
 
     function copy(v) { return JSON.parse(JSON.stringify(v)); }
     function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
@@ -1122,6 +1342,16 @@
         var period = USAGE_PERIODS.indexOf(a.period) !== -1 ? a.period : 'today';
         return delay(copy(usage[period]));
       }
+      if (cmd === 'usage_records') {
+        // Mirrors the native contract: invalid period is a fixed error, page
+        // clamps to >=1 and pageSize clamps to 1..50 with default 20.
+        if (USAGE_PERIODS.indexOf(a.period) === -1) return Promise.reject(new Error('统计周期无效'));
+        var recPage = Math.max(1, Math.floor(Number(a.page) || 1));
+        var recSize = Math.min(50, Math.max(1, Math.floor(Number(a.pageSize) || RECORDS_PAGE_SIZE)));
+        var all = recordsFor(a.period);
+        var recStart = (recPage - 1) * recSize;
+        return delay({ period: a.period, page: recPage, pageSize: recSize, total: all.length, records: all.slice(recStart, recStart + recSize) });
+      }
       if (cmd === 'clients_snapshot') return delay(copy(clients));
       if (cmd === 'clients_update') {
         var client = null;
@@ -1178,6 +1408,7 @@
     normalizeCredentialsStatus: normalizeCredentialsStatus, createCredentialsController: createCredentialsController,
     // shared helpers
     errorMessage: errorMessage, formatInt: formatInt, formatCompact: formatCompact, formatClock: formatClock,
+    formatMs: formatMs, formatSpeed: formatSpeed, formatSuccessRate: formatSuccessRate,
     // routing tab
     ROUTING_SCOPES: ROUTING_SCOPES, ROUTING_SCENARIOS: ROUTING_SCENARIOS, USAGE_PERIODS: USAGE_PERIODS,
     SCOPE_LABELS: SCOPE_LABELS, SCENARIO_LABELS: SCENARIO_LABELS,
@@ -1187,6 +1418,11 @@
     createRoutingController: createRoutingController,
     // usage / clients / service
     normalizeUsageSnapshot: normalizeUsageSnapshot, createUsageController: createUsageController,
+    // usage records
+    RECORDS_PAGE_SIZE: RECORDS_PAGE_SIZE, clientLabel: clientLabel,
+    normalizeRecord: normalizeRecord, normalizeRecordsPage: normalizeRecordsPage,
+    modelChain: modelChain, topModelsByTotal: topModelsByTotal,
+    createRecordsController: createRecordsController,
     normalizeClientsResponse: normalizeClientsResponse, createClientsController: createClientsController,
     SERVICE_MODES: SERVICE_MODES, normalizeServiceState: normalizeServiceState,
     serviceView: serviceView, quitTitleFor: quitTitleFor, createServiceController: createServiceController,
@@ -1353,6 +1589,7 @@
     });
     var routingCtrl = mode === 'missing' ? null : createRoutingController({ invoke: invoke });
     var usageCtrl = mode === 'missing' ? null : createUsageController({ invoke: invoke });
+    var recordsCtrl = mode === 'missing' ? null : createRecordsController({ invoke: invoke });
     var clientsCtrl = mode === 'missing' ? null : createClientsController({ invoke: invoke });
     var serviceCtrl = mode === 'missing' ? null : createServiceController({ invoke: invoke });
     var els = {
@@ -1860,6 +2097,7 @@
       if (!s.snapshot) {
         // No snapshot yet: never fabricate an empty state.
         body.appendChild(noteEl(s.loading ? '正在读取用量…' : (s.error ? '用量读取失败：' + s.error : '尚未读取用量数据')));
+        renderRecords(recordsCtrl ? recordsCtrl.state() : null);
         return;
       }
       var u = s.snapshot;
@@ -1869,20 +2107,25 @@
       grid.appendChild(usageNumCell('请求', formatInt(u.totalRequests)));
       grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
       grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
-      var totalTokens = u.inputTokens === null || u.outputTokens === null ? null : u.inputTokens + u.outputTokens;
+      grid.appendChild(usageNumCell('成功率', formatSuccessRate(u.successCount, u.totalRequests)));
+      var totalTokens = rowTotalTokens(u);
       var totalCell = usageNumCell('总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
-      totalCell.title = '已记录输入 + 输出；缓存独立展示，不重复相加';
+      totalCell.title = '有效输入 + 输出；上游 inputTokens 已含缓存时直接采用，否则加计缓存读/写';
       grid.appendChild(totalCell);
       grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
       grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
       grid.appendChild(usageNumCell('缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
       grid.appendChild(usageNumCell('缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
       grid.appendChild(usageNumCell('估算条目', formatInt(u.estimatedCount)));
+      grid.appendChild(usageNumCell('平均 TTFT', formatMs(u.avgTtftMs)));
+      grid.appendChild(usageNumCell('生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
       body.appendChild(totals);
-      totals.appendChild(noteEl('总 tokens = 已记录输入 + 输出；缓存读写独立展示。'));
+      totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
+      body.appendChild(buildDayChart(u.byDay));
+      body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
-        var rowTotal = m.inputTokens === null || m.outputTokens === null ? null : m.inputTokens + m.outputTokens;
+        var rowTotal = rowTotalTokens(m);
         return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
           { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
           { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
@@ -1894,6 +2137,204 @@
       body.appendChild(usageTable('按模型', ['模型'].concat(tokenHeaders), u.byModel.map(tokenRow), 1));
       body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
       body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
+      renderRecords(recordsCtrl ? recordsCtrl.state() : null);
+    }
+
+    // Charts are plain divs; per-bar sizes go through CSSOM writes because the
+    // CSP (style-src 'self') blocks inline style attributes.
+    function buildDayChart(rows) {
+      var card = el('div', 'usage-card');
+      card.appendChild(el('div', 'usage-title', '每日用量（有效输入 + 输出）'));
+      var days = (Array.isArray(rows) ? rows : []).slice().sort(function (a, b) {
+        return String(a.name) < String(b.name) ? -1 : String(a.name) > String(b.name) ? 1 : 0;
+      });
+      if (!days.length) {
+        card.appendChild(noteEl('该周期暂无调用记录'));
+        return card;
+      }
+      var totals = days.map(function (d) { return rowTotalTokens(d) || 0; });
+      var max = Math.max.apply(null, totals);
+      var bars = el('div', 'usage-bars');
+      days.forEach(function (d, i) {
+        var v = totals[i];
+        var pct = v > 0 && max > 0 ? Math.max(4, Math.round((v / max) * 100)) : 4;
+        var col = el('div', 'usage-bar-col');
+        var bar = el('div', 'usage-bar');
+        bar.style.height = pct + '%';
+        bar.title = d.name + ' · 输入 ' + (formatCompact(d.inputTokens) || '—') + '（' + (formatInt(d.inputTokens) || '—') + '）'
+          + ' · 输出 ' + (formatCompact(d.outputTokens) || '—') + '（' + (formatInt(d.outputTokens) || '—') + '）'
+          + ' · 总量 ' + (formatCompact(v) || '—') + '（' + (formatInt(v) || '—') + '）';
+        col.appendChild(bar);
+        bars.appendChild(col);
+      });
+      card.appendChild(bars);
+      var axis = el('div', 'usage-chart-axis');
+      axis.appendChild(el('span', null, String(days[0].name)));
+      axis.appendChild(el('span', 'spacer'));
+      axis.appendChild(el('span', null, String(days[days.length - 1].name)));
+      card.appendChild(axis);
+      return card;
+    }
+
+    function buildModelChart(models) {
+      var card = el('div', 'usage-card');
+      card.appendChild(el('div', 'usage-title', '模型 Top 10（按有效总量）'));
+      if (!Array.isArray(models) || !models.length) {
+        card.appendChild(noteEl('该周期暂无调用记录'));
+        return card;
+      }
+      var max = 0;
+      models.forEach(function (m) {
+        var t = rowTotalTokens(m) || 0;
+        if (t > max) max = t;
+      });
+      var list = el('div', 'usage-hbar');
+      models.forEach(function (m) {
+        var total = rowTotalTokens(m) || 0;
+        // Visible bars floor at 1% so a tiny-but-nonzero total still renders.
+        var pct = total > 0 && max > 0 ? Math.max(1, Math.round((total / max) * 1000) / 10) : 0;
+        var row = el('div', 'usage-hbar-row');
+        var name = el('span', 'usage-hbar-name', m.name);
+        name.title = m.name + ' · 请求 ' + (formatInt(m.requests) || '—')
+          + ' · 输入 ' + (formatInt(m.inputTokens) || '—') + ' · 输出 ' + (formatInt(m.outputTokens) || '—')
+          + ' · 缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—');
+        var track = el('div', 'usage-hbar-track');
+        var fill = el('div', 'usage-hbar-fill');
+        fill.style.width = pct + '%';
+        track.appendChild(fill);
+        var totalSpan = el('span', 'usage-hbar-total', formatCompact(total) || '—');
+        if (formatInt(total) != null) totalSpan.title = formatInt(total);
+        row.appendChild(name);
+        row.appendChild(track);
+        row.appendChild(totalSpan);
+        list.appendChild(row);
+      });
+      card.appendChild(list);
+      return card;
+    }
+
+    function recordClock(ts) {
+      var s = toStr(ts);
+      if (!s) return null;
+      var t = new Date(s);
+      return Number.isNaN(t.getTime()) ? s : formatClock(t.getTime());
+    }
+    var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
+    function recordsTokenCell(value, estimated) {
+      return {
+        text: (estimated ? '≈' : '') + (formatCompact(value) || '—'),
+        title: formatInt(value) == null ? null : formatInt(value),
+      };
+    }
+    function recordsNumCell(cell) {
+      var td = el('td', 'num', cell.text);
+      if (cell.title != null) td.title = cell.title;
+      return td;
+    }
+    function buildRecordsTable(records) {
+      var table = el('table', 'records-table');
+      var thead = el('thead');
+      var hr = el('tr');
+      RECORD_HEADERS.forEach(function (h, i) {
+        var th = el('th', i >= 4 && i <= 10 ? 'num' : null, h);
+        th.setAttribute('scope', 'col');
+        hr.appendChild(th);
+      });
+      thead.appendChild(hr);
+      table.appendChild(thead);
+      var tbody = el('tbody');
+      records.forEach(function (r) {
+        var tr = el('tr');
+        var time = recordClock(r.timestamp);
+        var timeTd = el('td', null, time || '—');
+        if (r.timestamp) timeTd.title = r.timestamp;
+        tr.appendChild(timeTd);
+        tr.appendChild(el('td', null, r.provider));
+        var chain = modelChain(r);
+        var modelTd = el('td', 'cell-truncate', chain);
+        modelTd.title = chain;
+        tr.appendChild(modelTd);
+        tr.appendChild(el('td', null, clientLabel(r.clientType)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.inputTokens, r.usageEstimated)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.outputTokens, r.usageEstimated)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheReadTokens, false)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheWriteTokens, false)));
+        tr.appendChild(recordsNumCell({ text: formatMs(r.durationMs) || '—' }));
+        tr.appendChild(recordsNumCell({ text: formatMs(r.ttftMs) || '—' }));
+        tr.appendChild(recordsNumCell({ text: formatSpeed(r.tokensPerSecond) || '—' }));
+        var failed = r.status === 'error';
+        var statusTd = el('td', null);
+        var dot = el('span', 'record-dot');
+        dot.setAttribute('data-tone', failed ? 'error' : 'ok');
+        statusTd.appendChild(dot);
+        // The message stays a tooltip; responseBody is never projected across IPC.
+        statusTd.title = failed ? (r.errorMessage || '调用失败') : '成功';
+        tr.appendChild(statusTd);
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      return table;
+    }
+
+    function buildRecordsCard() {
+      var root = el('div', 'usage-card records-card');
+      root.appendChild(el('div', 'usage-title', '调用记录'));
+      var pager = el('div', 'records-pager');
+      var prev = mkBtn('‹ 上一页', '上一页', function () { if (recordsCtrl) recordsCtrl.prev(); });
+      var info = el('span', 'records-info');
+      var next = mkBtn('下一页 ›', '下一页', function () { if (recordsCtrl) recordsCtrl.next(); });
+      pager.appendChild(prev);
+      pager.appendChild(info);
+      pager.appendChild(next);
+      root.appendChild(pager);
+      var scroll = el('div', 'records-scroll');
+      root.appendChild(scroll);
+      return { root: root, prev: prev, info: info, next: next, scroll: scroll };
+    }
+
+    function syncRecordsCard(refs, rs) {
+      var missing = !recordsCtrl;
+      var loading = !!rs && rs.loading === true;
+      refs.prev.disabled = missing || loading || !rs || !rs.canPrev;
+      refs.next.disabled = missing || loading || !rs || !rs.canNext;
+      if (rs && rs.totalPages !== null) {
+        refs.info.textContent = '第 ' + rs.page + ' / ' + rs.totalPages + ' 页 · 共 ' + (formatInt(rs.total) || '—') + ' 条';
+      } else if (loading) {
+        refs.info.textContent = '正在读取调用记录…';
+      } else {
+        refs.info.textContent = '—';
+      }
+      refs.scroll.textContent = '';
+      if (missing) {
+        refs.scroll.appendChild(noteEl('桌面 IPC 不可用，无法读取调用记录。'));
+        return;
+      }
+      if (rs && rs.error) {
+        var err = noteEl('调用记录读取失败：' + rs.error);
+        err.setAttribute('data-tone', 'error');
+        refs.scroll.appendChild(err);
+        return;
+      }
+      if (!rs || !rs.data) {
+        refs.scroll.appendChild(noteEl(loading ? '正在读取调用记录…' : '尚未读取调用记录'));
+        return;
+      }
+      if (!rs.data.records.length) {
+        refs.scroll.appendChild(noteEl('该周期暂无调用记录'));
+        return;
+      }
+      refs.scroll.appendChild(buildRecordsTable(rs.data.records));
+    }
+
+    var recordsRefs = null;
+    function renderRecords(rs) {
+      // renderUsage rebuilds usage-body on every emit, so the records card is
+      // re-appended after it; records-only updates sync the existing card.
+      if (!recordsRefs || !recordsRefs.root.parentNode) {
+        recordsRefs = buildRecordsCard();
+        els.usageBody.appendChild(recordsRefs.root);
+      }
+      syncRecordsCard(recordsRefs, rs);
     }
 
     // ---- clients tab ------------------------------------------------------
@@ -2056,7 +2497,7 @@
       if (mode === 'missing' || loadedTabs[name]) return;
       loadedTabs[name] = true;
       if (name === 'routing') routingCtrl.refresh();
-      if (name === 'usage') usageCtrl.refresh();
+      if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); }
       if (name === 'clients') clientsCtrl.refresh();
       if (name === 'projects') projectsCtrl.refresh();
     }
@@ -2124,9 +2565,15 @@
       });
     });
     Array.prototype.slice.call(els.usagePeriods.querySelectorAll('.period-btn')).forEach(function (b) {
-      b.addEventListener('click', function () { if (usageCtrl) usageCtrl.setPeriod(b.dataset.period); });
+      b.addEventListener('click', function () {
+        if (usageCtrl) usageCtrl.setPeriod(b.dataset.period);
+        if (recordsCtrl) recordsCtrl.setPeriod(b.dataset.period); // resets to page 1
+      });
     });
-    els.usageRefresh.addEventListener('click', function () { if (usageCtrl) usageCtrl.refresh(); });
+    els.usageRefresh.addEventListener('click', function () {
+      if (usageCtrl) usageCtrl.refresh();
+      if (recordsCtrl) recordsCtrl.refresh();
+    });
     els.clientsRefresh.addEventListener('click', function () { if (clientsCtrl) clientsCtrl.refresh(); });
     els.serviceStart.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('start'); });
     els.serviceStop.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('stop'); });
@@ -2184,6 +2631,10 @@
       usageCtrl.subscribe(renderUsage);
       renderUsage(usageCtrl.state());
     } else renderUsage({ snapshot: null, loading: false, error: null, period: 'today' });
+    if (recordsCtrl) {
+      recordsCtrl.subscribe(renderRecords);
+      renderRecords(recordsCtrl.state());
+    } else renderRecords(null);
     if (clientsCtrl) {
       clientsCtrl.subscribe(renderClients);
       renderClients(clientsCtrl.state());

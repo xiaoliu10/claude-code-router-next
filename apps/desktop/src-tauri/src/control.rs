@@ -37,6 +37,13 @@ const MAX_PROVIDER_BUCKETS: usize = 50;
 const MAX_MODEL_BUCKETS: usize = 100;
 const MAX_DAY_BUCKETS: usize = 62;
 const MAX_ALIAS_LENGTH: usize = 64;
+/// Defaults and bounds for the usage records pager; the panel shows 20 rows.
+const DEFAULT_USAGE_PAGE: u32 = 1;
+const DEFAULT_USAGE_PAGE_SIZE: u32 = 20;
+const MAX_USAGE_PAGE_SIZE: u32 = 50;
+/// Error messages are display hints; 500 characters is enough without
+/// shipping an upstream response body across IPC.
+const MAX_USAGE_ERROR_MESSAGE_CHARS: usize = 500;
 
 // Safe fixed error messages. Transport failures from AdminClient are already
 // sanitized to method, path, and status; validation failures use these.
@@ -112,7 +119,49 @@ pub struct UsageSnapshot {
     pub by_model: Vec<UsageBucket>,
     pub by_provider: Vec<UsageBucket>,
     pub by_day: Vec<UsageBucket>,
+    /// Average time to first token in milliseconds; None when absent or not a
+    /// usable number.
+    pub avg_ttft_ms: Option<u64>,
+    /// Average generation speed in tokens per second; None when absent or not
+    /// a finite number.
+    pub avg_tokens_per_second: Option<f64>,
     pub updated_at: String,
+}
+
+/// One paginated page of usage records, projected from GET /api/usage.
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRecordsPage {
+    pub period: String,
+    pub page: u32,
+    pub page_size: u32,
+    pub total: u64,
+    pub records: Vec<UsageRecordView>,
+}
+
+/// Whitelisted record fields only: responseBody, sessionId, stream, id,
+/// modelFamily, and any key/config field are never projected across IPC.
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRecordView {
+    pub timestamp: String,
+    pub provider: String,
+    pub model: String,
+    pub original_model: Option<String>,
+    pub upstream_model: Option<String>,
+    pub client_type: Option<String>,
+    pub scenario_type: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub ttft_ms: Option<u64>,
+    pub tokens_per_second: Option<f64>,
+    pub duration_ms: u64,
+    pub status: String,
+    pub usage_estimated: bool,
+    /// Truncated to MAX_USAGE_ERROR_MESSAGE_CHARS characters.
+    pub error_message: Option<String>,
 }
 
 #[derive(Serialize, Clone, PartialEq, Debug)]
@@ -234,6 +283,29 @@ impl ControlService {
         usage_snapshot_from(&summary, period)
     }
 
+    pub(crate) async fn usage_records(
+        &self,
+        period: &str,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<UsageRecordsPage, String> {
+        if !USAGE_PERIODS.contains(&period) {
+            return Err(ERR_PERIOD.into());
+        }
+        let page = page.unwrap_or(DEFAULT_USAGE_PAGE).max(1);
+        let page_size = page_size
+            .unwrap_or(DEFAULT_USAGE_PAGE_SIZE)
+            .clamp(1, MAX_USAGE_PAGE_SIZE);
+        let (start, end) = usage_window(period)?;
+        let path = format!(
+            "/api/usage?startDate={}&endDate={}&page={page}&pageSize={page_size}",
+            encode_query(&start),
+            encode_query(&end)
+        );
+        let response = self.client()?.get_json(&path).await?;
+        usage_records_from(&response, period, page, page_size)
+    }
+
     pub(crate) async fn clients_snapshot(&self) -> ClientSnapshot {
         let Some(client) = self.client.as_ref() else {
             return ClientSnapshot {
@@ -347,6 +419,18 @@ pub async fn usage_snapshot(
 ) -> Result<UsageSnapshot, String> {
     crate::popup::guard(&window)?;
     service.usage_snapshot(&period).await
+}
+
+#[tauri::command]
+pub async fn usage_records(
+    window: WebviewWindow,
+    service: tauri::State<'_, ControlService>,
+    period: String,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<UsageRecordsPage, String> {
+    crate::popup::guard(&window)?;
+    service.usage_records(&period, page, page_size).await
 }
 
 #[tauri::command]
@@ -763,6 +847,24 @@ fn counter(summary: &Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// counter() analogue that keeps absence: missing, non-numeric, or negative
+/// values become None instead of 0.
+fn optional_counter(value: &Value, key: &str) -> Option<u64> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value as u64)
+}
+
+/// Finite-only float metric: missing, non-numeric, or non-finite → None.
+fn optional_metric(value: &Value, key: &str) -> Option<f64> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
 fn buckets(summary: &Value, key: &str, cap: usize, sort_desc: bool) -> Vec<UsageBucket> {
     let mut entries: Vec<UsageBucket> = summary
         .get(key)
@@ -788,8 +890,9 @@ fn buckets(summary: &Value, key: &str, cap: usize, sort_desc: bool) -> Vec<Usage
     entries
 }
 
-/// Whitelisted counters only: aggregates like avgTtft/avgTokensPerSecond and
-/// non-whitelisted buckets (byClient) are never projected.
+/// Whitelisted counters only: non-whitelisted buckets (byClient, byScenario,
+/// byFamily) are never projected; avgTtft/avgTokensPerSecond are surfaced as
+/// the optional typed metrics on the snapshot.
 fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, String> {
     if !summary.is_object() {
         return Err(ERR_USAGE.into());
@@ -807,7 +910,73 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
         by_model: buckets(summary, "byModel", MAX_MODEL_BUCKETS, true),
         by_provider: buckets(summary, "byProvider", MAX_PROVIDER_BUCKETS, true),
         by_day: buckets(summary, "byDay", MAX_DAY_BUCKETS, false),
+        avg_ttft_ms: optional_counter(summary, "avgTtft"),
+        avg_tokens_per_second: optional_metric(summary, "avgTokensPerSecond"),
         updated_at: rfc3339(OffsetDateTime::now_utc()),
+    })
+}
+
+/// Char-boundary-safe truncation so the IPC payload can never split a codepoint
+/// or carry an unbounded upstream error body.
+fn truncate_error_message(value: Option<&Value>) -> Option<String> {
+    projected_text(value).map(|text| {
+        text.chars()
+            .take(MAX_USAGE_ERROR_MESSAGE_CHARS)
+            .collect::<String>()
+    })
+}
+
+/// Non-object entries are skipped rather than defaulted, mirroring the client
+/// projection's treatment of unknown ids.
+fn usage_record_view(entry: &Value) -> Option<UsageRecordView> {
+    // get() resolves keys only on objects, so this doubles as the object check.
+    entry.as_object()?;
+    Some(UsageRecordView {
+        timestamp: projected_text(entry.get("timestamp")).unwrap_or_default(),
+        provider: projected_text(entry.get("provider")).unwrap_or_default(),
+        model: projected_text(entry.get("model")).unwrap_or_default(),
+        original_model: projected_text(entry.get("originalModel")),
+        upstream_model: projected_text(entry.get("upstreamModel")),
+        client_type: projected_text(entry.get("clientType")),
+        scenario_type: projected_text(entry.get("scenarioType")).unwrap_or_default(),
+        input_tokens: counter(entry, "inputTokens"),
+        output_tokens: counter(entry, "outputTokens"),
+        cache_read_tokens: counter(entry, "cacheReadInputTokens"),
+        cache_write_tokens: counter(entry, "cacheCreationInputTokens"),
+        ttft_ms: optional_counter(entry, "ttft"),
+        tokens_per_second: optional_metric(entry, "tokensPerSecond"),
+        duration_ms: counter(entry, "durationMs"),
+        status: projected_text(entry.get("status")).unwrap_or_default(),
+        usage_estimated: entry
+            .get("usageEstimated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        error_message: truncate_error_message(entry.get("errorMessage")),
+    })
+}
+
+/// Whitelisted usage records projection: non-object payloads, non-array
+/// records, and sensitive fields (responseBody, sessionId, stream, id) never
+/// cross IPC; the pager echoes the clamped values the gateway was queried with.
+fn usage_records_from(
+    response: &Value,
+    period: &str,
+    page: u32,
+    page_size: u32,
+) -> Result<UsageRecordsPage, String> {
+    if !response.is_object() {
+        return Err(ERR_USAGE.into());
+    }
+    let entries = response
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or(ERR_USAGE)?;
+    Ok(UsageRecordsPage {
+        period: period.into(),
+        page,
+        page_size,
+        total: counter(response, "total"),
+        records: entries.iter().filter_map(usage_record_view).collect(),
     })
 }
 
@@ -1285,14 +1454,20 @@ mod tests {
         assert_eq!(snapshot.cache_read_tokens, 30);
         assert_eq!(snapshot.cache_write_tokens, 40);
         assert_eq!(snapshot.estimated_count, 3);
+        // Optional aggregates are surfaced from the same summary payload.
+        assert_eq!(snapshot.avg_ttft_ms, Some(999));
+        assert_eq!(snapshot.avg_tokens_per_second, Some(42.0));
         assert_eq!(snapshot.by_provider[0].name, "alpha");
         assert_eq!(snapshot.by_provider[0].requests, 10);
         assert_eq!(snapshot.by_day.first().unwrap().name, "2026-11-16");
         let rendered = serialized(&snapshot);
-        assert!(!rendered.contains("avgTtft"));
+        assert!(rendered.contains("\"avgTtftMs\":999"));
+        assert!(rendered.contains("\"avgTokensPerSecond\":42.0"));
         assert_eq!(snapshot.by_model[0].name, "model-a");
         assert_eq!(snapshot.by_model[0].cache_read_tokens, 9);
         assert_eq!(snapshot.by_model[0].cache_write_tokens, 2);
+        assert!(!rendered.contains("byScenario"));
+        assert!(!rendered.contains("byFamily"));
         assert!(!rendered.contains("byClient"));
         assert!(!rendered.contains("secret-client"));
         assert!(!rendered.contains("sekret"));
@@ -1335,6 +1510,25 @@ mod tests {
                 .unwrap();
         assert_eq!(snapshot.total_requests, 0);
         assert_eq!(snapshot.error_count, 0);
+        assert_eq!(snapshot.avg_ttft_ms, None);
+        assert_eq!(snapshot.avg_tokens_per_second, None);
+    }
+
+    #[test]
+    fn usage_snapshot_optional_metrics_follow_summary_availability() {
+        // Absent, null, non-numeric, and negative metrics are all None.
+        let snapshot = usage_snapshot_from(
+            &json!({"avgTtft": null, "avgTokensPerSecond": "leak"}),
+            "today",
+        )
+        .unwrap();
+        assert_eq!(snapshot.avg_ttft_ms, None);
+        assert_eq!(snapshot.avg_tokens_per_second, None);
+        let snapshot =
+            usage_snapshot_from(&json!({"avgTtft": -5, "avgTokensPerSecond": 12.5}), "today")
+                .unwrap();
+        assert_eq!(snapshot.avg_ttft_ms, None);
+        assert_eq!(snapshot.avg_tokens_per_second, Some(12.5));
     }
 
     #[tokio::test]
@@ -1347,6 +1541,193 @@ mod tests {
         let mock = Mock::new(vec![(500, "LEAK_SECRET".into())]);
         let service = ControlService::new(Some(mock.client()));
         let error = service.usage_snapshot("today").await.unwrap_err();
+        assert!(!error.contains("LEAK_SECRET"));
+        assert_eq!(mock.finish().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn usage_records_project_whitelist_and_echo_clamped_pager() {
+        let payload = json!({
+            "records": [
+                {
+                    "id": "row-1", "timestamp": "2026-11-17T09:30:00.000Z",
+                    "sessionId": "sess-LEAK", "stream": true,
+                    "provider": "alpha", "originalModel": "claude-opus-4,group:main",
+                    "model": "claude-opus-4", "upstreamModel": "claude-opus-4-5",
+                    "modelFamily": "opus", "scenarioType": "think",
+                    "clientType": "claude-code", "usageEstimated": true,
+                    "inputTokens": 100, "outputTokens": 200.7,
+                    "cacheReadInputTokens": 30, "cacheCreationInputTokens": 40,
+                    "ttft": 820, "tokensPerSecond": 55.5, "durationMs": 3600,
+                    "status": "success", "responseBody": "LEAK_SECRET_BODY"
+                },
+                {
+                    "timestamp": "2026-11-17T10:00:00.000Z", "provider": "beta",
+                    "model": "model-b", "scenarioType": "default",
+                    "inputTokens": "leak", "outputTokens": -5,
+                    "ttft": null, "tokensPerSecond": null, "durationMs": 10,
+                    "status": "error", "errorMessage": "upstream exploded"
+                },
+                "not-an-object",
+                {"APIKEY": "$SECRET"}
+            ],
+            "summary": {"totalRequests": "unused"},
+            "total": 41, "page": 3, "pageSize": 10
+        });
+        let mock = Mock::new(vec![response(payload)]);
+        let service = ControlService::new(Some(mock.client()));
+        let page = service.usage_records("7d", None, None).await.unwrap();
+
+        // The pager echoes the clamped request values, not the gateway's.
+        assert_eq!(page.period, "7d");
+        assert_eq!(page.page, 1);
+        assert_eq!(page.page_size, 20);
+        assert_eq!(page.total, 41);
+
+        let full = &page.records[0];
+        assert_eq!(full.timestamp, "2026-11-17T09:30:00.000Z");
+        assert_eq!(full.provider, "alpha");
+        assert_eq!(full.model, "claude-opus-4");
+        assert_eq!(
+            full.original_model.as_deref(),
+            Some("claude-opus-4,group:main")
+        );
+        assert_eq!(full.upstream_model.as_deref(), Some("claude-opus-4-5"));
+        assert_eq!(full.client_type.as_deref(), Some("claude-code"));
+        assert_eq!(full.scenario_type, "think");
+        assert_eq!(full.input_tokens, 100);
+        assert_eq!(full.output_tokens, 200);
+        assert_eq!(full.cache_read_tokens, 30);
+        assert_eq!(full.cache_write_tokens, 40);
+        assert_eq!(full.ttft_ms, Some(820));
+        assert_eq!(full.tokens_per_second, Some(55.5));
+        assert_eq!(full.duration_ms, 3600);
+        assert_eq!(full.status, "success");
+        assert!(full.usage_estimated);
+        assert_eq!(full.error_message, None);
+
+        // Null, missing, and non-numeric fields default to None/0.
+        let errored = &page.records[1];
+        assert_eq!(errored.input_tokens, 0);
+        assert_eq!(errored.output_tokens, 0);
+        assert_eq!(errored.ttft_ms, None);
+        assert_eq!(errored.tokens_per_second, None);
+        assert_eq!(errored.status, "error");
+        assert_eq!(errored.error_message.as_deref(), Some("upstream exploded"));
+        assert!(!errored.usage_estimated);
+
+        // Non-object entries are skipped, object entries survive without any
+        // unknown-key leakage.
+        assert_eq!(page.records.len(), 3);
+        let rendered = serialized(&page);
+        for secret in [
+            "LEAK_SECRET_BODY",
+            "sess-LEAK",
+            "\"sessionId\"",
+            "\"stream\"",
+            "row-1",
+            "modelFamily",
+            "responseBody",
+            "summary",
+            "APIKEY",
+            "$SECRET",
+            "\"leak\"",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret}");
+        }
+
+        let requests = mock.finish().await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/usage?startDate="));
+        assert!(requests[0].contains("&page=1&pageSize=20"));
+    }
+
+    #[tokio::test]
+    async fn usage_records_clamp_page_and_page_size_bounds() {
+        for (page, page_size, expected) in [
+            (None, None, "&page=1&pageSize=20"),
+            (Some(0), Some(0), "&page=1&pageSize=1"),
+            (Some(7), Some(999), "&page=7&pageSize=50"),
+        ] {
+            let mock = Mock::new(vec![response(json!({"records": [], "total": 0}))]);
+            let service = ControlService::new(Some(mock.client()));
+            service
+                .usage_records("today", page, page_size)
+                .await
+                .unwrap();
+            let requests = mock.finish().await;
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].contains(expected), "missing {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_records_truncate_error_messages_on_char_boundaries() {
+        let long = "E".repeat(600) + "TAIL_LEAK";
+        let multibyte = "中".repeat(600);
+        let payload = json!({
+            "records": [
+                {"status": "error", "errorMessage": long},
+                {"status": "error", "errorMessage": multibyte}
+            ],
+            "total": 2
+        });
+        let mock = Mock::new(vec![response(payload)]);
+        let service = ControlService::new(Some(mock.client()));
+        let page = service.usage_records("today", None, None).await.unwrap();
+        assert_eq!(
+            page.records[0].error_message,
+            Some("E".repeat(MAX_USAGE_ERROR_MESSAGE_CHARS))
+        );
+        // Truncation counts characters, not bytes, so no codepoint is split.
+        assert_eq!(
+            page.records[1].error_message,
+            Some("中".repeat(MAX_USAGE_ERROR_MESSAGE_CHARS))
+        );
+        let rendered = serialized(&page);
+        assert!(!rendered.contains("TAIL_LEAK"));
+    }
+
+    #[tokio::test]
+    async fn usage_records_malformed_and_failures_are_safe() {
+        // Unknown period is rejected before any request.
+        let mock = Mock::new(vec![]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service.usage_records("90d", None, None).await.unwrap_err(),
+            ERR_PERIOD
+        );
+        assert!(mock.finish().await.is_empty());
+
+        // Non-object payloads and non-array records are fixed safe errors.
+        let mock = Mock::new(vec![
+            response(json!([])),
+            response(json!({"records": "leak"})),
+        ]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service
+                .usage_records("today", None, None)
+                .await
+                .unwrap_err(),
+            ERR_USAGE
+        );
+        assert_eq!(
+            service
+                .usage_records("today", None, None)
+                .await
+                .unwrap_err(),
+            ERR_USAGE
+        );
+        assert_eq!(mock.finish().await.len(), 2);
+
+        // Transport failures stay sanitized.
+        let mock = Mock::new(vec![(500, "LEAK_SECRET".into())]);
+        let service = ControlService::new(Some(mock.client()));
+        let error = service
+            .usage_records("today", None, None)
+            .await
+            .unwrap_err();
         assert!(!error.contains("LEAK_SECRET"));
         assert_eq!(mock.finish().await.len(), 1);
     }
@@ -1495,6 +1876,13 @@ mod tests {
         assert_eq!(service.routing_snapshot().await.unwrap_err(), ERR_OFFLINE);
         assert_eq!(
             service.usage_snapshot("today").await.unwrap_err(),
+            ERR_OFFLINE
+        );
+        assert_eq!(
+            service
+                .usage_records("today", None, None)
+                .await
+                .unwrap_err(),
             ERR_OFFLINE
         );
         assert!(!service.clients_snapshot().await.success);
