@@ -9,6 +9,7 @@ fn main() {
             "routing_save",
             "routing_flags",
             "usage_snapshot",
+            "usage_records",
             "clients_snapshot",
             "clients_update",
             "projects_snapshot",
