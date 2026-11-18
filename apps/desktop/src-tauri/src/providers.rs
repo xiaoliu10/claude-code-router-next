@@ -108,14 +108,10 @@ impl ProvidersService {
         let client = self.client.as_ref().ok_or(ERR_UNAVAILABLE)?;
         let _write = client.write_guard().await;
         let mut config = client.config().await.map_err(|_| ERR_UNAVAILABLE)?;
+        let key = crate::api::provider_list_key(&config);
         let root = config.as_object_mut().ok_or(ERR_UNAVAILABLE)?;
         // The gateway also accepts legacy `providers`. Creating a parallel
         // `Providers` array would shadow the existing list on runtime reload.
-        let key = if !root.contains_key("Providers") && root.contains_key("providers") {
-            "providers"
-        } else {
-            "Providers"
-        };
         let entries = root
             .entry(key)
             .or_insert_with(|| json!([]))
@@ -236,6 +232,36 @@ mod tests {
         let service = ProvidersService::new(Some(mock.client()));
         assert_eq!(service.add(Some(input())).await.unwrap_err(), ERR_DUPLICATE);
         assert_eq!(mock.finish().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_add_is_visible_to_quota_and_routing_choices() {
+        let verified = json!({"providers":[entry()]});
+        let mock = Mock::new(vec![
+            response(json!({"providers":[]})),
+            response(json!({"success":true})),
+            response(verified.clone()),
+            response(verified.clone()),
+            response(json!({"quotas":[]})),
+        ]);
+        let client = mock.client();
+        ProvidersService::new(Some(client.clone()))
+            .add(Some(input()))
+            .await
+            .unwrap();
+        let quota = crate::quota::QuotaService::new(Some(client))
+            .snapshot(Some("Example".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(quota).unwrap()["providers"][0]["name"],
+            "Example"
+        );
+        assert_eq!(
+            crate::api::providers(&verified)[0].models,
+            ["model-a", "model-b"]
+        );
+        mock.finish().await;
     }
 
     #[test]

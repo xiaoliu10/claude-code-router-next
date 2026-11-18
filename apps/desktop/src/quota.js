@@ -236,6 +236,14 @@
     function refreshProvider(name, newlyAdded) {
       if (newlyAdded && loadingAll) return allPromise.then(function () { return refreshProvider(name, true); });
       if ((!snapshot && !newlyAdded) || loadingAll) return Promise.resolve();
+      if (newlyAdded) {
+        // Earlier card snapshots predate the config change and can omit the new row.
+        flags.forEach(function (flag, key) {
+          if (!flag.loading) return;
+          seq.set(key, (seq.get(key) || 0) + 1);
+          flags.set(key, { loading: false, error: null });
+        });
+      }
       var f = flags.get(name);
       if (f && f.loading) return Promise.resolve();
       var my = (seq.get(name) || 0) + 1;
@@ -325,8 +333,17 @@
       if (openName !== null && !known(openName)) { openName = null; saveError = null; savedFlash = null; }
     }
 
-    function refresh() {
-      if (loading || saving) return;
+    var refreshQueued = false;
+    function drainRefresh() {
+      if (!refreshQueued || loading || saving) return;
+      refreshQueued = false;
+      refresh();
+    }
+    function refresh(afterConfigChange) {
+      if (loading || saving) {
+        if (afterConfigChange === true) refreshQueued = true;
+        return;
+      }
       loading = true;
       error = null;
       emit();
@@ -341,7 +358,7 @@
         loading = false;
         error = errorMessage(err);
         emit();
-      });
+      }).then(drainRefresh);
     }
 
     function open(name) {
@@ -382,7 +399,7 @@
         saving = false;
         saveError = errorMessage(err);
         emit();
-      });
+      }).then(drainRefresh);
     }
 
     function save(name, values) {
@@ -1663,8 +1680,10 @@
         if (!saved || saved.name !== name) throw new Error();
       } catch (err) {
         setSaving(false);
-        var duplicate = err === 'PROVIDER_DUPLICATE' || (err && err.message === 'PROVIDER_DUPLICATE');
+        var code = typeof err === 'string' ? err : err && err.message;
+        var duplicate = code === 'PROVIDER_DUPLICATE';
         var message = duplicate ? '供应商名称已存在，请使用其他名称。' : '添加供应商失败，请检查输入后重试。';
+        if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
         if (form.hidden) status.textContent = message;
         else {
           error.textContent = message;
@@ -2645,7 +2664,7 @@
     var loadedTabs = { quota: true };
     var providerForm = mountProviderForm(invoke, function (name) {
       controller.refreshProvider(name, true);
-      credentialsCtrl.refresh();
+      credentialsCtrl.refresh(true);
       if (!loadedTabs.routing) return;
       // A snapshot taken before the addition can still be in flight. Wait for
       // the current routing read/write to finish so its result cannot win.

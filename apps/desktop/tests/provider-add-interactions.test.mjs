@@ -95,8 +95,10 @@ test('provider_add: duplicate and unknown errors are fixed, safe and retryable',
   await flush(); h.id('provider-add-open').click(); fill(h); submit(h); await flush();
   assert.match(h.id('provider-add-error').textContent, /名称已存在/);
   assert.equal(h.doc.activeElement, h.id('provider-name'));
+  failure = 'PROVIDER_SAVE_UNCONFIRMED'; submit(h); await flush();
+  assert.match(h.id('provider-add-error').textContent, /刷新供应商列表/);
   failure = new Error('test-key'); submit(h); await flush();
-  assert.equal(addCalls(h).length, 2);
+  assert.equal(addCalls(h).length, 3);
   assert.match(h.id('provider-add-error').textContent, /添加供应商失败/);
   assert.doesNotMatch(h.id('panel-quota').textContent, /test-key/);
   assert.equal(h.id('provider-add-form').hidden, false);
@@ -107,16 +109,19 @@ test('provider_add: duplicate and unknown errors are fixed, safe and retryable',
 });
 
 test('provider_add: pending initial snapshots cannot mask the post-save refresh', async () => {
-  let finishQuota, finishRouting, quotaReads = 0, routingReads = 0;
+  let finishQuota, finishRouting, finishCredentials, quotaReads = 0, routingReads = 0, credentialReads = 0;
   const h = harness({
     provider_add: () => ({ name }),
     quota_snapshot: () => ++quotaReads === 1 ? new Promise(resolve => { finishQuota = resolve; }) : { online: true, providers: [{ name }] },
+    quota_credentials_status: () => ++credentialReads === 1 ? new Promise(resolve => { finishCredentials = resolve; }) : { providers: [{ name, configured: false }] },
     routing_snapshot: () => ++routingReads === 1 ? new Promise(resolve => { finishRouting = resolve; }) : { revision: '2', providers: [{ name, models: ['one'] }] },
   });
   h.id('tab-routing').click(); h.id('tab-quota').click(); h.id('provider-add-open').click();
   fill(h); submit(h); await flush();
   assert.equal(h.id('provider-add-form').hidden, true);
-  finishQuota({ online: true, providers: [] }); finishRouting({ revision: '1', providers: [] }); await flush();
+  finishQuota({ online: true, providers: [] }); finishRouting({ revision: '1', providers: [] });
+  finishCredentials({ providers: [] }); await flush();
+  assert.equal(credentialReads, 2);
   assert.equal(h.id('list').querySelector('.card-name').textContent, name);
   assert.ok(h.id('route-choices').children.some(option => option.value === 'example.com,one'));
 });
