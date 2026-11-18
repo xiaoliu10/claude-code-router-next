@@ -126,6 +126,8 @@ pub struct PluginCatalog {
 #[serde(rename_all = "camelCase")]
 pub struct InstallOutcome {
     pub restart_required: bool,
+    pub id: String,
+    pub version: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -595,6 +597,8 @@ impl PluginsService {
         // Never restart here: the user restarts explicitly via service controls.
         Ok(InstallOutcome {
             restart_required: true,
+            id: confirmed["name"].as_str().ok_or(ERR_INSTALL)?.to_owned(),
+            version,
         })
     }
 
@@ -1142,7 +1146,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::to_value(outcome).unwrap(),
-            json!({"restartRequired": true})
+            json!({"restartRequired": true, "id":"pkg", "version":"1.2.3"})
         );
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 2);
@@ -1228,7 +1232,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::to_value(outcome).unwrap(),
-            json!({"restartRequired": true})
+            json!({"restartRequired": true, "id":"pkg", "version":"1.3.0"})
         );
         let requests = mock.finish().await;
         assert_eq!(

@@ -429,7 +429,9 @@ test("preview: plugin DTOs model partial catalog, install/update, safe actions a
   assert.deepEqual({ ...disconnected }, { success: true })
   for (const [row, isUpdate] of [[offer, false], [update, true]]) {
     const result = await previewCall(invoke, "plugin_install", { name: row.name, version: row.version, installed: isUpdate ? { name: row.installedName, version: row.installedVersion } : null })
-    assert.deepEqual({ ...result }, { restartRequired: true })
+    assert.equal(result.restartRequired, true)
+    assert.equal(result.version, row.version)
+    assert.ok(result.id)
   }
   const installed = await previewCall(invoke, "plugin_catalog")
   assert.ok(installed.plugins.every(row => row.installed && !row.updateAvailable))

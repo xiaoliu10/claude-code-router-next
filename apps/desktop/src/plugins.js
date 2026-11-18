@@ -130,7 +130,7 @@
         var label = installedView ? (plugin.loaded ? '已加载' : '未加载')
           : (plugin.localOnly ? '仅本地' : plugin.updateAvailable ? '有更新' : plugin.installed ? '已安装' : '未安装');
         title.appendChild(el('span', 'card-name', plugin.name));
-        title.appendChild(el('span', awaiting ? 'badge badge-stale' : 'badge', awaiting || label));
+        title.appendChild(el('span', awaiting ? 'badge badge-stale' : 'badge', awaiting ? awaiting.label : label));
         card.appendChild(title);
         var version = (installedView && plugin.loaded ? '已加载版本：' : '版本：') + (plugin.version || '未知');
         if (!installedView && plugin.installed) {
@@ -200,6 +200,15 @@
         if (target.request !== request) return;
         target.data = data;
         target.error = '';
+        if (targetView === INSTALLED) {
+          awaitingActivation.forEach(function (expected, name) {
+            if (data.plugins.some(function (p) { return p.loaded && p.id === expected.id && p.version === expected.version; })) {
+              awaitingActivation.delete(name);
+            }
+          });
+          renderRestart();
+          if (view === MARKET) renderList();
+        }
       } catch {
         if (target.request !== request) return;
         target.error = targetView === INSTALLED ? '无法读取已安装插件。' : '无法读取插件市场。';
@@ -231,7 +240,9 @@
         if (install) {
           if (!result || typeof result.restartRequired !== 'boolean') throw new Error();
           if (result.restartRequired) {
-            awaitingActivation.set(request.args.name, request.args.installed ? '已更新 · 待激活' : '已安装 · 待激活');
+            if (!MANIFEST_ID.test(text(result.id)) || result.version !== request.args.version) throw new Error();
+            awaitingActivation.set(request.args.name, { id: result.id, version: result.version,
+              label: request.args.installed ? '已更新 · 待激活' : '已安装 · 待激活' });
             startingForActivation = false;
             if (view === MARKET) renderList();
           }
@@ -289,7 +300,6 @@
         lastServiceAction = state.pending;
         if (startingForActivation && !state.pending && !state.loading) {
           if (!state.error && service && service.mode === 'owned' && service.running) {
-            awaitingActivation.clear();
             startingForActivation = false;
             status(feedback, '托管网关已启动。请在已安装列表核对插件的加载状态。');
             if (view === MARKET) { renderList(); renderStatus(); }
@@ -336,7 +346,7 @@
               inventory.push({ id: entry.id, name: 'Gemini OAuth', version: entry.version, loaded: false, actions: [] });
             }
             awaitingLoad.add(entry.id);
-            return delay({ restartRequired: true });
+            return delay({ restartRequired: true, id: entry.id, version: entry.version });
           }
           return Promise.reject(new Error('PLUGIN_INSTALL_FAILED'));
         }

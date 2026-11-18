@@ -164,7 +164,7 @@ test('plugins: market install and update use names, preserve partial results and
   assert.equal(h.id('plugins-restart').hidden, true);
   market.plugins[0].installed = true;
   market.plugins[0].installedVersion = '2.0.0';
-  install.resolve({ restartRequired: true });
+  install.resolve({ restartRequired: true, id: 'new', version: '2.0.0' });
   await flush();
   assert.deepEqual(pluginCalls(h), [['plugin_install', { name: '@example/new', version: '2.0.0', installed: null }]]);
   assert.deepEqual(serviceCalls(h), []);
@@ -184,6 +184,20 @@ test('plugins: market install and update use names, preserve partial results and
   assert.equal(button(h, '更新 @example/update').disabled, false);
 });
 
+test('plugins: a manual inventory refresh recognizes external activation by manifest id and version', async () => {
+  const market = catalog(); let loadedVersion = '2.0.0';
+  const h = harness({ plugin_catalog: () => market,
+    plugin_inventory: () => ({ plugins: [{ id: 'update', name: 'Demo', loaded: true, version: loadedVersion, actions: [] }] }),
+    plugin_install: () => ({ restartRequired: true, id: 'update', version: '3.0.0' }) });
+  await open(h, true); confirm(h, '更新', '@example/update'); await flush();
+  assert.equal(h.id('plugins-restart').hidden, false);
+  loadedVersion = '3.0.0'; market.plugins[1].version = '4.0.0'; market.plugins[1].installedVersion = loadedVersion;
+  h.id('plugins-installed').click(); h.id('plugins-refresh').click(); await flush();
+  assert.equal(h.id('plugins-restart').hidden, true);
+  h.id('plugins-market').click(); h.id('plugins-refresh').click(); await flush();
+  assert.ok(button(h, '更新 @example/update'));
+});
+
 test('plugins: owned activation requires separate stop and start clicks and refreshes the loaded inventory', async () => {
   let mode = 'owned';
   let activated = false;
@@ -199,7 +213,7 @@ test('plugins: owned activation requires separate stop and start clicks and refr
   }, plugin_catalog: () => market, plugin_install: () => {
     market.plugins[1].installedVersion = '3.0.0';
     market.plugins[1].updateAvailable = false;
-    return { restartRequired: true };
+    return { restartRequired: true, id: 'update', version: '3.0.0' };
   } });
   await open(h, true);
   confirm(h, '更新', '@example/update'); await flush();
