@@ -245,8 +245,20 @@ body {
 .period-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .usage-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05); }
 .usage-title { font-weight: 600; font-size: 12px; color: var(--text-2); margin-bottom: 6px; }
-.usage-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px 8px; }
-.usage-cell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.usage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 90px), 1fr)); gap: 6px; }
+.usage-cell { display: flex; flex-direction: column; align-items: center; text-align: center; justify-content: center; gap: 2px; min-width: 0; padding: 6px 4px; border: 1px solid var(--border); border-radius: 7px; }
+.usage-cell[data-metric="requests"] { background: #eff6ff; color: #1e40af; }
+.usage-cell[data-metric="success"] { background: #ecfdf5; color: #166534; }
+.usage-cell[data-metric="errors"] { background: #fef2f2; color: #991b1b; }
+.usage-cell[data-metric="rate"] { background: #f3f4f6; color: #374151; }
+.usage-cell[data-metric="total"] { background: #eef2ff; color: #3730a3; }
+.usage-cell[data-metric="input"] { background: #f0fdf4; color: #166534; }
+.usage-cell[data-metric="output"] { background: #fefce8; color: #854d0e; }
+.usage-cell[data-metric="cache-read"] { background: #ecfdf5; color: #065f46; }
+.usage-cell[data-metric="cache-write"] { background: #f0fdfa; color: #115e59; }
+.usage-cell[data-metric="estimated"] { background: #fff7ed; color: #9a3412; }
+.usage-cell[data-metric="ttft"] { background: #faf5ff; color: #6b21a8; }
+.usage-cell[data-metric="speed"] { background: #fdf2f8; color: #9d174d; }
 .usage-num { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .usage-label { font-size: 10.5px; color: var(--text-3); }
 .usage-table { width: 100%; border-collapse: collapse; font-size: 11.5px; font-variant-numeric: tabular-nums; }
@@ -336,7 +348,7 @@ body {
 /* Fill the main window using the same small gutters as the tray popup;
    only the grids need additional columns on wide viewports. */
 @media (min-width: 720px) {
-  .usage-grid { grid-template-columns: repeat(5, 1fr); }
+  .usage-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   #routing-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; }
 }
 
