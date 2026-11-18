@@ -2267,7 +2267,13 @@
       grid.appendChild(usageNumCell('output', '输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
       grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
       grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
-      grid.appendChild(usageNumCell('estimated', '估算条目', formatInt(u.estimatedCount)));
+      var effectiveInput = effectiveInputTokens(u.inputTokens, u.cacheReadTokens, u.cacheWriteTokens);
+      var hitRate = effectiveInput > 0 && u.cacheReadTokens !== null
+        ? ((u.cacheReadTokens / effectiveInput) * 100).toFixed(1) + '%'
+        : null;
+      var cacheHitCell = usageNumCell('cache-hit', '缓存命中率', hitRate);
+      cacheHitCell.title = '缓存读取 tokens ÷ 有效输入 tokens';
+      grid.appendChild(cacheHitCell);
       grid.appendChild(usageNumCell('ttft', '平均 TTFT', formatMs(u.avgTtftMs)));
       grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
