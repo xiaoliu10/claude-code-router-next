@@ -75,7 +75,17 @@ pub struct PluginInventoryEntry {
     /// ACTIVE manifest version; null when installed but not loaded.
     pub version: Option<String>,
     pub loaded: bool,
+    #[serde(rename = "connectionState", skip_serializing_if = "Option::is_none")]
+    pub connection_state: Option<ConnectionState>,
     pub actions: Vec<&'static str>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionState {
+    Connected,
+    Disconnected,
+    Unknown,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -299,6 +309,7 @@ fn inventory_from(response: &Value) -> Result<PluginInventory, &'static str> {
             name: id.to_owned(),
             version,
             loaded,
+            connection_state: None,
             actions: if loaded {
                 action_routes(id).iter().map(|route| route.action).collect()
             } else {
@@ -355,6 +366,51 @@ fn catalog_from(response: &Value) -> Result<PluginCatalog, &'static str> {
     Ok(PluginCatalog { plugins, partial })
 }
 
+// WorkBuddy's status handler can migrate local config. A passive inventory
+// read only queries status routes that are read-only. Qoder's two sites
+// together describe whether any account is connected to the plugin.
+const STATUS_ROUTES: &[(&str, &[&str])] = &[
+    ("codex", &["/api/codex/status"]),
+    ("gemini-oauth", &["/api/gemini-oauth/status"]),
+    ("kiro", &["/api/kiro/status"]),
+    ("cursor", &["/api/cursor/status"]),
+    ("grok", &["/api/grok/status"]),
+    ("qoder", &["/api/qoder/status", "/api/qoder/cn/status"]),
+];
+
+async fn connection_state(
+    client: &AdminClient,
+    id: &str,
+    paths: &[&'static str],
+) -> ConnectionState {
+    use ConnectionState::*;
+    let mut combined = Disconnected;
+    for path in paths {
+        // The authenticated transport caps both the status body and read time.
+        let state = match client.quota_json(Method::GET, path, None).await {
+            Ok(body) if matches!(id, "kiro" | "gemini-oauth") => {
+                match body["connected"].as_bool() {
+                    Some(true) => Connected,
+                    Some(false) => Disconnected,
+                    _ => Unknown,
+                }
+            }
+            Ok(body) => match body["status"].as_str() {
+                Some("connected") => Connected,
+                Some("not_connected") => Disconnected,
+                _ => Unknown,
+            },
+            Err(_) => Unknown,
+        };
+        match state {
+            Connected => return Connected,
+            Unknown => combined = Unknown,
+            Disconnected => (),
+        }
+    }
+    combined
+}
+
 // ============================== Service ==============================
 
 pub struct PluginsService {
@@ -366,13 +422,36 @@ impl PluginsService {
         Self { client }
     }
 
-    async fn inventory(&self) -> Result<PluginInventory, &'static str> {
+    async fn manifests(&self) -> Result<PluginInventory, &'static str> {
         let client = self.client.as_ref().ok_or(ERR_UNAVAILABLE)?;
         let response = client
             .get_json("/api/plugins")
             .await
             .map_err(|_| ERR_UNAVAILABLE)?;
         inventory_from(&response)
+    }
+
+    async fn inventory(&self) -> Result<PluginInventory, &'static str> {
+        let mut inventory = self.manifests().await?;
+        let client = self.client.as_ref().ok_or(ERR_UNAVAILABLE)?;
+        let mut probes = tokio::task::JoinSet::new();
+        for &(id, paths) in STATUS_ROUTES {
+            if let Some(index) = inventory
+                .plugins
+                .iter()
+                .position(|row| row.loaded && row.id == id)
+            {
+                inventory.plugins[index].connection_state = Some(ConnectionState::Unknown);
+                let client = client.clone();
+                probes.spawn(async move { (index, connection_state(&client, id, paths).await) });
+            }
+        }
+        while let Some(result) = probes.join_next().await {
+            if let Ok((index, state)) = result {
+                inventory.plugins[index].connection_state = Some(state);
+            }
+        }
+        Ok(inventory)
     }
 
     async fn catalog(&self) -> Result<PluginCatalog, &'static str> {
@@ -482,7 +561,7 @@ impl PluginsService {
         let _write = client.write_guard().await;
         // Actions drive live plugin routes: confirm the plugin is actually
         // activated on a fresh read instead of trusting a stale UI list.
-        let inventory = self.inventory().await?;
+        let inventory = self.manifests().await?;
         if !inventory
             .plugins
             .iter()
@@ -599,7 +678,7 @@ mod tests {
             {"name": "disabled", "version": null, "enabled": false, "error": "disabled"},
         ]}))]);
         let inventory = PluginsService::new(Some(mock.client()))
-            .inventory()
+            .manifests()
             .await
             .unwrap();
         let actions = |id: &str| {
@@ -655,7 +734,7 @@ mod tests {
             {"name": "no-version", "enabled": true},
         ]}))]);
         let inventory = PluginsService::new(Some(mock.client()))
-            .inventory()
+            .manifests()
             .await
             .unwrap();
         assert_eq!(inventory.plugins.len(), 2);
@@ -667,7 +746,7 @@ mod tests {
             let mock = Mock::new(vec![response(bad)]);
             assert_eq!(
                 PluginsService::new(Some(mock.client()))
-                    .inventory()
+                    .manifests()
                     .await
                     .unwrap_err(),
                 ERR_INVENTORY
@@ -675,16 +754,111 @@ mod tests {
             mock.finish().await;
         }
         assert_eq!(
-            PluginsService::new(None).inventory().await.unwrap_err(),
+            PluginsService::new(None).manifests().await.unwrap_err(),
             ERR_UNAVAILABLE
         );
         let mock = Mock::new(vec![(500, "LEAK_SECRET".into())]);
         let error = PluginsService::new(Some(mock.client()))
-            .inventory()
+            .manifests()
             .await
             .unwrap_err();
         assert!(!error.contains("LEAK_SECRET"));
         mock.finish().await;
+    }
+
+    #[tokio::test]
+    async fn inventory_projects_only_connection_state_from_status() {
+        for (id, path, reply, state) in [
+            (
+                "codex",
+                "/api/codex/status",
+                response(json!({"status":"connected", "email":"private", "accountId":"private"})),
+                "connected",
+            ),
+            (
+                "kiro",
+                "/api/kiro/status",
+                response(json!({"connected":false,"accounts":["private"]})),
+                "disconnected",
+            ),
+            (
+                "gemini-oauth",
+                "/api/gemini-oauth/status",
+                response(json!({"connected":true,"email":"private"})),
+                "connected",
+            ),
+            (
+                "cursor",
+                "/api/cursor/status",
+                response(json!({"status":"not_connected","account":"private"})),
+                "disconnected",
+            ),
+            (
+                "grok",
+                "/api/grok/status",
+                response(json!({"status":"expired"})),
+                "unknown",
+            ),
+            (
+                "codex",
+                "/api/codex/status",
+                (503, "private".into()),
+                "unknown",
+            ),
+            (
+                "codex",
+                "/api/codex/status",
+                response(json!({"status": "private"})),
+                "unknown",
+            ),
+        ] {
+            let mock = Mock::new(vec![
+                response(
+                    json!({"plugins":[installed_record(id, "1.0.0"), failed_record("qoder"), installed_record("unknown-plugin", "1.0.0"), installed_record("workbuddy", "1.0.0")]}),
+                ),
+                reply,
+            ]);
+            let inventory = PluginsService::new(Some(mock.client()))
+                .inventory()
+                .await
+                .unwrap();
+            let safe = serde_json::to_value(inventory).unwrap();
+            assert_eq!(safe["plugins"][0]["connectionState"], state);
+            for index in 1..4 {
+                assert!(safe["plugins"][index].get("connectionState").is_none());
+            }
+            assert!(!safe.to_string().contains("private"));
+            let requests = mock.finish().await;
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].starts_with(&format!("GET {path} ")));
+        }
+    }
+
+    #[tokio::test]
+    async fn qoder_connection_state_covers_both_sites() {
+        for (international, cn, expected) in [
+            ("not_connected", "connected", ConnectionState::Connected),
+            (
+                "not_connected",
+                "not_connected",
+                ConnectionState::Disconnected,
+            ),
+            ("invalid", "not_connected", ConnectionState::Unknown),
+        ] {
+            let mock = Mock::new(vec![
+                response(json!({"plugins": [installed_record("qoder", "0.3.5")]})),
+                response(json!({"status":international})),
+                response(json!({"status":cn})),
+            ]);
+            let inventory = PluginsService::new(Some(mock.client()))
+                .inventory()
+                .await
+                .unwrap();
+            assert_eq!(inventory.plugins[0].connection_state, Some(expected));
+            let requests = mock.finish().await;
+            assert!(requests[1].starts_with("GET /api/qoder/status "));
+            assert!(requests[2].starts_with("GET /api/qoder/cn/status "));
+        }
     }
 
     // ------------------------------ catalog ------------------------------
