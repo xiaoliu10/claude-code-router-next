@@ -587,6 +587,8 @@ export interface CodexUsageWindow {
 }
 
 export interface CodexUsage {
+  /** Explicit upstream permission plus complete, live quota windows. */
+  canResume?: boolean;
   plan: string;
   primary?: CodexUsageWindow;
   secondary?: CodexUsageWindow;
@@ -612,7 +614,16 @@ export function parseCodexUsage(raw: unknown): CodexUsage | null {
   const primary = readUsageWindow(rateLimit.primary_window ?? rateLimit.primaryWindow);
   const secondary = readUsageWindow(rateLimit.secondary_window ?? rateLimit.secondaryWindow);
   if (!plan && !primary && !secondary) return null;
+  const windows = [rateLimit.primary_window ?? rateLimit.primaryWindow, rateLimit.secondary_window ?? rateLimit.secondaryWindow]
+    .filter(w => w != null);
+  const canResume = rateLimit.allowed === true && rateLimit.limit_reached === false && windows.length > 0 &&
+    windows.every(w => {
+      const parsed = readUsageWindow(w);
+      return parsed && Number.isFinite(parsed.usedPercent) && parsed.usedPercent >= 0 && parsed.usedPercent < 100 &&
+        Number.isFinite(parsed.windowSeconds) && parsed.windowSeconds > 0 && parsed.resetAt > Date.now();
+    });
   return {
+    ...(canResume ? { canResume: true } : {}),
     plan,
     ...(primary ? { primary } : {}),
     ...(secondary ? { secondary } : {}),
