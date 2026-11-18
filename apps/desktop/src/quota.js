@@ -2152,27 +2152,46 @@
         card.appendChild(noteEl('该周期暂无调用记录'));
         return card;
       }
-      var totals = days.map(function (d) { return rowTotalTokens(d) || 0; });
-      var max = Math.max.apply(null, totals);
+      if (days.length === 1) {
+        var day = days[0];
+        var single = el('div', 'usage-day-summary');
+        single.appendChild(el('div', 'usage-day-date', String(day.name)));
+        var singleTotal = rowTotalTokens(day);
+        var totalValue = el('div', 'usage-day-total', (formatCompact(singleTotal) || '—') + ' tokens');
+        if (singleTotal !== null) totalValue.title = formatInt(singleTotal) + ' tokens';
+        single.appendChild(totalValue);
+        single.appendChild(el('div', 'usage-day-caption', '当日总量 · 有效输入 + 输出'));
+        card.appendChild(single);
+        return card;
+      }
+      var totals = days.map(function (d) { return rowTotalTokens(d); });
+      var max = Math.max.apply(null, totals.map(function (v) { return v === null ? 0 : v; }));
+      var scroll = el('div', 'usage-days-scroll');
+      scroll.tabIndex = 0;
+      scroll.setAttribute('role', 'region');
+      scroll.setAttribute('aria-label', '每日用量，日期较多时可横向滚动');
       var bars = el('div', 'usage-bars');
       days.forEach(function (d, i) {
         var v = totals[i];
-        var pct = v > 0 && max > 0 ? Math.max(4, Math.round((v / max) * 100)) : 4;
+        var pct = v > 0 && max > 0 ? Math.max(1, Math.round((v / max) * 100)) : 0;
         var col = el('div', 'usage-bar-col');
+        var value = el('div', 'usage-day-value', formatCompact(v) || '—');
+        if (v !== null) value.title = formatInt(v) + ' tokens';
+        col.appendChild(value);
+        var track = el('div', 'usage-day-track');
         var bar = el('div', 'usage-bar');
         bar.style.height = pct + '%';
         bar.title = d.name + ' · 输入 ' + (formatCompact(d.inputTokens) || '—') + '（' + (formatInt(d.inputTokens) || '—') + '）'
           + ' · 输出 ' + (formatCompact(d.outputTokens) || '—') + '（' + (formatInt(d.outputTokens) || '—') + '）'
           + ' · 总量 ' + (formatCompact(v) || '—') + '（' + (formatInt(v) || '—') + '）';
-        col.appendChild(bar);
+        track.appendChild(bar);
+        col.appendChild(track);
+        var date = el('div', 'usage-day-date', String(d.name));
+        col.appendChild(date);
         bars.appendChild(col);
       });
-      card.appendChild(bars);
-      var axis = el('div', 'usage-chart-axis');
-      axis.appendChild(el('span', null, String(days[0].name)));
-      axis.appendChild(el('span', 'spacer'));
-      axis.appendChild(el('span', null, String(days[days.length - 1].name)));
-      card.appendChild(axis);
+      scroll.appendChild(bars);
+      card.appendChild(scroll);
       return card;
     }
 
