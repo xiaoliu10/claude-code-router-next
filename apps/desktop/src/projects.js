@@ -1112,6 +1112,7 @@
         var grid = el('div', 'project-routes');
         var labelsByScenario = { default: '默认', background: '后台', think: '思考', longContext: '长上下文', extendedContext: '扩展上下文', webSearch: '网页搜索', image: '图像' };
         PROJECT_SCENARIOS.forEach(function (scenario) {
+          if (scope !== 'root' && scenario === 'background') return;
           var label = labelsByScenario[scenario], card = el('div', 'route'); card.dataset.scenario = scenario;
           card.appendChild(el('div', 'route-name', label));
           card.appendChild(routeInput(label + ' 目标', obj[scenario], scenario));
