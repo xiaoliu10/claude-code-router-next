@@ -610,11 +610,31 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     ? moduleDir
     : existsSync(join(moduleDir, "..", "index.html"))
       ? join(moduleDir, "..")
-      : join(moduleDir, "..", "dist");
+      : existsSync(join(moduleDir, "..", "dist", "index.html"))
+        ? join(moduleDir, "..", "dist")
+        : existsSync(join(moduleDir, "..", "..", "dist", "index.html"))
+          ? join(moduleDir, "..", "..", "dist")
+          : join(moduleDir, "..", "dist");
   _app.register(fastifyStatic, {
     root: bundledUiRoot,
     prefix: "/ui/",
-    maxAge: "1h",
+    // The UI ships as a SINGLE self-contained index.html: all JS/CSS are
+    // inlined (~4MB), so the HTML itself is the whole app. A max-age here let
+    // browsers keep running a stale UI for up to an hour after an upgrade —
+    // new features (e.g. model-list drag reorder) appeared missing while the
+    // old bundle was still mounted. Always revalidate instead: unchanged
+    // files still answer 304 via ETag, so the cost is one conditional
+    // request per page load.
+    //
+    // cacheControl:false is REQUIRED: without it @fastify/send emits its own
+    // `Cache-Control: public, max-age=<maxAge>` AFTER setHeaders ran, and
+    // fastify's stream sender then overwrites our header with it (verified:
+    // the response degraded to `public, max-age=0`). With it, our no-cache
+    // stands and the ETag-based 304 revalidation below still works.
+    cacheControl: false,
+    setHeaders: (_res, _pathName) => {
+      _res.setHeader("Cache-Control", "no-cache");
+    },
   });
 
   // Redirect /ui to /ui/ for proper static file serving
