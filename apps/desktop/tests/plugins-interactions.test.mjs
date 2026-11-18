@@ -15,9 +15,9 @@ const cards = h => h.id('plugins-list').querySelectorAll('.card');
 const buttons = h => h.id('plugins-list').querySelectorAll('button');
 const button = (h, label) => buttons(h).find(node => node.getAttribute('aria-label') === label);
 const inventory = () => ({ plugins: [
-  { id: 'codex', name: 'Codex <img src=x>', version: '1.0.0', loaded: true, actions: ['sync', 'usage', 'disconnect', 'login', '../file', 'usage'] },
+  { id: 'codex', name: 'Codex <img src=x>', version: '1.0.0', loaded: true, actions: ['sync', 'usage', 'disconnect', 'login', '../file', 'usage'], connectionState: 'connected' },
   { id: 'local', name: 'Local', version: null, loaded: false, actions: ['disconnect'] },
-  { id: 'kiro', name: 'Kiro', version: '1.2.3', loaded: true, actions: [] },
+  { id: 'kiro', name: 'Kiro', version: '1.2.3', loaded: true, actions: [], connectionState: 'disconnected' },
 ] });
 const catalog = () => ({ partial: true, plugins: [
   { name: '@example/new', description: '<script>demo()</script>', version: '2.0.0', installed: false, installedVersion: null, updateAvailable: false, localOnly: false },
@@ -50,10 +50,10 @@ test('plugins: lazy mounted tab and advertised actions use manifest ID with expl
   assert.equal(h.doc.activeElement, h.id('tab-plugins'));
   assert.equal(h.id('panel-plugins').hidden, false);
   assert.equal(h.id('tab-plugins').getAttribute('aria-selected'), 'true');
-  assert.match(cards(h)[0].textContent, /Codex <img src=x>.*已加载.*1\.0\.0/);
+  assert.match(cards(h)[0].textContent, /Codex <img src=x>.*已加载版本：1\.0\.0.*连接状态：已连接/);
   assert.equal(cards(h)[0].querySelector('img'), null);
-  assert.match(cards(h)[1].textContent, /Local.*未加载.*未知/);
-  assert.match(cards(h)[2].textContent, /Kiro.*没有可在桌面使用/);
+  assert.match(cards(h)[1].textContent, /Local.*未加载.*连接状态：未知/);
+  assert.match(cards(h)[2].textContent, /Kiro.*已加载.*连接状态：未连接.*没有可在桌面使用/);
   assert.match(h.id('plugins-advanced').textContent, /站点和账号管理.*请使用主窗口/);
   assert.deepEqual(buttons(h).map(node => node.textContent), ['同步模型', '刷新用量', '断开连接']);
   const disconnect = button(h, '断开连接 Codex <img src=x>');
@@ -143,7 +143,8 @@ test('plugins: market install and update use names, preserve partial results and
   await flush();
   assert.deepEqual(pluginCalls(h), [['plugin_install', { name: '@example/new', update: false }]]);
   assert.deepEqual(serviceCalls(h), []);
-  assert.match(h.id('plugins-restart').textContent, /外部网关.*手动重启/);
+  assert.match(h.id('plugins-restart').textContent, /1 个插件变更待激活.*外部网关.*手动重启/);
+  assert.match(cards(h)[0].textContent, /已安装 · 待激活/);
   assert.equal(h.id('service-stop').disabled, true);
   assert.equal(h.id('service-start').disabled, true);
   assert.equal(button(h, '安装 @example/new'), undefined);
@@ -163,15 +164,24 @@ test('plugins: owned activation requires separate stop and start clicks and refr
   let activated = false;
   let inventoryReads = 0;
   const snapshot = () => ({ mode, running: mode !== 'stopped', message: '' });
+  const market = catalog();
   const h = harness({ service_snapshot: snapshot, service_action: ({ action }) => {
     mode = action === 'stop' ? 'stopped' : 'starting';
     return snapshot();
   }, plugin_inventory: () => {
     inventoryReads += 1;
-    return { plugins: [{ id: 'new', name: 'New plugin', version: '2.0.0', loaded: activated, actions: [] }] };
-  }, plugin_catalog: catalog, plugin_install: () => ({ restartRequired: true }) });
+    return { plugins: [{ id: 'update', name: 'Demo plugin', version: activated ? '3.0.0' : '2.0.0', loaded: true, actions: [], connectionState: 'unknown' }] };
+  }, plugin_catalog: () => market, plugin_install: () => {
+    market.plugins[1].installedVersion = '3.0.0';
+    market.plugins[1].updateAvailable = false;
+    return { restartRequired: true };
+  } });
   await open(h, true);
-  confirm(h, '安装', '@example/new'); await flush();
+  confirm(h, '更新', '@example/update'); await flush();
+  assert.match(cards(h)[1].textContent, /已更新 · 待激活.*已安装版本：3\.0\.0/);
+  h.id('plugins-installed').click();
+  assert.match(cards(h)[0].textContent, /已加载版本：2\.0\.0.*连接状态：未知/);
+  h.id('plugins-market').click();
   assert.match(h.id('plugins-restart').textContent, /托管网关.*「停止」.*「启动」/);
   assert.deepEqual(serviceCalls(h), []);
   h.id('service-stop').click(); await flush();
@@ -186,8 +196,9 @@ test('plugins: owned activation requires separate stop and start clicks and refr
   assert.equal(h.id('plugins-restart').hidden, true);
   assert.match(h.id('plugins-feedback').textContent, /托管网关已启动/);
   assert.equal(inventoryReads, previousReads + 1);
+  assert.doesNotMatch(cards(h)[1].textContent, /待激活/);
   h.id('plugins-installed').click();
-  assert.match(h.id('plugins-list').textContent, /New plugin.*已加载/);
+  assert.match(h.id('plugins-list').textContent, /Demo plugin.*已加载版本：3\.0\.0/);
 });
 
 test('plugins: sync and usage invoke only the selected operation, and stale reads cannot win after install', async () => {

@@ -388,9 +388,12 @@ test("preview: plugin DTOs model partial catalog, install/update, safe actions a
   const inventory = await previewCall(invoke, "plugin_inventory")
   assert.deepEqual(Object.keys(inventory), ["plugins"])
   for (const row of inventory.plugins) {
-    assert.deepEqual(Object.keys(row), ["id", "name", "version", "loaded", "actions"])
+    const { connectionState, ...required } = row
+    assert.deepEqual(Object.keys(required), ["id", "name", "version", "loaded", "actions"])
     assert.ok(Array.isArray(row.actions))
+    assert.ok(connectionState === undefined || ["connected", "disconnected", "unknown"].includes(connectionState))
   }
+  assert.equal(inventory.plugins.find(row => row.id === "codex").connectionState, "connected")
   assert.ok(inventory.plugins.some(row => row.loaded && row.actions.includes("usage")))
   assert.ok(inventory.plugins.some(row => !row.loaded && row.actions.length === 0))
   const catalog = await previewCall(invoke, "plugin_catalog")
@@ -415,6 +418,7 @@ test("preview: plugin DTOs model partial catalog, install/update, safe actions a
   const beforeStart = await previewCall(invoke, "plugin_inventory")
   assert.equal(beforeStart.plugins.find(row => row.id === "gemini-oauth").loaded, false)
   assert.equal(beforeStart.plugins.find(row => row.id === "codex").version, update.installedVersion)
+  assert.equal(beforeStart.plugins.find(row => row.id === "codex").connectionState, "disconnected")
   await previewCall(invoke, "service_action", { action: "stop" })
   await previewCall(invoke, "service_action", { action: "start" })
   const afterStart = await previewCall(invoke, "plugin_inventory")

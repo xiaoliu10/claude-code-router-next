@@ -3,6 +3,7 @@
 
   var ACTION_LABELS = { sync: '同步模型', usage: '刷新用量', disconnect: '断开连接' };
   var ACTIONS = Object.keys(ACTION_LABELS);
+  var CONNECTION_LABELS = { connected: '已连接', disconnected: '未连接', unknown: '未知' };
   var MANIFEST_ID = /^[a-z0-9][a-z0-9-]*$/i;
   var NPM_NAME = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
   var INSTALLED = 'installed';
@@ -25,6 +26,8 @@
         if (view === INSTALLED) {
           return {
             id: row.id, name: text(row.name) || row.id, version: text(row.version), loaded: row.loaded === true,
+            connectionState: row.connectionState === 'connected' || row.connectionState === 'disconnected'
+              ? row.connectionState : 'unknown',
             actions: row.loaded === true && MANIFEST_ID.test(row.id) && Array.isArray(row.actions)
               ? ACTIONS.filter(function (action) { return row.actions.indexOf(action) !== -1; }) : [],
           };
@@ -60,7 +63,8 @@
     var controls = [];
     var confirm = null;
     var pending = false;
-    var restartRequired = false;
+    // Install uses a catalog name, while inventory is keyed by manifest ID.
+    var awaitingActivation = new Map();
     var service = null;
     var startingForActivation = false;
     var lastServiceAction = null;
@@ -81,11 +85,12 @@
 
     function renderRestart() {
       var message = '';
-      if (restartRequired) {
+      if (awaitingActivation.size) {
         if (service && service.mode === 'external') message = '需要重启外部网关才能生效。请在原启动环境中手动重启，然后刷新已安装列表。';
         else if (service && service.mode === 'owned' && service.running) message = '需要重启托管网关才能生效。请在上方服务栏手动点击「停止」，再点击「启动」。';
         else if (service && (service.mode === 'stopped' || service.mode === 'error')) message = '插件变更将在网关启动后生效。请在上方服务栏手动点击「启动」。';
         else message = '需要在下次启动或重启网关后生效。请先查看上方服务状态。';
+        message = awaitingActivation.size + ' 个插件变更待激活。' + message;
       }
       status(restart, message, 'warn');
     }
@@ -120,12 +125,13 @@
         var card = el('li', 'card');
         var title = el('div', 'plugins-card-title');
         var installedView = view === INSTALLED;
+        var awaiting = !installedView && awaitingActivation.get(plugin.name);
         var label = installedView ? (plugin.loaded ? '已加载' : '未加载')
           : (plugin.localOnly ? '仅本地' : plugin.updateAvailable ? '有更新' : plugin.installed ? '已安装' : '未安装');
         title.appendChild(el('span', 'card-name', plugin.name));
-        title.appendChild(el('span', 'badge', label));
+        title.appendChild(el('span', awaiting ? 'badge badge-stale' : 'badge', awaiting || label));
         card.appendChild(title);
-        var version = '版本：' + (plugin.version || '未知');
+        var version = (installedView && plugin.loaded ? '已加载版本：' : '版本：') + (plugin.version || '未知');
         if (!installedView && plugin.installed) {
           version = '已安装版本：' + (plugin.installedVersion || '未知');
           if (!plugin.localOnly) version += ' · 市场版本：' + (plugin.version || '未知');
@@ -134,6 +140,7 @@
         if (!installedView && plugin.description) card.appendChild(el('p', 'card-message', plugin.description));
         var actions = el('div', 'plugins-actions');
         if (installedView) {
+          card.appendChild(el('p', 'card-message', '连接状态：' + CONNECTION_LABELS[plugin.connectionState]));
           plugin.actions.forEach(function (action) {
             addControl(actions, ACTION_LABELS[action], plugin.name, {
               cmd: 'plugin_action', args: { id: plugin.id, action: action }, label: ACTION_LABELS[action],
@@ -141,7 +148,7 @@
           });
           if (!plugin.actions.length) card.appendChild(el('p', 'card-message',
             plugin.loaded ? '此插件没有可在桌面使用的基础操作。' : '加载后才可使用此插件。'));
-        } else if (!plugin.localOnly && NPM_NAME.test(plugin.name) && (!plugin.installed || plugin.updateAvailable)) {
+        } else if (!awaiting && !plugin.localOnly && NPM_NAME.test(plugin.name) && (!plugin.installed || plugin.updateAvailable)) {
           var verb = plugin.installed ? '更新' : '安装';
           addControl(actions, verb, plugin.name, {
             cmd: 'plugin_install', args: { name: plugin.name, update: plugin.installed }, label: verb,
@@ -222,11 +229,12 @@
         if (install) {
           if (!result || typeof result.restartRequired !== 'boolean') throw new Error();
           if (result.restartRequired) {
-            restartRequired = true;
+            awaitingActivation.set(request.args.name, request.args.update ? '已更新 · 待激活' : '已安装 · 待激活');
             startingForActivation = false;
+            if (view === MARKET) renderList();
           }
           renderRestart();
-          status(feedback, request.label + '完成。');
+          status(feedback, request.label + (result.restartRequired ? '完成，等待激活。' : '完成。'));
           await Promise.all([refresh(INSTALLED, true), refresh(MARKET)]);
         } else {
           if (!result || result.success !== true) throw new Error();
@@ -271,13 +279,14 @@
       cancel: cancel,
       serviceChanged: function (state) {
         service = state.service;
-        if (state.pending === 'start' && lastServiceAction !== 'start') startingForActivation = restartRequired;
+        if (state.pending === 'start' && lastServiceAction !== 'start') startingForActivation = awaitingActivation.size > 0;
         lastServiceAction = state.pending;
         if (startingForActivation && !state.pending && !state.loading) {
           if (!state.error && service && service.mode === 'owned' && service.running) {
-            restartRequired = false;
+            awaitingActivation.clear();
             startingForActivation = false;
             status(feedback, '托管网关已启动。请在已安装列表核对插件的加载状态。');
+            if (view === MARKET) { renderList(); renderStatus(); }
             refresh(INSTALLED, true);
           } else if (state.error || !service || service.mode !== 'starting') startingForActivation = false;
         }
@@ -289,8 +298,8 @@
   // Browser preview uses the same DTOs and mutations entirely in memory.
   function createPreviewPlugins(delay) {
     var inventory = [
-      { id: 'codex', name: 'Codex', version: '1.0.0', loaded: true, actions: ['sync', 'usage', 'disconnect'] },
-      { id: 'workbuddy', name: 'WorkBuddy', version: '1.0.0', loaded: true, actions: [] },
+      { id: 'codex', name: 'Codex', version: '1.0.0', loaded: true, actions: ['sync', 'usage', 'disconnect'], connectionState: 'connected' },
+      { id: 'workbuddy', name: 'WorkBuddy', version: '1.0.0', loaded: true, actions: [], connectionState: 'unknown' },
       { id: 'local-example', name: 'local-example', version: '0.1.0', loaded: false, actions: [] },
     ];
     var catalog = [
@@ -328,7 +337,10 @@
           if (!plugin || !plugin.loaded || plugin.actions.indexOf(args.action) === -1) {
             return Promise.reject(new Error('PLUGIN_ACTION_FAILED'));
           }
-          if (args.action === 'disconnect') plugin.actions = [];
+          if (args.action === 'disconnect') {
+            plugin.actions = [];
+            plugin.connectionState = 'disconnected';
+          }
           return delay({ success: true });
         }
         return Promise.resolve(null);
@@ -338,7 +350,10 @@
           if (!awaitingLoad.has(row.id)) return;
           row.version = catalog.find(function (entry) { return entry.id === row.id; }).version;
           row.loaded = true;
-          if (row.id === 'gemini-oauth') row.actions = ['sync', 'disconnect'];
+          if (row.id === 'gemini-oauth') {
+            row.actions = ['sync', 'disconnect'];
+            row.connectionState = 'disconnected';
+          }
         });
         awaitingLoad.clear();
       },
