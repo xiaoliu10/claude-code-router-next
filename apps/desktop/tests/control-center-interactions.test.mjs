@@ -360,6 +360,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
       { name: '2026-11-18', requests: 1, inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
       { name: '2026-11-16', requests: 1, inputTokens: 900, outputTokens: 400, cacheReadTokens: 0, cacheWriteTokens: 0 },
       { name: '2026-11-17', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      { name: '2026-11-19', requests: 1, inputTokens: 100, outputTokens: null, cacheReadTokens: 0, cacheWriteTokens: 0 },
     ], updatedAt: 1 }) });
   await openUsage(h);
   const body = h.id('usage-body');
@@ -370,20 +371,21 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   // Cards order: summary → charts → detail tables → records.
   const titles = body.querySelectorAll('.usage-card').map(c => c.querySelector('.usage-title').textContent);
   assert.deepEqual(titles.slice(0, 6), ['汇总 · 今天', '每日用量（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
-  // Daily chart: ascending dates, max day 100%, zero day floored at 4%.
+  // Daily chart: ascending dates, visible labels, and no fabricated zero bar.
   const dayCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
   const bars = dayCard.querySelectorAll('.usage-bar');
-  assert.equal(bars.length, 3);
+  assert.equal(bars.length, 4);
   assert.ok(bars[0].title.startsWith('2026-11-16'), 'bars ordered by date ascending');
   assert.equal(bars[0].style.height, '100%');
   assert.equal(bars[0].title.includes('输入 900（900）'), true);
   assert.ok(bars[0].title.includes('总量 1.3K（1,300）'));
   assert.equal(bars[1].title.startsWith('2026-11-17'), true);
-  assert.equal(bars[1].style.height, '4%', 'zero-token days floor at the minimum height');
+  assert.equal(bars[1].style.height, '0%', 'zero-token days have no filled bar');
   assert.equal(bars[2].title.startsWith('2026-11-18'), true);
   assert.equal(bars[2].style.height, '12%', 'smaller days scale relative to the max');
-  assert.ok(dayCard.querySelector('.usage-chart-axis').textContent.includes('2026-11-16'));
-  assert.ok(dayCard.querySelector('.usage-chart-axis').textContent.includes('2026-11-18'));
+  assert.equal(bars[3].style.height, '0%', 'unknown totals have no filled bar');
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19']);
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), ['1.3K', '0', '150', '—']);
   // Model chart: ranked by effective (cache-aware) input+output desc, capped at 10, exact values in title.
   const modelCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('模型 Top 10'));
   const rows = modelCard.querySelectorAll('.usage-hbar-row');
@@ -397,6 +399,21 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   // Structural safeguards against horizontal overflow at 440px (visual check in preview browser).
   assert.ok(dayCard.querySelector('.usage-bars'));
   assert.ok(recordsCard(body).querySelector('.records-scroll'));
+});
+
+test('interaction: a single day shows one date and a readable total without a chart', async () => {
+  for (const input of [1200, 0, null]) {
+    const h = harness({ usage_snapshot: () => ({ period: 'today', byDay: [
+      { name: '2026-11-18', inputTokens: input, outputTokens: input === 0 ? 0 : 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    ] }) });
+    await openUsage(h);
+    const card = h.id('usage-body').querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
+    assert.equal(card.querySelectorAll('.usage-day-date').length, 1);
+    assert.equal(card.querySelector('.usage-day-date').textContent, '2026-11-18');
+    assert.equal(card.querySelector('.usage-bar'), null);
+    assert.equal(card.querySelector('.usage-day-total').textContent, input === null ? '— tokens' : input === 0 ? '0 tokens' : '1.25K tokens');
+    if (input === 1200) assert.equal(card.querySelector('.usage-day-total').title, '1,250 tokens');
+  }
 });
 
 test('interaction: charts and records fall back to the shared empty note when a period has no data', async () => {
