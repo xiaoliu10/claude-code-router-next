@@ -29,11 +29,12 @@ import { createCodexManagedRuntime } from "./managed-runtime";
 import { registerCodexAdminRoutes } from "./admin-routes";
 import { codexLocales } from "./locales";
 import { protectCodexConfig } from "./protocol";
+import { CodexTokenMaintenance, replaceCodexTokenMaintenance } from "./token-maintenance";
 import type { PluginContext } from "./core-types";
 
 export const manifest = {
   name: "codex",
-  version: "1.0.11",
+  version: "1.0.14",
   coreApi: "1",
   description:
     "Codex subscription managed provider: chatgpt.com backend-api/codex data plane, browser OAuth login (PKCE, loopback 1455/1457 + paste), model sync, usage and admin routes.",
@@ -70,6 +71,20 @@ async function activate(ctx: PluginContext): Promise<void> {
   }
 
   const runtime = createCodexManagedRuntime({ service, host: upstreamHost, log: ctx.log });
+
+  // Proactive token renewal (the v2.3.9-era core scheduler removed in the
+  // plugin migration): an unref'ed 30-minute maintenance loop reuses the
+  // service's 5-minute lead + single-flight refresh, so a healthy token costs
+  // no network and a machine with no Codex traffic still rotates its grant.
+  // Failures are logged without latching account health. coreApi=1 has no
+  // dispose hook; the unref'ed timer ends with the process and a re-activation
+  // (restart) builds a fresh service + scheduler pair.
+  const maintenance = new CodexTokenMaintenance(
+    () => service.runTokenMaintenanceCycle(),
+    { warn: (message) => ctx.log.warn(message), info: (message) => ctx.log.info(message) },
+  );
+  maintenance.start();
+  replaceCodexTokenMaintenance(maintenance);
 
   ctx.registerTransformer(ActivatedCodexTransformer as unknown as new () => any);
   ctx.registerManagedRuntime(runtime);
