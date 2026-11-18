@@ -160,6 +160,15 @@ body {
 .note[data-tone="error"] { color: var(--danger); }
 
 
+/* Manual API provider (quota tab) */
+.provider-form { margin: 0 14px 8px; display: grid; gap: 8px; min-height: 0; overflow-y: auto; }
+.provider-form label { display: grid; gap: 3px; min-width: 0; font-size: 12px; }
+.provider-form .route-input { width: 100%; }
+.provider-form textarea { resize: vertical; }
+.provider-form-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; }
+.provider-form-actions .inline-msg { flex: 1 1 10em; }
+#provider-add-status:empty { margin: 0; }
+
 /* Routing tab */
 .flags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 0 14px 6px; }
 .flag { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }

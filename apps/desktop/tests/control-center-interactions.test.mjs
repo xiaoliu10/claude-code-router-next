@@ -82,7 +82,7 @@ export function harness(overrides = {}) {
       const tag = text.match(/^<([a-z0-9]+)/i)[1]; const n = doc.createElement(tag);
       for (const a of text.matchAll(/([\w-]+)(?:="([^"]*)")?/g)) if (a[1] !== tag) n.setAttribute(a[1], a[2] ?? '');
       stack.at(-1).appendChild(n);
-      if (!['meta', 'link', 'input'].includes(tag)) stack.push(n);
+      if (!text.endsWith('/>') && !['meta', 'link', 'input'].includes(tag)) stack.push(n);
     } else stack.at(-1)._text += text;
   }
   doc.getElementById = id => [root, ...root.querySelectorAll('[id]')].find(n => n.getAttribute('id') === id) || null;
@@ -109,9 +109,9 @@ export function harness(overrides = {}) {
     calls.push({ cmd, args });
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };
-  vm.runInNewContext(projectsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, setTimeout, setInterval, clearInterval });
+  vm.runInNewContext(projectsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout, setInterval, clearInterval });
   doc.events.DOMContentLoaded();
-  return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus() };
+  return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus(), windowEvents };
 }
 
 test('interaction: tab keyboard, external stop disabled, offline quota never shows fake empty state', async () => {
