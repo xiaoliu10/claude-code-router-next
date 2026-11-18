@@ -404,6 +404,7 @@
   var ROUTING_SCOPES = ['global', 'opus', 'sonnet', 'haiku', 'models'];
   var ROUTING_SCENARIOS = ['default', 'background', 'think', 'longContext', 'extendedContext', 'webSearch', 'image'];
   var USAGE_PERIODS = ['today', '7d', '30d'];
+  var DEFAULT_USAGE_PERIOD = '7d';
   var SCOPE_LABELS = { global: '全局', opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', models: '模型别名' };
   var SCENARIO_LABELS = { default: '默认', background: '后台', think: '思考', longContext: '长上下文', extendedContext: '扩展上下文', webSearch: '网页搜索', image: '图像' };
 
@@ -737,7 +738,7 @@
   function createUsageController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createUsageController: 需要 invoke 函数');
-    var snapshot = null, loading = false, error = null, period = 'today';
+    var snapshot = null, loading = false, error = null, period = DEFAULT_USAGE_PERIOD;
     var epoch = 0;
     var listeners = new Set();
 
@@ -865,7 +866,7 @@
   function createRecordsController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createRecordsController: 需要 invoke 函数');
-    var period = 'today', page = 1, pageSize = RECORDS_PAGE_SIZE;
+    var period = DEFAULT_USAGE_PERIOD, page = 1, pageSize = RECORDS_PAGE_SIZE;
     var data = null, loading = false, error = null;
     var epoch = 0;
     var listeners = new Set();
@@ -2649,7 +2650,7 @@
     if (usageCtrl) {
       usageCtrl.subscribe(renderUsage);
       renderUsage(usageCtrl.state());
-    } else renderUsage({ snapshot: null, loading: false, error: null, period: 'today' });
+    } else renderUsage({ snapshot: null, loading: false, error: null, period: DEFAULT_USAGE_PERIOD });
     if (recordsCtrl) {
       recordsCtrl.subscribe(renderRecords);
       renderRecords(recordsCtrl.state());

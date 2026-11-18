@@ -163,7 +163,8 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
     byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-input', outputTokens: 100 }],
     byProvider: [{ name: '<img src=provider>', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-output', inputTokens: 100 }],
     byDay: [{ name: '2026-11-17', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: '2026-11-16', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: '2026-11-15', outputTokens: 100 }], updatedAt: 1 }) });
-  await flush(); h.id('tab-usage').click(); await flush();
+  await openUsage(h);
+  h.id('usage-periods').children[0].click(); await flush();
   const body = h.id('usage-body');
   const total = body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens'));
   assert.match(total.textContent, /9.25M/);
@@ -224,8 +225,8 @@ test('interaction: restore is local confirmation then single individual IPC; usa
   h.id('tab-usage').click(); await flush();
   assert.match(h.id('usage-body').textContent, /<img src=x>/);
   assert.equal(h.id('usage-body').querySelectorAll('img').length, 0);
-  h.id('usage-periods').children[1].click(); await flush();
-  assert.equal(h.calls.filter(c => c.cmd === 'usage_snapshot').at(-1).args.period, '7d');
+  h.id('usage-periods').children[0].click(); await flush();
+  assert.equal(h.calls.filter(c => c.cmd === 'usage_snapshot').at(-1).args.period, 'today');
 });
 
 const recordFixture = (i, extra = {}) => ({
@@ -258,6 +259,21 @@ const plain = (v) => JSON.parse(JSON.stringify(v));
 
 async function openUsage(h) { await flush(); h.id('tab-usage').click(); await flush(); }
 
+test('interaction: opening usage loads the seven-day chart and matching records by default', async () => {
+  const h = harness({ usage_snapshot: ({ period }) => ({ period, byDay: Array.from({ length: 7 }, (_, i) => ({
+    name: `2026-11-${11 + i}`, inputTokens: 100 + i, outputTokens: 10,
+  })) }) });
+  await openUsage(h);
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_snapshot' || c.cmd === 'usage_records')), [
+    { cmd: 'usage_snapshot', args: { period: '7d' } },
+    { cmd: 'usage_records', args: { period: '7d', page: 1, pageSize: 20 } },
+  ]);
+  const selected = h.id('usage-periods').children.filter(button => button.getAttribute('aria-pressed') === 'true');
+  assert.deepEqual(selected.map(button => button.dataset.period), ['7d']);
+  assert.match(h.id('usage-body').textContent, /汇总 · 近 7 天/);
+  assert.equal(h.id('usage-body').querySelectorAll('.usage-bar').length, 7);
+});
+
 test('interaction: records pager walks pages, resets on period switch, shows page/total info', async () => {
   const h = recordsHarness(); await openUsage(h);
   const body = h.id('usage-body');
@@ -271,7 +287,7 @@ test('interaction: records pager walks pages, resets on period switch, shows pag
   assert.equal(next.disabled, false);
   assert.equal(card.querySelectorAll('tbody')[0].children.length, 20);
   next.click(); await flush();
-  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'today', page: 2, pageSize: 20 });
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: '7d', page: 2, pageSize: 20 });
   const card2 = recordsCard(body);
   assert.match(card2.querySelector('.records-info').textContent, /第 2 \/ 3 页/);
   assert.equal(card2.querySelectorAll('tbody')[0].children.length, 20);
@@ -284,10 +300,10 @@ test('interaction: records pager walks pages, resets on period switch, shows pag
   card3.querySelectorAll('.btn')[1].click(); await flush();
   assert.equal(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args.page, 3, 'next on the last page never hits IPC');
   card3.querySelectorAll('.btn')[0].click(); await flush();
-  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'today', page: 2, pageSize: 20 });
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: '7d', page: 2, pageSize: 20 });
   // Period switch resets to page 1 for both summary and records.
-  h.id('usage-periods').children[1].click(); await flush();
-  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: '7d', page: 1, pageSize: 20 });
+  h.id('usage-periods').children[0].click(); await flush();
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'today', page: 1, pageSize: 20 });
   assert.match(recordsCard(body).querySelector('.records-info').textContent, /第 1 \/ 3 页 · 共 45 条/);
 });
 
@@ -342,7 +358,7 @@ test('interaction: records error surfaces a failed note while the usage summary 
   const buttons = card.querySelectorAll('.btn');
   assert.equal(buttons[0].disabled, true);
   assert.equal(buttons[1].disabled, true);
-  assert.match(h.id('usage-body').textContent, /汇总 · 今天/, 'summary rendering unaffected by records failure');
+  assert.match(h.id('usage-body').textContent, /汇总 · 近 7 天/, 'summary rendering unaffected by records failure');
 });
 
 test('interaction: summary gains ttft/speed/success cells and css charts sort, floor and cap at 10', async () => {
@@ -370,7 +386,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(numCell('生成速度').textContent, '33.4 t/s');
   // Cards order: summary → charts → detail tables → records.
   const titles = body.querySelectorAll('.usage-card').map(c => c.querySelector('.usage-title').textContent);
-  assert.deepEqual(titles.slice(0, 6), ['汇总 · 今天', '每日用量（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
+  assert.deepEqual(titles.slice(0, 6), ['汇总 · 近 7 天', '每日用量（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
   // Daily chart: ascending dates, visible labels, and no fabricated zero bar.
   const dayCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
   const bars = dayCard.querySelectorAll('.usage-bar');
@@ -403,10 +419,11 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
 
 test('interaction: a single day shows one date and a readable total without a chart', async () => {
   for (const input of [1200, 0, null]) {
-    const h = harness({ usage_snapshot: () => ({ period: 'today', byDay: [
+    const h = harness({ usage_snapshot: ({ period }) => ({ period, byDay: [
       { name: '2026-11-18', inputTokens: input, outputTokens: input === 0 ? 0 : 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
     ] }) });
     await openUsage(h);
+    h.id('usage-periods').children[0].click(); await flush();
     const card = h.id('usage-body').querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
     assert.equal(card.querySelectorAll('.usage-day-date').length, 1);
     assert.equal(card.querySelector('.usage-day-date').textContent, '2026-11-18');
