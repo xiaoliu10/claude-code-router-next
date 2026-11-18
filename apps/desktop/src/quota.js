@@ -2557,7 +2557,7 @@
       totals.appendChild(grid);
       body.appendChild(totals);
       totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
-      body.appendChild(buildDayChart(u.byDay));
+      body.appendChild(buildDayChart(u.byDay, u.period === 'all'));
       body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
         var rowTotal = rowTotalTokens(m);
@@ -2577,7 +2577,7 @@
 
     // Charts are plain divs; per-bar sizes go through CSSOM writes because the
     // CSP (style-src 'self') blocks inline style attributes.
-    function buildDayChart(rows) {
+    function buildDayChart(rows, compact) {
       var card = el('div', 'usage-card');
       card.appendChild(el('div', 'usage-title', '每日用量（有效输入 + 输出）'));
       var days = (Array.isArray(rows) ? rows : []).slice().sort(function (a, b) {
@@ -2601,18 +2601,20 @@
       }
       var totals = days.map(function (d) { return rowTotalTokens(d); });
       var max = Math.max.apply(null, totals.map(function (v) { return v === null ? 0 : v; }));
-      var scroll = el('div', 'usage-days-scroll');
-      scroll.tabIndex = 0;
+      var scroll = el('div', compact ? 'usage-days-compact' : 'usage-days-scroll');
+      if (!compact) scroll.tabIndex = 0;
       scroll.setAttribute('role', 'region');
-      scroll.setAttribute('aria-label', '每日用量，日期较多时可横向滚动');
+      scroll.setAttribute('aria-label', compact ? '每日用量，全部历史' : '每日用量，日期较多时可横向滚动');
       var bars = el('div', 'usage-bars');
       days.forEach(function (d, i) {
         var v = totals[i];
         var pct = v > 0 && max > 0 ? Math.max(1, Math.round((v / max) * 100)) : 0;
         var col = el('div', 'usage-bar-col');
-        var value = el('div', 'usage-day-value', formatCompact(v) || '—');
-        if (v !== null) value.title = formatInt(v) + ' tokens';
-        col.appendChild(value);
+        if (!compact) {
+          var value = el('div', 'usage-day-value', formatCompact(v) || '—');
+          if (v !== null) value.title = formatInt(v) + ' tokens';
+          col.appendChild(value);
+        }
         var track = el('div', 'usage-day-track');
         var bar = el('div', 'usage-bar');
         bar.style.height = pct + '%';
@@ -2621,11 +2623,17 @@
           + ' · 总量 ' + (formatCompact(v) || '—') + '（' + (formatInt(v) || '—') + '）';
         track.appendChild(bar);
         col.appendChild(track);
-        var date = el('div', 'usage-day-date', String(d.name));
-        col.appendChild(date);
+        if (compact) col.title = bar.title;
+        else col.appendChild(el('div', 'usage-day-date', String(d.name)));
         bars.appendChild(col);
       });
       scroll.appendChild(bars);
+      if (compact) {
+        var axis = el('div', 'usage-day-range');
+        axis.appendChild(el('span', 'usage-day-date', days[0].name));
+        axis.appendChild(el('span', 'usage-day-date', days[days.length - 1].name));
+        scroll.appendChild(axis);
+      }
       card.appendChild(scroll);
       return card;
     }
