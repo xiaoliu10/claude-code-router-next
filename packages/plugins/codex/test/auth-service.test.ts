@@ -526,11 +526,191 @@ describe("token refresh", () => {
     const { service } = await harness();
     await expect(service.getAccessToken()).rejects.toMatchObject({ code: "codex_not_connected" });
   });
+
+  describe("runTokenMaintenanceCycle", () => {
+    it("is a network-free no-op while the access token is healthy", async () => {
+      const h = await connected(); // default access token: 1h, well outside the lead
+      const impl = (h.service as any).options.fetchImpl;
+      const before = impl.mock.calls.length;
+      const result = await h.service.runTokenMaintenanceCycle();
+      expect(result).toEqual({ refreshed: false });
+      expect(impl.mock.calls.length).toBe(before);
+    });
+
+    it("refreshes inside the lead window and reports the rotation", async () => {
+      const h = await connected({ accessSecs: 240 });
+      const persistedBefore = (await h.store.load())!;
+      const result = await h.service.runTokenMaintenanceCycle();
+      expect(result).toEqual({ refreshed: true });
+      const persistedAfter = (await h.store.load())!;
+      expect(persistedAfter.account.accessToken).not.toBe(persistedBefore.account.accessToken);
+      expect(persistedAfter.account.refreshToken).toBe("rt-rotated");
+      // Maintenance never latches account health.
+      expect(persistedAfter.account.lastError).toBeNull();
+      expect(persistedAfter.account.cooldownUntil).toBeNull();
+    });
+
+    it("propagates a rejected refresh without writing any health latch", async () => {
+      const h = await connected({ refreshStatus: 400, accessSecs: 240 });
+      await expect(h.service.runTokenMaintenanceCycle())
+        .rejects.toMatchObject({ code: "codex_reauth_required" });
+      const persisted = (await h.store.load())!;
+      expect(persisted.account.lastError).toBeNull();
+      expect(persisted.account.cooldownUntil).toBeNull();
+      expect(persisted.account.refreshToken).toBe("rt-1");
+    });
+
+    it("is a quiet no-op when no account is connected", async () => {
+      const { service } = await harness();
+      await expect(service.runTokenMaintenanceCycle()).resolves.toEqual({ refreshed: false });
+    });
+
+    it("shares the data-plane single-flight: a concurrent maintenance cycle and getAccessToken issue one token POST", async () => {
+      const h = await connected({ accessSecs: 240 }); // inside the 5-minute lead
+      const impl = (h.service as any).options.fetchImpl;
+      const tokenPosts = () =>
+        impl.mock.calls.filter((c: any[]) => String(c[0]).endsWith("/oauth/token")).length;
+      const before = tokenPosts();
+      const [maintenance, direct] = await Promise.all([
+        h.service.runTokenMaintenanceCycle(),
+        h.service.getAccessToken(),
+      ]);
+      expect(maintenance).toEqual({ refreshed: true });
+      expect(direct).toMatch(/^ey/);
+      expect(tokenPosts() - before).toBe(1); // one shared grant, not two
+    });
+
+    it("does not consume the 401 seam's forced-refresh flag while the token is healthy", async () => {
+      const h = await connected(); // default 1h token, well outside the lead
+      const impl = (h.service as any).options.fetchImpl;
+      const before = impl.mock.calls.length;
+      (h.service as any).forceRefreshRequested = true;
+      const result = await h.service.runTokenMaintenanceCycle();
+      expect(result).toEqual({ refreshed: false });
+      expect(impl.mock.calls.length).toBe(before); // healthy token: zero network
+      // The flag survives for the 401 seam's own forced re-send.
+      expect((h.service as any).forceRefreshRequested).toBe(true);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
 // Models / usage / rate limits / cooling / disconnect
 // ---------------------------------------------------------------------------
+
+describe("quota recovery after a plan upgrade", () => {
+  const recovered = () => ({ plan_type: "prolite", rate_limit: {
+    allowed: true, limit_reached: false,
+    primary_window: { used_percent: 10, limit_window_seconds: 604800, reset_at: nowSec() + 604800 },
+  } });
+  async function cooled() {
+    const h = await connected();
+    await h.service.noteUpstreamError({ code: "codex_usage_limit", message: "quota", httpStatus: 429, cooldownMs: 86400000 });
+    await h.service.noteRateLimits({ source: "sse", observedAt: Date.now(),
+      primary: { usedPercent: 100, resetAt: Date.now() + 86400000 } });
+    return h;
+  }
+
+  it.each([false, true])("unlocks a weekly-only upgraded plan, including after model sync (%s)", async legacy => {
+    const h = await cooled();
+    if (legacy) await h.service.syncModels();
+    const fetcher = vi.fn(async () => json(recovered()));
+    (h.service as any).options.fetchImpl = fetcher;
+    // Exercise the same preflight used by chat and background recovery probes.
+    expect(await h.service.isAccountCooling()).toBe(false);
+    expect(await h.service.getStatus()).toMatchObject({ plan: "prolite", lastError: null });
+    const stored = (await h.store.load())!;
+    expect(stored.account.cooldownUntil).toBeNull();
+    expect(stored.account.rateLimitCooldownUntil).toBeNull();
+    expect(stored.rateLimits).toBeNull();
+    await h.service.getUsage();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["missing-permission", "saturated", "malformed-window", "denied", "http-error", "network-error"])("retains the lock on %s", async mode => {
+    const h = await cooled();
+    const payload: any = recovered();
+    if (mode === "missing-permission") delete payload.rate_limit.allowed;
+    if (mode === "saturated") payload.rate_limit.primary_window.used_percent = 100;
+    if (mode === "malformed-window") payload.rate_limit.secondary_window = { used_percent: 0 };
+    if (mode === "denied") payload.rate_limit.allowed = false;
+    (h.service as any).options.fetchImpl = vi.fn(async () => {
+      if (mode === "network-error") throw new Error("offline");
+      return json(payload, mode === "http-error" ? 503 : 200);
+    });
+    expect(await h.service.isAccountCooling()).toBe(true);
+    expect((await h.store.load())!.account.cooldownUntil).not.toBeNull();
+  });
+
+  it.each(["codex_reauth_required", "codex_rate_limited", "codex_overloaded"])("does not clear %s on a healthy quota response", async code => {
+    const h = await cooled();
+    await h.service.noteUpstreamError({ code, message: "failure", httpStatus: 429, cooldownMs: 60000 });
+    await h.service.syncModels();
+    (h.service as any).options.fetchImpl = vi.fn(async () => json(recovered()));
+    await h.service.getUsage();
+    expect((await h.store.load())!.account.lastError?.code).toBe(code);
+    expect(await h.service.isAccountCooling()).toBe(true);
+  });
+
+  it("preserves legacy cooldowns without provenance but clears the separate quota channel", async () => {
+    const h = await cooled();
+    const data = (await h.store.load())!;
+    await (h.service as any).saveData({ ...data, account: { ...data.account, lastError: null } });
+    (h.service as any).options.fetchImpl = vi.fn(async () => json(recovered()));
+    expect(await h.service.isAccountCooling()).toBe(true);
+    const saved = (await h.store.load())!;
+    expect(saved.account.cooldownUntil).toBe(data.account.cooldownUntil);
+    expect(saved.account.rateLimitCooldownUntil).toBeNull();
+    expect(saved.account.plan).toBe("prolite");
+  });
+
+  it.each(["rejected", "offline"])("throttles sequential failed token refreshes (%s)", async mode => {
+    const h = await connected({ accessSecs: -60 });
+    await h.service.noteUpstreamError({ code: "codex_usage_limit", message: "quota", httpStatus: 429, cooldownMs: 86400000 });
+    let now = Date.now();
+    (h.service as any).options.now = () => now;
+    const fetcher = vi.fn(async () => {
+      if (mode === "offline") throw new Error("offline");
+      return json({ error: "invalid_grant" }, 400);
+    });
+    (h.service as any).options.fetchImpl = fetcher;
+    expect(await h.service.isAccountCooling()).toBe(true);
+    expect(await h.service.isAccountCooling()).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    now += 60001;
+    expect(await h.service.isAccountCooling()).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not apply or cache a delayed response after a new rate-limit observation", async () => {
+    const h = await cooled();
+    let resolve!: (res: Response) => void;
+    let started!: () => void;
+    const ready = new Promise<void>(r => { started = r; });
+    (h.service as any).options.fetchImpl = vi.fn(() => { started(); return new Promise<Response>(r => { resolve = r; }); });
+    const pending = h.service.getUsage();
+    await ready;
+    await h.service.noteRateLimits({ source: "sse", observedAt: Date.now(), primary: { usedPercent: 100, resetAt: Date.now() + 900000 } });
+    resolve(json(recovered()));
+    expect(await pending).toBeNull();
+    expect((h.service as any).usageCache).toBeNull();
+    expect((await h.store.load())!.account.cooldownUntil).not.toBeNull();
+  });
+
+  it("discards a quota result after disconnect", async () => {
+    const h = await cooled();
+    let resolve!: (res: Response) => void;
+    let started!: () => void;
+    const ready = new Promise<void>(r => { started = r; });
+    (h.service as any).options.fetchImpl = vi.fn(() => { started(); return new Promise<Response>(r => { resolve = r; }); });
+    const pending = h.service.getUsage();
+    await ready;
+    await h.service.disconnect();
+    resolve(json(recovered()));
+    expect(await pending).toBeNull();
+    expect(await h.store.load()).toBeNull();
+  });
+});
 
 describe("models, usage, rate limits", () => {
   it("getModelInstructions is a stable synchronous cache read", async () => {
@@ -542,7 +722,7 @@ describe("models, usage, rate limits", () => {
     expect(service.getModelInstructions("nope")).toBeUndefined();
   });
 
-  it("syncModels rewrites the model list and clears lastError", async () => {
+  it("syncModels rewrites the model list", async () => {
     const h = await connected();
     (h.service as any).options.fetchImpl = fakeUpstream().impl;
     const result = await h.service.syncModels();

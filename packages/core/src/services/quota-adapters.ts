@@ -1,3 +1,4 @@
+import { createHash, createHmac } from "node:crypto";
 import type { LLMProvider } from "../types/llm";
 import { getProxyDispatcher } from "./proxy";
 
@@ -866,11 +867,19 @@ class KimiCodingPlanQuotaAdapter extends BaseQuotaAdapter {
         const detail = limits[0].detail;
         const limit = parseOptionalNumber(detail.limit);
         const remaining = parseOptionalNumber(detail.remaining);
+        const used = parseOptionalNumber(detail.used);
         const resetTime = detail.resetTime;
 
-        if (limit !== undefined && remaining !== undefined) {
-          result.usedDailyBalance = Math.max(0, limit - remaining);
+        // Kimi may omit remaining for exhausted windows and provide used instead.
+        // Prefer explicit usage, as for the weekly window, and retain a known
+        // limit without inventing usage when both usage fields are absent.
+        if (limit !== undefined) {
           result.limitDaily = limit;
+          if (used !== undefined) {
+            result.usedDailyBalance = used;
+          } else if (remaining !== undefined) {
+            result.usedDailyBalance = Math.max(0, limit - remaining);
+          }
         }
         if (resetTime) {
           result.resetTime = new Date(resetTime).toISOString();
@@ -993,6 +1002,214 @@ class MiniMaxCodingPlanQuotaAdapter extends BaseQuotaAdapter {
   }
 }
 
+/**
+ * Volcengine OpenAPI V4-variant request signing. This is NOT standard AWS
+ * SigV4: the algorithm tag is "HMAC-SHA256" (no AWS4 prefix), the credential
+ * scope terminates with "request" (not "aws4_request"), kDate is
+ * HMAC(secretKey, YYYYMMDD) with no prefix on the secret, and SignedHeaders
+ * uses the fixed order host;x-date;x-content-sha256;content-type (the order
+ * only needs to be self-consistent between CanonicalHeaders and SignedHeaders).
+ * Returns the headers the caller must attach to the request.
+ */
+export function volcengineSigV4Sign(options: {
+  accessKey: string;
+  secretKey: string;
+  method: string;
+  url: URL;
+  body: string;
+  region: string;
+  service: string;
+  /** UTC timestamp in YYYYMMDDTHHMMSSZ format (the X-Date header value) */
+  xDate: string;
+}): Record<string, string> {
+  const { accessKey, secretKey, method, url, body, region, service, xDate } = options;
+  const shortDate = xDate.slice(0, 8);
+  const contentType = "application/json";
+  const payloadHash = sha256Hex(body);
+  const signedHeaders = "host;x-date;x-content-sha256;content-type";
+
+  // Canonical headers follow the fixed SignedHeaders order, each line
+  // terminated by \n (so a blank line separates the block from SignedHeaders).
+  const canonicalHeaders =
+    `host:${url.host}\n` +
+    `x-date:${xDate}\n` +
+    `x-content-sha256:${payloadHash}\n` +
+    `content-type:${contentType}\n`;
+
+  // Canonical query: parameter names in lexicographic order, RFC3986 encoding.
+  const canonicalQuery = [...url.searchParams.entries()]
+    .sort(([keyA, valueA], [keyB, valueB]) =>
+      keyA < keyB ? -1 : keyA > keyB ? 1 : valueA < valueB ? -1 : valueA > valueB ? 1 : 0
+    )
+    .map(([key, value]) => `${rfc3986Encode(key)}=${rfc3986Encode(value)}`)
+    .join("&");
+
+  const canonicalRequest = [
+    method.toUpperCase(),
+    url.pathname,
+    canonicalQuery,
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join("\n");
+
+  const credentialScope = `${shortDate}/${region}/${service}/request`;
+  const stringToSign = [
+    "HMAC-SHA256",
+    xDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join("\n");
+
+  // Key derivation chain: date -> region -> service -> "request".
+  const kDate = hmacSha256(secretKey, shortDate);
+  const kRegion = hmacSha256(kDate, region);
+  const kService = hmacSha256(kRegion, service);
+  const kSigning = hmacSha256(kService, "request");
+  const signature = hmacSha256(kSigning, stringToSign).toString("hex");
+
+  return {
+    "Content-Type": contentType,
+    "X-Date": xDate,
+    "X-Content-Sha256": payloadHash,
+    Authorization: `HMAC-SHA256 Credential=${accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+  };
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function hmacSha256(key: string | Buffer, value: string): Buffer {
+  return createHmac("sha256", key).update(value, "utf8").digest();
+}
+
+/** RFC3986 percent-encoding: encodeURIComponent plus the !'()* escapes it skips. */
+function rfc3986Encode(value: string): string {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+}
+
+/**
+ * Parse the GetCodingPlanUsage response into a ProviderQuotaResult.
+ *
+ * Confirmed response shape (ark-cli / cc-switch / CodexBar agree):
+ *   Result: { Status?: string, QuotaUsage?: [
+ *     { Level: "session"|"weekly"|"monthly", Percent: number (used %),
+ *       ResetTimestamp: epoch seconds (-1/0 = no active window) } ] }
+ *
+ * Only percentages are available (no absolute counts), so each window maps to
+ * limit=100 / used=Percent with no currency, which admin-routes classifies as
+ * a rateLimit quota. session fills the 5h slot, weekly the 7d slot; monthly
+ * has no UI slot and is intentionally not mapped. A reclaimed/unsubscribed
+ * plan returns Status without QuotaUsage — that is "no data", not an error.
+ */
+function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | null {
+  if (!payload || typeof payload !== "object") return null;
+
+  // Business/auth errors are often HTTP 200 with an error envelope — reject
+  // them before mining the payload for quota.
+  if (payload.ResponseMetadata?.Error) return null;
+
+  const quotaUsage = payload.Result?.QuotaUsage;
+  if (!Array.isArray(quotaUsage)) return null;
+
+  const result: ProviderQuotaResult = {};
+  for (const window of quotaUsage) {
+    const level = window?.Level;
+    if (level !== "session" && level !== "weekly") continue;
+
+    const percent = parseOptionalNumber(window?.Percent);
+    if (percent === undefined) continue;
+
+    const resetSeconds = parseOptionalNumber(window?.ResetTimestamp);
+    // -1/0 means the window has no active limit — skip it entirely rather
+    // than displaying a zero usage.
+    if (resetSeconds !== undefined && resetSeconds <= 0) continue;
+
+    let resetIso: string | undefined;
+    if (resetSeconds !== undefined) {
+      const resetDate = new Date(resetSeconds * 1000);
+      resetIso = isNaN(resetDate.getTime()) ? undefined : resetDate.toISOString();
+    }
+
+    if (level === "session") {
+      result.limitDaily = 100;
+      result.usedDailyBalance = percent;
+      if (resetIso) result.resetTime = resetIso;
+    } else {
+      result.totalBalance = 100;
+      result.usedBalance = percent;
+      if (resetIso) result.resetTime7d = resetIso;
+    }
+  }
+
+  // limit/reset fields are only ever set alongside a used value, so the two
+  // used slots fully decide whether any window was mapped.
+  return result.usedDailyBalance !== undefined || result.usedBalance !== undefined
+    ? result
+    : null;
+}
+
+class VolcengineCodingPlanQuotaAdapter extends BaseQuotaAdapter {
+  async queryQuota(
+    provider: LLMProvider,
+    timeoutMs: number,
+    proxyUrl?: string
+  ): Promise<ProviderQuotaResult | null> {
+    // Control-plane OpenAPI auth: account AK/SK only. The inference apiKey
+    // (data plane) is rejected by the gateway and must not be sent here.
+    const accessKey = provider.quotaAccessKey?.trim();
+    const secretKey = provider.quotaSecretKey?.trim();
+    if (!accessKey || !secretKey) return null;
+
+    const body = "{}";
+    const url = new URL(
+      "https://open.volcengineapi.com/?Action=GetCodingPlanUsage&Version=2024-01-01"
+    );
+    // X-Date: UTC YYYYMMDDTHHMMSSZ (strip dashes, colons and milliseconds).
+    const xDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
+    const signedHeaders = volcengineSigV4Sign({
+      accessKey,
+      secretKey,
+      method: "POST",
+      url,
+      body,
+      region: "cn-beijing",
+      service: "ark",
+      xDate,
+    });
+
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        // See BaseQuotaAdapter: identity avoids undici ProxyAgent gzip that
+        // would otherwise surface as a parse failure and a null quota result.
+        "Accept-Encoding": "identity",
+        ...signedHeaders,
+      },
+      body,
+      signal: AbortSignal.timeout(timeoutMs),
+    };
+
+    try {
+      if (proxyUrl) {
+        fetchOptions.dispatcher = getProxyDispatcher(proxyUrl);
+      }
+      const response = await fetch(url.toString(), fetchOptions);
+      if (!response.ok) return null;
+      const payload = await response.json();
+      return parseVolcengineCodingPlanUsage(payload);
+    } catch {
+      // Never log credentials — degrade to "no quota data" silently.
+      return null;
+    }
+  }
+}
+
 const deepSeekQuotaAdapter = new DeepSeekQuotaAdapter();
 const openRouterQuotaAdapter = new OpenRouterQuotaAdapter();
 const siliconFlowQuotaAdapter = new SiliconFlowQuotaAdapter();
@@ -1002,6 +1219,7 @@ const aliyunTokenPlanQuotaAdapter = new AliyunTokenPlanQuotaAdapter();
 const xfyunCodingPlanQuotaAdapter = new XfyunCodingPlanQuotaAdapter();
 const kimiCodingPlanQuotaAdapter = new KimiCodingPlanQuotaAdapter();
 const miniMaxCodingPlanQuotaAdapter = new MiniMaxCodingPlanQuotaAdapter();
+const volcengineCodingPlanQuotaAdapter = new VolcengineCodingPlanQuotaAdapter();
 
 export function getQuotaAdapter(baseUrl: string): QuotaAdapter | null {
   const hostname = getHostname(baseUrl);
@@ -1084,6 +1302,16 @@ export function getQuotaAdapter(baseUrl: string): QuotaAdapter | null {
     return xfyunCodingPlanQuotaAdapter;
   }
 
+  // Volcengine Ark Coding Plan (personal subscription) quota adapter — the
+  // /api/coding/ data-plane path ONLY. Pay-as-you-go /api/v3 and Agent Plan
+  // /api/plan use different quota APIs and must not match here.
+  if (
+    hostname === "ark.cn-beijing.volces.com" &&
+    getUrlPath(baseUrl)?.includes("/api/coding/")
+  ) {
+    return volcengineCodingPlanQuotaAdapter;
+  }
+
   return null;
 }
 
@@ -1135,6 +1363,14 @@ function extractCookieValue(cookie: string, name: string): string | undefined {
 function getHostname(baseUrl: string): string | null {
   try {
     return new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function getUrlPath(baseUrl: string): string | null {
+  try {
+    return new URL(baseUrl).pathname;
   } catch {
     return null;
   }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-quota-hide"
+description = "Enables the quota_hide command without any pre-configured scope."
+commands.allow = ["quota_hide"]
+
+[[permission]]
+identifier = "deny-quota-hide"
+description = "Denies the quota_hide command without any pre-configured scope."
+commands.deny = ["quota_hide"]

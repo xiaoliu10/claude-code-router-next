@@ -358,6 +358,9 @@ export class CodexAuthService {
   private refreshFlight: { key: string; promise: Promise<string> } | null = null;
   private forceRefreshRequested = false;
   private usageCache: { at: number; value: CodexUsage | null } | null = null;
+  /** Reject quota reads overtaken by a new data-plane observation. */
+  private quotaRevision = 0;
+  private usageFlight: Promise<CodexUsage | null> | null = null;
   /** Reset-credit listing cache (same short-TTL shape as usage). */
   private resetCache: { at: number; value: CodexResetCredits | null } | null = null;
   /** Single-flight for reset consumption: a queued second consume could
@@ -1140,6 +1143,37 @@ export class CodexAuthService {
     await this.getAccessToken();
   }
 
+  /**
+   * Background maintenance entry point for CodexTokenMaintenance.
+   *
+   * Renews ONLY when the 5-minute lead has elapsed — the exact gate used by
+   * getAccessToken — and reuses its single-flight refresh, so a healthy token
+   * costs no network and a background cycle overlapping a data-plane refresh
+   * shares the same grant. A disconnected service is a quiet no-op. The
+   * forced-refresh flag belongs to the 401 seam and is deliberately not
+   * consumed here.
+   *
+   * This never writes lastError/cooldown: account health is owned
+   * exclusively by the data plane. A rejected refresh (e.g.
+   * codex_reauth_required) propagates to the scheduler, which logs it without
+   * latching anything; the next real request or card status read surfaces the
+   * sticky reauth state through the normal channels.
+   */
+  async runTokenMaintenanceCycle(): Promise<{ refreshed: boolean }> {
+    const data = await this.ensureLoaded();
+    const account = data?.account;
+    if (!account) return { refreshed: false };
+    const fresh = typeof account.accessExp === "number" &&
+      account.accessExp - this.now > CODEX_REFRESH_LEAD_MS;
+    if (fresh) return { refreshed: false };
+    const before = account.accessToken;
+    // getAccessToken's refresh path persists through saveData(), which updates
+    // the in-memory identity synchronously — compare against it instead of a
+    // forced disk re-read just to compute the boolean.
+    await this.getAccessToken();
+    return { refreshed: this.data?.account.accessToken !== before };
+  }
+
   async getAccountId(): Promise<string> {
     const data = await this.ensureLoaded();
     if (!data?.account) throw codexAdminError("codex_not_connected", 409);
@@ -1179,7 +1213,8 @@ export class CodexAuthService {
       registered = slugs.filter((s) => !hidden.has(s));
       await this.saveData({
         ...current,
-        account: { ...current.account, lastError: null },
+        // Model discovery does not prove chat quota or request limits recovered.
+        account: current.account,
         models: visible.map((m) => ({
           slug: m.slug,
           displayName: m.displayName,
@@ -1199,19 +1234,66 @@ export class CodexAuthService {
   // ------------------------------------------------------------------- usage -
 
   async getUsage(): Promise<CodexUsage | null> {
+    if (this.usageFlight) return this.usageFlight;
+    const flight = this.readUsageAndReconcile();
+    this.usageFlight = flight;
+    try { return await flight; }
+    finally { if (this.usageFlight === flight) this.usageFlight = null; }
+  }
+
+  private async readUsageAndReconcile(): Promise<CodexUsage | null> {
+    const revision = this.quotaRevision;
+    const epoch = this.epoch;
     const data = await this.ensureLoaded();
     if (!data?.account) return null;
     if (this.usageCache && this.now - this.usageCache.at < USAGE_CACHE_MS) {
       return this.usageCache.value;
     }
     const accessToken = await this.getAccessToken().catch(() => null);
-    if (!accessToken) return null;
+    if (!accessToken) {
+      if (this.epoch === epoch && this.quotaRevision === revision &&
+          this.data?.account === data.account) {
+        this.usageCache = { at: this.now, value: null };
+      }
+      return null;
+    }
     const fresh = await this.ensureLoaded(true);
+    if (this.epoch !== epoch || fresh?.account.accountId !== data.account.accountId ||
+        fresh?.account.connectedAt !== data.account.connectedAt) return null;
     const usage = await fetchCodexUsage({
       accessToken,
       accountId: fresh?.account.accountId || undefined,
       fetchImpl: (url, init) => this.directFetch(url, init),
     }).catch(() => null);
+    const matches = (current: CodexCredentialData | null) => !!current && !!fresh &&
+      this.epoch === epoch && this.quotaRevision === revision &&
+      current.account.connectedAt === fresh.account.connectedAt &&
+      current.account.accountId === fresh.account.accountId &&
+      current.account.refreshToken === fresh.account.refreshToken;
+    let accepted = false;
+    await this.enqueueMutation(async () => {
+      const current = await this.store.load().catch(() => null);
+      if (!matches(current) || !current) return;
+      accepted = true;
+      const code = current.account.lastError?.code;
+      // Only the explicit quota error proves the generic cooldown is quota-owned.
+      // Legacy null-error cooldowns have lost their provenance: preserve those,
+      // while independently clearing the quota-observation channel.
+      const recover = usage?.canResume === true && (!code || code === "codex_usage_limit");
+      const clearErrorCooldown = recover && code === "codex_usage_limit";
+      const plan = usage?.plan || current.account.plan;
+      if (plan !== current.account.plan || recover &&
+          (current.account.cooldownUntil || current.account.rateLimitCooldownUntil || code === "codex_usage_limit" || current.rateLimits)) {
+        await this.saveData({ ...current,
+          ...(recover ? { rateLimits: null } : {}),
+          account: { ...current.account, plan, ...(recover ? {
+            cooldownUntil: clearErrorCooldown ? null : current.account.cooldownUntil,
+            rateLimitCooldownUntil: null, lastError: null,
+          } : {}) },
+        });
+      }
+    });
+    if (!accepted || this.quotaRevision !== revision || this.epoch !== epoch) return null;
     this.usageCache = { at: this.now, value: usage };
     return usage;
   }
@@ -1317,7 +1399,14 @@ export class CodexAuthService {
 
   async isAccountCooling(): Promise<boolean> {
     const data = await this.ensureLoaded();
-    return this.latestCooldown(data) !== undefined;
+    if (this.latestCooldown(data) === undefined) return false;
+    const code = data?.account.lastError?.code;
+    if (!code || code === "codex_usage_limit") {
+      // Bounded, single-flight management read; even cooling accounts can
+      // discover an upgrade/reset. Failures leave the existing lock intact.
+      await this.getUsage().catch(() => null);
+    }
+    return this.latestCooldown(this.data) !== undefined;
   }
 
   /**
@@ -1350,6 +1439,8 @@ export class CodexAuthService {
 
   /** Data-plane error channel (usage_limit_reached, 401, …). Never throws. */
   noteUpstreamError(info: PluginClassifiedError): Promise<void> {
+    this.quotaRevision++;
+    this.usageCache = null;
     return this.enqueueMutation(async () => {
       const current = await this.store.load().catch((): CodexCredentialData | null => null);
       if (!current) return;
@@ -1374,6 +1465,8 @@ export class CodexAuthService {
    * Never throws.
    */
   noteRateLimits(limits: CodexRateLimits): Promise<void> {
+    this.quotaRevision++;
+    this.usageCache = null;
     return (async () => {
       const clean = normalizeRateLimits(limits);
       if (!clean) return;
@@ -1407,6 +1500,7 @@ export class CodexAuthService {
   async disconnect(): Promise<{ success: true }> {
     const job = this.pending;
     this.epoch++;
+    this.usageFlight = null;
     if (job) {
       this.terminalize(job, { status: "cancelled" });
       job.rejectCode(codexAdminError("codex_login_cancelled", 409));

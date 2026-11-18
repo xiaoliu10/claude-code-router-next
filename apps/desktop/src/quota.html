@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CCR 控制中心</title>
+  <link rel="stylesheet" href="quota.css">
+  <!-- CSP is enforced by tauri.conf.json (script-src 'self'): external scripts only, no inline script/handlers. -->
+  <script src="projects.js" defer></script>
+  <script src="quota.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="header">
+      <div class="brand"><span class="brand-dot" aria-hidden="true"></span><span class="brand-name">CCR</span></div>
+      <div class="header-actions">
+        <button id="refresh-all" class="btn" type="button" title="读取服务端额度快照">
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/><path d="M13.4 1.6v3h-3"/></svg>
+          <span>刷新全部</span>
+        </button>
+        <button id="open-ui" class="btn" type="button" title="打开本地主窗口">
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6.8 3.2H4.4A1.4 1.4 0 0 0 3 4.6v8a1.4 1.4 0 0 0 1.4 1.4h8a1.4 1.4 0 0 0 1.4-1.4v-2.4"/><path d="M9.6 2.6h3.8v3.8"/><path d="M13.2 2.8 8.2 7.8"/></svg>
+          <span>打开主窗口</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="service-bar">
+      <span id="service-chip" class="status" data-tone="muted">
+        <span id="service-text">正在检测服务…</span>
+      </span>
+      <span class="spacer"></span>
+      <button id="service-start" class="btn" type="button" title="启动桌面托管的网关服务">启动</button>
+      <button id="service-stop" class="btn" type="button" title="停止由桌面启动的网关服务">停止</button>
+      <button id="service-refresh" class="btn btn-icon" type="button" aria-label="刷新服务状态" title="刷新服务状态">
+        <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/><path d="M13.4 1.6v3h-3"/></svg>
+      </button>
+    </div>
+
+    <nav id="tabs" class="tabs" role="tablist" aria-label="控制中心页签">
+      <button id="tab-quota" class="tab" type="button" role="tab" aria-selected="true" aria-controls="panel-quota">额度</button>
+      <button id="tab-routing" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-routing" tabindex="-1">路由</button>
+      <button id="tab-usage" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-usage" tabindex="-1">用量</button>
+      <button id="tab-clients" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-clients" tabindex="-1">客户端</button>
+      <button id="tab-projects" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-projects" tabindex="-1">项目</button>
+    </nav>
+
+    <section id="panel-quota" class="panel" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
+      <div class="heading"><h1>额度</h1><span id="provider-count" class="count">正在读取…</span></div>
+      <p class="hint">读取服务端额度快照，不会重置任何额度。</p>
+      <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
+      <ul id="list" class="list" aria-label="提供方额度列表" aria-busy="false" tabindex="0">
+        <li id="empty" class="empty" hidden>
+          <p class="empty-title">暂无已配置的提供方</p>
+          <p class="empty-note">在 config.json 中配置提供方后，这里会显示额度信息。</p>
+        </li>
+      </ul>
+    </section>
+
+    <section id="panel-routing" class="panel" role="tabpanel" aria-labelledby="tab-routing" tabindex="-1" hidden>
+      <div class="panel-head">
+        <h1>路由</h1>
+        <span id="routing-revision" class="count"></span>
+        <span class="spacer"></span>
+        <button id="routing-refresh" class="btn" type="button" title="重新读取路由配置；未保存的修改会保留">刷新</button>
+      </div>
+      <p class="hint">修改后需点击保存才会写入配置；回退按顺序依次尝试。</p>
+      <div class="flags" role="group" aria-label="路由开关">
+        <label class="flag"><input id="flag-family" class="switch" type="checkbox" role="switch"><span>家族路由</span></label>
+        <label class="flag"><input id="flag-fallback" class="switch" type="checkbox" role="switch"><span>回退</span></label>
+        <span id="routing-flags-msg" class="inline-msg" role="status"></span>
+      </div>
+      <div id="routing-msg" class="banner" role="status" aria-live="polite" hidden></div>
+      <div id="routing-scopes" class="scopes" role="group" aria-label="路由范围">
+        <button class="scope-btn" type="button" data-scope="global" aria-pressed="true">全局</button>
+        <button class="scope-btn" type="button" data-scope="opus" aria-pressed="false">Opus</button>
+        <button class="scope-btn" type="button" data-scope="sonnet" aria-pressed="false">Sonnet</button>
+        <button class="scope-btn" type="button" data-scope="haiku" aria-pressed="false">Haiku</button>
+        <button class="scope-btn" type="button" data-scope="models" aria-pressed="false">模型别名</button>
+      </div>
+      <datalist id="route-choices"></datalist>
+      <div id="routing-body" class="list" aria-live="polite" aria-busy="false"></div>
+      <div id="alias-add" class="alias-add" hidden>
+        <input id="alias-name" class="route-input" type="text" placeholder="新别名，如 glm-5" aria-label="新模型别名">
+        <input id="alias-target" class="route-input" type="text" list="route-choices" placeholder="目标 提供方,模型" aria-label="别名目标">
+        <button id="alias-add-btn" class="btn" type="button">添加别名</button>
+        <span id="alias-add-msg" class="inline-msg" role="status"></span>
+      </div>
+    </section>
+
+    <section id="panel-usage" class="panel" role="tabpanel" aria-labelledby="tab-usage" tabindex="-1" hidden>
+      <div class="panel-head">
+        <h1>用量</h1>
+        <span id="usage-updated" class="count"></span>
+        <span class="spacer"></span>
+        <button id="usage-refresh" class="btn" type="button" title="重新读取用量统计">刷新</button>
+      </div>
+      <div id="usage-periods" class="periods" role="group" aria-label="统计周期">
+        <button class="period-btn" type="button" data-period="today" aria-pressed="true">今天</button>
+        <button class="period-btn" type="button" data-period="7d" aria-pressed="false">近 7 天</button>
+        <button class="period-btn" type="button" data-period="30d" aria-pressed="false">近 30 天</button>
+      </div>
+      <div id="usage-msg" class="banner" role="status" aria-live="polite" hidden></div>
+      <div id="usage-body" class="list" aria-live="polite" aria-busy="false"></div>
+    </section>
+
+    <section id="panel-clients" class="panel" role="tabpanel" aria-labelledby="tab-clients" tabindex="-1" hidden>
+      <div class="panel-head">
+        <h1>客户端</h1>
+        <span class="spacer"></span>
+        <button id="clients-refresh" class="btn" type="button" title="重新读取客户端接入状态">刷新</button>
+      </div>
+      <p class="hint">将 Claude Code、Codex、Pi 等接入 CCR。各客户端单独操作，恢复前会先确认。</p>
+      <div id="clients-msg" class="banner" role="status" aria-live="polite" hidden></div>
+      <ul id="clients-list" class="list" aria-label="客户端列表" aria-busy="false"></ul>
+    </section>
+
+    <section id="panel-projects" class="panel" role="tabpanel" aria-labelledby="tab-projects" tabindex="-1" hidden>
+      <div class="panel-head"><h1>项目</h1><span id="projects-count" class="count"></span><span class="spacer"></span><button id="projects-refresh" class="btn" type="button" title="刷新列表；保留未保存的修改">刷新</button></div>
+      <p class="hint">项目路由独立保存；接管客户端需单独应用。</p>
+      <div id="projects-msg" class="banner" role="status" aria-live="polite" hidden></div>
+      <div class="projects-picker"><label for="projects-select">当前项目</label><select id="projects-select" class="route-input" aria-label="选择项目"></select></div>
+      <div id="projects-body" class="list"></div>
+    </section>
+
+    <footer class="footer">
+      <span id="updated-at" class="updated">—</span>
+      <span class="spacer"></span>
+      <button id="quit" class="btn btn-quiet" type="button" title="退出桌面应用；由本应用启动的网关服务会一并停止">
+        <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2v5"/><path d="M10.9 3.7a4.8 4.8 0 1 1-5.8 0"/></svg>
+        <span>退出桌面</span>
+      </button>
+    </footer>
+  </div>
+</body>
+</html>
