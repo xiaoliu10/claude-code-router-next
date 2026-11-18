@@ -1316,6 +1316,7 @@
 
     function copy(v) { return JSON.parse(JSON.stringify(v)); }
     function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
+    var pluginsPreview = typeof PluginsUI !== 'undefined' ? PluginsUI.createPreviewPlugins(function (v) { return delay(copy(v)); }) : null;
     function bump() { rev += 1; routing.revision = 'rev-' + rev; }
 
     function previewQuotaProviders(now) {
@@ -1348,6 +1349,7 @@
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
       if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
+      if (cmd.indexOf('plugin_') === 0 && pluginsPreview) return pluginsPreview.invoke(cmd, a);
       if (cmd === 'quota_snapshot') {
         return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
       }
@@ -1464,6 +1466,7 @@
             return Promise.reject(new Error('服务已在运行或启动中'));
           }
           service = { mode: 'owned', running: true, message: '' };
+          if (pluginsPreview) pluginsPreview.start();
           return delay(copy(service));
         }
         if (a.action === 'stop') {
@@ -2005,6 +2008,7 @@
     };
     var projectsCtrl = mode === 'missing' ? null : ProjectsUI.createProjectsController({ invoke: invoke });
     ProjectsUI.mount(document, projectsCtrl);
+    var pluginsPanel = PluginsUI.mount(document, invoke);
     var cards = new Map();
 
     function safeCommand(cmd) {
@@ -2142,6 +2146,7 @@
     // ---- service bar ------------------------------------------------------
 
     function renderService(sState) {
+      pluginsPanel.serviceChanged(sState);
       var view = serviceView(sState.service);
       var busy = !!sState.pending || sState.loading;
       if (sState.error) {
@@ -2879,7 +2884,7 @@
 
     // ---- tabs -------------------------------------------------------------
 
-    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects'];
+    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects', 'plugins'];
     var tabButtons = {};
     var panels = {};
     TAB_IDS.forEach(function (id) {
@@ -2910,11 +2915,13 @@
       if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); }
       if (name === 'clients') clientsCtrl.refresh();
       if (name === 'projects') projectsCtrl.refresh();
+      if (name === 'plugins') pluginsPanel.load();
     }
 
     function selectTab(name) {
       if (TAB_IDS.indexOf(name) === -1) return;
       if (name !== 'quota') providerForm.close(false);
+      if (name !== 'plugins') pluginsPanel.cancel(false);
       activeTab = name;
       TAB_IDS.forEach(function (id) {
         var on = id === name;
@@ -3057,7 +3064,7 @@
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
       if (event.key === 'Escape' && !event.isComposing) {
-        if (providerForm.escape()) event.preventDefault();
+        if (providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
         else safeCommand('quota_hide');
       }
     });
