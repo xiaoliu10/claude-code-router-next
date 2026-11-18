@@ -2,6 +2,7 @@ mod api;
 mod control;
 mod credentials;
 mod lifecycle;
+mod plugins;
 mod popup;
 mod projects;
 mod providers;
@@ -41,6 +42,10 @@ pub fn run() {
             providers::provider_get,
             providers::provider_update,
             providers::provider_transformers,
+            plugins::plugin_inventory,
+            plugins::plugin_catalog,
+            plugins::plugin_install,
+            plugins::plugin_action,
             credentials::quota_credentials_status,
             credentials::quota_credentials_save,
             lifecycle::service_snapshot,
@@ -67,6 +72,7 @@ pub fn run() {
                     app.manage(control::ControlService::new(Some(client.clone())));
                     app.manage(projects::ProjectsService::new(Some(client.clone())));
                     app.manage(providers::ProvidersService::new(Some(client.clone())));
+                    app.manage(plugins::PluginsService::new(Some(client.clone())));
                     app.manage(credentials::CredentialsService::new(Some(client.clone())));
                     let resources = app.path().resource_dir().ok();
                     let bundle = lifecycle::RuntimeBundle::detect(resources.as_deref());
@@ -84,6 +90,7 @@ pub fn run() {
                     app.manage(control::ControlService::new(None));
                     app.manage(projects::ProjectsService::new(None));
                     app.manage(providers::ProvidersService::new(None));
+                    app.manage(plugins::PluginsService::new(None));
                     app.manage(credentials::CredentialsService::new(None));
                     eprintln!("Invalid CCR connection settings: {e}");
                     tray::install_offline(app.handle(), e.clone())?;
