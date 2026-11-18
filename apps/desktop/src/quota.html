@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="quota.css">
   <!-- CSP is enforced by tauri.conf.json (script-src 'self'): external scripts only, no inline script/handlers. -->
   <script src="projects.js" defer></script>
+  <script src="plugins.js" defer></script>
   <script src="quota.js" defer></script>
 </head>
 <body>
@@ -43,6 +44,7 @@
       <button id="tab-usage" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-usage" tabindex="-1">用量</button>
       <button id="tab-clients" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-clients" tabindex="-1">客户端</button>
       <button id="tab-projects" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-projects" tabindex="-1">项目</button>
+      <button id="tab-plugins" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-plugins" tabindex="-1">插件</button>
     </nav>
 
     <section id="panel-quota" class="panel" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
@@ -151,6 +153,29 @@
       <div id="projects-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <div class="projects-picker"><label for="projects-select">当前项目</label><select id="projects-select" class="route-input" aria-label="选择项目"></select></div>
       <div id="projects-body" class="list"></div>
+    </section>
+
+    <section id="panel-plugins" class="panel" role="tabpanel" aria-labelledby="tab-plugins" tabindex="-1" hidden>
+      <div class="panel-head">
+        <h1>插件</h1><span class="spacer"></span>
+        <button id="plugins-refresh" class="btn" type="button" title="重新读取当前插件列表">刷新</button>
+      </div>
+      <div class="scopes" role="group" aria-label="插件视图">
+        <button id="plugins-installed" class="scope-btn" type="button" aria-pressed="true" aria-controls="plugins-list">已安装</button>
+        <button id="plugins-market" class="scope-btn" type="button" aria-pressed="false" aria-controls="plugins-list">插件市场</button>
+      </div>
+      <p id="plugins-advanced" class="hint">桌面仅提供插件支持的基础操作。授权登录、站点和账号管理、模型管理等高级操作请使用主窗口。</p>
+      <div id="plugins-feedback" class="banner" role="status" hidden></div>
+      <div id="plugins-restart" class="banner" data-tone="warn" role="status" hidden></div>
+      <div id="plugins-read-status" class="banner" role="status" hidden></div>
+      <div id="plugins-confirm" class="plugins-confirm card" role="group" aria-labelledby="plugins-confirm-text" hidden>
+        <p id="plugins-confirm-text" class="card-message"></p>
+        <div class="plugins-actions">
+          <button id="plugins-cancel" class="btn" type="button">取消</button>
+          <button id="plugins-confirm-button" class="btn btn-primary" type="button">确认</button>
+        </div>
+      </div>
+      <ul id="plugins-list" class="list" aria-label="已安装插件列表" aria-busy="false" tabindex="0"></ul>
     </section>
 
     <footer class="footer">

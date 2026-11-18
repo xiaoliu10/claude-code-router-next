@@ -13,10 +13,12 @@ import vm from "node:vm"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const js = readFileSync(path.join(here, "..", "src", "quota.js"), "utf8")
+const pluginsJs = readFileSync(path.join(here, "..", "src", "plugins.js"), "utf8")
 const html = readFileSync(path.join(here, "..", "src", "quota.html"), "utf8")
 
 const sandbox = { setTimeout, URL, TextEncoder }
 vm.createContext(sandbox)
+new vm.Script(pluginsJs, { filename: "plugins.js" }).runInContext(sandbox)
 new vm.Script(js, { filename: "quota.js" }).runInContext(sandbox)
 const Q = sandbox.QuotaUI
 assert.ok(Q && typeof Q.createPreviewInvoke === "function", "QuotaUI.createPreviewInvoke must exist")
@@ -399,6 +401,51 @@ test("preview: quota_credentials_status/save follow the {name, configured} contr
   )
 })
 
+test("preview: plugin DTOs model partial catalog, install/update, safe actions and manual activation", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const inventory = await previewCall(invoke, "plugin_inventory")
+  assert.deepEqual(Object.keys(inventory), ["plugins"])
+  for (const row of inventory.plugins) {
+    const { connectionState, ...required } = row
+    assert.deepEqual(Object.keys(required), ["id", "name", "version", "loaded", "actions"])
+    assert.ok(Array.isArray(row.actions))
+    assert.ok(connectionState === undefined || ["connected", "disconnected", "unknown"].includes(connectionState))
+  }
+  assert.equal(inventory.plugins.find(row => row.id === "codex").connectionState, "connected")
+  assert.ok(inventory.plugins.some(row => row.loaded && row.actions.includes("usage")))
+  assert.ok(inventory.plugins.some(row => !row.loaded && row.actions.length === 0))
+  const catalog = await previewCall(invoke, "plugin_catalog")
+  assert.equal(catalog.partial, true)
+  for (const row of catalog.plugins) {
+    assert.deepEqual(Object.keys(row), ["name", "description", "version", "installed", "installedVersion", ...(row.installed && !row.localOnly ? ["installedName"] : []), "updateAvailable", "localOnly"])
+  }
+  const offer = catalog.plugins.find(row => !row.installed)
+  const update = catalog.plugins.find(row => row.updateAvailable)
+  await assert.rejects(previewCall(invoke, "plugin_install", { name: catalog.plugins.find(row => row.localOnly).name, version: "0.1.0", installed: { name: "local-example", version: "0.1.0" } }), /PLUGIN_INSTALL_FAILED/)
+  await assert.rejects(previewCall(invoke, "plugin_action", { id: "workbuddy", action: "disconnect" }), /PLUGIN_ACTION_FAILED/)
+  const usage = await previewCall(invoke, "plugin_action", { id: "codex", action: "usage" })
+  assert.deepEqual({ ...usage }, { usage: "fresh" })
+  const disconnected = await previewCall(invoke, "plugin_action", { id: "codex", action: "disconnect" })
+  assert.deepEqual({ ...disconnected }, { success: true })
+  for (const [row, isUpdate] of [[offer, false], [update, true]]) {
+    const result = await previewCall(invoke, "plugin_install", { name: row.name, version: row.version, installed: isUpdate ? { name: row.installedName, version: row.installedVersion } : null })
+    assert.equal(result.restartRequired, true)
+    assert.equal(result.version, row.version)
+    assert.ok(result.id)
+  }
+  const installed = await previewCall(invoke, "plugin_catalog")
+  assert.ok(installed.plugins.every(row => row.installed && !row.updateAvailable))
+  const beforeStart = await previewCall(invoke, "plugin_inventory")
+  assert.equal(beforeStart.plugins.find(row => row.id === "gemini-oauth").loaded, false)
+  assert.equal(beforeStart.plugins.find(row => row.id === "codex").version, update.installedVersion)
+  assert.equal(beforeStart.plugins.find(row => row.id === "codex").connectionState, "disconnected")
+  await previewCall(invoke, "service_action", { action: "stop" })
+  await previewCall(invoke, "service_action", { action: "start" })
+  const afterStart = await previewCall(invoke, "plugin_inventory")
+  assert.equal(afterStart.plugins.find(row => row.id === "gemini-oauth").loaded, true)
+  assert.equal(afterStart.plugins.find(row => row.id === "codex").version, update.version)
+})
+
 test("preview: unknown commands resolve null (never fabricate responses)", async () => {
   const invoke = Q.createPreviewInvoke()
   assert.equal(await previewCall(invoke, "totally_unknown", {}), null)
@@ -407,9 +454,9 @@ test("preview: unknown commands resolve null (never fabricate responses)", async
 // ---------------- HTML / JS wiring ----------------
 
 const htmlIds = () => new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]))
-const jsIds = () => new Set([...js.matchAll(/getElementById\('([^']+)'\)/g)].map((m) => m[1]))
+const jsIds = () => new Set([...(js + pluginsJs).matchAll(/getElementById\('([^']+)'\)/g)].map((m) => m[1]))
 
-test("wiring: every id referenced from quota.js exists in quota.html", () => {
+test("wiring: every id referenced from quota.js and plugins.js exists in quota.html", () => {
   const missing = [...jsIds()].filter((id) => !htmlIds().has(id))
   assert.deepEqual(missing, [], `ids used in JS but missing in HTML: ${missing.join(", ")}`)
 })
@@ -420,13 +467,14 @@ test("wiring: scripts are external only and there are no inline handlers (CSP sc
   }
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i, "no inline on* handlers in HTML")
   assert.match(html, /<script src="quota\.js" defer><\/script>/)
+  assert.ok(html.indexOf('src="plugins.js" defer') > 0 && html.indexOf('src="plugins.js" defer') < html.indexOf('src="quota.js" defer'))
 })
 
 test("wiring: stylesheet and tab structure are present", () => {
   assert.match(html, /<link rel="stylesheet" href="quota\.css">/)
   assert.ok(JSON.stringify(jsIds()).length > 0)
   const ids = htmlIds()
-  for (const tab of ["quota", "routing", "usage", "clients"]) {
+  for (const tab of ["quota", "routing", "usage", "clients", "plugins"]) {
     assert.ok(ids.has(`tab-${tab}`), `tab-${tab} exists`)
     assert.ok(ids.has(`panel-${tab}`), `panel-${tab} exists`)
     assert.ok(new RegExp(`aria-controls="panel-${tab}"`).test(html), `tab-${tab} aria-controls wired`)
@@ -435,7 +483,7 @@ test("wiring: stylesheet and tab structure are present", () => {
 
 test("wiring: product wording matches the approved labels", () => {
   const text = html.replace(/\s+/g, "")
-  for (const label of ["额度", "路由", "用量", "客户端"]) {
+  for (const label of ["额度", "路由", "用量", "客户端", "插件", "已安装", "插件市场"]) {
     assert.ok(text.includes(`>${label}</button>`), `tab label ${label} present`)
   }
   assert.ok(html.includes("将 Claude Code、Codex、Pi 等接入 CCR"), "clients tab description present")
