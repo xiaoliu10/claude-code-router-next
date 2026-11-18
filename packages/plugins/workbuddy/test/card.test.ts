@@ -20,7 +20,7 @@ class Element {
   dataset: Record<string, string> = {};
   parent: Element | null = null;
   attrs: Record<string, string> = {};
-  onclick?: () => void;
+  onclick?: (event?: { target?: unknown }) => void;
   firstChild: Element | null = null;
   constructor(tag: string) { this.tag = tag; }
   append(...nodes: Element[]) { for (const n of nodes) { n.parent = this; this.children.push(n); } this.firstChild = this.children[0] ?? null; }
@@ -40,6 +40,13 @@ class Element {
   }
   replaceChildren(...nodes: Element[]) { this.children = nodes; for (const n of nodes) n.parent = this; this.firstChild = nodes[0] ?? null; }
   setAttribute(name: string, value: string) { this.attrs[name] = value; }
+  remove() {
+    if (this.parent) {
+      const at = this.parent.children.indexOf(this);
+      if (at >= 0) this.parent.children.splice(at, 1);
+      this.parent = null;
+    }
+  }
   all(): Element[] { return [this, ...this.children.flatMap(n => n.all())]; }
   button(text: string) {
     const result = this.all().filter(n => n.tag === "button" && n.textContent === text).at(-1);
@@ -91,7 +98,20 @@ function harnessFocus(focusKey: string | null, scrolled: string[]) {
   return { host, callApi, notify: () => hostListener?.() };
 }
 function harness(overrides: Record<string, any> = {}, disabled = false, heldLease = false, locale = "en") {
-  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any });
+  // The confirm modal mounts at body level and registers its Escape handler on
+  // document; the double tracks both so tests can drive the real wiring.
+  const documentListeners = new Map<string, Array<(event?: { key?: string }) => void>>();
+  const body = new Element("body");
+  vi.stubGlobal("document", {
+    createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any,
+    body,
+    addEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
+    },
+    removeEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, (documentListeners.get(type) ?? []).filter(l => l !== listener));
+    },
+  });
   const host = new Element("div");
   const callApi = vi.fn(async (path: string, init?: any) => {
     if (overrides[path]) {
@@ -124,7 +144,8 @@ function harness(overrides: Record<string, any> = {}, disabled = false, heldLeas
   mount(host as any, props);
   cleanups.push(() => unmount(host as any));
   return {
-    host, callApi, release, onBusy: props.onBusy, refreshConfig,
+    host, callApi, release, onBusy: props.onBusy, refreshConfig, body,
+    keydown(key: string) { for (const l of [...(documentListeners.get("keydown") ?? [])]) l({ key }); },
     get lock() { return lock; },
     get unsubscribed() { return unsubscribed; },
     notify() { hostListener?.(); },
@@ -212,8 +233,8 @@ describe("self-contained WorkBuddy plugin card", () => {
     expect(h.callApi.mock.calls.some(([path, init]) => path === "/account/switch" && init.method === "POST" && init.body === JSON.stringify({ site: "workbuddy", uid }))).toBe(true);
     expect(h.refreshConfig).toHaveBeenCalled();
     h.host.card("workbuddy").click(en.remove);
-    expect(h.host.text()).toContain(en.account_remove_warning);
-    h.host.click(en.account_remove_confirm); await tick();
+    expect(h.body.text()).toContain(en.account_remove_warning); // modal on document.body
+    h.body.click(en.account_remove_confirm); await tick();
     expect(h.callApi.mock.calls.some(([path, init]) => path === "/account/remove" && init.body === JSON.stringify({ site: "workbuddy", uid }))).toBe(true);
   });
   it("a matching focusKey scrolls to and focuses that site's section, exactly once", async () => {
@@ -417,14 +438,49 @@ describe("self-contained WorkBuddy plugin card", () => {
     const h = harness();
     await tick();
     h.host.card("workbuddy").click(en.disconnect);
-    expect(h.host.text()).toContain(en.disconnect_warning);
+    expect(h.body.text()).toContain(en.disconnect_warning); // modal on document.body
     // Cancel keeps everything.
-    h.host.click(en["app.cancel"] ?? "Cancel");
+    h.body.click(en["app.cancel"] ?? "Cancel");
+    expect(h.body.children).toEqual([]); // overlay removed, nothing left on body
     h.host.card("workbuddy").click(en.disconnect);
-    h.host.button(en.disconnect).onclick!();
+    h.body.button(en.disconnect).onclick!();
     await tick();
     expect(h.callApi.mock.calls.some(([path, init]) => path === "/disconnect" && JSON.parse(init.body).site === "workbuddy")).toBe(true);
     expect(h.host.text()).toContain(en.disconnected);
+  });
+
+  it("the confirm dialog is a body-level modal: Escape/backdrop cancel, busy keeps it locked, unmount cleans up", async () => {
+    const h = harness({ "/disconnect": () => new Promise(() => {}) });
+    await tick();
+    h.host.card("workbuddy").click(en.disconnect);
+    expect(h.body.children).toHaveLength(1);
+    const overlay = h.body.children[0];
+    expect(overlay.className).toContain("fixed inset-0");
+    const panel = overlay.children[0];
+    expect(panel.attrs.role).toBe("dialog");
+    expect(panel.attrs["aria-modal"]).toBe("true");
+    expect(panel.attrs["aria-labelledby"]).toBe("workbuddy-confirm-title");
+    expect(h.host.text()).not.toContain(en.disconnect_warning);
+    // Escape cancels.
+    h.keydown("Escape");
+    expect(h.body.children).toEqual([]);
+    // Backdrop clicks cancel; panel clicks do not.
+    h.host.card("workbuddy").click(en.disconnect);
+    overlay.onclick({ target: overlay.children[0] });
+    expect(h.body.children).toHaveLength(1);
+    overlay.onclick({ target: overlay });
+    expect(h.body.children).toEqual([]);
+    // Confirm → action in flight: Escape/backdrop no-ops, cancel disabled.
+    h.host.card("workbuddy").click(en.disconnect);
+    h.body.button(en.disconnect).onclick!();
+    await tick();
+    expect(h.body.button(en["app.cancel"] ?? "Cancel").disabled).toBe(true);
+    h.body.children[0].onclick({ target: h.body.children[0] });
+    h.keydown("Escape");
+    expect(h.body.children).toHaveLength(1);
+    // Unmount removes the overlay: no body stragglers.
+    unmount(h.host as any);
+    expect(h.body.children).toEqual([]);
   });
 
   it("host disable re-renders in place with the other-edit note; busy gate blocks actions", async () => {

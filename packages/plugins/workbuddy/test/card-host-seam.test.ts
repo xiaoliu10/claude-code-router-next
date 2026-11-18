@@ -24,7 +24,7 @@ class El {
   type = "";
   style = { cssText: "" };
   attrs: Record<string, string> = {};
-  onclick?: () => void;
+  onclick?: (event?: { target?: unknown }) => void;
   firstChild: El | null = null;
   constructor(tag: string) { this.tag = tag; }
   append(...nodes: El[]) { for (const n of nodes) { n.parent = this; this.children.push(n); } this.firstChild = this.children[0] ?? null; }
@@ -80,7 +80,18 @@ function deferred<T = any>() {
 }
 
 function seamHarness() {
-  vi.stubGlobal("document", { createElement: (tag: string) => new El(tag), createElementNS: () => new El("svg") as any });
+  const documentListeners = new Map<string, Array<(event?: { key?: string }) => void>>();
+  const body = new El("body");
+  vi.stubGlobal("document", {
+    createElement: (tag: string) => new El(tag), createElementNS: () => new El("svg") as any,
+    body,
+    addEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
+    },
+    removeEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, (documentListeners.get(type) ?? []).filter(l => l !== listener));
+    },
+  });
   const host = new El("div");
   const site = {
     status: "connected", providerName: "workbuddy", activeUid: "uid-123456789",
@@ -132,7 +143,7 @@ function seamHarness() {
   };
   const controller = createPluginCardAreaController(bridge);
   return {
-    host, controller, calls, refreshConfig, disabled, fetches, blobs, revoked, defers,
+    host, controller, calls, refreshConfig, disabled, fetches, blobs, revoked, defers, body,
     acquireManagement: () => (lock ? null : (lock = true, release)),
     get releases() { return releaseCount; },
     get imports() { return imports; },
@@ -208,8 +219,8 @@ describe("real host controller × real WorkBuddy card seam", () => {
     const cardEl = seam.host.children[0];
     seam.defers.disconnect = deferred();
     cardEl.card("workbuddy").click(en.disconnect); // opens confirm dialog
-    expect(seam.host.text()).toContain(en.disconnect_warning);
-    seam.host.button(en.disconnect).onclick!(); // confirm dialog's button (host level)
+    expect(seam.body.text()).toContain(en.disconnect_warning); // modal lives on document.body
+    seam.body.button(en.disconnect).onclick!(); // confirm dialog's button (body level)
     await tick();
     expect(seam.calls).toContain("/disconnect");
     // The lease is held: a second acquire (an attempted save) gets null.
@@ -217,6 +228,7 @@ describe("real host controller × real WorkBuddy card seam", () => {
 
     seam.controller.dispose();
     expect(seam.host.children).toHaveLength(0);
+    expect(seam.body.children).toHaveLength(0); // disposal removes the body overlay too
     expect(seam.acquireManagement()).toBeNull();
 
     seam.defers.disconnect.resolve({ ok: true, success: true });

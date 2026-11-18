@@ -487,15 +487,37 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     const family = /^families\.([A-Za-z0-9_-]{1,80})\.default$/.exec(label);
     return family ? t("router_path.family_default", { family: family[1] }) : null;
   };
-  /** Modal dialog mirroring the host ui/dialog look (overlay + centered panel). */
-  const dialog = (title: string, warning: string, onClose: () => void, titleIcon?: SVGSVGElement): { panel: HTMLDivElement; body: HTMLDivElement; footer: HTMLDivElement } => {
-    const overlay = styled("div", "fixed inset-0 z-50 bg-black/80");
-    overlay.setAttribute("aria-hidden", "true");
-    const panel = styled("div", "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border bg-background p-6 shadow-lg sm:rounded-lg");
+  /**
+   * Modal dialog mirroring the host ui/dialog look: a dim body-level overlay
+   * with a flex-centered panel. The overlay mounts into document.body — never
+   * inside the card, whose .glass-card backdrop-filter would become the fixed
+   * overlay's containing block and clip it to the card area. Backdrop clicks
+   * and Escape route through onClose (call sites guard on busy, matching the
+   * disabled cancel button); render() rebuilds one overlay idempotently and
+   * unmount removes it.
+   */
+  let dialogOverlay: HTMLElement | null = null;
+  let dialogClose: (() => void) | null = null;
+  const onDialogKeydown = (event: { key?: string }): void => {
+    if (event?.key === "Escape") dialogClose?.();
+  };
+  const removeDialogOverlay = (): void => {
+    if (!dialogOverlay) return;
+    dialogOverlay.remove();
+    dialogOverlay = null;
+    dialogClose = null;
+    document.removeEventListener("keydown", onDialogKeydown);
+  };
+  const dialog = (title: string, warning: string, onClose: () => void, titleIcon?: SVGSVGElement, titleId = "gemini-oauth-dialog-title"): { panel: HTMLDivElement; body: HTMLDivElement; footer: HTMLDivElement } => {
+    removeDialogOverlay(); // idempotent render: never stack overlays
+    const overlay = styled("div", "fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4");
+    const panel = styled("div", "relative grid w-full max-w-lg gap-4 border bg-background p-6 shadow-lg sm:rounded-lg");
     panel.setAttribute("role", "dialog");
-    panel.setAttribute("aria-label", title);
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-labelledby", titleId);
     const header = styled("div", "flex flex-col space-y-1.5 text-center sm:text-left");
     const heading = styled("h3", "flex items-center gap-2 text-lg font-semibold leading-none tracking-tight", title);
+    heading.setAttribute("id", titleId);
     if (titleIcon) heading.prepend(titleIcon);
     header.append(heading);
     const body = styled("div", "space-y-3");
@@ -507,7 +529,16 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     close.append(icon(["M18 6 6 18", "m6 6 12 12"], "h-4 w-4"));
     close.onclick = onClose;
     panel.append(header, body, footer, close);
-    el.append(overlay, panel);
+    overlay.append(panel);
+    // Backdrop clicks (the overlay itself, not the panel) close via onClose,
+    // exactly like the corner close button.
+    overlay.onclick = (event?: { target?: unknown }) => {
+      if (event?.target === overlay) onClose();
+    };
+    document.body.append(overlay);
+    dialogOverlay = overlay;
+    dialogClose = onClose;
+    document.addEventListener("keydown", onDialogKeydown);
     return { panel, body, footer };
   };
   /** Compact localized reset instant; the view layer already proved the ISO
@@ -702,7 +733,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       el.append(message);
     }
     if (consentOpen) {
-      const { body: consentBody, footer } = dialog(t("risk_title"), "", () => { if (!busy) { consentGranted = false; consentOpen = false; consentAck = false; render(); } }, shieldAlertIcon("h-5 w-5 text-red-500"));
+      const { body: consentBody, footer } = dialog(t("risk_title"), "", () => { if (!busy) { consentGranted = false; consentOpen = false; consentAck = false; render(); } }, shieldAlertIcon("h-5 w-5 text-red-500"), "gemini-oauth-risk-title");
       // The risk text is an emphasized alert, not muted description text.
       consentBody.replaceChildren();
       consentBody.append(errorAlert(t("risk"), "rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm font-medium text-red-600"));
@@ -717,13 +748,15 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       button(footer, t("risk_continue"), () => { if (consentAck) void run("login"); }, disabled || !consentAck, "destructive", "h-9 rounded-lg px-4", triangleAlertIcon("mr-1 h-3.5 w-3.5"));
     }
     if (confirmDisconnect) {
-      const { footer } = dialog(t("disconnect_title"), t("disconnect_warning"), () => { if (!busy) { confirmDisconnect = false; render(); } });
+      const { footer } = dialog(t("disconnect_title"), t("disconnect_warning"), () => { if (!busy) { confirmDisconnect = false; render(); } }, undefined, "gemini-oauth-disconnect-title");
       button(footer, cancelText, () => { confirmDisconnect = false; render(); }, busy, "outline", "h-9 rounded-lg px-4");
       button(footer, t("disconnect"), () => { void run("disconnect"); }, disabled, "destructive", "h-9 rounded-lg px-4");
     }
+    if (!consentOpen && !confirmDisconnect) removeDialogOverlay();
   };
   mounted.set(el, () => {
     alive = false; consentGranted = false; consentOpen = false; confirmDisconnect = false;
+    removeDialogOverlay();
     // Drop any in-flight quota response: a disposed/replaced card must never
     // paint another account's snapshot back into the DOM.
     quotaReadGeneration += 1; quotaLoading = false; quota = null;

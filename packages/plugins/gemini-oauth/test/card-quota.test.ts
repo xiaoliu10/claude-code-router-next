@@ -25,7 +25,7 @@ class Element {
   dataset: Record<string, string> = {};
   parent: Element | null = null;
   attrs: Record<string, string> = {};
-  onclick?: () => void;
+  onclick?: (event?: { target?: unknown }) => void;
   onchange?: () => void;
   firstChild: Element | null = null;
   constructor(tag: string) { this.tag = tag; }
@@ -41,6 +41,13 @@ class Element {
   }
   replaceChildren(...nodes: Element[]) { this.children = nodes; for (const n of nodes) n.parent = this; this.firstChild = nodes[0] ?? null; }
   setAttribute(name: string, value: string) { this.attrs[name] = value; }
+  remove() {
+    if (this.parent) {
+      const at = this.parent.children.indexOf(this);
+      if (at >= 0) this.parent.children.splice(at, 1);
+      this.parent = null;
+    }
+  }
   all(): Element[] { return [this, ...this.children.flatMap(n => n.all())]; }
   button(text: string) {
     const result = this.all().filter(n => n.tag === "button" && n.textContent === text).at(-1);
@@ -90,7 +97,18 @@ interface HarnessOptions {
 }
 
 function harness(options: HarnessOptions = {}) {
-  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any });
+  const documentListeners = new Map<string, Array<(event?: { key?: string }) => void>>();
+  const body = new Element("body");
+  vi.stubGlobal("document", {
+    createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any,
+    body,
+    addEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
+    },
+    removeEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, (documentListeners.get(type) ?? []).filter(l => l !== listener));
+    },
+  });
   vi.stubGlobal("window", { open: vi.fn() });
   const host = new Element("div");
   const routes = options.routes ?? {};
@@ -123,7 +141,7 @@ function harness(options: HarnessOptions = {}) {
   const quotaSection = () =>
     host.all().find(n => n.tag === "section" && n.children.some(c => c.tag === "div" && c.text().includes((options.locale ?? "en").startsWith("zh") ? zh.quota.title : en.quota.title))) as Element | undefined;
   return {
-    host, props, calls, callApi, release, refreshConfig,
+    host, props, calls, callApi, release, refreshConfig, body,
     get lock() { return lock; },
     notify() { hostListener?.(); },
     paths() { return calls.map(c => c.path); },
@@ -339,7 +357,7 @@ describe("Gemini card quota surface — identity races and disposal", () => {
     await tick();
     expect(h.host.text()).toContain("gemini-4-argon");
     h.host.click(en.disconnect); await tick();
-    h.host.click(en.disconnect); await tick(); // confirm dialog
+    h.body.click(en.disconnect); await tick(); // confirm dialog (body-level modal)
     expect(h.quotaSection()).toBeUndefined();
     // Only the single mount quota read: disconnect invalidated it, no refill.
     expect(h.quotaCalls()).toHaveLength(1);
@@ -367,9 +385,9 @@ describe("Gemini card quota surface — identity races and disposal", () => {
     expect(h.quotaCalls()).toHaveLength(1); // account A read, pending
     // Complete the consent flow; poll succeeds and settle re-reads status as B.
     h.host.click(en.reconnect);
-    const ack = h.host.all().find(n => n.tag === "input")!;
+    const ack = h.body.all().find(n => n.tag === "input")!; // consent dialog lives on document.body
     ack.checked = true; ack.onchange?.();
-    h.host.click(en.risk_continue); await tick();
+    h.body.click(en.risk_continue); await tick();
     // A fresh quota read was issued for account B; the old read is now stale.
     expect(h.quotaCalls()).toHaveLength(2);
     resolveOldQuota({ models: { "gemini-4-argon": { remaining: 0.01 } }, pools: [] });
@@ -391,9 +409,9 @@ describe("Gemini card quota surface — identity races and disposal", () => {
     await tick();
     expect(h.quotaCalls()).toHaveLength(1);
     h.host.click(en.reconnect);
-    const ack = h.host.all().find(n => n.tag === "input")!;
+    const ack = h.body.all().find(n => n.tag === "input")!; // consent dialog lives on document.body
     ack.checked = true; ack.onchange?.();
-    h.host.click(en.risk_continue); await tick();
+    h.body.click(en.risk_continue); await tick();
     // The action cleared the surface at start; the same-account finally refills.
     expect(h.quotaCalls()).toHaveLength(2);
     expect(h.host.text()).toContain("gemini-4-argon");

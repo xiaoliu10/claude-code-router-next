@@ -19,7 +19,7 @@ class Element {
   dataset: Record<string, string> = {};
   parent: Element | null = null;
   attrs: Record<string, string> = {};
-  onclick?: () => void;
+  onclick?: (event?: { target?: unknown }) => void;
   onchange?: () => void;
   firstChild: Element | null = null;
   constructor(tag: string) { this.tag = tag; }
@@ -35,6 +35,13 @@ class Element {
   }
   replaceChildren(...nodes: Element[]) { this.children = nodes; for (const n of nodes) n.parent = this; this.firstChild = nodes[0] ?? null; }
   setAttribute(name: string, value: string) { this.attrs[name] = value; }
+  remove() {
+    if (this.parent) {
+      const at = this.parent.children.indexOf(this);
+      if (at >= 0) this.parent.children.splice(at, 1);
+      this.parent = null;
+    }
+  }
   all(): Element[] { return [this, ...this.children.flatMap(n => n.all())]; }
   button(text: string) {
     const result = this.all().filter(n => n.tag === "button" && n.textContent === text).at(-1);
@@ -48,7 +55,20 @@ const tick = async () => { for (let i = 0; i < 15; ++i) await Promise.resolve();
 const cleanups: Array<() => void> = [];
 afterEach(() => { cleanups.splice(0).forEach(f => f()); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 function harness(overrides: Record<string, (init?: any) => any> = {}, disabled = false) {
-  vi.stubGlobal("document", { createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any });
+  // Dialogs (consent + disconnect confirm) mount at body level and register
+  // their Escape handler on document; the double tracks both.
+  const documentListeners = new Map<string, Array<(event?: { key?: string }) => void>>();
+  const body = new Element("body");
+  vi.stubGlobal("document", {
+    createElement: (tag: string) => new Element(tag), createElementNS: () => new Element("svg") as any,
+    body,
+    addEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
+    },
+    removeEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, (documentListeners.get(type) ?? []).filter(l => l !== listener));
+    },
+  });
   const open = vi.fn(); vi.stubGlobal("window", { open });
   const host = new Element("div");
   const status = { configured: true, connected: true, kind: "antigravity", email: "user@example.test", project: "p", tier: "paid", modelsCount: 2 };
@@ -82,7 +102,8 @@ function harness(overrides: Record<string, (init?: any) => any> = {}, disabled =
   mount(host as any, props);
   cleanups.push(() => unmount(host as any));
   return {
-    host, callApi, open, release, onBusy: props.onBusy, refreshConfig, props,
+    host, callApi, open, release, onBusy: props.onBusy, refreshConfig, props, body,
+    keydown(key: string) { for (const l of [...(documentListeners.get("keydown") ?? [])]) l({ key }); },
     get lock() { return lock; },
     get unsubscribed() { return unsubscribed; },
     notify() { hostListener?.(); },
@@ -112,13 +133,13 @@ describe("self-contained Gemini plugin card", () => {
     const statusBadge = h.host.all().find(n => n.textContent === en.status.connected && n.attrs?.role === "status")!;
     expect(statusBadge.className).toContain("bg-white/5");
     h.host.click(en.reconnect);
-    expect(h.host.text()).toContain(en.risk);
-    expect(h.host.button(en.risk_continue).disabled).toBe(true);
-    h.host.click(en.risk_continue); await tick();
+    expect(h.body.text()).toContain(en.risk); // dialogs live on document.body
+    expect(h.body.button(en.risk_continue).disabled).toBe(true);
+    h.body.click(en.risk_continue); await tick();
     expect(h.callApi).toHaveBeenCalledTimes(2); // still just the two read-only mount reads
-    const ack = h.host.all().find(n => n.tag === "input")!;
+    const ack = h.body.all().find(n => n.tag === "input")!;
     ack.checked = true; ack.onchange?.();
-    h.host.click(en.risk_continue); await tick();
+    h.body.click(en.risk_continue); await tick();
     expect(h.open).toHaveBeenCalledWith("https://accounts.google.com/oauth", "_blank", "noopener,noreferrer");
     expect(h.callApi.mock.calls.map(([path]) => path)).toContain("/login/poll");
     expect(h.refreshConfig).toHaveBeenCalledTimes(1);
@@ -133,12 +154,12 @@ describe("self-contained Gemini plugin card", () => {
     // Open the consent dialog: its survival across a disabled flip proves the
     // same card instance re-rendered (a remount would reset to the loading view).
     h.host.click(en.reconnect);
-    expect(h.host.text()).toContain(en.risk);
+    expect(h.body.text()).toContain(en.risk);
     h.props.disabled = true; h.notify();
     expect(h.host.button(en.sync).disabled).toBe(true);
     expect(h.host.button(en.reconnect).disabled).toBe(true);
     expect(h.host.text()).toContain(en.other_edit);
-    expect(h.host.text()).toContain(en.risk);
+    expect(h.body.text()).toContain(en.risk); // in-place re-render, dialog stays on body
     // In-place update only: no extra status read, no lease movement, no unmount.
     expect(h.statusReads()).toBe(1);
     expect(h.release).toHaveBeenCalledTimes(0);
@@ -146,7 +167,7 @@ describe("self-contained Gemini plugin card", () => {
     h.props.disabled = false; h.notify();
     expect(h.host.button(en.sync).disabled).toBe(false);
     expect(h.host.button(en.reconnect).disabled).toBe(false);
-    expect(h.host.text()).toContain(en.risk);
+    expect(h.body.text()).toContain(en.risk);
     expect(h.statusReads()).toBe(1);
     unmount(h.host as any);
     expect(h.unsubscribed).toBe(1);
@@ -172,18 +193,57 @@ describe("self-contained Gemini plugin card", () => {
     expect(merge(local, { Providers: [] }).Router).toBe(local.Router);
     h.host.click(en.disconnect); await tick();
     expect(h.callApi.mock.calls.some(([path]) => path === "/disconnect")).toBe(false);
-    expect(h.host.text()).toContain(en.disconnect_warning);
-    h.host.click(en.disconnect); await tick();
+    expect(h.body.text()).toContain(en.disconnect_warning); // modal on document.body
+    expect(h.host.text()).not.toContain(en.disconnect_warning);
+    h.body.click(en.disconnect); await tick();
     expect(h.callApi.mock.calls.filter(([path]) => path === "/disconnect")).toHaveLength(1);
+  });
+
+  it("the disconnect dialog is a body-level modal: aria wiring, Escape/backdrop cancel, busy keeps it locked", async () => {
+    const h = harness({ "/disconnect": () => new Promise(() => {}) }); await tick();
+    h.host.click(en.disconnect);
+    const overlay = h.body.children[0];
+    const panel = overlay.children[0];
+    expect(overlay.className).toContain("fixed inset-0");
+    expect(panel.attrs.role).toBe("dialog");
+    expect(panel.attrs["aria-modal"]).toBe("true");
+    expect(panel.attrs["aria-labelledby"]).toBe("gemini-oauth-disconnect-title");
+    expect(panel.all().some(n => n.attrs.id === "gemini-oauth-disconnect-title" && n.textContent === en.disconnect_title)).toBe(true);
+    // Clicks inside the panel do not close; backdrop clicks route through the
+    // same guarded onClose as the corner button.
+    overlay.onclick({ target: panel });
+    expect(h.body.children).toHaveLength(1);
+    overlay.onclick({ target: overlay });
+    expect(h.body.children).toEqual([]);
+    // Escape cancels; other keys do nothing.
+    h.host.click(en.disconnect);
+    h.keydown("Enter");
+    expect(h.body.children).toHaveLength(1);
+    h.keydown("Escape");
+    expect(h.body.children).toEqual([]);
+    // While the disconnect action runs: Escape/backdrop are no-ops, the
+    // dialog stays mounted, and unmount still cleans the body up.
+    h.host.click(en.disconnect);
+    h.body.click(en.disconnect); await tick();
+    expect(h.callApi.mock.calls.some(([path]) => path === "/disconnect")).toBe(true);
+    expect(h.body.children).toHaveLength(1);
+    h.body.children[0].onclick({ target: h.body.children[0] });
+    h.keydown("Escape");
+    expect(h.body.children).toHaveLength(1);
+    unmount(h.host as any);
+    expect(h.body.children).toEqual([]);
+    h.keydown("Escape"); // listener gone: nothing may resurrect on body
+    expect(h.body.children).toEqual([]);
   });
   it("unmount while login/start is pending cancels the late job and never opens a window", async () => {
     let resolve!: (value: any) => void;
     const pending = new Promise(done => { resolve = done; });
     const h = harness({ "/login/start": () => pending }); await tick();
     h.host.click(en.reconnect);
-    const ack = h.host.all().find(n => n.tag === "input")!; ack.checked = true; ack.onchange?.();
-    h.host.click(en.risk_continue); await tick();
+    const ack = h.body.all().find(n => n.tag === "input")!; ack.checked = true; ack.onchange?.();
+    h.body.click(en.risk_continue); await tick();
     unmount(h.host as any);
+    expect(h.body.children).toEqual([]); // dialog overlay removed with the card
     resolve({ loginId: "a".repeat(48), url: "https://accounts.google.com/oauth", expiresAt: Date.now() + 60_000 });
     await tick();
     expect(h.open).not.toHaveBeenCalled();
@@ -224,7 +284,7 @@ describe("self-contained Gemini plugin card", () => {
     const pending = new Promise(done => { resolveDisconnect = done; });
     const h = harness({ "/disconnect": () => pending }); await tick();
     h.host.click(en.disconnect); await tick();
-    h.host.click(en.disconnect); await tick(); // dialog confirm
+    h.body.click(en.disconnect); await tick(); // dialog confirm (body-level modal)
     expect(h.lock).toBe(true);
     unmount(h.host as any);
     expect(h.props.acquireManagement()).toBeNull();
@@ -249,7 +309,7 @@ describe("self-contained Gemini plugin card", () => {
   it("a committed disconnect settles status even when draft reconciliation fails", async () => {
     const h = harness({ refreshFail: true }); await tick();
     h.host.click(en.disconnect); await tick();
-    h.host.click(en.disconnect); await tick();
+    h.body.click(en.disconnect); await tick();
     expect(h.refreshConfig).toHaveBeenCalledTimes(1);
     expect(h.statusReads()).toBe(2);
     expect(h.host.text()).toContain(en.disconnected);
@@ -265,7 +325,7 @@ describe("self-contained Gemini plugin card", () => {
     h.refreshConfig.mockImplementation(async () => { if (failRefresh) throw new Error("Configuration refresh failed"); });
     await tick();
     h.host.click(en.disconnect); await tick();
-    h.host.click(en.disconnect); await tick();
+    h.body.click(en.disconnect); await tick();
     expect(h.host.text()).toContain(en.errors.reconciliation_failed);
     failRefresh = false;
     h.host.click(en.sync); await tick();

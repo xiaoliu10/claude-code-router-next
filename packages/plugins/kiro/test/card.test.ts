@@ -32,7 +32,7 @@ class El {
   dataset: Record<string, string> = {};
   attrs: Record<string, string> = {};
   parent: El | null = null;
-  onclick?: () => void;
+  onclick?: (event?: { target?: unknown }) => void;
   oninput?: () => void;
   onchange?: (event?: unknown) => void;
   onkeydown?: (event: { key: string; preventDefault(): void }) => void;
@@ -50,6 +50,13 @@ class El {
   replaceChildren(...nodes: El[]) { this.children = [...nodes]; for (const n of nodes) n.parent = this; }
   setAttribute(name: string, value: string) { this.attrs[name] = value; }
   getAttribute(name: string): string | null { return this.attrs[name] ?? null; }
+  remove() {
+    if (this.parent) {
+      const at = this.parent.children.indexOf(this);
+      if (at >= 0) this.parent.children.splice(at, 1);
+      this.parent = null;
+    }
+  }
   all(): El[] { return [this, ...this.children.flatMap(n => n.all())]; }
   button(text: string): El {
     const result = this.all().filter(n => n.tag === "button" && n.textContent === text).at(-1);
@@ -109,9 +116,20 @@ interface HarnessOptions {
 }
 
 function harness(options: HarnessOptions = {}) {
+  // The confirm modal mounts at body level and registers its Escape handler on
+  // document; the double tracks both so tests can drive the real wiring.
+  const documentListeners = new Map<string, Array<(event?: { key?: string }) => void>>();
+  const body = new El("body");
   vi.stubGlobal("document", {
     createElement: (tag: string) => new El(tag),
     createElementNS: (_ns: string, tag: string) => new El(tag),
+    body,
+    addEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
+    },
+    removeEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, (documentListeners.get(type) ?? []).filter(l => l !== listener));
+    },
   });
   const open = vi.fn(); vi.stubGlobal("window", { open });
   const map = new Map<string, string>();
@@ -169,7 +187,8 @@ function harness(options: HarnessOptions = {}) {
     const hit = byPath(path).at(-1);
     return hit?.init?.body ? JSON.parse(hit.init.body) : {};
   };
-  return { host, callApi, refreshConfig, release, props, calls, byPath, lastBody, notify: () => hostListener?.() };
+  return { host, callApi, refreshConfig, release, props, calls, byPath, lastBody, notify: () => hostListener?.(), body,
+    keydown(key: string) { for (const l of [...(documentListeners.get("keydown") ?? [])]) l({ key }); } };
 }
 
 // ---------------------------------------------------------------------------
@@ -539,9 +558,10 @@ describe("kiro card: accounts and quota", () => {
     // The first row's Remove belongs to acc-aaa (two rows share the label).
     h.host.all().filter(n => n.tag === "button" && n.textContent === "Remove")[0].onclick!();
     await flush();
-    expect(h.host.text()).toContain("Remove Kiro account?");
-    expect(h.host.text()).toContain("Removing the last account disconnects");
-    h.host.click("Remove account");
+    expect(h.body.text()).toContain("Remove Kiro account?"); // modal on document.body
+    expect(h.body.text()).toContain("Removing the last account disconnects");
+    expect(h.host.text()).not.toContain("Remove Kiro account?");
+    h.body.click("Remove account");
     await flush(); await flush();
     expect(h.lastBody("/disconnect")).toEqual({ account: "acc-aaa" });
     expect(h.host.text()).toContain("Account removed.");
@@ -553,10 +573,51 @@ describe("kiro card: accounts and quota", () => {
     await flush();
     h.host.click("Disconnect");
     await flush();
-    expect(h.host.text()).toContain("Disconnect Kiro?");
-    h.host.click("Disconnect");
+    expect(h.body.text()).toContain("Disconnect Kiro?");
+    h.body.click("Disconnect");
     await flush(); await flush();
     expect(h.lastBody("/disconnect")).toEqual({});
+    expect(h.host.text()).toContain("Disconnected.");
+    unmount(h.host as any);
+  });
+
+  it("the confirm dialog is a body-level modal: Escape and backdrop cancel, busy actions ignore both", async () => {
+    let releaseDisconnect!: (value: unknown) => void;
+    const pending = new Promise(done => { releaseDisconnect = done; });
+    const h = harness({ overrides: { "/disconnect": () => pending } });
+    await flush();
+    h.host.click("Disconnect");
+    await flush();
+    // Overlay on document.body with the aria wiring; the card itself carries
+    // no dialog content.
+    expect(h.body.children).toHaveLength(1);
+    const overlay = h.body.children[0];
+    expect(overlay.className).toContain("fixed inset-0");
+    const panel = overlay.children[0];
+    expect(panel.attrs.role).toBe("dialog");
+    expect(panel.attrs["aria-modal"]).toBe("true");
+    expect(panel.attrs["aria-labelledby"]).toBe("kiro-confirm-title");
+    expect(h.host.text()).not.toContain("Disconnect Kiro?");
+    // Escape cancels; the overlay leaves no body stragglers.
+    h.keydown("Escape");
+    expect(h.body.children).toEqual([]);
+    // Clicks inside the panel do not cancel; backdrop clicks do.
+    h.host.click("Disconnect");
+    overlay.onclick({ target: overlay.children[0] });
+    expect(h.body.children).toHaveLength(1);
+    overlay.onclick({ target: overlay });
+    expect(h.body.children).toEqual([]);
+    // Confirm → action in flight: Escape/backdrop no-ops, cancel disabled.
+    h.host.click("Disconnect");
+    h.body.click("Disconnect");
+    await flush();
+    expect(h.body.button("Cancel").disabled).toBe(true);
+    h.body.children[0].onclick({ target: h.body.children[0] });
+    h.keydown("Escape");
+    expect(h.body.children).toHaveLength(1);
+    releaseDisconnect({ success: true });
+    await flush(); await flush();
+    expect(h.body.children).toEqual([]);
     expect(h.host.text()).toContain("Disconnected.");
     unmount(h.host as any);
   });
@@ -568,7 +629,7 @@ describe("kiro card: accounts and quota", () => {
     await flush();
     h.host.click("Remove");
     await flush();
-    h.host.click("Remove account");
+    h.body.click("Remove account");
     await flush(); await flush();
     expect(h.host.text()).toContain("Removing the account failed.");
     unmount(h.host as any);
