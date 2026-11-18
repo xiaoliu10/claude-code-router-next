@@ -321,12 +321,9 @@ body {
 .creds-actions { display: flex; gap: 6px; }
 .creds-actions .btn { padding: 2px 8px; font-size: 11.5px; }
 
-/* The same panel doubles as the local main window: keep the compact popup
-   column but center it and relax grids on wide viewports. */
+/* Fill the main window using the same small gutters as the tray popup;
+   only the grids need additional columns on wide viewports. */
 @media (min-width: 720px) {
-  .shell > header, .shell > .service-bar, .shell > .tabs, .shell > .panel, .shell > .footer {
-    width: 100%; max-width: 780px; margin-left: auto; margin-right: auto;
-  }
   .usage-grid { grid-template-columns: repeat(5, 1fr); }
   #routing-body { display: grid; grid-template-columns: 1fr 1fr; align-content: start; }
 }
