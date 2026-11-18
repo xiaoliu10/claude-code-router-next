@@ -312,7 +312,11 @@ test('interaction: opening usage loads the seven-day chart and matching records 
   assert.equal(h.id('usage-body').querySelectorAll('.usage-bar').length, 7);
   h.id('usage-periods').children.find(button => button.dataset.period === 'all').click(); await flush();
   assert.match(h.id('usage-body').textContent, /汇总 · 全部/);
-  assert.ok(h.id('usage-body').querySelectorAll('.usage-day-date').some(n => n.textContent === '2026-09-01'));
+  const chart = h.id('usage-body').querySelector('.usage-days-compact');
+  assert.deepEqual(chart.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-09-01', '2026-11-17']);
+  assert.equal(chart.querySelectorAll('.usage-day-value').length, 0);
+  assert.equal(chart.querySelectorAll('.usage-bar-col').length, 8);
+  assert.match(chart.querySelector('.usage-bar-col').title, /2026-09-01.*1,250/);
   const dateTable = h.id('usage-body').querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
   assert.match(dateTable.querySelector('tbody').textContent, /2026-09-01/);
   assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'all', page: 1, pageSize: 20 });
