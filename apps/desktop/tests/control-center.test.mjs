@@ -335,6 +335,7 @@ test("usage: normalizeUsageSnapshot whitelists contract fields only", () => {
   const u = Q.normalizeUsageSnapshot({
     period: "7d", totalRequests: 10, successCount: 8, errorCount: 2,
     inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
+    avgTtftMs: 812, avgTokensPerSecond: 33.4,
     byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, secret: "sekret" }],
     byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, cost: 9.9 }],
     byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50 }],
@@ -343,6 +344,7 @@ test("usage: normalizeUsageSnapshot whitelists contract fields only", () => {
   assert.deepEqual(plain(u), {
     period: "7d", totalRequests: 10, successCount: 8, errorCount: 2,
     inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
+    avgTtftMs: 812, avgTokensPerSecond: 33.4,
     byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6 }],
     byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null }],
     byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null }],
@@ -350,6 +352,10 @@ test("usage: normalizeUsageSnapshot whitelists contract fields only", () => {
   })
   assert.equal(JSON.stringify(u).includes("cost"), false, "no fabricated cost fields")
   assert.deepEqual(plain(Q.normalizeUsageSnapshot(null)).byProvider, [])
+  // Older gateways without the optional TTFT/speed fields stay compatible.
+  const legacy = Q.normalizeUsageSnapshot({ period: "today", totalRequests: 1 })
+  assert.equal(legacy.avgTtftMs, null)
+  assert.equal(legacy.avgTokensPerSecond, null)
 })
 
 test("usage: period picker loads the requested period; invalid ignored; latest period wins", async () => {
@@ -373,6 +379,163 @@ test("usage: period picker loads the requested period; invalid ignored; latest p
   assert.equal(c.state().error, "slow")
   assert.equal(c.state().period, "30d")
   assert.equal(JSON.stringify(c.state().snapshot).includes("99"), false, "stale period response must not land")
+})
+
+// ---------------- usage records ----------------
+
+test("formatMs/formatSpeed/formatSuccessRate follow the summary-card contract", () => {
+  assert.equal(Q.formatMs(820), "820ms")
+  assert.equal(Q.formatMs(1200), "1.2s")
+  assert.equal(Q.formatMs(30000), "30.0s")
+  assert.equal(Q.formatMs(150000), "2.5m")
+  assert.equal(Q.formatMs(0), "0ms")
+  assert.equal(Q.formatMs(null), null)
+  assert.equal(Q.formatSpeed(35.66), "35.7 t/s")
+  assert.equal(Q.formatSpeed(33), "33.0 t/s")
+  assert.equal(Q.formatSpeed(null), null)
+  assert.equal(Q.formatSuccessRate(125, 128), "97.7%")
+  assert.equal(Q.formatSuccessRate(8, 10), "80.0%")
+  assert.equal(Q.formatSuccessRate(0, 0), null, "total=0 has no success rate")
+  assert.equal(Q.formatSuccessRate(null, 10), null)
+  assert.equal(Q.formatSuccessRate(5, null), null)
+})
+
+test("records: normalizeRecord whitelists fields; responseBody/sessionId never reach render data", () => {
+  const r = Q.normalizeRecord({
+    timestamp: "2026-11-17T09:05:03Z", provider: "alpha", model: "m1",
+    originalModel: "m0", upstreamModel: "m2", clientType: "claude-code", scenarioType: "think",
+    inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
+    ttftMs: 300, tokensPerSecond: 42.5, durationMs: 1500,
+    status: "error", usageEstimated: true, errorMessage: "boom",
+    responseBody: "SECRET-BODY", sessionId: "session-1", apiKey: "k", id: "rec-1",
+  })
+  assert.deepEqual(plain(r), {
+    timestamp: "2026-11-17T09:05:03Z", provider: "alpha", model: "m1",
+    originalModel: "m0", upstreamModel: "m2", clientType: "claude-code", scenarioType: "think",
+    inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
+    ttftMs: 300, tokensPerSecond: 42.5, durationMs: 1500,
+    status: "error", usageEstimated: true, errorMessage: "boom",
+  })
+  assert.equal(JSON.stringify(r).includes("SECRET-BODY"), false)
+  assert.equal(JSON.stringify(r).includes("session-1"), false)
+  assert.equal(Q.normalizeRecord(null).status, "success", "missing record never renders as error")
+  assert.equal(Q.normalizeRecord({ status: "weird" }).status, "success", "unknown status downgrades to success")
+  assert.equal(Q.normalizeRecord({}).provider, "—")
+})
+
+test("records: normalizeRecordsPage coerces the envelope; non-array records are dropped", () => {
+  const p = Q.normalizeRecordsPage({ period: "7d", page: 2, pageSize: 20, total: 45, records: [{ model: "m1" }], junk: 1 })
+  assert.equal(p.period, "7d")
+  assert.equal(p.page, 2)
+  assert.equal(p.pageSize, 20)
+  assert.equal(p.total, 45)
+  assert.equal(p.records.length, 1)
+  assert.deepEqual(plain(Q.normalizeRecordsPage(null)), { period: null, page: null, pageSize: null, total: null, records: [] })
+  assert.deepEqual(plain(Q.normalizeRecordsPage({ records: "nope" }).records), [])
+})
+
+test("records: modelChain dedupes adjacent legs and joins with arrows", () => {
+  assert.equal(Q.modelChain({ originalModel: "a", model: "a", upstreamModel: "a" }), "a")
+  assert.equal(Q.modelChain({ originalModel: "opus", model: "glm-5", upstreamModel: "glm-5-air" }), "opus → glm-5 → glm-5-air")
+  assert.equal(Q.modelChain({ originalModel: "opus", model: "glm-5", upstreamModel: "glm-5" }), "opus → glm-5", "upstream equal to routed collapses")
+  assert.equal(Q.modelChain({ originalModel: null, model: "m", upstreamModel: null }), "m")
+  assert.equal(Q.modelChain({}), "—")
+  assert.equal(Q.modelChain(null), "—")
+})
+
+test("records: topModelsByTotal ranks by input+output descending and truncates", () => {
+  const rows = [
+    { name: "small", requests: 99, inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 1 },
+    { name: "big", requests: 1, inputTokens: 800, outputTokens: 200, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    { name: "mid", requests: 50, inputTokens: 100, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 },
+  ]
+  assert.deepEqual(Q.topModelsByTotal(rows, 2).map((m) => m.name), ["big", "mid"])
+  assert.equal(Q.topModelsByTotal(rows).length, 3)
+  assert.equal(Q.topModelsByTotal(rows, 10).length, 3)
+  assert.equal(Q.topModelsByTotal([], 10).length, 0)
+  assert.equal(Q.topModelsByTotal(null, 10).length, 0)
+})
+
+test("records: clientLabel maps known client types and passes unknown through", () => {
+  assert.equal(Q.clientLabel("claude-code"), "Claude Code")
+  assert.equal(Q.clientLabel("codex"), "Codex")
+  assert.equal(Q.clientLabel("mystery-client"), "mystery-client")
+  assert.equal(Q.clientLabel(null), "未知")
+  assert.equal(Q.clientLabel(""), "未知")
+})
+
+test("records: first load sends page 1 with fixed pageSize; invalid period and missing invoke rejected", async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createRecordsController({ invoke: ipc.fn })
+  assert.throws(() => Q.createRecordsController({}))
+  c.setPeriod("bogus")
+  c.prev()
+  c.next()
+  assert.equal(ipc.calls.length, 0, "invalid period and empty data never hit IPC")
+  c.refresh()
+  await flush()
+  assert.deepEqual(plain(ipc.calls[0]), { cmd: "usage_records", args: { period: "today", page: 1, pageSize: 20 } })
+  ipc.resolve(0, { period: "today", page: 1, pageSize: 20, total: 45, records: [{ model: "m1" }] })
+  await flush()
+  const s = c.state()
+  assert.equal(s.data.total, 45)
+  assert.equal(s.totalPages, 3)
+  assert.equal(s.canPrev, false)
+  assert.equal(s.canNext, true)
+})
+
+test("records: next/prev walk pages, bounds are no-ops, period switch resets to page 1", async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createRecordsController({ invoke: ipc.fn })
+  c.refresh(); await flush()
+  ipc.resolve(0, { period: "today", page: 1, pageSize: 20, total: 45, records: [] }); await flush()
+
+  c.prev(); await flush()
+  assert.equal(ipc.calls.length, 1, "prev on the first page is a local no-op")
+  c.next(); await flush()
+  assert.deepEqual(plain(ipc.calls.at(-1).args), { period: "today", page: 2, pageSize: 20 })
+  ipc.resolve(1, { period: "today", page: 2, pageSize: 20, total: 45, records: [] }); await flush()
+  assert.equal(c.state().page, 2)
+  c.next(); await flush()
+  ipc.resolve(2, { period: "today", page: 3, pageSize: 20, total: 45, records: [] }); await flush()
+  assert.equal(c.state().canNext, false, "last page disables next")
+  const callsBefore = ipc.calls.length
+  c.next(); await flush()
+  assert.equal(ipc.calls.length, callsBefore, "next past the last page is a local no-op")
+
+  c.setPeriod("7d"); await flush()
+  assert.deepEqual(plain(ipc.calls.at(-1).args), { period: "7d", page: 1, pageSize: 20 }, "period switch resets to page 1")
+  ipc.resolve(3, { period: "7d", page: 1, pageSize: 20, total: 3, records: [{ model: "m2" }] }); await flush()
+  assert.equal(c.state().totalPages, 1)
+  assert.equal(c.state().canNext, false)
+
+  // A superseded response (older epoch) must never land.
+  c.setPeriod("30d"); await flush()
+  const staleIndex = ipc.calls.length - 1
+  c.refresh()
+  const freshIndex = ipc.calls.length - 1
+  ipc.resolve(freshIndex, { period: "30d", page: 1, pageSize: 20, total: 9, records: [{ model: "fresh" }] })
+  await flush()
+  ipc.resolve(staleIndex, { period: "30d", page: 1, pageSize: 20, total: 999, records: [{ model: "stale" }] })
+  await flush()
+  const s = c.state()
+  assert.equal(s.data.total, 9)
+  assert.equal(s.data.records[0].model, "fresh")
+})
+
+test("records: transport failure keeps the previous page and surfaces the error", async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createRecordsController({ invoke: ipc.fn })
+  c.refresh(); await flush()
+  ipc.resolve(0, { period: "today", page: 1, pageSize: 20, total: 45, records: [{ model: "m1" }] }); await flush()
+  c.next(); await flush()
+  ipc.reject(1, new Error("网关超时"))
+  await flush()
+  const s = c.state()
+  assert.equal(s.error, "网关超时")
+  assert.equal(s.loading, false)
+  assert.equal(s.data.records[0].model, "m1", "failed load keeps the last complete page")
+  assert.equal(s.canPrev, true)
 })
 
 // ---------------- clients ----------------

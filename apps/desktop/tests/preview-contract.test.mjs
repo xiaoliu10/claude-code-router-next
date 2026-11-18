@@ -26,9 +26,17 @@ const ROUTE_ENTRY_KEYS = ["scope", "field", "target", "fallback"]
 const USAGE_KEYS = [
   "period", "totalRequests", "successCount", "errorCount",
   "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "estimatedCount",
+  "avgTtftMs", "avgTokensPerSecond",
   "byModel", "byProvider", "byDay", "updatedAt",
 ]
 const USAGE_ROW_KEYS = ["name", "requests", "inputTokens", "outputTokens"]
+const RECORDS_PAGE_KEYS = ["period", "page", "pageSize", "total", "records"]
+const RECORD_KEYS = [
+  "timestamp", "provider", "model", "originalModel", "upstreamModel",
+  "clientType", "scenarioType", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
+  "ttftMs", "tokensPerSecond", "durationMs", "status", "usageEstimated", "errorMessage",
+]
+const RECORDS_BANNED = ["responseBody", "sessionId", "apiKey", "secret"]
 const CLIENT_KEYS = ["id", "name", "enabled", "managed", "exists", "activeModel", "modelAlias"]
 const CLIENT_RESPONSE_KEYS = ["clients", "success", "message"]
 const CLIENT_IDS = ["claudeCode", "codex", "pi", "qwenCode", "opencode"]
@@ -86,6 +94,50 @@ function assertUsageSnapshot(u, period, label) {
   assert.equal(JSON.stringify(u).includes("cost"), false, `${label}: no fabricated costs`)
   assert.equal(JSON.stringify(u).includes("currency"), false, `${label}: no fabricated currency`)
 }
+
+test("preview: usage_records paginates with cross-page totals, error and estimated records", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const first = await previewCall(invoke, "usage_records", { period: "today", page: 1, pageSize: 20 })
+  for (const k of RECORDS_PAGE_KEYS) assert.ok(k in first, `records page: missing ${k}`)
+  assert.equal(first.period, "today")
+  assert.equal(first.page, 1)
+  assert.equal(first.pageSize, 20)
+  assert.equal(typeof first.total, "number")
+  assert.ok(first.total > first.records.length, "cross-page total exceeds one page")
+  assert.ok(Array.isArray(first.records) && first.records.length > 0, "records populated")
+  for (const r of first.records) {
+    for (const k of RECORD_KEYS) assert.ok(k in r, `record missing ${k}`)
+    assert.ok(r.status === "success" || r.status === "error")
+    assert.equal(typeof r.usageEstimated, "boolean")
+    assert.ok(r.ttftMs === null || typeof r.ttftMs === "number")
+    assert.ok(r.errorMessage === null || typeof r.errorMessage === "string")
+  }
+  const s = JSON.stringify(first)
+  for (const banned of RECORDS_BANNED) assert.equal(s.includes(banned), false, `${banned} must never cross IPC`)
+  assert.ok(first.records.some((r) => r.status === "error" && r.errorMessage), "an error record is present")
+  assert.ok(first.records.some((r) => r.usageEstimated), "an estimated record is present")
+
+  const second = await previewCall(invoke, "usage_records", { period: "today", page: 2, pageSize: 20 })
+  assert.equal(second.page, 2)
+  assert.notEqual(JSON.stringify(second.records), JSON.stringify(first.records), "page 2 serves different records")
+  const empty = await previewCall(invoke, "usage_records", { period: "today", page: 99, pageSize: 20 })
+  assert.equal(empty.records.length, 0, "out-of-range page yields no records")
+
+  for (const period of ["7d", "30d"]) {
+    const page = await previewCall(invoke, "usage_records", { period })
+    for (const k of RECORDS_PAGE_KEYS) assert.ok(k in page, `${period}: missing ${k}`)
+    assert.equal(page.period, period)
+    assert.ok(page.total > page.pageSize, `${period} total spans multiple pages`)
+  }
+
+  await assert.rejects(previewCall(invoke, "usage_records", { period: "bogus" }), /周期/)
+  const clamped = await previewCall(invoke, "usage_records", { period: "today", page: -5, pageSize: 999 })
+  assert.equal(clamped.page, 1, "page clamps to >= 1")
+  assert.equal(clamped.pageSize, 50, "pageSize clamps to 50")
+  const defaulted = await previewCall(invoke, "usage_records", { period: "today" })
+  assert.equal(defaulted.page, 1)
+  assert.equal(defaulted.pageSize, 20)
+})
 
 function assertClientsResponse(r, label) {
   for (const k of CLIENT_RESPONSE_KEYS) assert.ok(k in r, `${label}: missing ${k}`)
