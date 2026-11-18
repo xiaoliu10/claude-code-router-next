@@ -166,6 +166,11 @@ body {
 .provider-form label { display: grid; gap: 3px; min-width: 0; font-size: 12px; }
 .provider-form .route-input { width: 100%; }
 .provider-form textarea { resize: vertical; }
+.provider-transformers { min-width: 0; margin: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+.transformer-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; margin-bottom: 8px; }
+.transformer-params { grid-column: 1 / -1; }
+.transformer-row > .btn:last-child { justify-self: start; }
+.transformer-param { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.5fr) auto; gap: 4px; margin-top: 4px; }
 .provider-form-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; }
 .provider-form-actions .inline-msg { flex: 1 1 10em; }
 #provider-add-status:empty { margin: 0; }

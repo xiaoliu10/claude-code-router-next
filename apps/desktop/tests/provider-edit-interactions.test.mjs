@@ -67,7 +67,7 @@ test('provider_update omits a blank key and refreshes renamed card and routing c
   h.id('provider-name').value = 'Renamed'; h.id('provider-models').value = 'three';
   submit(h); submit(h); await flush();
   assert.deepEqual(JSON.parse(JSON.stringify(updates(h))), [{ cmd: 'provider_update', args: {
-    name: entry.name, provider: { name: 'Renamed', baseUrl: entry.baseUrl, models: ['three'] },
+    name: entry.name, provider: { name: 'Renamed', baseUrl: entry.baseUrl, models: ['three'], transformer: null },
   } }]);
   assert.equal(h.calls.filter(c => c.cmd === 'quota_snapshot').at(-1).args.provider, 'Renamed');
   assert.equal(editButton(h).getAttribute('aria-label'), '编辑 Renamed');

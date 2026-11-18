@@ -1341,7 +1341,7 @@
     var quotaProviders = previewQuotaProviders(Date.now());
     var providerDetails = new Map(quotaProviders.map(function (row) {
       var route = routing.providers.find(function (p) { return p.name === row.name; });
-      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false }];
+      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false, transformer: null, transformerProtected: false }];
     }));
 
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
@@ -1351,6 +1351,7 @@
       if (cmd === 'quota_snapshot') {
         return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
       }
+      if (cmd === 'provider_transformers') return delay({ names: ['anthropic', 'openai'] });
       if (cmd === 'provider_get') {
         var detail = providerDetails.get(a.name);
         return detail ? delay(copy(detail)) : Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
@@ -1369,8 +1370,17 @@
         }
         var models = provider.models.map(function (m) { return m.trim(); });
         var managed = name === 'ccr' || (provider.apiKey || '').trim().startsWith('ccr-managed-');
+        var transformer = previous ? previous.transformer : null;
+        var transformerProtected = previous ? previous.transformerProtected : false;
+        if (provider.transformer !== undefined) {
+          var chain = provider.transformer === null ? [] : provider.transformer.use;
+          if (!Array.isArray(chain)) return Promise.reject(new Error('PROVIDER_INVALID'));
+          transformerProtected = chain.some(Array.isArray);
+          transformer = chain.length ? { use: chain.map(function (item) { return Array.isArray(item) ? item[0] : item; }) } : null;
+        }
         if (editing) providerDetails.delete(a.name);
-        providerDetails.set(name, { name: name, baseUrl: provider.baseUrl.trim(), models: models, managed: managed });
+        providerDetails.set(name, { name: name, baseUrl: provider.baseUrl.trim(), models: models, managed: managed,
+          transformer: transformer, transformerProtected: transformerProtected });
         if (row) row.name = name;
         else quotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
         var route = editing && routing.providers.find(function (p) { return p.name === a.name; });
@@ -1638,6 +1648,117 @@
     return li;
   }
 
+  function mountTransformerEditor() {
+    var section = document.getElementById('provider-transformers');
+    var rows = document.getElementById('provider-transformer-rows');
+    var add = document.getElementById('provider-transformer-add');
+    var protectedPanel = document.getElementById('provider-transformer-protected');
+    var summary = document.getElementById('provider-transformer-summary');
+    var replace = document.getElementById('provider-transformer-replace');
+    var names = [], keepProtected = false;
+
+    function input(label, cls) {
+      var field = el('input', 'route-input ' + cls);
+      field.setAttribute('aria-label', label);
+      field.placeholder = label;
+      return field;
+    }
+    function select(label, cls, options) {
+      var field = el('select', 'route-input ' + cls);
+      field.setAttribute('aria-label', label);
+      options.forEach(function (value) {
+        var option = el('option', null, value);
+        option.value = value;
+        field.appendChild(option);
+      });
+      return field;
+    }
+    function addParam(params) {
+      var pair = el('div', 'transformer-param');
+      var key = input('参数名', 'param-key');
+      pair.appendChild(key);
+      pair.appendChild(select('参数值类型', 'param-type', ['文本', 'JSON']));
+      var value = input('参数值', 'param-value');
+      value.setAttribute('autocomplete', 'off');
+      value.spellcheck = false;
+      pair.appendChild(value);
+      pair.appendChild(mkBtn('移除', '移除参数', function () { pair.remove(); }));
+      params.appendChild(pair);
+      key.focus();
+    }
+    function addRow(name) {
+      var row = el('div', 'transformer-row');
+      var field = names.length && (!name || names.includes(name))
+        ? select('转换器名称', 'transformer-name', names) : input('转换器名称', 'transformer-name');
+      field.value = name || names[0] || '';
+      row.appendChild(field);
+      row.appendChild(mkBtn('移除', '移除转换器', function () { row.remove(); }));
+      var params = el('div', 'transformer-params');
+      row.appendChild(params);
+      row.appendChild(mkBtn('添加参数', null, function () { addParam(params); }));
+      rows.appendChild(row);
+      return field;
+    }
+    function reset() {
+      rows.textContent = summary.textContent = '';
+      protectedPanel.hidden = true;
+      keepProtected = false;
+      add.hidden = false;
+      add.disabled = true;
+      names = [];
+    }
+    add.addEventListener('click', function () { addRow('').focus(); });
+    replace.addEventListener('click', function () {
+      keepProtected = false;
+      protectedPanel.hidden = true;
+      add.hidden = false;
+      add.focus();
+    });
+    function prefill(entry) {
+      var chain = entry.transformer && entry.transformer.use || [];
+      if (!Array.isArray(chain) || !chain.every(function (name) { return typeof name === 'string'; })) throw new Error();
+      keepProtected = entry.transformerProtected === true;
+      if (keepProtected) {
+        summary.textContent = '已保留现有转换器和参数。替换会移除整条链中的原有参数。' + chain.join(' → ');
+        protectedPanel.hidden = false;
+        add.hidden = true;
+      } else chain.forEach(addRow);
+    }
+    function writeTo(provider, editing, error) {
+      if (keepProtected) return true;
+      function invalid(field, message) { error.textContent = message; field.focus(); return false; }
+      var use = [];
+      for (var row of rows.children) {
+        var field = row.querySelector('.transformer-name');
+        var name = field.value.trim();
+        if (!name) return invalid(field, '请输入转换器名称。');
+        var params = Object.create(null);
+        for (var pair of row.querySelectorAll('.transformer-param')) {
+          var key = pair.querySelector('.param-key');
+          var paramName = key.value.trim();
+          if (!paramName || paramName in params) return invalid(key, '请输入唯一的参数名。');
+          var value = pair.querySelector('.param-value');
+          if (pair.querySelector('.param-type').value === 'JSON') {
+            try { params[paramName] = JSON.parse(value.value); }
+            catch { return invalid(value, '请输入有效的 JSON 值。'); }
+          } else params[paramName] = value.value;
+        }
+        use.push(Object.keys(params).length ? [name, params] : name);
+      }
+      if (use.length) provider.transformer = { use: use };
+      else if (editing) provider.transformer = null;
+      return true;
+    }
+    return {
+      reset: reset, prefill: prefill, writeTo: writeTo,
+      disable: function (disabled) { section.disabled = disabled; },
+      setNames: function (result) {
+        names = result && Array.isArray(result.names) ? result.names.filter(function (n) { return typeof n === 'string' && n.trim(); }) : [];
+        add.disabled = false;
+      },
+    };
+  }
+
   function mountProviderForm(invoke, onSaved) {
     var open = document.getElementById('provider-add-open');
     var form = document.getElementById('provider-add-form');
@@ -1657,12 +1778,14 @@
     };
     var saving = false, loading = false, managed = false, editName = null;
     var trigger = open, readId = 0;
+    var transformers = mountTransformerEditor();
     var managedNote = '系统托管的供应商请在对应插件卡片中管理';
 
     function close(restoreFocus) {
       if (form.hidden) return;
       Object.values(fields).forEach(function (field) { field.value = ''; });
       error.textContent = '';
+      transformers.reset();
       form.hidden = true;
       trigger.setAttribute('aria-expanded', 'false');
       if (restoreFocus) trigger.focus();
@@ -1673,6 +1796,7 @@
     }
     function syncControls() {
       Object.values(fields).forEach(function (field) { field.disabled = saving || loading || managed; });
+      transformers.disable(saving || loading || managed);
       form.setAttribute('aria-busy', String(saving || loading));
       open.disabled = !invoke || saving;
       cancel.disabled = saving;
@@ -1690,20 +1814,27 @@
       status.textContent = '';
       form.hidden = false;
       trigger.setAttribute('aria-expanded', 'true');
+      transformers.reset();
       syncControls();
+      var id = ++readId;
+      return invoke('provider_transformers').catch(function () { return null; }).then(function (result) {
+        if (id === readId) transformers.setNames(result);
+      });
     }
     async function edit(name, button) {
       if (!invoke || saving) return;
-      show(name, button);
-      var id = ++readId;
+      var catalog = show(name, button);
+      var id = readId;
       try {
-        var entry = await invoke('provider_get', { name: name });
+        var results = await Promise.all([invoke('provider_get', { name: name }), catalog]);
+        var entry = results[0];
         if (id !== readId) return;
         if (!entry || entry.name !== name || typeof entry.baseUrl !== 'string' || !Array.isArray(entry.models)
             || !entry.models.every(function (m) { return typeof m === 'string'; }) || typeof entry.managed !== 'boolean') throw new Error();
         fields.name.value = entry.name;
         fields.baseUrl.value = entry.baseUrl;
         fields.models.value = entry.models.join('\n');
+        transformers.prefill(entry);
         managed = entry.managed;
         loading = false;
         syncControls();
@@ -1738,6 +1869,7 @@
         fields[invalid].focus();
         return;
       }
+      if (!transformers.writeTo(provider, editing, error)) return;
       if (provider.apiKey !== undefined) provider.apiKey = provider.apiKey.trim();
       error.textContent = '';
       saving = true;

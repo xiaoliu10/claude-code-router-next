@@ -192,17 +192,31 @@ test('preview: provider_get projects editable fields and provider_update renames
   const provider = { name: 'example.com', baseUrl: 'https://example.com/v1', models: ['one'] }
   await invoke('provider_add', { provider: { ...provider, apiKey: 'test-key' } })
   const detail = await invoke('provider_get', { name: provider.name })
-  assert.deepEqual(JSON.parse(JSON.stringify(detail)), { ...provider, managed: false })
+  assert.deepEqual(JSON.parse(JSON.stringify(detail)), { ...provider, managed: false, transformer: null, transformerProtected: false })
   const change = { ...provider, name: 'Renamed', models: ['two'] }
   const updated = await invoke('provider_update', { name: provider.name, provider: change })
   assert.deepEqual({ ...updated }, { name: change.name })
-  assert.deepEqual(JSON.parse(JSON.stringify(await invoke('provider_get', updated))), { ...change, managed: false })
+  assert.deepEqual(JSON.parse(JSON.stringify(await invoke('provider_get', updated))), { ...change, managed: false, transformer: null, transformerProtected: false })
   await assert.rejects(invoke('provider_get', { name: provider.name }), /PROVIDER_UNAVAILABLE/)
   const quota = await invoke('quota_snapshot')
   assert.ok(quota.providers.some(p => p.name === change.name))
   assert.ok(!quota.providers.some(p => p.name === provider.name))
   const routes = await invoke('routing_snapshot')
   assert.deepEqual(JSON.parse(JSON.stringify(routes.providers.at(-1))), { name: change.name, models: change.models })
+})
+
+test('preview: provider_get summarizes protected tuples and omitted transformer keeps the chain', async () => {
+  const invoke = Q.createPreviewInvoke()
+  const { names } = await invoke('provider_transformers')
+  assert.ok(names.length)
+  const provider = { name: 'example.com', baseUrl: 'https://example.com', models: ['one'] }
+  const transformer = { use: [[names[0], { value: 'test-key' }]] }
+  const target = await invoke('provider_add', { provider: { ...provider, apiKey: 'test-key', transformer } })
+  await invoke('provider_update', { ...target, provider })
+  const summary = await invoke('provider_get', target)
+  assert.equal(summary.transformerProtected, true)
+  assert.deepEqual(JSON.parse(JSON.stringify(summary.transformer)), { use: [names[0]] })
+  assert.doesNotMatch(JSON.stringify(summary), /test-key/)
 })
 
 test("preview: routing_snapshot has the complete routing contract", async () => {
