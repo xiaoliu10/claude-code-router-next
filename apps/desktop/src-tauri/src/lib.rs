@@ -2,6 +2,7 @@ mod api;
 mod control;
 mod lifecycle;
 mod popup;
+mod projects;
 mod quota;
 mod settings;
 mod tray;
@@ -28,6 +29,11 @@ pub fn run() {
             control::usage_snapshot,
             control::clients_snapshot,
             control::clients_update,
+            projects::projects_snapshot,
+            projects::projects_add,
+            projects::projects_save,
+            projects::projects_takeover,
+            projects::projects_delete,
             lifecycle::service_snapshot,
             lifecycle::service_action
         ])
@@ -50,6 +56,7 @@ pub fn run() {
                 Ok((settings, client)) => {
                     app.manage(quota::QuotaService::new(Some(client.clone())));
                     app.manage(control::ControlService::new(Some(client.clone())));
+                    app.manage(projects::ProjectsService::new(Some(client.clone())));
                     let resources = app.path().resource_dir().ok();
                     let bundle = lifecycle::RuntimeBundle::detect(resources.as_deref());
                     let controller =
@@ -64,6 +71,7 @@ pub fn run() {
                 Err(e) => {
                     app.manage(quota::QuotaService::new(None));
                     app.manage(control::ControlService::new(None));
+                    app.manage(projects::ProjectsService::new(None));
                     eprintln!("Invalid CCR connection settings: {e}");
                     tray::install_offline(app.handle(), e.clone())?;
                     if let Some(window) = app.get_webview_window("main") {

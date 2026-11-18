@@ -16,9 +16,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// Families accepted in `Router.families` (shared MODEL_FAMILIES).
-const FAMILIES: [&str; 3] = ["opus", "sonnet", "haiku"];
+pub(crate) const FAMILIES: [&str; 3] = ["opus", "sonnet", "haiku"];
 /// Scenario fields on the `Router` root and per family (core RouterScenarioType).
-const SCENARIOS: [&str; 7] = [
+pub(crate) const SCENARIOS: [&str; 7] = [
     "default",
     "background",
     "think",
@@ -464,7 +464,7 @@ fn routing_snapshot_from(config: &Value) -> RoutingSnapshot {
 /// FNV-1a 64-bit over the canonical JSON encoding: a non-reversible
 /// change-detection digest only. Never persisted, never a secret carrier, and
 /// the config cannot be reconstructed from it.
-fn revision_of(config: &Value) -> String {
+pub(crate) fn revision_of(config: &Value) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     if let Ok(encoded) = serde_json::to_string(config) {
         for byte in encoded.as_bytes() {
@@ -524,7 +524,7 @@ fn available_targets(config: &Value) -> HashSet<String> {
         .collect()
 }
 
-fn valid_alias(alias: &str) -> bool {
+pub(crate) fn valid_alias(alias: &str) -> bool {
     let alias = alias.trim();
     !alias.is_empty()
         && alias.len() <= MAX_ALIAS_LENGTH
@@ -804,7 +804,9 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
     })
 }
 
-fn encode_query(value: &str) -> String {
+/// Percent-encodes everything outside the unreserved set. Used for query
+/// values here and for project id path segments in `projects`.
+pub(crate) fn encode_query(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {

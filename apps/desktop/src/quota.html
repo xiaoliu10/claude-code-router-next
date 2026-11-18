@@ -6,6 +6,7 @@
   <title>CCR 控制中心</title>
   <link rel="stylesheet" href="quota.css">
   <!-- CSP is enforced by tauri.conf.json (script-src 'self'): external scripts only, no inline script/handlers. -->
+  <script src="projects.js" defer></script>
   <script src="quota.js" defer></script>
 </head>
 <body>
@@ -41,6 +42,7 @@
       <button id="tab-routing" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-routing" tabindex="-1">路由</button>
       <button id="tab-usage" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-usage" tabindex="-1">用量</button>
       <button id="tab-clients" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-clients" tabindex="-1">客户端</button>
+      <button id="tab-projects" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-projects" tabindex="-1">项目</button>
     </nav>
 
     <section id="panel-quota" class="panel" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
@@ -111,6 +113,14 @@
       <p class="hint">将 Claude Code、Codex、Pi 等接入 CCR。各客户端单独操作，恢复前会先确认。</p>
       <div id="clients-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <ul id="clients-list" class="list" aria-label="客户端列表" aria-busy="false"></ul>
+    </section>
+
+    <section id="panel-projects" class="panel" role="tabpanel" aria-labelledby="tab-projects" tabindex="-1" hidden>
+      <div class="panel-head"><h1>项目</h1><span id="projects-count" class="count"></span><span class="spacer"></span><button id="projects-refresh" class="btn" type="button" title="刷新列表；保留未保存的修改">刷新</button></div>
+      <p class="hint">项目路由独立保存；接管客户端需单独应用。</p>
+      <div id="projects-msg" class="banner" role="status" aria-live="polite" hidden></div>
+      <div class="projects-picker"><label for="projects-select">当前项目</label><select id="projects-select" class="route-input" aria-label="选择项目"></select></div>
+      <div id="projects-body" class="list"></div>
     </section>
 
     <footer class="footer">

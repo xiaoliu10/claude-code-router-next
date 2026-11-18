@@ -57,6 +57,16 @@ The dedicated service entry uses the public core exports `readConfigFileRaw` and
 
 Both desktop windows reuse bundled `quota.html`; the main window does not load a server page. The package excludes Web UI `index.html`. An isolated process probe with a copied core CJS bundle, temporary HOME/config, restricted PATH and no HTML assets verified `/health` 200, `/api/config` 200 and `/ui/` 404. This proves the core can serve APIs without the Web UI; it does not yet prove the final standalone bundle or desktop lifecycle. Final portable runtime validation remains pending.
 
+## Project configuration extension
+
+The desktop also exposes existing project-level configuration through a fifth local Projects tab. This is distinct from global routing and global client integrations. Reuse the existing /api/projects endpoints; no gateway restart or core change is needed.
+
+Project snapshots include the project id/path, a narrow typed router, inheritance state, takeover client ids and a revision. The stored configPath, credentials and arbitrary raw config stay in Rust. Global fallback lives outside Router, while project fallback lives inside Router; copy/preview logic must preserve that distinction. Custom saves preserve unexposed fields, while selecting follow-global explicitly writes an empty Router. New target selections are validated; unchanged legacy targets may roundtrip. All mutations use the shared desktop write lock, fetch fresh project/global state, reject stale revisions and verify readback.
+
+The UI supports adding an absolute path (disclosing the server's default Claude Code takeover), project selection, explicit saves, project/client takeover selection, and confirmed removal of CCR project configuration. Switching projects or refreshing must preserve dirty drafts; late responses cannot attach one project's draft to another. Known routes, family options, context thresholds and fallback order are editable without exposing a raw JSON editor. Project paths are displayed because they identify the user's selected project.
+
+Acceptance uses temporary HOME/config/project directories only: existing-project discovery, follow-global/custom roundtrip, preservation of unknown fields, project A/B isolation, takeover selection, delete confirmation and stale draft handling. No acceptance mutation targets a real project or the live gateway.
+
 ## UI and validation
 
 Four tabs retain the compact light neutral/orange design: quota, routing, usage, clients. Routing supports global/family scenarios and ordered fallback choices with clear save feedback, family/fallback switches, and model aliases. Usage period picker and totals/provider breakdown; clients show connected state and explicit connect/disconnect/restore operations. Header service state/start-stop, footer exit wording reflects ownership. Keep edits while typing; avoid focus-triggered rerenders discarding route drafts. Keys stay in Rust.
