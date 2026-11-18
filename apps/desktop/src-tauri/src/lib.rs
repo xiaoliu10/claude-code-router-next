@@ -40,6 +40,7 @@ pub fn run() {
             providers::provider_add,
             providers::provider_get,
             providers::provider_update,
+            providers::provider_transformers,
             credentials::quota_credentials_status,
             credentials::quota_credentials_save,
             lifecycle::service_snapshot,

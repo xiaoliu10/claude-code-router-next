@@ -20,6 +20,7 @@ fn main() {
             "provider_add",
             "provider_get",
             "provider_update",
+            "provider_transformers",
             "quota_credentials_status",
             "quota_credentials_save",
             "service_snapshot",

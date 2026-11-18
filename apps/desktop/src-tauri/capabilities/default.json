@@ -26,6 +26,7 @@
     "allow-provider-add",
     "allow-provider-get",
     "allow-provider-update",
+    "allow-provider-transformers",
     "allow-quota-credentials-status",
     "allow-quota-credentials-save",
     "allow-service-snapshot",
