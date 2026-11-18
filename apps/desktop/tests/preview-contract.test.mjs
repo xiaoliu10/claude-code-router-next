@@ -187,6 +187,24 @@ test("preview: provider_add returns only the name and updates safe quota and rou
   assert.doesNotMatch(JSON.stringify([added, quota, routing]), /test-key|https:\/\/example\.com/)
 })
 
+test('preview: provider_get projects editable fields and provider_update renames the same card', async () => {
+  const invoke = Q.createPreviewInvoke()
+  const provider = { name: 'example.com', baseUrl: 'https://example.com/v1', models: ['one'] }
+  await invoke('provider_add', { provider: { ...provider, apiKey: 'test-key' } })
+  const detail = await invoke('provider_get', { name: provider.name })
+  assert.deepEqual(JSON.parse(JSON.stringify(detail)), { ...provider, managed: false })
+  const change = { ...provider, name: 'Renamed', models: ['two'] }
+  const updated = await invoke('provider_update', { name: provider.name, provider: change })
+  assert.deepEqual({ ...updated }, { name: change.name })
+  assert.deepEqual(JSON.parse(JSON.stringify(await invoke('provider_get', updated))), { ...change, managed: false })
+  await assert.rejects(invoke('provider_get', { name: provider.name }), /PROVIDER_UNAVAILABLE/)
+  const quota = await invoke('quota_snapshot')
+  assert.ok(quota.providers.some(p => p.name === change.name))
+  assert.ok(!quota.providers.some(p => p.name === provider.name))
+  const routes = await invoke('routing_snapshot')
+  assert.deepEqual(JSON.parse(JSON.stringify(routes.providers.at(-1))), { name: change.name, models: change.models })
+})
+
 test("preview: routing_snapshot has the complete routing contract", async () => {
   const invoke = Q.createPreviewInvoke()
   assertRoutingSnapshot(await previewCall(invoke, "routing_snapshot", {}), "routing_snapshot")

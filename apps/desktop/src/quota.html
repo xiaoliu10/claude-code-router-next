@@ -51,7 +51,8 @@
         <button id="provider-add-open" class="btn" type="button" aria-expanded="false" aria-controls="provider-add-form">添加供应商</button>
       </div>
       <p class="hint">读取服务端额度快照，不会重置任何额度。</p>
-      <form id="provider-add-form" class="provider-form card" aria-label="添加供应商" autocomplete="off" novalidate hidden>
+      <form id="provider-add-form" class="provider-form card" aria-labelledby="provider-form-title" autocomplete="off" novalidate hidden>
+        <h2 id="provider-form-title">添加供应商</h2>
         <label>供应商名称<input id="provider-name" class="route-input" type="text" placeholder="example.com" required></label>
         <label>API 地址<input id="provider-base-url" class="route-input" type="url" placeholder="https://example.com/v1/chat/completions" spellcheck="false" required></label>
         <label>API 密钥<input id="provider-api-key" class="route-input" type="password" autocomplete="new-password" spellcheck="false" required></label>

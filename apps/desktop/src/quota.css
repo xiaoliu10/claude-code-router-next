@@ -162,6 +162,7 @@ body {
 
 /* Manual API provider (quota tab) */
 .provider-form { margin: 0 14px 8px; display: grid; gap: 8px; min-height: 0; overflow-y: auto; }
+.provider-form h2 { margin: 0; font-size: 13px; }
 .provider-form label { display: grid; gap: 3px; min-width: 0; font-size: 12px; }
 .provider-form .route-input { width: 100%; }
 .provider-form textarea { resize: vertical; }
@@ -339,7 +340,7 @@ body {
 .btn-danger:active { background: #b32e24; }
 
 /* Coding Plan quota credentials: inline AK/SK editor on matching quota cards */
-.card-creds { padding: 2px 8px; font-size: 11.5px; }
+.card-edit, .card-creds { padding: 2px 8px; font-size: 11.5px; }
 .card-creds-note { margin: 6px 0 0; font-size: 11px; color: var(--warn); overflow-wrap: anywhere; }
 .creds-panel {
   margin-top: 8px; padding: 8px; border-radius: 8px;

@@ -264,7 +264,7 @@
   }
 
 
-  function providerInputError(provider) {
+  function providerInputError(provider, editing) {
     function validText(value, maxBytes) {
       return typeof value === 'string' && value.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
         && new TextEncoder().encode(value.trim()).length <= maxBytes;
@@ -276,7 +276,8 @@
     var authority = /^https?:\/\/([^/?#]+)/i.exec(endpoint);
     if (!authority || authority[1].includes('@') || /[\\#\s]/.test(endpoint)) return 'baseUrl';
     try { if (!new URL(endpoint).hostname) return 'baseUrl'; } catch { return 'baseUrl'; }
-    if (!validText(provider.apiKey, 4096)) return 'apiKey';
+    var keepKey = editing && (provider.apiKey === undefined || provider.apiKey === '');
+    if (!keepKey && !validText(provider.apiKey, 4096)) return 'apiKey';
     var models = provider.models;
     if (!Array.isArray(models) || !models.length || models.length > 256 || !models.every(validId)) return 'models';
     if (new Set(models.map(function (m) { return m.trim(); })).size !== models.length) return 'models';
@@ -1317,10 +1318,9 @@
     function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
     function bump() { rev += 1; routing.revision = 'rev-' + rev; }
 
-    var addedQuotaProviders = [];
-    function quotaSnapshot(now) {
+    function previewQuotaProviders(now) {
       var h = function (n) { return new Date(now + n * 3600e3).toISOString(); };
-      var all = [
+      return [
         { name: 'alpha.example.com', enabled: true, plan: 'Pro', status: 'ready', message: null, updatedAt: now - 5e3, windows: [
           { label: '五小时', used: 12.3, limit: 45, remaining: 32.7, unit: '次', resetAt: h(3) },
           { label: '每周', used: 210, limit: 1000, remaining: 790, unit: '次', resetAt: h(74) },
@@ -1337,25 +1337,47 @@
           { label: '五小时', used: null, limit: null, remaining: null, unit: null, resetAt: null }] },
         { name: '火山agent plan', enabled: true, plan: null, status: 'unavailable', message: '未提供可用额度数据（来源未声明查询能力）', windows: [], updatedAt: null },
       ];
-      return { providers: all.concat(copy(addedQuotaProviders)), updatedAt: now - 2e3, online: true, error: null };
     }
+    var quotaProviders = previewQuotaProviders(Date.now());
+    var providerDetails = new Map(quotaProviders.map(function (row) {
+      var route = routing.providers.find(function (p) { return p.name === row.name; });
+      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false }];
+    }));
 
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
       if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
       if (cmd === 'quota_snapshot') {
-        return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
+        return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
       }
-      if (cmd === 'provider_add') {
+      if (cmd === 'provider_get') {
+        var detail = providerDetails.get(a.name);
+        return detail ? delay(copy(detail)) : Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
+      }
+      if (cmd === 'provider_add' || cmd === 'provider_update') {
+        var editing = cmd === 'provider_update';
         var provider = a.provider;
-        if (providerInputError(provider)) return Promise.reject(new Error('PROVIDER_INVALID'));
+        if (providerInputError(provider, editing)) return Promise.reject(new Error('PROVIDER_INVALID'));
         var name = provider.name.trim();
-        if (quotaSnapshot(Date.now()).providers.some(function (p) { return p.name.toLowerCase() === name.toLowerCase(); })) {
+        var previous = editing && providerDetails.get(a.name);
+        if (editing && !previous) return Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
+        if (previous && previous.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
+        var row = editing && quotaProviders.find(function (p) { return p.name === a.name; });
+        if (quotaProviders.some(function (p) { return p !== row && p.name.toLowerCase() === name.toLowerCase(); })) {
           return Promise.reject(new Error('PROVIDER_DUPLICATE'));
         }
-        routing.providers.push({ name: name, models: provider.models.map(function (m) { return m.trim(); }) });
-        addedQuotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
+        var models = provider.models.map(function (m) { return m.trim(); });
+        var managed = name === 'ccr' || (provider.apiKey || '').trim().startsWith('ccr-managed-');
+        if (editing) providerDetails.delete(a.name);
+        providerDetails.set(name, { name: name, baseUrl: provider.baseUrl.trim(), models: models, managed: managed });
+        if (row) row.name = name;
+        else quotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
+        var route = editing && routing.providers.find(function (p) { return p.name === a.name; });
+        if (route) { route.name = name; route.models = models; }
+        else if (!row || row.enabled) routing.providers.push({ name: name, models: models });
+        var credential = editing && credentials.providers.find(function (p) { return p.name === a.name; });
+        if (credential) credential.name = name;
         bump();
         return delay({ name: name });
       }
@@ -1533,6 +1555,9 @@
     creds.textContent = '用量凭证';
     creds.title = '配置火山 Coding Plan 用量查询凭证（AK/SK）';
     creds.hidden = true;
+    var edit = el('button', 'btn card-edit', '编辑');
+    edit.type = 'button';
+    edit.setAttribute('aria-controls', 'provider-add-form');
     var refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.className = 'btn btn-icon card-refresh';
@@ -1540,6 +1565,7 @@
     refresh.appendChild(icon(REFRESH_PATHS));
     actions.appendChild(status);
     actions.appendChild(creds);
+    actions.appendChild(edit);
     actions.appendChild(refresh);
     head.appendChild(title);
     head.appendChild(actions);
@@ -1550,7 +1576,7 @@
     var credsPanel = buildCredsPanel();
     var loading = el('p', 'card-loading'); loading.hidden = true;
     li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(credsNote); li.appendChild(windows); li.appendChild(credsPanel.root); li.appendChild(loading);
-    return { li: li, name: name, badges: badges, status: status, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
+    return { li: li, name: name, badges: badges, status: status, edit: edit, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
   }
 
   // Inline AK/SK editor in the client-confirm style; buttons are wired by
@@ -1615,6 +1641,7 @@
   function mountProviderForm(invoke, onSaved) {
     var open = document.getElementById('provider-add-open');
     var form = document.getElementById('provider-add-form');
+    var title = document.getElementById('provider-form-title');
     var cancel = document.getElementById('provider-add-cancel');
     var save = document.getElementById('provider-add-save');
     var error = document.getElementById('provider-add-error');
@@ -1628,72 +1655,122 @@
       baseUrl: '请输入完整的 HTTP 或 HTTPS 地址，不能包含账号、密码或片段。',
       apiKey: '请输入有效的 API 密钥。', models: '请输入 1 至 256 个有效的模型 ID。',
     };
-    var saving = false;
+    var saving = false, loading = false, managed = false, editName = null;
+    var trigger = open, readId = 0;
+    var managedNote = '系统托管的供应商请在对应插件卡片中管理';
 
     function close(restoreFocus) {
       if (form.hidden) return;
       Object.values(fields).forEach(function (field) { field.value = ''; });
       error.textContent = '';
       form.hidden = true;
-      open.setAttribute('aria-expanded', 'false');
-      if (restoreFocus) open.focus();
+      trigger.setAttribute('aria-expanded', 'false');
+      if (restoreFocus) trigger.focus();
+      trigger = open;
+      editName = null;
+      loading = managed = false;
+      readId++;
     }
-    function setSaving(busy) {
-      saving = busy;
-      Object.values(fields).forEach(function (field) { field.disabled = busy; });
-      form.setAttribute('aria-busy', String(busy));
-      open.disabled = !invoke || busy;
-      cancel.disabled = save.disabled = busy;
-      save.textContent = busy ? '正在保存…' : '保存';
+    function syncControls() {
+      Object.values(fields).forEach(function (field) { field.disabled = saving || loading || managed; });
+      form.setAttribute('aria-busy', String(saving || loading));
+      open.disabled = !invoke || saving;
+      cancel.disabled = saving;
+      save.disabled = saving || loading || managed;
+      save.textContent = saving ? '正在保存…' : editName !== null ? '保存修改' : '保存';
+    }
+    function show(name, button) {
+      close(false);
+      editName = name;
+      loading = name !== null;
+      trigger = button;
+      title.textContent = loading ? '编辑供应商' : '添加供应商';
+      fields.apiKey.required = !loading;
+      fields.apiKey.placeholder = loading ? '已保存，留空则不修改' : '';
+      status.textContent = '';
+      form.hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      syncControls();
+    }
+    async function edit(name, button) {
+      if (!invoke || saving) return;
+      show(name, button);
+      var id = ++readId;
+      try {
+        var entry = await invoke('provider_get', { name: name });
+        if (id !== readId) return;
+        if (!entry || entry.name !== name || typeof entry.baseUrl !== 'string' || !Array.isArray(entry.models)
+            || !entry.models.every(function (m) { return typeof m === 'string'; }) || typeof entry.managed !== 'boolean') throw new Error();
+        fields.name.value = entry.name;
+        fields.baseUrl.value = entry.baseUrl;
+        fields.models.value = entry.models.join('\n');
+        managed = entry.managed;
+        loading = false;
+        syncControls();
+        if (managed) { error.textContent = managedNote; cancel.focus(); }
+        else fields.name.focus();
+      } catch {
+        if (id !== readId) return;
+        close(true);
+        status.textContent = '暂时无法读取供应商，请刷新后重试。';
+      }
     }
     open.disabled = !invoke;
     open.addEventListener('click', function () {
-      if (!form.hidden) { close(true); return; }
-      status.textContent = '';
-      form.hidden = false;
-      open.setAttribute('aria-expanded', 'true');
+      if (!form.hidden && editName === null) { close(true); return; }
+      show(null, open);
       fields.name.focus();
     });
     cancel.addEventListener('click', function () { close(true); });
     form.addEventListener('submit', async function (event) {
       event.preventDefault();
-      if (!invoke || saving || form.hidden) return;
+      if (!invoke || saving || loading || managed || form.hidden) return;
+      var editing = editName !== null;
       var models = fields.models.value.split(/[\r\n,]/).map(function (m) { return m.trim(); }).filter(Boolean);
       var provider = {
         name: fields.name.value.trim(), baseUrl: fields.baseUrl.value.trim(),
-        apiKey: fields.apiKey.value.trim(), models: Array.from(new Set(models)),
+        models: Array.from(new Set(models)),
       };
-      var invalid = providerInputError(provider);
+      if (!editing || fields.apiKey.value !== '') provider.apiKey = fields.apiKey.value;
+      var invalid = providerInputError(provider, editing);
       if (invalid) {
         error.textContent = invalidMessages[invalid];
         fields[invalid].focus();
         return;
       }
+      if (provider.apiKey !== undefined) provider.apiKey = provider.apiKey.trim();
       error.textContent = '';
-      setSaving(true);
+      saving = true;
+      syncControls();
       var name = provider.name;
       var saved;
       try {
-        var request = invoke('provider_add', { provider: provider });
+        var request = editing ? invoke('provider_update', { name: editName, provider: provider }) : invoke('provider_add', { provider: provider });
         provider = null;
         saved = await request;
-        if (!saved || saved.name !== name) throw new Error();
+        if (!saved || saved.name !== name) throw new Error('PROVIDER_SAVE_UNCONFIRMED');
       } catch (err) {
-        setSaving(false);
+        saving = false;
         var code = typeof err === 'string' ? err : err && err.message;
         var duplicate = code === 'PROVIDER_DUPLICATE';
-        var message = duplicate ? '供应商名称已存在，请使用其他名称。' : '添加供应商失败，请检查输入后重试。';
-        if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
+        var message = editing ? '更新供应商失败，请检查输入后重试。' : '添加供应商失败，请检查输入后重试。';
+        if (duplicate) message = '供应商名称已存在，请使用其他名称。';
+        if (code === 'PROVIDER_INVALID') message = '供应商信息无效，请检查输入后重试。';
+        if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = editing ? '暂时无法确认保存结果，请刷新后再决定是否重试' : '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
+        if (editing && code === 'PROVIDER_MANAGED') { managed = !form.hidden; message = managedNote; fields.apiKey.value = ''; }
+        syncControls();
         if (form.hidden) status.textContent = message;
         else {
           error.textContent = message;
-          (duplicate ? fields.name : save).focus();
+          if (duplicate || code === 'PROVIDER_INVALID') fields.name.focus();
+          else (managed ? cancel : save).focus();
         }
         return;
       }
-      setSaving(false);
+      saving = false;
+      syncControls();
       close(true);
-      status.textContent = '供应商已添加。';
+      status.textContent = editing ? '已更新供应商' : '供应商已添加。';
       onSaved(saved.name);
     });
     // A tray window can be hidden and reused without unloading its document.
@@ -1701,6 +1778,7 @@
     document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') close(false); });
     return {
       close: close,
+      edit: edit,
       escape: function () {
         if (form.hidden) return false;
         if (!saving) close(true);
@@ -1832,6 +1910,7 @@
       refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';
       refs.refresh.setAttribute('aria-label', '刷新 ' + p.name);
       refs.refresh.title = '刷新 ' + p.name;
+      refs.edit.setAttribute('aria-label', '编辑 ' + p.name);
       syncCardCredentials(refs, p.name, credentialsCtrl ? credentialsCtrl.state() : null);
     }
 
@@ -2777,10 +2856,12 @@
           if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
           return;
         }
+        var providerCard = target.closest('.card');
+        if (!providerCard || !providerCard.dataset.provider) return;
+        var name = providerCard.dataset.provider;
+        var edit = target.closest('.card-edit');
+        if (edit) { providerForm.edit(name, edit); return; }
         if (!credentialsCtrl) return;
-        var credsCard = target.closest('.card');
-        if (!credsCard || !credsCard.dataset.provider) return;
-        var name = credsCard.dataset.provider;
         if (target.closest('[data-creds-open]')) credentialsCtrl.open(name);
         else if (target.closest('[data-creds-cancel]')) credentialsCtrl.close();
         else if (target.closest('[data-creds-save]')) {
