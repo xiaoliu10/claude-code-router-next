@@ -305,6 +305,22 @@ body {
 .btn-danger:hover { background: #b32e24; }
 .btn-danger:active { background: #b32e24; }
 
+/* Coding Plan quota credentials: inline AK/SK editor on matching quota cards */
+.card-creds { padding: 2px 8px; font-size: 11.5px; }
+.card-creds-note { margin: 6px 0 0; font-size: 11px; color: var(--warn); overflow-wrap: anywhere; }
+.creds-panel {
+  margin-top: 8px; padding: 8px; border-radius: 8px;
+  background: var(--surface-hover); border: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.creds-title { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
+.creds-field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--text-2); }
+.creds-field .route-input { width: 100%; }
+.creds-msg { margin: 0; font-size: 11px; color: var(--danger); overflow-wrap: anywhere; }
+.creds-msg[data-tone="ok"] { color: var(--ok); }
+.creds-actions { display: flex; gap: 6px; }
+.creds-actions .btn { padding: 2px 8px; font-size: 11.5px; }
+
 /* The same panel doubles as the local main window: keep the compact popup
    column but center it and relax grids on wide viewports. */
 @media (min-width: 720px) {

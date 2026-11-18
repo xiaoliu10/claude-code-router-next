@@ -294,6 +294,46 @@ test("preview: service_snapshot/service_action follow the lifecycle contract", a
   await assert.rejects(previewCall(invoke, "service_action", { action: "reboot" }), /无效/)
 })
 
+test("preview: quota_credentials_status/save follow the {name, configured} contract without secrets", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const assertStatus = (s, label) => {
+    assert.ok(Array.isArray(s.providers) && s.providers.length > 0, `${label}: providers listed`)
+    for (const p of s.providers) {
+      assert.deepEqual(Object.keys(p).sort(), ["configured", "name"], `${label}: projection is name+configured only`)
+      assert.equal(typeof p.name, "string")
+      assert.equal(typeof p.configured, "boolean")
+    }
+    assert.equal(JSON.stringify(s).includes("secretKey"), false, `${label}: no secret fields`)
+    assert.equal(JSON.stringify(s).includes("accessKey"), false, `${label}: no secret fields`)
+  }
+  const before = await previewCall(invoke, "quota_credentials_status", {})
+  assertStatus(before, "status")
+  const volc = before.providers.find((p) => p.name === "火山agent plan")
+  assert.ok(volc, "preview lists the Coding Plan provider")
+  assert.equal(volc.configured, false)
+  // The preview quota snapshot renders the same provider, so the panel is demoable.
+  const quota = await previewCall(invoke, "quota_snapshot", { provider: null })
+  assert.ok(quota.providers.some((p) => p.name === volc.name))
+
+  const saved = await previewCall(invoke, "quota_credentials_save", { name: volc.name, accessKey: "PREVIEW_AK", secretKey: "PREVIEW_SK" })
+  assertStatus(saved, "after save")
+  assert.equal(saved.providers.find((p) => p.name === volc.name).configured, true)
+  assert.equal(JSON.stringify(saved).includes("PREVIEW_SK"), false, "submitted secrets never echo back")
+
+  // Omitted fields keep the saved value; an empty string clears that field.
+  const kept = await previewCall(invoke, "quota_credentials_save", { name: volc.name, secretKey: "OTHER_SK" })
+  assert.equal(kept.providers.find((p) => p.name === volc.name).configured, true)
+  const cleared = await previewCall(invoke, "quota_credentials_save", { name: volc.name, accessKey: "", secretKey: "" })
+  assertStatus(cleared, "after clear")
+  assert.equal(cleared.providers.find((p) => p.name === volc.name).configured, false)
+
+  // Error wording mirrors credentials.rs ERR_NOT_FOUND exactly in both preview and production.
+  await assert.rejects(
+    previewCall(invoke, "quota_credentials_save", { name: "unknown", accessKey: "x" }),
+    /^Error: Coding Plan provider is no longer configured; refresh the panel$/
+  )
+})
+
 test("preview: unknown commands resolve null (never fabricate responses)", async () => {
   const invoke = Q.createPreviewInvoke()
   assert.equal(await previewCall(invoke, "totally_unknown", {}), null)

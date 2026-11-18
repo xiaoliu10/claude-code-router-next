@@ -255,6 +255,144 @@
   }
 
 
+  // ---- Coding Plan quota credentials (quota tab) -------------------------
+  // quota_credentials_status() / quota_credentials_save({name, accessKey?, secretKey?})
+  // Rust lists only providers on ark.cn-beijing.volces.com/api/coding/ (the
+  // same condition as the core adapter) and projects {name, configured} only:
+  // secret values never cross IPC. Omitted input keeps the saved field; an
+  // empty string clears it. Inputs are never prefilled with saved values.
+
+  function normalizeCredentialsStatus(r) {
+    var s = r && typeof r === 'object' ? r : {};
+    var list = Array.isArray(s.providers) ? s.providers : [];
+    var seen = {}, providers = [];
+    list.forEach(function (p) {
+      var o = p && typeof p === 'object' ? p : {};
+      var name = toStr(o.name);
+      if (!name || seen[name]) return;
+      seen[name] = true;
+      providers.push({ name: name, configured: o.configured === true });
+    });
+    return { providers: providers };
+  }
+
+  function createCredentialsController(options) {
+    var invoke = options && options.invoke;
+    if (typeof invoke !== 'function') throw new TypeError('createCredentialsController: 需要 invoke 函数');
+    // Best-effort usage refresh after credentials change; ownership stays with the quota controller.
+    var onSaved = options && typeof options.onSaved === 'function' ? options.onSaved : function () {};
+    var status = null, loading = false, error = null;
+    var openName = null, saving = false, saveError = null, savedFlash = null;
+    var epoch = 0;
+    var listeners = new Set();
+
+    function state() {
+      return { status: status, loading: loading, error: error, openName: openName, saving: saving, saveError: saveError, savedFlash: savedFlash };
+    }
+    function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
+    function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
+    function known(name) {
+      return !!status && status.providers.some(function (p) { return p.name === name; });
+    }
+    function configured(name) {
+      if (!status) return false;
+      for (var i = 0; i < status.providers.length; i++) if (status.providers[i].name === name) return status.providers[i].configured;
+      return false;
+    }
+    function adopt(result) {
+      status = normalizeCredentialsStatus(result);
+      error = null;
+      if (openName !== null && !known(openName)) { openName = null; saveError = null; savedFlash = null; }
+    }
+
+    function refresh() {
+      if (loading || saving) return;
+      loading = true;
+      error = null;
+      emit();
+      var my = ++epoch;
+      invoke('quota_credentials_status').then(function (r) {
+        if (my !== epoch) return;
+        adopt(r);
+        loading = false;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        loading = false;
+        error = errorMessage(err);
+        emit();
+      });
+    }
+
+    function open(name) {
+      if (saving || !known(name)) return false;
+      openName = name;
+      saveError = null;
+      savedFlash = null;
+      emit();
+      return true;
+    }
+    function close() {
+      if (openName === null || saving) return false;
+      openName = null;
+      saveError = null;
+      savedFlash = null;
+      emit();
+      return true;
+    }
+
+    function performSave(name, args, cleared) {
+      saving = true;
+      saveError = null;
+      savedFlash = null;
+      emit();
+      var my = ++epoch;
+      invoke('quota_credentials_save', args).then(function (r) {
+        if (my !== epoch) return;
+        saving = false;
+        adopt(r);
+        if (openName === name) savedFlash = { name: name, at: Date.now(), cleared: cleared };
+        emit();
+        // The card's usage snapshot is stale once credentials change; refresh it
+        // (best-effort: the Rust quota service applies the 3s attempt dedupe, while this
+        // controller's loading flag collapses concurrent in-flight refreshes).
+        try { onSaved(name); } catch { /* rendering-only hook */ }
+      }, function (err) {
+        if (my !== epoch) return;
+        saving = false;
+        saveError = errorMessage(err);
+        emit();
+      });
+    }
+
+    function save(name, values) {
+      if (saving || openName !== name || !known(name)) return false;
+      var v = values && typeof values === 'object' ? values : {};
+      var ak = typeof v.accessKey === 'string' ? v.accessKey.trim() : '';
+      var sk = typeof v.secretKey === 'string' ? v.secretKey.trim() : '';
+      if (!ak && !sk) {
+        // Blank inputs never overwrite saved credentials; clearing is explicit.
+        saveError = configured(name) ? '留空表示不修改；如需清除已保存凭证请点「清除凭证」' : '请输入 AccessKey ID 和 Secret AccessKey';
+        emit();
+        return false;
+      }
+      var args = { name: name };
+      if (ak) args.accessKey = ak;
+      if (sk) args.secretKey = sk;
+      performSave(name, args, false);
+      return true;
+    }
+
+    function clear(name) {
+      if (saving || openName !== name || !known(name) || !configured(name)) return false;
+      performSave(name, { name: name, accessKey: '', secretKey: '' }, true);
+      return true;
+    }
+
+    return { subscribe: subscribe, state: state, refresh: refresh, open: open, close: close, save: save, clear: clear, configured: configured };
+  }
+
+
   // ---- Routing tab -------------------------------------------------------
   // Projection contract (docs/design/desktop-control-center.md):
   // snapshot = {providers:[{name,models:[string]}], routes:[{scope,field,target,fallback}],
@@ -1088,6 +1226,10 @@
       message: null,
     };
     var service = { mode: 'owned', running: true, message: '' };
+    // Coding Plan credentials preview: fake in-memory values only; the DTO
+    // never carries them, mirroring the Rust projection.
+    var credentials = { providers: [{ name: '火山agent plan', configured: false }] };
+    var credentialKeys = { accessKey: '', secretKey: '' };
 
     // Deterministic record fixtures spanning several pages (45/132/260 items)
     // with one stable error record and one estimated record on the first page.
@@ -1154,6 +1296,7 @@
           { label: '五小时', used: 58, limit: 60, remaining: 2, unit: '次', resetAt: h(0.5) }] },
         { name: 'eta.example.com', enabled: true, plan: null, status: 'ready', message: null, updatedAt: null, windows: [
           { label: '五小时', used: null, limit: null, remaining: null, unit: null, resetAt: null }] },
+        { name: '火山agent plan', enabled: true, plan: null, status: 'unavailable', message: '未提供可用额度数据（来源未声明查询能力）', windows: [], updatedAt: null },
       ];
       return { providers: all, updatedAt: now - 2e3, online: true, error: null };
     }
@@ -1220,6 +1363,17 @@
         else if (a.action === 'restore') { client.enabled = false; client.managed = false; client.activeModel = null; client.modelAlias = null; }
         return delay(copy(clients));
       }
+      if (cmd === 'quota_credentials_status') return delay(copy(credentials));
+      if (cmd === 'quota_credentials_save') {
+        var credEntry = null;
+        for (var k = 0; k < credentials.providers.length; k++) if (credentials.providers[k].name === a.name) { credEntry = credentials.providers[k]; break; }
+        // Keep wording identical to credentials.rs ERR_NOT_FOUND so preview and production match.
+        if (!credEntry) return Promise.reject(new Error('Coding Plan provider is no longer configured; refresh the panel'));
+        if (typeof a.accessKey === 'string') credentialKeys.accessKey = a.accessKey.trim();
+        if (typeof a.secretKey === 'string') credentialKeys.secretKey = a.secretKey.trim();
+        credEntry.configured = !!(credentialKeys.accessKey && credentialKeys.secretKey);
+        return delay(copy(credentials));
+      }
       if (cmd === 'service_snapshot') return delay(copy(service));
       if (cmd === 'service_action') {
         if (a.action === 'start') {
@@ -1250,6 +1404,8 @@
     statusMeta: statusMeta, computePercent: computePercent, formatPercent: formatPercent,
     formatAmount: formatAmount, formatResetTime: formatResetTime, formatTimestamp: formatTimestamp,
     describeWindow: describeWindow, createController: createController,
+    // Coding Plan quota credentials (quota tab)
+    normalizeCredentialsStatus: normalizeCredentialsStatus, createCredentialsController: createCredentialsController,
     // shared helpers
     errorMessage: errorMessage, formatInt: formatInt, formatCompact: formatCompact, formatClock: formatClock,
     formatMs: formatMs, formatSpeed: formatSpeed, formatSuccessRate: formatSuccessRate,
@@ -1317,21 +1473,69 @@
     title.appendChild(badges);
     var actions = el('div', 'card-actions');
     var status = el('span', 'status');
+    // Coding Plan credentials affordances; visibility is driven by the
+    // credentials status projection (only matching volces providers).
+    var creds = document.createElement('button');
+    creds.type = 'button';
+    creds.className = 'btn card-creds';
+    creds.setAttribute('data-creds-open', '1');
+    creds.textContent = '用量凭证';
+    creds.title = '配置火山 Coding Plan 用量查询凭证（AK/SK）';
+    creds.hidden = true;
     var refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.className = 'btn btn-icon card-refresh';
     refresh.dataset.refresh = '1';
     refresh.appendChild(icon(REFRESH_PATHS));
     actions.appendChild(status);
+    actions.appendChild(creds);
     actions.appendChild(refresh);
     head.appendChild(title);
     head.appendChild(actions);
     var message = el('p', 'card-message'); message.hidden = true;
     var error = el('p', 'card-error'); error.hidden = true;
+    var credsNote = el('p', 'card-creds-note', '未配置 AK/SK，无法查询套餐用量'); credsNote.hidden = true;
     var windows = el('ul', 'windows');
+    var credsPanel = buildCredsPanel();
     var loading = el('p', 'card-loading'); loading.hidden = true;
-    li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(windows); li.appendChild(loading);
-    return { li: li, name: name, badges: badges, status: status, refresh: refresh, message: message, error: error, windows: windows, loading: loading };
+    li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(credsNote); li.appendChild(windows); li.appendChild(credsPanel.root); li.appendChild(loading);
+    return { li: li, name: name, badges: badges, status: status, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
+  }
+
+  // Inline AK/SK editor in the client-confirm style; buttons are wired by
+  // delegation on the quota list. Password inputs are never prefilled.
+  function buildCredsPanel() {
+    var root = el('div', 'creds-panel'); root.hidden = true;
+    root.appendChild(el('div', 'creds-title', '火山 Coding Plan 用量凭证'));
+    function field(labelText) {
+      var label = el('label', 'creds-field');
+      label.appendChild(el('span', null, labelText));
+      var input = document.createElement('input');
+      input.type = 'password';
+      input.className = 'route-input';
+      input.setAttribute('autocomplete', 'new-password');
+      input.setAttribute('aria-label', labelText);
+      label.appendChild(input);
+      root.appendChild(label);
+      return input;
+    }
+    var ak = field('AccessKey ID');
+    var sk = field('Secret AccessKey');
+    var msg = el('p', 'creds-msg'); msg.hidden = true;
+    root.appendChild(msg);
+    var actions = el('div', 'creds-actions');
+    var saveBtn = mkBtn('保存', '保存用量凭证', function () {});
+    saveBtn.className = 'btn btn-primary';
+    saveBtn.setAttribute('data-creds-save', '1');
+    var clearBtn = mkBtn('清除凭证', '清除已保存的 AK/SK', function () {});
+    clearBtn.className = 'btn btn-danger-quiet';
+    clearBtn.setAttribute('data-creds-clear', '1');
+    clearBtn.hidden = true;
+    var cancelBtn = mkBtn('取消', '关闭凭证面板', function () {});
+    cancelBtn.setAttribute('data-creds-cancel', '1');
+    actions.appendChild(saveBtn); actions.appendChild(clearBtn); actions.appendChild(cancelBtn);
+    root.appendChild(actions);
+    return { root: root, ak: ak, sk: sk, msg: msg, saveBtn: saveBtn, clearBtn: clearBtn, cancelBtn: cancelBtn };
   }
 
   function buildWindow(win) {
@@ -1379,6 +1583,10 @@
       ? function (cmd, args) { return tauri.core.invoke(cmd, args); }
       : mode === 'preview' ? createPreviewInvoke() : null;
     var controller = mode === 'missing' ? null : createController({ invoke: invoke });
+    var credentialsCtrl = mode === 'missing' ? null : createCredentialsController({
+      invoke: invoke,
+      onSaved: function (name) { if (controller) controller.refreshProvider(name); },
+    });
     var routingCtrl = mode === 'missing' ? null : createRoutingController({ invoke: invoke });
     var usageCtrl = mode === 'missing' ? null : createUsageController({ invoke: invoke });
     var recordsCtrl = mode === 'missing' ? null : createRecordsController({ invoke: invoke });
@@ -1476,6 +1684,56 @@
       refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';
       refs.refresh.setAttribute('aria-label', '刷新 ' + p.name);
       refs.refresh.title = '刷新 ' + p.name;
+      syncCardCredentials(refs, p.name, credentialsCtrl ? credentialsCtrl.state() : null);
+    }
+
+    // Credentials affordances follow the credentials status projection, not
+    // the quota snapshot: only Rust-matched Coding Plan providers get them.
+    function syncCardCredentials(refs, name, s) {
+      var matched = !!s && !!s.status && s.status.providers.some(function (p) { return p.name === name; });
+      var configured = matched && s.status.providers.some(function (p) { return p.name === name && p.configured; });
+      var saving = !!s && !!s.saving;
+      refs.creds.hidden = !matched || mode === 'missing';
+      refs.creds.disabled = !matched || saving;
+      refs.credsNote.hidden = !matched || configured;
+      var open = matched && s.openName === name;
+      refs.credsPanel.hidden = !open;
+      if (!open) { refs.credsWasOpen = false; return; }
+      if (!refs.credsWasOpen) {
+        // Opening always starts blank: saved secrets are never echoed.
+        refs.credsAk.value = '';
+        refs.credsSk.value = '';
+        refs.credsWasOpen = true;
+      }
+      refs.credsAk.placeholder = configured ? '已保存，留空则不修改' : '输入 AccessKey ID';
+      refs.credsSk.placeholder = configured ? '已保存，留空则不修改' : '输入 Secret AccessKey';
+      refs.credsAk.disabled = saving;
+      refs.credsSk.disabled = saving;
+      refs.credsSave.disabled = saving;
+      refs.credsSave.textContent = saving ? '保存中…' : '保存';
+      refs.credsClear.hidden = !configured;
+      refs.credsClear.disabled = saving;
+      refs.credsCancel.disabled = saving;
+      var flash = s.savedFlash && s.savedFlash.name === name ? s.savedFlash : null;
+      if (flash && refs.credsFlashStamp !== flash.at) {
+        refs.credsFlashStamp = flash.at;
+        refs.credsAk.value = '';
+        refs.credsSk.value = '';
+      }
+      var text = '', tone = null;
+      if (s.saveError) { text = s.saveError; }
+      else if (flash) {
+        var clock = formatClock(flash.at);
+        text = (flash.cleared ? '已清除' : '已保存') + (clock ? ' ' + clock : '');
+        tone = 'ok';
+      }
+      refs.credsMsg.hidden = !text;
+      refs.credsMsg.textContent = text;
+      if (tone) refs.credsMsg.setAttribute('data-tone', tone); else refs.credsMsg.removeAttribute('data-tone');
+    }
+
+    function renderCredentials(s) {
+      cards.forEach(function (refs, name) { syncCardCredentials(refs, name, s); });
     }
 
     function render(state) {
@@ -2326,14 +2584,32 @@
       render(controller.state());
       els.refreshAll.addEventListener('click', function () { controller.refreshAll(); });
       els.list.addEventListener('click', function (event) {
-        var btn = event.target && event.target.closest ? event.target.closest('[data-refresh]') : null;
-        if (!btn) return;
-        var card = btn.closest('.card');
-        if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
+        var target = event.target && event.target.closest ? event.target : null;
+        if (!target) return;
+        var btn = target.closest('[data-refresh]');
+        if (btn) {
+          var card = btn.closest('.card');
+          if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
+          return;
+        }
+        if (!credentialsCtrl) return;
+        var credsCard = target.closest('.card');
+        if (!credsCard || !credsCard.dataset.provider) return;
+        var name = credsCard.dataset.provider;
+        if (target.closest('[data-creds-open]')) credentialsCtrl.open(name);
+        else if (target.closest('[data-creds-cancel]')) credentialsCtrl.close();
+        else if (target.closest('[data-creds-save]')) {
+          var refs = cards.get(name);
+          if (refs) credentialsCtrl.save(name, { accessKey: refs.credsAk.value, secretKey: refs.credsSk.value });
+        } else if (target.closest('[data-creds-clear]')) credentialsCtrl.clear(name);
       });
       controller.refreshAll();
     } else {
       render({ snapshot: null, rows: [], count: null, loadingAll: false, fullError: null });
+    }
+    if (credentialsCtrl) {
+      credentialsCtrl.subscribe(renderCredentials);
+      credentialsCtrl.refresh();
     }
     if (serviceCtrl) {
       serviceCtrl.subscribe(renderService);
@@ -2374,6 +2650,7 @@
     window.addEventListener('focus', function () {
       if (serviceCtrl) serviceCtrl.refresh();
       if (activeTab === 'quota' && controller) controller.refreshAll();
+      if (activeTab === 'quota' && credentialsCtrl) credentialsCtrl.refresh();
     });
   }
 
