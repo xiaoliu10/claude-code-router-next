@@ -289,6 +289,12 @@ body {
 .usage-day-track { height: 96px; display: flex; align-items: flex-end; justify-content: center; border-bottom: 1px solid var(--border-strong); }
 .usage-bar { width: 32px; max-width: 100%; background: var(--accent); border-radius: 3px 3px 0 0; opacity: 0.85; }
 .usage-bar:hover { opacity: 1; }
+/* All-history tracks share one viewport, even when individual days are subpixel. */
+.usage-days-compact .usage-bars { width: 100%; gap: 0; }
+.usage-days-compact .usage-bar-col { flex: 1 1 0; min-width: 0; }
+.usage-days-compact .usage-day-track { height: 56px; }
+.usage-days-compact .usage-bar { width: 84%; max-width: 32px; }
+.usage-day-range { display: flex; justify-content: space-between; }
 .usage-day-date { margin-top: 6px; font-size: 10.5px; color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .usage-hbar { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .usage-hbar-row { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 11px; }
