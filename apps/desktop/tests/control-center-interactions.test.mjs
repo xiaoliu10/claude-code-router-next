@@ -300,7 +300,7 @@ async function openUsage(h) { await flush(); h.id('tab-usage').click(); await fl
 test('interaction: opening usage loads the seven-day chart and matching records by default', async () => {
   const h = harness({ usage_snapshot: ({ period }) => ({ period, byDay: Array.from({ length: 7 }, (_, i) => ({
     name: `2026-11-${11 + i}`, inputTokens: 100 + i, outputTokens: 10,
-  })) }) });
+  })).concat(period === 'all' ? [{ name: '2026-09-01', inputTokens: 1000, outputTokens: 250 }] : []) }) });
   await openUsage(h);
   assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_snapshot' || c.cmd === 'usage_records')), [
     { cmd: 'usage_snapshot', args: { period: '7d' } },
@@ -310,6 +310,12 @@ test('interaction: opening usage loads the seven-day chart and matching records 
   assert.deepEqual(selected.map(button => button.dataset.period), ['7d']);
   assert.match(h.id('usage-body').textContent, /汇总 · 近 7 天/);
   assert.equal(h.id('usage-body').querySelectorAll('.usage-bar').length, 7);
+  h.id('usage-periods').children.find(button => button.dataset.period === 'all').click(); await flush();
+  assert.match(h.id('usage-body').textContent, /汇总 · 全部/);
+  assert.ok(h.id('usage-body').querySelectorAll('.usage-day-date').some(n => n.textContent === '2026-09-01'));
+  const dateTable = h.id('usage-body').querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
+  assert.match(dateTable.querySelector('tbody').textContent, /2026-09-01/);
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'all', page: 1, pageSize: 20 });
 });
 
 test('interaction: records pager walks pages, resets on period switch, shows page/total info', async () => {
