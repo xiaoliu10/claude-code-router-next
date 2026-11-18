@@ -166,14 +166,14 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   await flush(); h.id('tab-usage').click(); await flush();
   const body = h.id('usage-body');
   const total = body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens'));
-  assert.match(total.textContent, /1.25M/);
-  assert.equal(total.querySelector('.usage-num').title, '1,250,000');
+  assert.match(total.textContent, /9.25M/);
+  assert.equal(total.querySelector('.usage-num').title, '9,251,250');
   const models = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按模型'));
   assert.ok(models.textContent.includes('缓存（读 / 写）'));
   assert.equal(models.querySelectorAll('th').at(-1).textContent, '总 tokens');
   const modelRows = models.querySelectorAll('tbody')[0].children;
-  assert.equal(modelRows[0].children.at(-1).textContent, '1.25M');
-  assert.equal(modelRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(modelRows[0].children.at(-1).textContent, '9.25M');
+  assert.equal(modelRows[0].children.at(-1).title, '9,251,250');
   assert.equal(modelRows[1].children.at(-1).textContent, '0');
   assert.equal(modelRows[2].children.at(-1).textContent, '—');
   assert.ok(models.textContent.includes('8M / 1.25K'));
@@ -183,8 +183,8 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   const providers = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按提供方'));
   assert.deepEqual(providers.querySelectorAll('th').map(n => n.textContent), ['提供方', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens']);
   const providerRows = providers.querySelectorAll('tbody')[0].children;
-  assert.equal(providerRows[0].children.at(-1).textContent, '1.25M');
-  assert.equal(providerRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(providerRows[0].children.at(-1).textContent, '9.25M');
+  assert.equal(providerRows[0].children.at(-1).title, '9,251,250');
   assert.equal(providerRows[0].children[4].textContent, '8M / 1.25K');
   assert.equal(providerRows[0].children[4].title, '缓存读 8,000,000 / 缓存写 1,250');
   assert.equal(providerRows[1].children.at(-1).textContent, '0');
@@ -195,8 +195,8 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   const days = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
   assert.deepEqual(days.querySelectorAll('th').map(n => n.textContent), ['日期', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens']);
   const dayRows = days.querySelectorAll('tbody')[0].children;
-  assert.equal(dayRows[0].children.at(-1).textContent, '1.25M');
-  assert.equal(dayRows[0].children.at(-1).title, '1,250,000');
+  assert.equal(dayRows[0].children.at(-1).textContent, '9.25M');
+  assert.equal(dayRows[0].children.at(-1).title, '9,251,250');
   assert.equal(dayRows[0].children[4].textContent, '8M / 1.25K');
   assert.equal(dayRows[0].children[4].title, '缓存读 8,000,000 / 缓存写 1,250');
   assert.equal(dayRows[1].children.at(-1).textContent, '0');
@@ -204,11 +204,11 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   assert.equal(dayRows[2].children.at(-1).textContent, '—');
   assert.equal(dayRows[2].children[4].textContent, '— / —');
   h.id('usage-periods').children[1].click(); await flush();
-  assert.match(body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens')).textContent, /2.25M/);
+  assert.match(body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens')).textContent, /10.25M/);
   const refreshedProviders = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按提供方'));
-  assert.equal(refreshedProviders.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '2.25M');
+  assert.equal(refreshedProviders.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '10.25M');
   const refreshedDays = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
-  assert.equal(refreshedDays.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '2.25M');
+  assert.equal(refreshedDays.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '10.25M');
 });
 
 test('interaction: restore is local confirmation then single individual IPC; usage uses safe text', async () => {
@@ -369,7 +369,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(numCell('生成速度').textContent, '33.4 t/s');
   // Cards order: summary → charts → detail tables → records.
   const titles = body.querySelectorAll('.usage-card').map(c => c.querySelector('.usage-title').textContent);
-  assert.deepEqual(titles.slice(0, 6), ['汇总 · 今天', '每日用量（输入 + 输出）', '模型 Top 10（按输入 + 输出）', '按模型', '按提供方', '按日期']);
+  assert.deepEqual(titles.slice(0, 6), ['汇总 · 今天', '每日用量（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
   // Daily chart: ascending dates, max day 100%, zero day floored at 4%.
   const dayCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
   const bars = dayCard.querySelectorAll('.usage-bar');
@@ -393,7 +393,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.ok(!rows.some(r => r.textContent.includes('model-0')), 'smallest models are cut by the top-10 cap');
   assert.equal(rows[0].querySelector('.usage-hbar-fill').style.width, '100%');
   assert.ok(rows[0].querySelector('.usage-hbar-name').title.includes('请求 12 · 输入 5,000 · 输出 1,000 · 缓存读 7 / 缓存写 3'));
-  assert.ok(rows[0].querySelector('.usage-hbar-total').textContent.includes('6K'));
+  assert.ok(rows[0].querySelector('.usage-hbar-total').textContent.includes('6.01K'), 'model-11 effective total 6010');
   // Structural safeguards against horizontal overflow at 440px (visual check in preview browser).
   assert.ok(dayCard.querySelector('.usage-bars'));
   assert.ok(recordsCard(body).querySelector('.records-scroll'));

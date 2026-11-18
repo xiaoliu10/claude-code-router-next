@@ -698,11 +698,27 @@
     return out.join(' → ');
   }
   // byModel arrives sorted by request count; charts rank by total tokens.
+  // Effective input mirrors the Web UsageStats heuristic (computeEffectiveInputTokens):
+  // some upstreams report inputTokens inclusive of cache read/write (then input
+  // ~= cache sum within a tolerance), others report net input. Never double-count.
+  function effectiveInputTokens(input, cacheRead, cacheWrite) {
+    if (input === null) return null;
+    var cacheTotal = (toNum(cacheRead) || 0) + (toNum(cacheWrite) || 0);
+    if (cacheTotal <= 0) return input;
+    var tolerance = Math.max(500, input * 0.02);
+    return Math.abs(input - cacheTotal) <= tolerance ? input : input + cacheTotal;
+  }
+  function rowTotalTokens(row) {
+    var input = effectiveInputTokens(row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens);
+    if (input === null || row.outputTokens === null) return null;
+    return input + row.outputTokens;
+  }
+
   function topModelsByTotal(rows, limit) {
     var list = (Array.isArray(rows) ? rows : []).slice();
     list.sort(function (a, b) {
-      var ta = (toNum(a.inputTokens) || 0) + (toNum(a.outputTokens) || 0);
-      var tb = (toNum(b.inputTokens) || 0) + (toNum(b.outputTokens) || 0);
+      var ta = rowTotalTokens(a) || 0;
+      var tb = rowTotalTokens(b) || 0;
       return tb - ta;
     });
     return typeof limit === 'number' ? list.slice(0, limit) : list;
@@ -1834,9 +1850,9 @@
       grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
       grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
       grid.appendChild(usageNumCell('成功率', formatSuccessRate(u.successCount, u.totalRequests)));
-      var totalTokens = u.inputTokens === null || u.outputTokens === null ? null : u.inputTokens + u.outputTokens;
+      var totalTokens = rowTotalTokens(u);
       var totalCell = usageNumCell('总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
-      totalCell.title = '已记录输入 + 输出；缓存独立展示，不重复相加';
+      totalCell.title = '有效输入 + 输出；上游 inputTokens 已含缓存时直接采用，否则加计缓存读/写';
       grid.appendChild(totalCell);
       grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
       grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
@@ -1847,11 +1863,11 @@
       grid.appendChild(usageNumCell('生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
       body.appendChild(totals);
-      totals.appendChild(noteEl('总 tokens = 已记录输入 + 输出；缓存读写独立展示。'));
+      totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
       body.appendChild(buildDayChart(u.byDay));
       body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
-        var rowTotal = m.inputTokens === null || m.outputTokens === null ? null : m.inputTokens + m.outputTokens;
+        var rowTotal = rowTotalTokens(m);
         return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
           { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
           { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
@@ -1870,7 +1886,7 @@
     // CSP (style-src 'self') blocks inline style attributes.
     function buildDayChart(rows) {
       var card = el('div', 'usage-card');
-      card.appendChild(el('div', 'usage-title', '每日用量（输入 + 输出）'));
+      card.appendChild(el('div', 'usage-title', '每日用量（有效输入 + 输出）'));
       var days = (Array.isArray(rows) ? rows : []).slice().sort(function (a, b) {
         return String(a.name) < String(b.name) ? -1 : String(a.name) > String(b.name) ? 1 : 0;
       });
@@ -1878,7 +1894,7 @@
         card.appendChild(noteEl('该周期暂无调用记录'));
         return card;
       }
-      var totals = days.map(function (d) { return (toNum(d.inputTokens) || 0) + (toNum(d.outputTokens) || 0); });
+      var totals = days.map(function (d) { return rowTotalTokens(d) || 0; });
       var max = Math.max.apply(null, totals);
       var bars = el('div', 'usage-bars');
       days.forEach(function (d, i) {
@@ -1904,19 +1920,19 @@
 
     function buildModelChart(models) {
       var card = el('div', 'usage-card');
-      card.appendChild(el('div', 'usage-title', '模型 Top 10（按输入 + 输出）'));
+      card.appendChild(el('div', 'usage-title', '模型 Top 10（按有效总量）'));
       if (!Array.isArray(models) || !models.length) {
         card.appendChild(noteEl('该周期暂无调用记录'));
         return card;
       }
       var max = 0;
       models.forEach(function (m) {
-        var t = (toNum(m.inputTokens) || 0) + (toNum(m.outputTokens) || 0);
+        var t = rowTotalTokens(m) || 0;
         if (t > max) max = t;
       });
       var list = el('div', 'usage-hbar');
       models.forEach(function (m) {
-        var total = (toNum(m.inputTokens) || 0) + (toNum(m.outputTokens) || 0);
+        var total = rowTotalTokens(m) || 0;
         // Visible bars floor at 1% so a tiny-but-nonzero total still renders.
         var pct = total > 0 && max > 0 ? Math.max(1, Math.round((total / max) * 1000) / 10) : 0;
         var row = el('div', 'usage-hbar-row');
