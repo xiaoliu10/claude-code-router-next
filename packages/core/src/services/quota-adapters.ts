@@ -866,11 +866,19 @@ class KimiCodingPlanQuotaAdapter extends BaseQuotaAdapter {
         const detail = limits[0].detail;
         const limit = parseOptionalNumber(detail.limit);
         const remaining = parseOptionalNumber(detail.remaining);
+        const used = parseOptionalNumber(detail.used);
         const resetTime = detail.resetTime;
 
-        if (limit !== undefined && remaining !== undefined) {
-          result.usedDailyBalance = Math.max(0, limit - remaining);
+        // Kimi may omit remaining for exhausted windows and provide used instead.
+        // Prefer explicit usage, as for the weekly window, and retain a known
+        // limit without inventing usage when both usage fields are absent.
+        if (limit !== undefined) {
           result.limitDaily = limit;
+          if (used !== undefined) {
+            result.usedDailyBalance = used;
+          } else if (remaining !== undefined) {
+            result.usedDailyBalance = Math.max(0, limit - remaining);
+          }
         }
         if (resetTime) {
           result.resetTime = new Date(resetTime).toISOString();
