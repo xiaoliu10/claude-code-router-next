@@ -46,13 +46,28 @@
     </nav>
 
     <section id="panel-quota" class="panel" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
-      <div class="heading"><h1>额度</h1><span id="provider-count" class="count">正在读取…</span></div>
+      <div class="panel-head">
+        <h1>额度</h1><span id="provider-count" class="count">正在读取…</span><span class="spacer"></span>
+        <button id="provider-add-open" class="btn" type="button" aria-expanded="false" aria-controls="provider-add-form">添加供应商</button>
+      </div>
       <p class="hint">读取服务端额度快照，不会重置任何额度。</p>
+      <form id="provider-add-form" class="provider-form card" aria-label="添加供应商" autocomplete="off" novalidate hidden>
+        <label>供应商名称<input id="provider-name" class="route-input" type="text" placeholder="example.com" required></label>
+        <label>API 地址<input id="provider-base-url" class="route-input" type="url" placeholder="https://example.com/v1/chat/completions" spellcheck="false" required></label>
+        <label>API 密钥<input id="provider-api-key" class="route-input" type="password" autocomplete="new-password" spellcheck="false" required></label>
+        <label>模型 ID（用换行或逗号分隔）<textarea id="provider-models" class="route-input" rows="2" spellcheck="false" required></textarea></label>
+        <div class="provider-form-actions">
+          <span id="provider-add-error" class="inline-msg" role="alert"></span>
+          <button id="provider-add-cancel" class="btn" type="button">取消</button>
+          <button id="provider-add-save" class="btn btn-primary" type="submit">保存</button>
+        </div>
+      </form>
+      <div id="provider-add-status" class="hint" role="status"></div>
       <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
       <ul id="list" class="list" aria-label="提供方额度列表" aria-busy="false" tabindex="0">
         <li id="empty" class="empty" hidden>
           <p class="empty-title">暂无已配置的提供方</p>
-          <p class="empty-note">在 config.json 中配置提供方后，这里会显示额度信息。</p>
+          <p class="empty-note">点击「添加供应商」配置 API 接入信息。</p>
         </li>
       </ul>
     </section>

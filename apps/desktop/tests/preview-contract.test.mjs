@@ -15,7 +15,7 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const js = readFileSync(path.join(here, "..", "src", "quota.js"), "utf8")
 const html = readFileSync(path.join(here, "..", "src", "quota.html"), "utf8")
 
-const sandbox = { setTimeout }
+const sandbox = { setTimeout, URL, TextEncoder }
 vm.createContext(sandbox)
 new vm.Script(js, { filename: "quota.js" }).runInContext(sandbox)
 const Q = sandbox.QuotaUI
@@ -170,6 +170,21 @@ test("preview: quota_snapshot keeps the existing quota contract", async () => {
   assert.ok(Array.isArray(s.providers) && s.providers.length > 0)
   assert.equal(typeof s.updatedAt, "number")
   assert.equal(typeof s.online, "boolean")
+})
+
+test("preview: provider_add returns only the name and updates safe quota and routing projections", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const provider = { name: 'example.com', baseUrl: 'https://example.com/v1', apiKey: 'test-key', models: ['one'] }
+  const added = await previewCall(invoke, 'provider_add', { provider })
+  assert.deepEqual(Object.keys(added), ['name'])
+  assert.equal(added.name, provider.name)
+  await assert.rejects(previewCall(invoke, 'provider_add', { provider: { ...provider, name: 'EXAMPLE.com' } }), /^(Error: )?PROVIDER_DUPLICATE$/)
+  await assert.rejects(previewCall(invoke, 'provider_add', { provider: { ...provider, models: [] } }), /PROVIDER_INVALID/)
+  const quota = await invoke('quota_snapshot', { provider: provider.name })
+  const routing = await invoke('routing_snapshot')
+  assert.equal(quota.providers.filter(p => p.name === provider.name).length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(routing.providers.at(-1))), { name: provider.name, models: ['one'] })
+  assert.doesNotMatch(JSON.stringify([added, quota, routing]), /test-key|https:\/\/example\.com/)
 })
 
 test("preview: routing_snapshot has the complete routing contract", async () => {

@@ -110,7 +110,7 @@ fn live(value: &Value) -> bool {
 }
 fn configured(config: &Value) -> Vec<ConfiguredProvider> {
     let mut seen = HashSet::new();
-    config["Providers"]
+    config[crate::api::provider_list_key(config)]
         .as_array()
         .into_iter()
         .flatten()

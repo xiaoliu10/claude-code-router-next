@@ -233,8 +233,17 @@
       return allPromise;
     }
 
-    function refreshProvider(name) {
-      if (!snapshot || loadingAll) return Promise.resolve();
+    function refreshProvider(name, newlyAdded) {
+      if (newlyAdded && loadingAll) return allPromise.then(function () { return refreshProvider(name, true); });
+      if ((!snapshot && !newlyAdded) || loadingAll) return Promise.resolve();
+      if (newlyAdded) {
+        // Earlier card snapshots predate the config change and can omit the new row.
+        flags.forEach(function (flag, key) {
+          if (!flag.loading) return;
+          seq.set(key, (seq.get(key) || 0) + 1);
+          flags.set(key, { loading: false, error: null });
+        });
+      }
       var f = flags.get(name);
       if (f && f.loading) return Promise.resolve();
       var my = (seq.get(name) || 0) + 1;
@@ -254,6 +263,25 @@
     return { subscribe: subscribe, state: state, refreshAll: refreshAll, refreshProvider: refreshProvider };
   }
 
+
+  function providerInputError(provider) {
+    function validText(value, maxBytes) {
+      return typeof value === 'string' && value.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+        && new TextEncoder().encode(value.trim()).length <= maxBytes;
+    }
+    function validId(value) { return validText(value, 256) && !value.includes(','); }
+    if (!provider || !validId(provider.name)) return 'name';
+    if (!validText(provider.baseUrl, 2048)) return 'baseUrl';
+    var endpoint = provider.baseUrl.trim();
+    var authority = /^https?:\/\/([^/?#]+)/i.exec(endpoint);
+    if (!authority || authority[1].includes('@') || /[\\#\s]/.test(endpoint)) return 'baseUrl';
+    try { if (!new URL(endpoint).hostname) return 'baseUrl'; } catch { return 'baseUrl'; }
+    if (!validText(provider.apiKey, 4096)) return 'apiKey';
+    var models = provider.models;
+    if (!Array.isArray(models) || !models.length || models.length > 256 || !models.every(validId)) return 'models';
+    if (new Set(models.map(function (m) { return m.trim(); })).size !== models.length) return 'models';
+    return null;
+  }
 
   // ---- Coding Plan quota credentials (quota tab) -------------------------
   // quota_credentials_status() / quota_credentials_save({name, accessKey?, secretKey?})
@@ -305,8 +333,17 @@
       if (openName !== null && !known(openName)) { openName = null; saveError = null; savedFlash = null; }
     }
 
-    function refresh() {
-      if (loading || saving) return;
+    var refreshQueued = false;
+    function drainRefresh() {
+      if (!refreshQueued || loading || saving) return;
+      refreshQueued = false;
+      refresh();
+    }
+    function refresh(afterConfigChange) {
+      if (loading || saving) {
+        if (afterConfigChange === true) refreshQueued = true;
+        return;
+      }
       loading = true;
       error = null;
       emit();
@@ -321,7 +358,7 @@
         loading = false;
         error = errorMessage(err);
         emit();
-      });
+      }).then(drainRefresh);
     }
 
     function open(name) {
@@ -362,7 +399,7 @@
         saving = false;
         saveError = errorMessage(err);
         emit();
-      });
+      }).then(drainRefresh);
     }
 
     function save(name, values) {
@@ -1280,6 +1317,7 @@
     function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
     function bump() { rev += 1; routing.revision = 'rev-' + rev; }
 
+    var addedQuotaProviders = [];
     function quotaSnapshot(now) {
       var h = function (n) { return new Date(now + n * 3600e3).toISOString(); };
       var all = [
@@ -1299,7 +1337,7 @@
           { label: '五小时', used: null, limit: null, remaining: null, unit: null, resetAt: null }] },
         { name: '火山agent plan', enabled: true, plan: null, status: 'unavailable', message: '未提供可用额度数据（来源未声明查询能力）', windows: [], updatedAt: null },
       ];
-      return { providers: all, updatedAt: now - 2e3, online: true, error: null };
+      return { providers: all.concat(copy(addedQuotaProviders)), updatedAt: now - 2e3, online: true, error: null };
     }
 
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
@@ -1308,6 +1346,18 @@
       if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
       if (cmd === 'quota_snapshot') {
         return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
+      }
+      if (cmd === 'provider_add') {
+        var provider = a.provider;
+        if (providerInputError(provider)) return Promise.reject(new Error('PROVIDER_INVALID'));
+        var name = provider.name.trim();
+        if (quotaSnapshot(Date.now()).providers.some(function (p) { return p.name.toLowerCase() === name.toLowerCase(); })) {
+          return Promise.reject(new Error('PROVIDER_DUPLICATE'));
+        }
+        routing.providers.push({ name: name, models: provider.models.map(function (m) { return m.trim(); }) });
+        addedQuotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
+        bump();
+        return delay({ name: name });
       }
       if (cmd === 'routing_snapshot') return delay(copy(routing));
       if (cmd === 'routing_save') {
@@ -1560,6 +1610,103 @@
     var meta = describeWindow(win);
     if (meta) li.appendChild(el('div', 'window-meta', meta));
     return li;
+  }
+
+  function mountProviderForm(invoke, onSaved) {
+    var open = document.getElementById('provider-add-open');
+    var form = document.getElementById('provider-add-form');
+    var cancel = document.getElementById('provider-add-cancel');
+    var save = document.getElementById('provider-add-save');
+    var error = document.getElementById('provider-add-error');
+    var status = document.getElementById('provider-add-status');
+    var fields = {
+      name: document.getElementById('provider-name'), baseUrl: document.getElementById('provider-base-url'),
+      apiKey: document.getElementById('provider-api-key'), models: document.getElementById('provider-models'),
+    };
+    var invalidMessages = {
+      name: '请输入供应商名称，不能包含逗号或控制字符。',
+      baseUrl: '请输入完整的 HTTP 或 HTTPS 地址，不能包含账号、密码或片段。',
+      apiKey: '请输入有效的 API 密钥。', models: '请输入 1 至 256 个有效的模型 ID。',
+    };
+    var saving = false;
+
+    function close(restoreFocus) {
+      if (form.hidden) return;
+      Object.values(fields).forEach(function (field) { field.value = ''; });
+      error.textContent = '';
+      form.hidden = true;
+      open.setAttribute('aria-expanded', 'false');
+      if (restoreFocus) open.focus();
+    }
+    function setSaving(busy) {
+      saving = busy;
+      Object.values(fields).forEach(function (field) { field.disabled = busy; });
+      form.setAttribute('aria-busy', String(busy));
+      open.disabled = !invoke || busy;
+      cancel.disabled = save.disabled = busy;
+      save.textContent = busy ? '正在保存…' : '保存';
+    }
+    open.disabled = !invoke;
+    open.addEventListener('click', function () {
+      if (!form.hidden) { close(true); return; }
+      status.textContent = '';
+      form.hidden = false;
+      open.setAttribute('aria-expanded', 'true');
+      fields.name.focus();
+    });
+    cancel.addEventListener('click', function () { close(true); });
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      if (!invoke || saving || form.hidden) return;
+      var models = fields.models.value.split(/[\r\n,]/).map(function (m) { return m.trim(); }).filter(Boolean);
+      var provider = {
+        name: fields.name.value.trim(), baseUrl: fields.baseUrl.value.trim(),
+        apiKey: fields.apiKey.value.trim(), models: Array.from(new Set(models)),
+      };
+      var invalid = providerInputError(provider);
+      if (invalid) {
+        error.textContent = invalidMessages[invalid];
+        fields[invalid].focus();
+        return;
+      }
+      error.textContent = '';
+      setSaving(true);
+      var name = provider.name;
+      var saved;
+      try {
+        var request = invoke('provider_add', { provider: provider });
+        provider = null;
+        saved = await request;
+        if (!saved || saved.name !== name) throw new Error();
+      } catch (err) {
+        setSaving(false);
+        var code = typeof err === 'string' ? err : err && err.message;
+        var duplicate = code === 'PROVIDER_DUPLICATE';
+        var message = duplicate ? '供应商名称已存在，请使用其他名称。' : '添加供应商失败，请检查输入后重试。';
+        if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
+        if (form.hidden) status.textContent = message;
+        else {
+          error.textContent = message;
+          (duplicate ? fields.name : save).focus();
+        }
+        return;
+      }
+      setSaving(false);
+      close(true);
+      status.textContent = '供应商已添加。';
+      onSaved(saved.name);
+    });
+    // A tray window can be hidden and reused without unloading its document.
+    window.addEventListener('blur', function () { fields.apiKey.value = ''; });
+    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') close(false); });
+    return {
+      close: close,
+      escape: function () {
+        if (form.hidden) return false;
+        if (!saving) close(true);
+        return true;
+      },
+    };
   }
 
   function detectTauri() {
@@ -2515,6 +2662,20 @@
     });
     var activeTab = 'quota';
     var loadedTabs = { quota: true };
+    var providerForm = mountProviderForm(invoke, function (name) {
+      controller.refreshProvider(name, true);
+      credentialsCtrl.refresh(true);
+      if (!loadedTabs.routing) return;
+      // A snapshot taken before the addition can still be in flight. Wait for
+      // the current routing read/write to finish so its result cannot win.
+      function busy(s) { return s.loading || s.savingKey || s.flagsSaving; }
+      if (!busy(routingCtrl.state())) { routingCtrl.refresh(); return; }
+      var unsubscribe = routingCtrl.subscribe(function (s) {
+        if (busy(s)) return;
+        unsubscribe();
+        routingCtrl.refresh();
+      });
+    });
 
     function maybeLoadTab(name) {
       if (mode === 'missing' || loadedTabs[name]) return;
@@ -2527,6 +2688,7 @@
 
     function selectTab(name) {
       if (TAB_IDS.indexOf(name) === -1) return;
+      if (name !== 'quota') providerForm.close(false);
       activeTab = name;
       TAB_IDS.forEach(function (id) {
         var on = id === name;
@@ -2666,7 +2828,10 @@
     els.openUi.addEventListener('click', function () { safeCommand('quota_open_ui'); });
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') safeCommand('quota_hide');
+      if (event.key === 'Escape' && !event.isComposing) {
+        if (providerForm.escape()) event.preventDefault();
+        else safeCommand('quota_hide');
+      }
     });
     // Focus refreshes service status and quota data only; route drafts and
     // usage/client state must survive native select popups and tab changes.
