@@ -11,8 +11,8 @@
 //!   two legitimately differ. `updateAvailable` is computed by the route with
 //!   semver `valid` + `gt`; a registry outage degrades to an empty list plus
 //!   `warning:"registry_unavailable"` (never a 500).
-//! - POST /api/plugins/install  the same validated install core as the CLI
-//!   (`{name, force}`; force is the update/replace lane). Confirms with
+//! - POST /api/plugins/install-pinned  verifies the confirmed npm release and
+//!   previous install under the gateway install lock. Confirms with
 //!   `{ok:true, name, version, restartRequired:true}`. Nothing hot-loads and
 //!   this module NEVER restarts the gateway — the user decides via the
 //!   existing service controls.
@@ -61,6 +61,8 @@ const MAX_DESCRIPTION_LENGTH: usize = 4096;
 /// npm pack alone is bounded to 30s server-side; allow the full validated
 /// install (pack + archive checks + atomic swap) to finish before giving up.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Catalog searches run in parallel with a 30-second gateway budget.
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(35);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ============================== IPC projections ==============================
@@ -105,6 +107,8 @@ pub struct PluginCatalogEntry {
     /// On-disk installed manifest version — may differ from the ACTIVE
     /// manifest version in the inventory until the gateway restarts.
     pub installed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_name: Option<String>,
     pub update_available: bool,
     pub local_only: bool,
 }
@@ -125,8 +129,47 @@ pub struct InstallOutcome {
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
-pub struct ActionOutcome {
-    pub success: bool,
+#[serde(untagged)]
+pub enum ActionOutcome {
+    Completed { success: bool },
+    Usage { usage: UsageOutcome },
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageOutcome {
+    Fresh,
+    Stale,
+    Unavailable,
+}
+
+fn usage_outcome(id: &str, reply: &Value) -> UsageOutcome {
+    use UsageOutcome::*;
+    let available = match id {
+        "kiro" | "cursor" | "grok" if reply["known"] == true => match reply["stale"].as_bool() {
+            Some(true) => return Stale,
+            Some(false) => true,
+            None => false,
+        },
+        "workbuddy" => reply["usage"]["used"].is_number() && reply["usage"]["limit"].is_number(),
+        "codex" => ["primary", "secondary"]
+            .iter()
+            .any(|window| reply[*window]["usedPercent"].is_number()),
+        "gemini-oauth" => {
+            reply["pools"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["remaining"].is_number()))
+                || reply["models"]
+                    .as_object()
+                    .is_some_and(|rows| rows.values().any(|row| row["remaining"].is_number()))
+        }
+        _ => false,
+    };
+    if available {
+        Fresh
+    } else {
+        Unavailable
+    }
 }
 
 // ============================== Name allowlists ==============================
@@ -359,6 +402,10 @@ fn catalog_from(response: &Value) -> Result<PluginCatalog, &'static str> {
             version: version.to_owned(),
             installed,
             installed_version,
+            installed_name: entry["installedName"]
+                .as_str()
+                .filter(|id| valid_plugin_name(id))
+                .map(str::to_owned),
             update_available: entry["updateAvailable"] == json!(true),
             local_only: entry["localOnly"] == json!(true),
         });
@@ -457,7 +504,10 @@ impl PluginsService {
     async fn catalog(&self) -> Result<PluginCatalog, &'static str> {
         let client = self.client.as_ref().ok_or(ERR_UNAVAILABLE)?;
         let response = client
-            .get_json("/api/plugins/catalog")
+            .request_with_timeout(Method::GET, "/api/plugins/catalog", None, CATALOG_TIMEOUT)
+            .await
+            .map_err(|_| ERR_REGISTRY)?
+            .json()
             .await
             .map_err(|_| ERR_REGISTRY)?;
         catalog_from(&response)
@@ -466,7 +516,8 @@ impl PluginsService {
     async fn install(
         &self,
         name: Option<Value>,
-        update: Option<Value>,
+        version: Option<Value>,
+        installed: Option<Value>,
     ) -> Result<InstallOutcome, &'static str> {
         let Some(Value::String(name)) = name else {
             return Err(ERR_INVALID);
@@ -474,10 +525,21 @@ impl PluginsService {
         if !valid_npm_name(&name) {
             return Err(ERR_INVALID);
         }
-        let update = match update {
-            None | Some(Value::Null) => false,
-            Some(Value::Bool(update)) => update,
-            Some(_) => return Err(ERR_INVALID),
+        let Some(Value::String(version)) = version else {
+            return Err(ERR_INVALID);
+        };
+        let latest = semver::Version::parse(&version).map_err(|_| ERR_INVALID)?;
+        let installed = installed.unwrap_or(Value::Null);
+        let previous = if installed.is_null() {
+            None
+        } else {
+            let id = installed["name"]
+                .as_str()
+                .filter(|id| valid_plugin_name(id))
+                .ok_or(ERR_INVALID)?;
+            let version = installed["version"].as_str().ok_or(ERR_INVALID)?;
+            let current = semver::Version::parse(version).map_err(|_| ERR_INVALID)?;
+            Some((id, version, current))
         };
         let client = self.client.as_ref().ok_or(ERR_UNAVAILABLE)?;
         let _write = client.write_guard().await;
@@ -493,46 +555,40 @@ impl PluginsService {
             .iter()
             .find(|entry| entry.name == name)
             .ok_or(ERR_NOT_LISTED)?;
-        // Fail closed when the offered version is not a valid semantic version
-        // (the route's own updateAvailable uses semver valid + gt).
-        let latest = semver::Version::parse(&entry.version).map_err(|_| ERR_REGISTRY)?;
-        if update {
-            let current = entry
-                .installed_version
-                .as_deref()
-                .and_then(|version| semver::Version::parse(version).ok())
-                .ok_or(ERR_NO_UPDATE)?;
-            // Independently re-check the upgrade direction: a stale or lying
-            // catalog must never turn the update lane into a downgrade.
-            if !entry.installed || !entry.update_available || latest <= current {
+        if entry.version != version || entry.local_only {
+            return Err(ERR_REGISTRY);
+        }
+        if let Some((id, previous_version, current)) = &previous {
+            if !entry.installed
+                || !entry.update_available
+                || !latest.cmp_precedence(current).is_gt()
+                || entry.installed_name.as_deref() != Some(*id)
+                || entry.installed_version.as_deref() != Some(*previous_version)
+            {
                 return Err(ERR_NO_UPDATE);
             }
         } else if entry.installed {
             return Err(ERR_ALREADY_INSTALLED);
         }
-        // force is the documented update/replace lane (same staged atomic
-        // swap); a plain install never forces over an existing directory.
-        let body = json!({"name": name, "force": update});
+        let expected = previous
+            .as_ref()
+            .map(|(name, version, _)| json!({"name":name,"version":version}));
+        let body = json!({"name": name, "version": version, "installed": expected});
         let response = client
             .request_with_timeout(
                 Method::POST,
-                "/api/plugins/install",
+                "/api/plugins/install-pinned",
                 Some(&body),
                 INSTALL_TIMEOUT,
             )
             .await
             .map_err(|_| ERR_INSTALL)?;
         let confirmed: Value = response.json().await.map_err(|_| ERR_INSTALL)?;
-        // The route confirms with the VALIDATED manifest name/version and an
-        // explicit restartRequired:true. The manifest id may differ from the
-        // npm name, and the registry search index may lag the packed latest
-        // version, so confirmation checks shape, not equality with the catalog.
         if confirmed["ok"] != json!(true)
             || confirmed["restartRequired"] != json!(true)
             || !confirmed["name"].as_str().is_some_and(valid_plugin_name)
-            || !confirmed["version"]
-                .as_str()
-                .is_some_and(|version| semver::Version::parse(version).is_ok())
+            || confirmed["version"] != version
+            || previous.is_some_and(|(id, _, _)| confirmed["name"] != id)
         {
             return Err(ERR_INSTALL);
         }
@@ -588,7 +644,12 @@ impl PluginsService {
         if !ok {
             return Err(ERR_ACTION);
         }
-        Ok(ActionOutcome { success: true })
+        if action == "usage" {
+            return Ok(ActionOutcome::Usage {
+                usage: usage_outcome(&id, &confirmed),
+            });
+        }
+        Ok(ActionOutcome::Completed { success: true })
     }
 }
 
@@ -617,10 +678,14 @@ pub async fn plugin_install(
     window: WebviewWindow,
     service: tauri::State<'_, PluginsService>,
     name: Option<Value>,
-    update: Option<Value>,
+    version: Option<Value>,
+    installed: Option<Value>,
 ) -> Result<InstallOutcome, String> {
     crate::popup::guard(&window)?;
-    service.install(name, update).await.map_err(str::to_owned)
+    service
+        .install(name, version, installed)
+        .await
+        .map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -864,6 +929,27 @@ mod tests {
     // ------------------------------ catalog ------------------------------
 
     #[tokio::test]
+    async fn slow_catalog_can_deliver_the_registry_warning() {
+        assert!(
+            CATALOG_TIMEOUT > Duration::from_secs(30) && CATALOG_TIMEOUT <= Duration::from_secs(60)
+        );
+        let mock = Mock::delayed(
+            vec![response(
+                json!({"ok":true,"warning":"registry_unavailable","plugins":[]}),
+            )],
+            Duration::from_millis(5200),
+        );
+        assert!(
+            PluginsService::new(Some(mock.client()))
+                .catalog()
+                .await
+                .unwrap()
+                .partial
+        );
+        mock.finish().await;
+    }
+
+    #[tokio::test]
     async fn catalog_projects_installed_manifest_version_and_upgrade_flags() {
         let mut outdated = catalog_entry("@wengine-ai/ccr-provider-codex", "1.1.0", true);
         outdated["installedVersion"] = json!("1.0.0");
@@ -950,7 +1036,7 @@ mod tests {
     // ------------------------------ install ------------------------------
 
     #[tokio::test]
-    async fn install_validates_names_and_update_flag_before_any_request() {
+    async fn install_validates_name_version_and_previous_target_before_any_request() {
         let mock = Mock::new(vec![]);
         let service = PluginsService::new(Some(mock.client()));
         for name in [
@@ -968,12 +1054,32 @@ mod tests {
             Some(json!("@/pkg")),
             Some(json!("a".repeat(215))),
         ] {
-            assert_eq!(service.install(name, None).await.unwrap_err(), ERR_INVALID);
-        }
-        for update in [json!("true"), json!(1), json!({})] {
             assert_eq!(
                 service
-                    .install(Some(json!("pkg")), Some(update))
+                    .install(name, Some(json!("1.2.3")), None)
+                    .await
+                    .unwrap_err(),
+                ERR_INVALID
+            );
+        }
+        for version in [
+            None,
+            Some(json!("latest")),
+            Some(json!("^1.2.3")),
+            Some(json!(17)),
+        ] {
+            assert_eq!(
+                service
+                    .install(Some(json!("pkg")), version, None)
+                    .await
+                    .unwrap_err(),
+                ERR_INVALID
+            );
+        }
+        for previous in [json!("true"), json!(1), json!({})] {
+            assert_eq!(
+                service
+                    .install(Some(json!("pkg")), Some(json!("1.2.3")), Some(previous))
                     .await
                     .unwrap_err(),
                 ERR_INVALID
@@ -982,7 +1088,7 @@ mod tests {
         assert!(mock.finish().await.is_empty());
         assert_eq!(
             PluginsService::new(None)
-                .install(Some(json!("pkg")), None)
+                .install(Some(json!("pkg")), Some(json!("1.2.3")), None)
                 .await
                 .unwrap_err(),
             ERR_UNAVAILABLE
@@ -1011,7 +1117,7 @@ mod tests {
             let mock = Mock::new(vec![response(reply)]);
             assert_eq!(
                 PluginsService::new(Some(mock.client()))
-                    .install(Some(json!("pkg")), None)
+                    .install(Some(json!("pkg")), Some(json!("1.2.3")), None)
                     .await
                     .unwrap_err(),
                 error
@@ -1023,7 +1129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_install_posts_unforced_and_requires_full_confirmation() {
+    async fn plain_install_posts_a_pin_and_requires_full_confirmation() {
         let mock = Mock::new(vec![
             response(catalog(vec![catalog_entry("@scope/pkg", "1.2.3", false)])),
             response(
@@ -1031,7 +1137,7 @@ mod tests {
             ),
         ]);
         let outcome = PluginsService::new(Some(mock.client()))
-            .install(Some(json!("@scope/pkg")), Some(json!(false)))
+            .install(Some(json!("@scope/pkg")), Some(json!("1.2.3")), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1040,10 +1146,10 @@ mod tests {
         );
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].starts_with("POST /api/plugins/install "));
+        assert!(requests[1].starts_with("POST /api/plugins/install-pinned "));
         assert_eq!(
             serde_json::from_str::<Value>(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap(),
-            json!({"name": "@scope/pkg", "force": false})
+            json!({"name": "@scope/pkg", "version": "1.2.3", "installed": null})
         );
         // Missing/false confirmation fields are failures, never a silent success.
         for confirmed in [
@@ -1051,7 +1157,7 @@ mod tests {
             json!({"ok": true, "name": "pkg", "version": "1.2.3"}),
             json!({"ok": true, "name": "pkg", "version": "1.2.3", "restartRequired": false}),
             json!({"ok": true, "name": "../escape", "version": "1.2.3", "restartRequired": true}),
-            json!({"ok": true, "name": "pkg", "version": "junk", "restartRequired": true}),
+            json!({"ok": true, "name": "pkg", "version": "1.2.0", "restartRequired": true}),
         ] {
             let mock = Mock::new(vec![
                 response(catalog(vec![catalog_entry("pkg", "1.2.3", false)])),
@@ -1059,20 +1165,24 @@ mod tests {
             ]);
             assert_eq!(
                 PluginsService::new(Some(mock.client()))
-                    .install(Some(json!("pkg")), None)
+                    .install(Some(json!("pkg")), Some(json!("1.2.3")), None)
                     .await
                     .unwrap_err(),
                 ERR_INSTALL
             );
             assert_eq!(mock.finish().await.len(), 2);
         }
-        for reply in [(500, "LEAK_SECRET".into()), (200, "bad LEAK_SECRET".into())] {
+        for reply in [
+            (404, "old gateway".into()),
+            (500, "LEAK_SECRET".into()),
+            (200, "bad LEAK_SECRET".into()),
+        ] {
             let mock = Mock::new(vec![
                 response(catalog(vec![catalog_entry("pkg", "1.2.3", false)])),
                 reply,
             ]);
             let error = PluginsService::new(Some(mock.client()))
-                .install(Some(json!("pkg")), None)
+                .install(Some(json!("pkg")), Some(json!("1.2.3")), None)
                 .await
                 .unwrap_err();
             assert_eq!(error, ERR_INSTALL);
@@ -1088,7 +1198,7 @@ mod tests {
         )]))]);
         assert_eq!(
             PluginsService::new(Some(mock.client()))
-                .install(Some(json!("pkg")), None)
+                .install(Some(json!("pkg")), Some(json!("1.2.3")), None)
                 .await
                 .unwrap_err(),
             ERR_ALREADY_INSTALLED
@@ -1097,8 +1207,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_requires_a_validated_upgrade_and_posts_force() {
+    async fn update_posts_confirmed_version_and_previous_target() {
         let mut upgradable = catalog_entry("pkg", "1.3.0", true);
+        upgradable["installedName"] = json!("pkg");
         upgradable["installedVersion"] = json!("1.2.0");
         upgradable["updateAvailable"] = json!(true);
         let mock = Mock::new(vec![
@@ -1108,7 +1219,11 @@ mod tests {
             ),
         ]);
         let outcome = PluginsService::new(Some(mock.client()))
-            .install(Some(json!("pkg")), Some(json!(true)))
+            .install(
+                Some(json!("pkg")),
+                Some(json!("1.3.0")),
+                Some(json!({"name":"pkg","version":"1.2.0"})),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1118,7 +1233,7 @@ mod tests {
         let requests = mock.finish().await;
         assert_eq!(
             serde_json::from_str::<Value>(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap(),
-            json!({"name": "pkg", "force": true})
+            json!({"name": "pkg", "version": "1.3.0", "installed": {"name":"pkg", "version":"1.2.0"}})
         );
         // Every unvalidatable upgrade shape fails closed before any POST.
         let mut downgrade = upgradable.clone();
@@ -1133,7 +1248,10 @@ mod tests {
         bad_installed_version["installedVersion"] = json!("junk");
         let mut equal = upgradable.clone();
         equal["version"] = json!("1.2.0");
+        let mut build_only = upgradable.clone();
+        build_only["version"] = json!("1.2.0+new");
         for entry in [
+            build_only,
             downgrade,
             not_installed,
             no_flag,
@@ -1141,16 +1259,61 @@ mod tests {
             bad_installed_version,
             equal,
         ] {
+            let approved = entry["version"].clone();
             let mock = Mock::new(vec![response(catalog(vec![entry]))]);
             assert_eq!(
                 PluginsService::new(Some(mock.client()))
-                    .install(Some(json!("pkg")), Some(json!(true)))
+                    .install(
+                        Some(json!("pkg")),
+                        Some(approved),
+                        Some(json!({"name":"pkg","version":"1.2.0"}))
+                    )
                     .await
                     .unwrap_err(),
                 ERR_NO_UPDATE
             );
             assert_eq!(mock.finish().await.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn catalog_change_or_legacy_gateway_cannot_replace_a_plugin() {
+        let previous = json!({"name":"plugin", "version":"1.0.0"});
+        let mut row = catalog_entry("@scope/pkg", "2.0.0", true);
+        row["installedName"] = json!("plugin");
+        row["updateAvailable"] = json!(true);
+        for (field, changed) in [
+            ("version", json!("2.1.0")),
+            ("installedName", Value::Null),
+            ("installedName", json!("another")),
+            ("installedVersion", json!("1.1.0")),
+        ] {
+            let mut entry = row.clone();
+            entry[field] = changed;
+            let mock = Mock::new(vec![response(catalog(vec![entry]))]);
+            assert!(PluginsService::new(Some(mock.client()))
+                .install(
+                    Some(json!("@scope/pkg")),
+                    Some(json!("2.0.0")),
+                    Some(previous.clone())
+                )
+                .await
+                .is_err());
+            assert_eq!(mock.finish().await.len(), 1);
+        }
+        let mock = Mock::new(vec![
+            response(catalog(vec![row])),
+            response(json!({"ok":true,"name":"another","version":"2.0.0","restartRequired":true})),
+        ]);
+        assert!(PluginsService::new(Some(mock.client()))
+            .install(
+                Some(json!("@scope/pkg")),
+                Some(json!("2.0.0")),
+                Some(previous)
+            )
+            .await
+            .is_err());
+        assert_eq!(mock.finish().await.len(), 2);
     }
 
     #[tokio::test]
@@ -1164,7 +1327,7 @@ mod tests {
         let client = mock.client();
         let service = PluginsService::new(Some(client.clone()));
         let guard = client.write_guard().await;
-        let install = service.install(Some(json!("pkg")), None);
+        let install = service.install(Some(json!("pkg")), Some(json!("1.2.3")), None);
         tokio::pin!(install);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut install)
@@ -1313,7 +1476,7 @@ mod tests {
                 "usage",
                 "POST /api/kiro/usage ",
                 Some("{}"),
-                json!({"known": true, "windows": []}),
+                json!({"known": true, "stale": false, "windows": []}),
             ),
             (
                 "grok",
@@ -1327,7 +1490,7 @@ mod tests {
                 "usage",
                 "POST /api/grok/usage ",
                 Some("{}"),
-                json!({"known": true}),
+                json!({"known": true,"stale":true}),
             ),
             (
                 "grok",
@@ -1367,10 +1530,13 @@ mod tests {
                 .action(Some(json!(id)), Some(json!(action)))
                 .await
                 .unwrap_or_else(|error| panic!("{id}/{action}: {error}"));
-            assert_eq!(
-                serde_json::to_value(outcome).unwrap(),
-                json!({"success": true})
-            );
+            let expected = match (*id, *action) {
+                ("grok", "usage") => json!({"usage":"stale"}),
+                ("kiro", "usage") => json!({"usage":"fresh"}),
+                (_, "usage") => json!({"usage":"unavailable"}),
+                _ => json!({"success":true}),
+            };
+            assert_eq!(serde_json::to_value(outcome).unwrap(), expected);
             let requests = mock.finish().await;
             assert_eq!(requests.len(), 2);
             assert!(requests[0].starts_with("GET /api/plugins "));
@@ -1387,6 +1553,32 @@ mod tests {
             assert!(requests.iter().all(|request| request
                 .to_lowercase()
                 .contains("x-api-key: test-admin-key\r\n")));
+        }
+    }
+
+    #[test]
+    fn usage_responses_distinguish_readings_from_stale_or_missing_data() {
+        use UsageOutcome::*;
+        for (id, body, outcome) in [
+            ("grok", json!({"known":false,"stale":false}), Unavailable),
+            ("grok", json!({"known":true,"stale":true}), Stale),
+            ("grok", json!({"known":true,"stale":false}), Fresh),
+            ("workbuddy", json!({"ok":true,"usage":null}), Unavailable),
+            (
+                "workbuddy",
+                json!({"ok":true,"usage":{"used":0,"limit":100}}),
+                Fresh,
+            ),
+            ("codex", json!({"plan":"pro"}), Unavailable),
+            ("codex", json!({"secondary":{"usedPercent":0}}), Fresh),
+            ("gemini-oauth", json!({"models":{},"pools":[]}), Unavailable),
+            (
+                "gemini-oauth",
+                json!({"models":{"some-model":{"remaining":1}},"pools":[]}),
+                Fresh,
+            ),
+        ] {
+            assert_eq!(usage_outcome(id, &body), outcome);
         }
     }
 

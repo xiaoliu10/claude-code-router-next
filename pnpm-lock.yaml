@@ -408,6 +408,9 @@ importers:
       json5:
         specifier: ^2.2.3
         version: 2.2.3
+      semver:
+        specifier: ^7.8.6
+        version: 7.8.6
     devDependencies:
       '@types/adm-zip':
         specifier: ^0.5.7
@@ -418,6 +421,9 @@ importers:
       '@types/node':
         specifier: ^24.0.15
         version: 24.7.0
+      '@types/semver':
+        specifier: ^7.8.0
+        version: 7.8.0
       esbuild:
         specifier: ^0.25.1
         version: 0.25.10

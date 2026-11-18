@@ -9,7 +9,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 const pluginCalls = h => h.calls.filter(({ cmd }) => cmd === 'plugin_install' || cmd === 'plugin_action')
-  .map(({ cmd, args }) => [cmd, { ...args }]);
+  .map(({ cmd, args }) => [cmd, structuredClone(args)]);
 const serviceCalls = h => h.calls.filter(({ cmd }) => cmd === 'service_action').map(({ args }) => args.action);
 const cards = h => h.id('plugins-list').querySelectorAll('.card');
 const buttons = h => h.id('plugins-list').querySelectorAll('button');
@@ -21,7 +21,7 @@ const inventory = () => ({ plugins: [
 ] });
 const catalog = () => ({ partial: true, plugins: [
   { name: '@example/new', description: '<script>demo()</script>', version: '2.0.0', installed: false, installedVersion: null, updateAvailable: false, localOnly: false },
-  { name: '@example/update', description: '', version: '3.0.0', installed: true, installedVersion: '2.0.0', updateAvailable: true, localOnly: false },
+  { name: '@example/update', description: '', version: '3.0.0', installed: true, installedVersion: '2.0.0', installedName: 'update', updateAvailable: true, localOnly: false },
   { name: 'local', description: '', version: '0.4.0', installed: true, installedVersion: '0.4.0', updateAvailable: true, localOnly: true },
   { name: '/tmp/never', description: '', version: '0.4.0', installed: false, installedVersion: null, updateAvailable: false, localOnly: false },
 ] });
@@ -79,6 +79,30 @@ test('plugins: lazy mounted tab and advertised actions use manifest ID with expl
   assert.equal(disconnect.disabled, false);
 });
 
+test('plugins: confirmed disconnect refreshes the connection indicator while the plugin stays loaded', async () => {
+  const data = inventory();
+  const h = harness({ plugin_inventory: () => data, plugin_action: () => {
+    data.plugins[0].connectionState = 'disconnected';
+    return { success: true };
+  } });
+  await open(h);
+  assert.match(cards(h)[0].textContent, /连接状态：已连接/);
+  confirm(h, '断开连接', 'Codex <img src=x>'); await flush();
+  assert.match(cards(h)[0].textContent, /已加载版本：1\.0\.0.*连接状态：未连接/);
+});
+
+test('plugins: usage feedback distinguishes current, cached, and unavailable readings', async () => {
+  let reply;
+  const h = harness({ plugin_inventory: inventory, plugin_action: () => reply });
+  await open(h);
+  for (const [outcome, message] of [['fresh', /已获取当前用量/], ['stale', /仅有上次读取/], ['unavailable', /暂无可用/]]) {
+    reply = { usage: outcome, raw: 'private-result' };
+    button(h, '刷新用量 Codex <img src=x>').click(); await flush();
+    assert.match(h.id('plugins-feedback').textContent, message);
+    assert.doesNotMatch(h.id('panel-plugins').textContent, /private-result/);
+  }
+});
+
 test('plugins: reads recover from fixed errors and distinguish successful empty and partial states', async () => {
   const reading = deferred();
   let first = true;
@@ -119,7 +143,7 @@ test('plugins: market install and update use names, preserve partial results and
   const market = catalog();
   const h = harness({ plugin_inventory: inventory, plugin_catalog: () => market,
     plugin_install: args => {
-      if (args.update) throw new Error('private-upstream-detail');
+      if (args.installed) throw new Error('private-upstream-detail');
       return install.promise;
     },
   });
@@ -131,6 +155,7 @@ test('plugins: market install and update use names, preserve partial results and
   assert.match(cards(h)[2].textContent, /仅本地/);
   assert.deepEqual(buttons(h).map(node => node.textContent), ['安装', '更新']);
   button(h, '安装 @example/new').click();
+  assert.match(h.id('plugins-confirm-text').textContent, /@example\/new@2\.0\.0/);
   h.id('plugins-cancel').click();
   assert.deepEqual(pluginCalls(h), []);
   confirm(h, '安装', '@example/new');
@@ -141,7 +166,7 @@ test('plugins: market install and update use names, preserve partial results and
   market.plugins[0].installedVersion = '2.0.0';
   install.resolve({ restartRequired: true });
   await flush();
-  assert.deepEqual(pluginCalls(h), [['plugin_install', { name: '@example/new', update: false }]]);
+  assert.deepEqual(pluginCalls(h), [['plugin_install', { name: '@example/new', version: '2.0.0', installed: null }]]);
   assert.deepEqual(serviceCalls(h), []);
   assert.match(h.id('plugins-restart').textContent, /1 个插件变更待激活.*外部网关.*手动重启/);
   assert.match(cards(h)[0].textContent, /已安装 · 待激活/);
@@ -150,7 +175,7 @@ test('plugins: market install and update use names, preserve partial results and
   assert.equal(button(h, '安装 @example/new'), undefined);
   confirm(h, '更新', '@example/update');
   await flush();
-  assert.deepEqual(pluginCalls(h).at(-1), ['plugin_install', { name: '@example/update', update: true }]);
+  assert.deepEqual(pluginCalls(h).at(-1), ['plugin_install', { name: '@example/update', version: '3.0.0', installed: { name: 'update', version: '2.0.0' } }]);
   assert.match(h.id('plugins-read-status').textContent, /无法确认更新结果.*刷新/);
   assert.doesNotMatch(h.id('panel-plugins').textContent, /private-upstream-detail/);
   assert.match(h.id('plugins-restart').textContent, /外部网关/);

@@ -399,18 +399,18 @@ test("preview: plugin DTOs model partial catalog, install/update, safe actions a
   const catalog = await previewCall(invoke, "plugin_catalog")
   assert.equal(catalog.partial, true)
   for (const row of catalog.plugins) {
-    assert.deepEqual(Object.keys(row), ["name", "description", "version", "installed", "installedVersion", "updateAvailable", "localOnly"])
+    assert.deepEqual(Object.keys(row), ["name", "description", "version", "installed", "installedVersion", ...(row.installed && !row.localOnly ? ["installedName"] : []), "updateAvailable", "localOnly"])
   }
   const offer = catalog.plugins.find(row => !row.installed)
   const update = catalog.plugins.find(row => row.updateAvailable)
-  await assert.rejects(previewCall(invoke, "plugin_install", { name: catalog.plugins.find(row => row.localOnly).name, update: true }), /PLUGIN_INSTALL_FAILED/)
+  await assert.rejects(previewCall(invoke, "plugin_install", { name: catalog.plugins.find(row => row.localOnly).name, version: "0.1.0", installed: { name: "local-example", version: "0.1.0" } }), /PLUGIN_INSTALL_FAILED/)
   await assert.rejects(previewCall(invoke, "plugin_action", { id: "workbuddy", action: "disconnect" }), /PLUGIN_ACTION_FAILED/)
   const usage = await previewCall(invoke, "plugin_action", { id: "codex", action: "usage" })
-  assert.deepEqual({ ...usage }, { success: true })
+  assert.deepEqual({ ...usage }, { usage: "fresh" })
   const disconnected = await previewCall(invoke, "plugin_action", { id: "codex", action: "disconnect" })
   assert.deepEqual({ ...disconnected }, { success: true })
   for (const [row, isUpdate] of [[offer, false], [update, true]]) {
-    const result = await previewCall(invoke, "plugin_install", { name: row.name, update: isUpdate })
+    const result = await previewCall(invoke, "plugin_install", { name: row.name, version: row.version, installed: isUpdate ? { name: row.installedName, version: row.installedVersion } : null })
     assert.deepEqual({ ...result }, { restartRequired: true })
   }
   const installed = await previewCall(invoke, "plugin_catalog")

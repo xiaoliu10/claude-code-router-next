@@ -444,6 +444,10 @@ pub(crate) mod mock {
 
     impl Mock {
         pub(crate) fn new(replies: Vec<(u16, String)>) -> Self {
+            Self::delayed(replies, Duration::ZERO)
+        }
+
+        pub(crate) fn delayed(replies: Vec<(u16, String)>, delay: Duration) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -512,6 +516,7 @@ pub(crate) mod mock {
                         .lock()
                         .unwrap()
                         .push(String::from_utf8(bytes).unwrap());
+                    thread::sleep(delay);
                     let redirect = if status == 302 {
                         format!(
                             "Location: http://{}/unexpected\r\n",

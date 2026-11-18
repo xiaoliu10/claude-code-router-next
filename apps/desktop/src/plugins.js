@@ -35,7 +35,8 @@
         return {
           name: row.name, description: text(row.description), version: text(row.version),
           installed: row.installed === true || row.localOnly === true, installedVersion: text(row.installedVersion),
-          updateAvailable: row.updateAvailable === true && row.installed === true && row.localOnly !== true,
+          installedName: text(row.installedName),
+          updateAvailable: row.updateAvailable === true && row.installed === true && row.localOnly !== true && MANIFEST_ID.test(text(row.installedName)),
           localOnly: row.localOnly === true,
         };
       }),
@@ -105,7 +106,7 @@
         if (request.cmd === 'plugin_install' || request.args.action === 'disconnect') {
           confirm = request;
           confirmText.textContent = request.cmd === 'plugin_install'
-            ? '确认' + label + '「' + cardName + '」？插件将在网关中运行，可能需要手动重启才能生效。'
+            ? '确认' + label + '「' + cardName + '@' + request.args.version + '」？插件将在网关中运行，可能需要手动重启才能生效。'
             : '确认断开「' + cardName + '」？断开后通过此插件接入的服务可能不可用。';
           confirmButton.textContent = '确认' + label;
           renderStatus();
@@ -151,7 +152,8 @@
         } else if (!awaiting && !plugin.localOnly && NPM_NAME.test(plugin.name) && (!plugin.installed || plugin.updateAvailable)) {
           var verb = plugin.installed ? '更新' : '安装';
           addControl(actions, verb, plugin.name, {
-            cmd: 'plugin_install', args: { name: plugin.name, update: plugin.installed }, label: verb,
+            cmd: 'plugin_install', args: { name: plugin.name, version: plugin.version,
+              installed: plugin.installed ? { name: plugin.installedName, version: plugin.installedVersion } : null }, label: verb,
           });
         }
         if (actions.children.length) card.appendChild(actions);
@@ -229,17 +231,21 @@
         if (install) {
           if (!result || typeof result.restartRequired !== 'boolean') throw new Error();
           if (result.restartRequired) {
-            awaitingActivation.set(request.args.name, request.args.update ? '已更新 · 待激活' : '已安装 · 待激活');
+            awaitingActivation.set(request.args.name, request.args.installed ? '已更新 · 待激活' : '已安装 · 待激活');
             startingForActivation = false;
             if (view === MARKET) renderList();
           }
           renderRestart();
           status(feedback, request.label + (result.restartRequired ? '完成，等待激活。' : '完成。'));
           await Promise.all([refresh(INSTALLED, true), refresh(MARKET)]);
+        } else if (request.args.action === 'usage') {
+          if (result && result.usage === 'fresh') status(feedback, '已获取当前用量。');
+          else if (result && result.usage === 'stale') status(feedback, '当前仅有上次读取的用量。', 'warn');
+          else status(feedback, '暂无可用的用量数据。', 'warn');
         } else {
           if (!result || result.success !== true) throw new Error();
           status(feedback, request.label + '完成。');
-          if (request.args.action !== 'usage') await refresh(INSTALLED);
+          await refresh(INSTALLED);
         }
       } catch {
         if (install) {
@@ -315,12 +321,14 @@
         if (cmd === 'plugin_catalog') {
           return delay({ partial: true, plugins: catalog.map(function (row) {
             return { name: row.name, description: row.description, version: row.version, installed: row.installed,
-              installedVersion: row.installedVersion, updateAvailable: row.updateAvailable, localOnly: row.localOnly };
+              installedVersion: row.installedVersion, ...(row.installed && !row.localOnly ? { installedName: row.id } : {}), updateAvailable: row.updateAvailable, localOnly: row.localOnly };
           }) });
         }
         if (cmd === 'plugin_install') {
           var entry = catalog.find(function (row) { return row.name === args.name; });
-          if (entry && !entry.localOnly && (entry.installed ? args.update === true && entry.updateAvailable : args.update === false)) {
+          if (entry && !entry.localOnly && entry.version === args.version && (entry.installed
+              ? args.installed && args.installed.name === entry.id && args.installed.version === entry.installedVersion && entry.updateAvailable
+              : args.installed === null)) {
             entry.installed = true;
             entry.installedVersion = entry.version;
             entry.updateAvailable = false;
@@ -337,6 +345,7 @@
           if (!plugin || !plugin.loaded || plugin.actions.indexOf(args.action) === -1) {
             return Promise.reject(new Error('PLUGIN_ACTION_FAILED'));
           }
+          if (args.action === 'usage') return delay({ usage: 'fresh' });
           if (args.action === 'disconnect') {
             plugin.actions = [];
             plugin.connectionState = 'disconnected';
