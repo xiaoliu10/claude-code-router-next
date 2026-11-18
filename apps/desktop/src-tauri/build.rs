@@ -18,6 +18,8 @@ fn main() {
             "projects_takeover",
             "projects_delete",
             "provider_add",
+            "provider_get",
+            "provider_update",
             "quota_credentials_status",
             "quota_credentials_save",
             "service_snapshot",

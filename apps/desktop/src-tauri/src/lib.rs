@@ -38,6 +38,8 @@ pub fn run() {
             projects::projects_takeover,
             projects::projects_delete,
             providers::provider_add,
+            providers::provider_get,
+            providers::provider_update,
             credentials::quota_credentials_status,
             credentials::quota_credentials_save,
             lifecycle::service_snapshot,
