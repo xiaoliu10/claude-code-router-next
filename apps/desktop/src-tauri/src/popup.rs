@@ -116,7 +116,7 @@ fn spawn_dismiss_watch(app: tauri::AppHandle) {
             if focused_seen {
                 // Grace for transient focus flickers (native select popups on
                 // macOS briefly defocus the webview); hide only once the loss
-                // has held across one full tick pair.
+                // has held across a recheck (~1.5 ticks).
                 std::thread::sleep(std::time::Duration::from_millis(450));
                 let still = window.is_focused().unwrap_or(false);
                 if !still {
@@ -124,6 +124,10 @@ fn spawn_dismiss_watch(app: tauri::AppHandle) {
                 }
                 return;
             }
+            // One re-focus attempt after 4s without any observed focus; if it
+            // lands, the poll keeps watching (poll-based dismissal stays live
+            // even when the Focused event path is dead) — the panel hides on
+            // the first real focus loss below.
             if !refocused && shown.elapsed() >= std::time::Duration::from_millis(4000) {
                 refocused = true;
                 let _ = window.set_focus();
@@ -134,11 +138,6 @@ fn spawn_dismiss_watch(app: tauri::AppHandle) {
                     let _ = window.hide();
                     return;
                 }
-            }
-            if refocused && shown.elapsed() >= std::time::Duration::from_secs(10) {
-                // Focused but the event path is dead (no Focused(false) seen);
-                // keep the panel usable and rely on Esc/tray toggle instead.
-                return;
             }
         }
     });
