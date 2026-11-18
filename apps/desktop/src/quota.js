@@ -2045,8 +2045,9 @@
 
     // ---- usage tab --------------------------------------------------------
 
-    function usageNumCell(label, value, fullValue) {
+    function usageNumCell(metric, label, value, fullValue) {
       var cell = el('div', 'usage-cell');
+      cell.dataset.metric = metric;
       var num = el('span', 'usage-num', value === null ? '—' : String(value));
       if (fullValue != null) num.title = fullValue;
       cell.appendChild(num);
@@ -2107,21 +2108,21 @@
       var totals = el('div', 'usage-card');
       totals.appendChild(el('div', 'usage-title', '汇总 · ' + (u.period === 'today' ? '今天' : u.period === '7d' ? '近 7 天' : '近 30 天')));
       var grid = el('div', 'usage-grid');
-      grid.appendChild(usageNumCell('请求', formatInt(u.totalRequests)));
-      grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
-      grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
-      grid.appendChild(usageNumCell('成功率', formatSuccessRate(u.successCount, u.totalRequests)));
+      grid.appendChild(usageNumCell('requests', '请求', formatInt(u.totalRequests)));
+      grid.appendChild(usageNumCell('success', '成功', formatInt(u.successCount)));
+      grid.appendChild(usageNumCell('errors', '失败', formatInt(u.errorCount)));
+      grid.appendChild(usageNumCell('rate', '成功率', formatSuccessRate(u.successCount, u.totalRequests)));
       var totalTokens = rowTotalTokens(u);
-      var totalCell = usageNumCell('总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
+      var totalCell = usageNumCell('total', '总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
       totalCell.title = '有效输入 + 输出；上游 inputTokens 已含缓存时直接采用，否则加计缓存读/写';
       grid.appendChild(totalCell);
-      grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
-      grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
-      grid.appendChild(usageNumCell('缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
-      grid.appendChild(usageNumCell('缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
-      grid.appendChild(usageNumCell('估算条目', formatInt(u.estimatedCount)));
-      grid.appendChild(usageNumCell('平均 TTFT', formatMs(u.avgTtftMs)));
-      grid.appendChild(usageNumCell('生成速度', formatSpeed(u.avgTokensPerSecond)));
+      grid.appendChild(usageNumCell('input', '输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
+      grid.appendChild(usageNumCell('output', '输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
+      grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
+      grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
+      grid.appendChild(usageNumCell('estimated', '估算条目', formatInt(u.estimatedCount)));
+      grid.appendChild(usageNumCell('ttft', '平均 TTFT', formatMs(u.avgTtftMs)));
+      grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
       body.appendChild(totals);
       totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
