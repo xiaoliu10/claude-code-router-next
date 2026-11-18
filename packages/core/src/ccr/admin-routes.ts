@@ -12,6 +12,7 @@ import { getAllRateLimitInfo, initRateLimitPersistence } from "../services/rate-
 import { getAllQuotaResults, initQuotaStorePersistence } from "../services/quota-store";
 import { pollPluginQuota, PLUGIN_QUOTA_INLINE_BUDGET_MS } from "../services/plugin-quota";
 import { isQuotaWindowExpired } from "../services/rate-limit";
+import { getQuotaAdapter } from "../services/quota-adapters";
 import { findInvalidProxyUrls } from "../services/proxy";
 import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
 import { getHealthStore } from "../services/provider-health";
@@ -321,6 +322,24 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     // an omitted entry. A protector throws to veto.
     server.pluginRegistry.applyConfigProtectors(newConfig, previousConfig);
 
+    // Web forms do not edit quota keys. Their cached draft may predate a desktop
+    // credential save, rotation or clear. Use the raw fields, including env refs.
+    if (req.headers["x-ccr-preserve-quota-credentials"] === "1") {
+      const latest = await readConfigFileRaw();
+      const saved = latest.Providers ?? latest.providers;
+      const incoming = newConfig.Providers ?? newConfig.providers;
+      if (Array.isArray(saved) && Array.isArray(incoming)) {
+        for (const entry of incoming) {
+          if (typeof entry?.api_base_url !== "string" || !getQuotaAdapter(entry.api_base_url)?.usesVolcengineCredentials) continue;
+          const matches = saved.filter(p => p?.name === entry.name && p.api_base_url === entry.api_base_url);
+          if (matches.length !== 1) continue;
+          for (const field of ["quotaAccessKey", "quotaSecretKey"]) {
+            if (Object.hasOwn(matches[0], field)) entry[field] = matches[0][field];
+            else delete entry[field];
+          }
+        }
+      }
+    }
     await writeConfigFile(newConfig);
     let projectTakeoverSync: Awaited<ReturnType<typeof syncGlobalProjectTakeovers>> | undefined;
     try {

@@ -269,11 +269,14 @@ class ApiClient {
   }
 
   // Update entire configuration
-  async updateConfig(config: Config): Promise<{ success: boolean; message?: string }> {
+  async updateConfig(config: Config, mode: "form" | "raw" = "form"): Promise<{ success: boolean; message?: string }> {
     if (this.managedProviderBusy) return { success: false };
     this.configWrites += 1;
     try {
-      return await this.post<{ success: boolean; message?: string }>('/config', config);
+      return await this.apiFetch<{ success: boolean; message?: string }>('/config', {
+        method: 'POST', body: JSON.stringify(config),
+        headers: mode === 'form' ? { 'X-CCR-Preserve-Quota-Credentials': '1' } : {},
+      });
     } finally {
       this.configWrites -= 1;
     }
