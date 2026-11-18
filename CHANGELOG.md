@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2433] - 2026-11-18
+
+### Added
+
+- **Desktop control center suite**: a menubar tray quota panel for all providers with K/M/B token formatting and a focus watchdog so the panel can never get stuck on screen (#140); a standalone local control-center window with a bundled gateway runtime (#141); and a project configuration page with per-project routing, model aliases and client takeover (#142).
+- **Desktop usage analytics (#144, #146)**: usage totals use cache-aware effective input — upstreams whose `inputTokens` already include cache (input ~= cache sum within a tolerance) are adopted as-is, otherwise cache read/write is added once, never double-counted; per-model / per-provider / per-date tables with cache columns, pure-CSS daily and model Top-10 charts, and paged call records with success rate / TTFT / tokens-per-second.
+- **Volcengine Coding Plan quota (#145)**: core Volcengine-SigV4 adapter for `GetCodingPlanUsage` (percentage windows mapped to used/limit, failures never fabricate data) plus a desktop credential panel — AK/SK stays local and is never echoed.
+- **Provider card confirm dialogs are centered body-level modals (#147)**: codex / kiro / workbuddy disconnect & remove and gemini-oauth disconnect + shared risk consent moved out of the card (whose `backdrop-filter` clipped fixed overlays), with Escape / backdrop cancel, in-flight lock and unmount cleanup. Plugin releases in this train: codex 1.0.14, kiro 0.1.3, workbuddy 1.0.3, gemini-oauth 1.0.14.
+
+### Fixed
+
+- **Kimi five-hour window restored when the upstream omits `remaining` (#143)**: an exhausted 5h window used to disappear entirely; parsing now prefers the explicit `used` and falls back to `limit - remaining`, and never fabricates usage from a bare limit.
+- **Codex quota recovery after plan upgrades (#138)**: plan changes reconcile quota state, and proactive token maintenance keeps sessions healthy.
+- **UI HTML negotiated caching (#139)**: the bundled UI served stale pages after a release; HTML is now revalidated (304) so browsers pick up the new build immediately.
+- **Codex card honesty and cooldown UX (#147)**: the WHAM `plan_type` renders as "Quota plan / 配额套餐", distinct from the id_token account-plan row; model sync stays clickable during quota cooldown (it is a management-plane call).
+- **Desktop stuck quota panel (#146 follow-up)**: a focus watchdog dismisses the panel when focus is lost — or when macOS silently declines activation — so the panel can no longer block the screen.
+
 ## [2.3.2432] - 2026-11-14
 
 ### Added
@@ -13,6 +30,23 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - **`ccr restart` now stops the real port listener when the PID file is stale**: the UI update flow installs the new package, then spawns detached `ccr restart` — but restart trusted the PID file alone, and a stale file (a previous crashed start wrote its own PID before failing to bind) meant nothing was killed, the respawn died on `EADDRINUSE`, and the old version kept serving forever — the page update appeared to keep failing. Restart now falls back to the actual `LISTEN` holder on the configured port (identity-checked so an unrelated process is never touched), waits for release before respawning, and the PID file is written only after a successful bind so a failed start can no longer poison it.
+
+## [2.3.2433] - 2026-11-18（中文）
+
+### 新增
+
+- **桌面控制中心套件**：菜单栏托盘额度面板覆盖全部供应商，token 按 K/M/B 显示，焦点看门狗保证面板永远不会卡死在屏幕上（#140）；独立本地控制中心窗口与内置网关运行时（#141）；项目配置页支持按项目路由、模型别名与客户端接管（#142）。
+- **桌面用量分析（#144、#146）**：用量总数采用缓存感知的有效输入——上游 `inputTokens` 已含缓存（输入 ≈ 缓存和且在容差内）时直接采用，否则加计缓存读/写一次，绝不重复计数；按模型/提供方/日期的表格带缓存列、纯 CSS 每日柱状图与模型 Top-10、分页调用记录（成功率 / TTFT / 每秒 token）。
+- **火山 Coding Plan 配额（#145）**：core 侧火山变体 SigV4 适配 `GetCodingPlanUsage`（百分比窗口映射为 used/limit，失败绝不伪造数据），桌面新增凭证面板——AK/SK 只留本地、永不回显。
+- **供应商卡片确认框改为居中 body 级模态（#147）**：codex / kiro / workbuddy 的断开与移除、gemini-oauth 的断开与共享风险同意，移出卡片（卡片 `backdrop-filter` 会裁剪 fixed 弹窗），支持 Escape / 点击遮罩取消、动作进行中锁定、卸载清理。本批插件发版：codex 1.0.14、kiro 0.1.3、workbuddy 1.0.3、gemini-oauth 1.0.14。
+
+### 修复
+
+- **上游省略 `remaining` 时恢复 Kimi 五小时窗口（#143）**：耗尽的 5h 窗口之前会整体消失；现在优先读显式 `used`、回落 `limit - remaining`，只有裸 limit 时绝不伪造用量。
+- **Codex 套餐升级后的配额恢复（#138）**：套餐变化会重建配额状态，主动 token 维护保持会话健康。
+- **UI HTML 协商缓存（#139）**：打包 UI 发版后曾出现浏览器跑旧页面；HTML 现在 304 协商缓存，浏览器立即拿到新构建。
+- **Codex 卡诚实口径与冷却体验（#147）**：WHAM `plan_type` 显示为「配额套餐」，与 id_token 账户套餐行区分；配额冷却期间「同步模型」保持可点（管理面调用）。
+- **桌面额度面板卡死（#146 追加）**：焦点看门狗在焦点丢失——或 macOS 静默拒绝激活——时收起面板，不再遮挡屏幕。
 
 ## [2.3.2432] - 2026-11-14（中文）
 
