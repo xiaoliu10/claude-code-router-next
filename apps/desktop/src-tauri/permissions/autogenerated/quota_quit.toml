@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-quota-quit"
+description = "Enables the quota_quit command without any pre-configured scope."
+commands.allow = ["quota_quit"]
+
+[[permission]]
+identifier = "deny-quota-quit"
+description = "Denies the quota_quit command without any pre-configured scope."
+commands.deny = ["quota_quit"]

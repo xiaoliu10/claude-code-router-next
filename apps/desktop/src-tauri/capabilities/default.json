@@ -1,7 +1,23 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "No native permissions, including for the external CCR web UI",
-  "windows": [],
-  "permissions": []
+  "identifier": "quota",
+  "description": "Only trusted local desktop views can invoke narrowly scoped commands; no remote origins are granted access",
+  "windows": [
+    "quota",
+    "main"
+  ],
+  "permissions": [
+    "allow-quota-snapshot",
+    "allow-quota-hide",
+    "allow-quota-open-ui",
+    "allow-quota-quit",
+    "allow-routing-snapshot",
+    "allow-routing-save",
+    "allow-routing-flags",
+    "allow-usage-snapshot",
+    "allow-clients-snapshot",
+    "allow-clients-update",
+    "allow-service-snapshot",
+    "allow-service-action"
+  ]
 }

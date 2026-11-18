@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-service-snapshot"
+description = "Enables the service_snapshot command without any pre-configured scope."
+commands.allow = ["service_snapshot"]
+
+[[permission]]
+identifier = "deny-service-snapshot"
+description = "Denies the service_snapshot command without any pre-configured scope."
+commands.deny = ["service_snapshot"]

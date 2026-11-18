@@ -1,0 +1,1904 @@
+(function () {
+  'use strict';
+
+  function toNum(v) { return typeof v === 'number' && Number.isFinite(v) ? v : null; }
+  function toStr(v) { return typeof v === 'string' && v ? v : null; }
+  function pad2(n) { return n < 10 ? '0' + n : String(n); }
+  function group(s) { return s.replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  function errorMessage(err) {
+    if (typeof err === 'string' && err) return err;
+    if (err && typeof err.message === 'string' && err.message) return err.message;
+    return '未知错误';
+  }
+  function formatInt(v) {
+    var n = toNum(v);
+    if (n === null) return null;
+    return group(String(Math.round(n)));
+  }
+  // Compact token counts for the narrow panel; the exact value stays available via title.
+  function formatCompact(v) {
+    var n = toNum(v);
+    if (n === null) return null;
+    var abs = Math.abs(n);
+    if (abs >= 1e8) return (Math.round(n / 1e7) / 10) + '亿';
+    if (abs >= 1e4) return (Math.round(n / 1e3) / 10) + '万';
+    return formatInt(n);
+  }
+  function formatClock(ms) {
+    var n = toNum(ms);
+    if (n === null) return null;
+    var t = new Date(n);
+    return pad2(t.getHours()) + ':' + pad2(t.getMinutes()) + ':' + pad2(t.getSeconds());
+  }
+  function arrayEq(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+
+  function normalizeWindow(w) {
+    var s = w && typeof w === 'object' ? w : {};
+    return { label: toStr(s.label), used: toNum(s.used), limit: toNum(s.limit), remaining: toNum(s.remaining), unit: toStr(s.unit), resetAt: toStr(s.resetAt) };
+  }
+  function normalizeProvider(p) {
+    var s = p && typeof p === 'object' ? p : {};
+    return {
+      name: toStr(s.name) || '未命名提供方',
+      enabled: s.enabled !== false,
+      plan: toStr(s.plan),
+      status: typeof s.status === 'string' ? s.status : null,
+      message: toStr(s.message),
+      windows: Array.isArray(s.windows) ? s.windows.map(normalizeWindow) : [],
+      updatedAt: toNum(s.updatedAt),
+    };
+  }
+  function normalizeSnapshot(r) {
+    var s = r && typeof r === 'object' ? r : {};
+    return {
+      providers: Array.isArray(s.providers) ? s.providers.map(normalizeProvider) : [],
+      updatedAt: toNum(s.updatedAt),
+      online: s.online !== false,
+      error: toStr(s.error),
+    };
+  }
+
+
+  var STATUS_META = { ready: ['就绪', 'ok'], unsupported: ['不支持', 'muted'], unavailable: ['不可用', 'warn'], reauth: ['需重新登录', 'warn'], cooling: ['冷却中', 'warn'] };
+  function statusMeta(status) {
+    var m = STATUS_META[status];
+    return m ? { label: m[0], tone: m[1] } : { label: status || '未知', tone: 'muted' };
+  }
+
+  function computePercent(w) {
+    var used = toNum(w && w.used), limit = toNum(w && w.limit), remaining = toNum(w && w.remaining);
+    if (limit === null || limit <= 0) return null;
+    var ratio = used !== null ? used / limit : remaining !== null ? (limit - remaining) / limit : null;
+    if (ratio === null || !Number.isFinite(ratio)) return null;
+    return Math.min(100, Math.max(0, ratio * 100));
+  }
+  function formatPercent(pct) {
+    var n = toNum(pct);
+    return n === null ? null : Math.min(100, Math.max(0, Math.floor(n))) + '%';
+  }
+  function formatAmount(v) {
+    var n = toNum(v);
+    if (n === null) return null;
+    if (n === 0) return '0';
+    var abs = Math.abs(n);
+    if (abs < 0.01) return n < 0 ? '-<0.01' : '<0.01';
+    var parts = String(Math.round(abs * 100) / 100).split('.');
+    return (n < 0 ? '-' : '') + group(parts[0]) + (parts[1] ? '.' + parts[1] : '');
+  }
+  function formatResetTime(resetAt, now) {
+    var t = new Date(toStr(resetAt) || '');
+    if (Number.isNaN(t.getTime())) return null;
+    var base = typeof now === 'number' ? now : Date.now();
+    var diff = t.getTime() - base;
+    var relative = null;
+    if (diff > 0) {
+      var min = Math.ceil(diff / 60000);
+      relative = min < 60 ? Math.max(1, min) + ' 分钟后' : min < 1440 ? Math.ceil(min / 60) + ' 小时后' : Math.ceil(min / 1440) + ' 天后';
+    }
+    return { absolute: (t.getMonth() + 1) + '月' + t.getDate() + '日 ' + pad2(t.getHours()) + ':' + pad2(t.getMinutes()), relative: relative };
+  }
+  function formatTimestamp(ms) {
+    var n = toNum(ms);
+    if (n === null) return null;
+    var t = new Date(n);
+    return (t.getMonth() + 1) + '月' + t.getDate() + '日 ' + pad2(t.getHours()) + ':' + pad2(t.getMinutes()) + ':' + pad2(t.getSeconds());
+  }
+  function describeWindow(w, now) {
+    if (!w || typeof w !== 'object') return '暂无数据';
+    var used = toNum(w.used), limit = toNum(w.limit), remaining = toNum(w.remaining);
+    var suffix = toStr(w.unit) ? ' ' + toStr(w.unit) : '';
+    var parts = [];
+    if (used !== null && limit !== null) parts.push('已用 ' + formatAmount(used) + ' / ' + formatAmount(limit) + suffix);
+    else if (remaining !== null && limit !== null) parts.push('剩余 ' + formatAmount(remaining) + ' / ' + formatAmount(limit) + suffix);
+    else if (remaining !== null) parts.push('剩余 ' + formatAmount(remaining) + suffix);
+    else if (used !== null) parts.push('已用 ' + formatAmount(used) + suffix);
+    else if (limit !== null) parts.push('总额度 ' + formatAmount(limit) + suffix);
+    var reset = formatResetTime(w.resetAt, now);
+    if (reset) parts.push('重置 ' + reset.absolute + (reset.relative ? '（' + reset.relative + '）' : ''));
+    return parts.length ? parts.join(' · ') : '暂无数据';
+  }
+
+
+  function createController(options) {
+    var invoke = options && options.invoke;
+    if (typeof invoke !== 'function') throw new TypeError('createController: 需要 invoke 函数');
+    var snapshot = null, fullError = null, loadingAll = false, allPromise = null, epoch = 0;
+    var seq = new Map();
+    var flags = new Map(); // name -> { loading, error }
+    var listeners = new Set();
+
+    function state() {
+      var rows = snapshot ? snapshot.providers.map(function (p) {
+        var f = flags.get(p.name) || {};
+        return { provider: p, stale: !snapshot.online || fullError !== null, loading: f.loading === true, cardError: toStr(f.error) };
+      }) : [];
+      return { snapshot: snapshot, rows: rows, count: snapshot ? snapshot.providers.length : null, loadingAll: loadingAll, fullError: fullError };
+    }
+    function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
+    function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
+
+    function findProvider(list, name) {
+      for (var i = 0; i < list.length; i++) if (list[i].name === name) return list[i];
+      return null;
+    }
+    function syncFlags(names) {
+      Array.from(flags.keys()).forEach(function (k) {
+        if (names.indexOf(k) === -1) {
+
+          seq.delete(k);
+          flags.delete(k);
+        }
+      });
+    }
+
+    function applyFull(result) {
+
+      snapshot = normalizeSnapshot(result);
+      fullError = null;
+      var names = [];
+      snapshot.providers.forEach(function (p) { names.push(p.name); });
+      Array.from(flags.keys()).forEach(function (k) {
+        if (names.indexOf(k) === -1) { seq.delete(k); flags.delete(k); }
+        else flags.set(k, { loading: false, error: null });
+      });
+    }
+
+    function applyMerged(result) {
+
+
+      var next = normalizeSnapshot(result);
+      var prev = snapshot;
+      if (prev) {
+        next.providers = next.providers.map(function (p) {
+          var f = flags.get(p.name);
+
+          return f && f.loading ? (findProvider(prev.providers, p.name) || p) : p;
+        });
+      }
+      snapshot = next;
+      fullError = null;
+      var names = [];
+      snapshot.providers.forEach(function (p) { names.push(p.name); });
+      syncFlags(names);
+    }
+
+    function refreshAll() {
+      if (loadingAll) return allPromise;
+      loadingAll = true;
+      fullError = null;
+      var my = ++epoch;
+
+      Array.from(seq.keys()).forEach(function (k) { seq.set(k, (seq.get(k) || 0) + 1); });
+      flags.forEach(function (f, k) { if (f.loading) flags.set(k, { loading: false, error: null }); });
+      emit();
+      allPromise = invoke('quota_snapshot', { provider: null }).then(function (r) {
+        if (my === epoch) applyFull(r);
+      }, function (err) {
+        if (my === epoch) fullError = errorMessage(err);
+      }).then(function () {
+        if (my === epoch) { loadingAll = false; allPromise = null; }
+        emit();
+      });
+      return allPromise;
+    }
+
+    function refreshProvider(name) {
+      if (!snapshot || loadingAll) return Promise.resolve();
+      var f = flags.get(name);
+      if (f && f.loading) return Promise.resolve();
+      var my = (seq.get(name) || 0) + 1;
+      seq.set(name, my);
+      flags.set(name, { loading: true, error: null });
+      emit();
+      return invoke('quota_snapshot', { provider: name }).then(function (r) {
+        if (seq.get(name) !== my) return;
+        flags.set(name, { loading: false, error: null });
+        applyMerged(r);
+      }, function (err) {
+        if (seq.get(name) !== my) return;
+        flags.set(name, { loading: false, error: errorMessage(err) });
+      }).then(emit);
+    }
+
+    return { subscribe: subscribe, state: state, refreshAll: refreshAll, refreshProvider: refreshProvider };
+  }
+
+
+  // ---- Routing tab -------------------------------------------------------
+  // Projection contract (docs/design/desktop-control-center.md):
+  // snapshot = {providers:[{name,models:[string]}], routes:[{scope,field,target,fallback}],
+  //             familyRouting, fallbackEnabled, revision}
+  // save    = routing_save({change:{revision,scope,field,target:string|null,fallback:[string]|null}})
+  //           null fallback preserves it; null/empty target clears the override.
+  // flags   = routing_flags({revision,familyRouting,fallbackEnabled})
+
+  var ROUTING_SCOPES = ['global', 'opus', 'sonnet', 'haiku', 'models'];
+  var ROUTING_SCENARIOS = ['default', 'background', 'think', 'longContext', 'extendedContext', 'webSearch', 'image'];
+  var USAGE_PERIODS = ['today', '7d', '30d'];
+  var SCOPE_LABELS = { global: '全局', opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', models: '模型别名' };
+  var SCENARIO_LABELS = { default: '默认', background: '后台', think: '思考', longContext: '长上下文', extendedContext: '扩展上下文', webSearch: '网页搜索', image: '图像' };
+
+  function routeKey(scope, field) { return scope + '|' + field; }
+  function splitKey(key) {
+    var i = String(key).indexOf('|');
+    return { scope: i === -1 ? String(key) : String(key).slice(0, i), field: i === -1 ? '' : String(key).slice(i + 1) };
+  }
+  function routeLabel(scope, field) {
+    if (scope === 'models') return field || '(空别名)';
+    return SCENARIO_LABELS[field] || field || '(未命名)';
+  }
+
+  function normalizeRoutingSnapshot(r) {
+    var s = r && typeof r === 'object' ? r : {};
+    var providers = Array.isArray(s.providers) ? s.providers : [];
+    var routes = Array.isArray(s.routes) ? s.routes : [];
+    return {
+      providers: providers.map(function (p) {
+        var o = p && typeof p === 'object' ? p : {};
+        return {
+          name: toStr(o.name) || '未命名提供方',
+          models: Array.isArray(o.models) ? o.models.filter(function (m) { return typeof m === 'string' && m; }) : [],
+        };
+      }),
+      routes: routes.map(function (rt) {
+        var o = rt && typeof rt === 'object' ? rt : {};
+        return {
+          scope: toStr(o.scope) || 'global',
+          field: toStr(o.field) || '',
+          target: toStr(o.target),
+          fallback: Array.isArray(o.fallback) ? o.fallback.filter(function (f) { return typeof f === 'string' && f; }) : [],
+        };
+      }),
+      familyRouting: s.familyRouting === true,
+      fallbackEnabled: s.fallbackEnabled === true,
+      revision: toStr(s.revision) || '',
+    };
+  }
+
+  function findRoute(snapshot, scope, field) {
+    var routes = snapshot && Array.isArray(snapshot.routes) ? snapshot.routes : [];
+    for (var i = 0; i < routes.length; i++) {
+      if (routes[i].scope === scope && routes[i].field === field) return routes[i];
+    }
+    return null;
+  }
+  function canonicalTarget(snapshot, scope, field) {
+    var rt = findRoute(snapshot, scope, field);
+    return rt && rt.target ? rt.target : '';
+  }
+  function canonicalFallback(snapshot, scope, field) {
+    var rt = findRoute(snapshot, scope, field);
+    return rt ? rt.fallback.slice() : [];
+  }
+
+  function createRoutingController(options) {
+    var invoke = options && options.invoke;
+    if (typeof invoke !== 'function') throw new TypeError('createRoutingController: 需要 invoke 函数');
+    var snapshot = null, loading = false, error = null;
+    var flagsSaving = false, flagsError = null;
+    var savingKey = null, saveQueue = [], saveError = null, savedFlash = null;
+    var drafts = new Map(); // key -> {target, fallback, fallbackDirty}
+    var epoch = 0;
+    var listeners = new Set();
+
+    function isClean(key) {
+      var d = drafts.get(key);
+      if (!d) return true;
+      var parts = splitKey(key);
+      if (d.target !== canonicalTarget(snapshot, parts.scope, parts.field)) return false;
+      if (d.fallbackDirty && !arrayEq(d.fallback, canonicalFallback(snapshot, parts.scope, parts.field))) return false;
+      return true;
+    }
+    function state() {
+      var dirtyKeys = [];
+      drafts.forEach(function (d, k) {
+        if (!isClean(k)) dirtyKeys.push(k);
+      });
+      return {
+        snapshot: snapshot, loading: loading, error: error,
+        flagsSaving: flagsSaving, flagsError: flagsError,
+        savingKey: savingKey, queued: saveQueue.slice(),
+        saveError: saveError, savedFlash: savedFlash,
+        dirtyKeys: dirtyKeys, isClean: isClean,
+        draftKeys: Array.from(drafts.keys()),
+        draft: function (key) { return drafts.get(key) || null; },
+      };
+    }
+    function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
+    function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
+    function clearFlash(key) { if (savedFlash && savedFlash.key === key) savedFlash = null; }
+
+    // Adopt a server snapshot: drafts whose values now match the server are
+    // dropped; drafts that still differ survive refreshes and saves.
+    function adopt(result) {
+      snapshot = normalizeRoutingSnapshot(result);
+      error = null;
+      Array.from(drafts.keys()).forEach(function (k) { if (isClean(k)) drafts.delete(k); });
+    }
+
+    function ensureDraft(key) {
+      var d = drafts.get(key);
+      if (d) return d;
+      var parts = splitKey(key);
+      d = {
+        target: canonicalTarget(snapshot, parts.scope, parts.field),
+        fallback: canonicalFallback(snapshot, parts.scope, parts.field),
+        fallbackDirty: false,
+      };
+      drafts.set(key, d);
+      return d;
+    }
+
+    function refresh() {
+      if (loading || savingKey || flagsSaving) return;
+      loading = true;
+      error = null;
+      emit();
+      var my = ++epoch;
+      invoke('routing_snapshot').then(function (r) {
+        if (my !== epoch) return;
+        adopt(r);
+        loading = false;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        loading = false;
+        error = errorMessage(err);
+        emit();
+      });
+    }
+
+    function setTarget(key, value) {
+      if (!snapshot) return;
+      var d = ensureDraft(key);
+      var next = String(value == null ? '' : value);
+      if (d.target === next) return;
+      d.target = next;
+      clearFlash(key);
+      emit();
+    }
+
+    function addFallback(key, rawValue) {
+      if (!snapshot) return { ok: false, message: '路由配置尚未读取' };
+      var v = String(rawValue == null ? '' : rawValue).trim();
+      if (!v) return { ok: false, message: '请输入 提供方,模型' };
+      var d = ensureDraft(key);
+      if (d.fallback.indexOf(v) !== -1) return { ok: false, message: '该回退已存在' };
+      d.fallback = d.fallback.concat([v]);
+      d.fallbackDirty = true;
+      clearFlash(key);
+      emit();
+      return { ok: true };
+    }
+
+    function removeFallback(key, index) {
+      if (!snapshot) return;
+      var d = ensureDraft(key);
+      var i = toNum(index);
+      if (i === null || i < 0 || i >= d.fallback.length) return;
+      d.fallback = d.fallback.slice(0, i).concat(d.fallback.slice(i + 1));
+      d.fallbackDirty = true;
+      clearFlash(key);
+      emit();
+    }
+
+    function moveFallback(key, index, direction) {
+      if (!snapshot) return;
+      var d = ensureDraft(key);
+      var i = toNum(index);
+      var j = i === null ? null : i + (direction < 0 ? -1 : 1);
+      if (i === null || j === null || i < 0 || j < 0 || i >= d.fallback.length || j >= d.fallback.length) return;
+      var arr = d.fallback.slice();
+      var moved = arr.splice(i, 1)[0];
+      arr.splice(j, 0, moved);
+      d.fallback = arr;
+      d.fallbackDirty = true;
+      clearFlash(key);
+      emit();
+    }
+
+    function resetDraft(key) {
+      if (!snapshot) return;
+      drafts.delete(key);
+      clearFlash(key);
+      emit();
+    }
+
+    function createAlias(field, target) {
+      if (!snapshot) return { ok: false, message: '路由配置尚未读取' };
+      var name = String(field == null ? '' : field).trim();
+      if (!name) return { ok: false, message: '请输入模型别名' };
+      if (name.indexOf('|') !== -1) return { ok: false, message: '别名不能包含 |' };
+      var key = routeKey('models', name);
+      var d = ensureDraft(key);
+      d.target = String(target == null ? '' : target);
+      if (isClean(key)) {
+        drafts.delete(key);
+        return { ok: false, message: '该别名已是当前配置' };
+      }
+      saveRow(key);
+      return { ok: true };
+    }
+
+    // Saves run one at a time so every change carries the latest known
+    // revision; the server rejects stale revisions instead of merging.
+    function pump() {
+      if (savingKey || flagsSaving || loading || !saveQueue.length) return;
+      var key = saveQueue.shift();
+      var d = drafts.get(key);
+      if (!d || isClean(key)) { pump(); return; }
+      savingKey = key;
+      emit();
+      var parts = splitKey(key);
+      var submittedTarget = d.target;
+      var t = String(submittedTarget).trim();
+      var change = {
+        revision: snapshot ? snapshot.revision : '',
+        scope: parts.scope,
+        field: parts.field,
+        target: t === '' ? null : t,
+        // Null fallback preserves the server list; only an edited list is sent.
+        fallback: d.fallbackDirty ? d.fallback.slice() : null,
+      };
+      var my = ++epoch;
+      invoke('routing_save', { change: change }).then(function (resp) {
+        if (my !== epoch) return;
+        savingKey = null;
+        var hadError = saveError && saveError.key === key;
+        var currentDraft = drafts.get(key);
+        // Normalize only the submitted target; newer typing remains a draft.
+        if (currentDraft && currentDraft.target === submittedTarget) currentDraft.target = t;
+        adopt(resp);
+        if (isClean(key)) {
+          drafts.delete(key);
+          savedFlash = { key: key, at: Date.now() };
+        }
+        if (hadError) saveError = null;
+        pump();
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        savingKey = null;
+        saveQueue = []; // Abort queued siblings: they would reuse a stale revision.
+        saveError = { key: key, message: errorMessage(err) };
+        emit();
+      });
+    }
+    function saveRow(key) {
+      if (!snapshot || loading || flagsSaving) return;
+      if (savingKey === key || saveQueue.indexOf(key) !== -1) return;
+      if (isClean(key)) return;
+      saveQueue.push(key);
+      emit();
+      pump();
+    }
+
+    function setFlag(name, value) {
+      if (!snapshot || flagsSaving || savingKey || loading) return false;
+      if (typeof value !== 'boolean') return false;
+      if (name !== 'familyRouting' && name !== 'fallbackEnabled') return false;
+      var payload = {
+        revision: snapshot.revision,
+        familyRouting: name === 'familyRouting' ? value : snapshot.familyRouting,
+        fallbackEnabled: name === 'fallbackEnabled' ? value : snapshot.fallbackEnabled,
+      };
+      flagsSaving = true;
+      flagsError = null;
+      emit();
+      var my = ++epoch;
+      invoke('routing_flags', payload).then(function (resp) {
+        if (my !== epoch) return;
+        adopt(resp);
+        flagsSaving = false;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        flagsSaving = false;
+        flagsError = errorMessage(err);
+        emit();
+      });
+      return true;
+    }
+
+    return {
+      subscribe: subscribe, state: state, refresh: refresh,
+      setTarget: setTarget, addFallback: addFallback, removeFallback: removeFallback,
+      moveFallback: moveFallback, resetDraft: resetDraft,
+      saveRow: saveRow, setFlag: setFlag, createAlias: createAlias,
+    };
+  }
+
+
+  // ---- Usage tab ---------------------------------------------------------
+  // usage_snapshot({period:'today'|'7d'|'30d'}) -> totals + byProvider/byDay.
+  // Numbers come from the server summary only; no currency/cost is shown.
+
+  function usageRow(x) {
+    var o = x && typeof x === 'object' ? x : {};
+    return {
+      name: toStr(o.name) || '—',
+      requests: toNum(o.requests),
+      inputTokens: toNum(o.inputTokens),
+      outputTokens: toNum(o.outputTokens),
+    };
+  }
+  function normalizeUsageSnapshot(r) {
+    var s = r && typeof r === 'object' ? r : {};
+    return {
+      period: toStr(s.period),
+      totalRequests: toNum(s.totalRequests),
+      successCount: toNum(s.successCount),
+      errorCount: toNum(s.errorCount),
+      inputTokens: toNum(s.inputTokens),
+      outputTokens: toNum(s.outputTokens),
+      cacheReadTokens: toNum(s.cacheReadTokens),
+      cacheWriteTokens: toNum(s.cacheWriteTokens),
+      estimatedCount: toNum(s.estimatedCount),
+      byProvider: Array.isArray(s.byProvider) ? s.byProvider.map(usageRow) : [],
+      byDay: Array.isArray(s.byDay) ? s.byDay.map(usageRow) : [],
+      updatedAt: toNum(s.updatedAt),
+    };
+  }
+
+  function createUsageController(options) {
+    var invoke = options && options.invoke;
+    if (typeof invoke !== 'function') throw new TypeError('createUsageController: 需要 invoke 函数');
+    var snapshot = null, loading = false, error = null, period = 'today';
+    var epoch = 0;
+    var listeners = new Set();
+
+    function state() {
+      return { snapshot: snapshot, loading: loading, error: error, period: period };
+    }
+    function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
+    function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
+
+    function load(p) {
+      if (USAGE_PERIODS.indexOf(p) === -1) return;
+      period = p;
+      loading = true;
+      error = null;
+      emit();
+      var my = ++epoch;
+      invoke('usage_snapshot', { period: p }).then(function (r) {
+        if (my !== epoch) return;
+        snapshot = normalizeUsageSnapshot(r);
+        loading = false;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        loading = false;
+        error = errorMessage(err);
+        emit();
+      });
+    }
+
+    return {
+      subscribe: subscribe, state: state,
+      setPeriod: function (p) { if (p !== period) load(p); },
+      refresh: function () { load(period); },
+    };
+  }
+
+
+  // ---- Clients tab -------------------------------------------------------
+  // clients_snapshot() / clients_update({id,action:'enable'|'disable'|'restore'})
+  // Operations are strictly per-client; restore requires an explicit local
+  // confirmation and there is no bulk apply.
+
+  function normalizeClientsResponse(r) {
+    var s = r && typeof r === 'object' ? r : {};
+    var list = Array.isArray(s.clients) ? s.clients : [];
+    return {
+      clients: list.map(function (c) {
+        var o = c && typeof c === 'object' ? c : {};
+        return {
+          id: toStr(o.id) || '',
+          name: toStr(o.name) || toStr(o.id) || '未知客户端',
+          enabled: o.enabled === true,
+          managed: o.managed === true,
+          exists: o.exists !== false,
+          activeModel: toStr(o.activeModel),
+          modelAlias: toStr(o.modelAlias),
+        };
+      }),
+      success: s.success !== false,
+      message: toStr(s.message),
+    };
+  }
+
+  function createClientsController(options) {
+    var invoke = options && options.invoke;
+    if (typeof invoke !== 'function') throw new TypeError('createClientsController: 需要 invoke 函数');
+    var snapshot = null, loading = false, error = null;
+    var pending = null; // {id, action}
+    var rowError = null; // {id, message}
+    var confirmId = null;
+    var epoch = 0;
+    var listeners = new Set();
+
+    function state() {
+      return { snapshot: snapshot, loading: loading, error: error, pending: pending, rowError: rowError, confirmId: confirmId };
+    }
+    function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
+    function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
+
+    function refresh() {
+      if (loading || pending) return;
+      loading = true;
+      error = null;
+      emit();
+      var my = ++epoch;
+      invoke('clients_snapshot').then(function (r) {
+        if (my !== epoch) return;
+        snapshot = normalizeClientsResponse(r);
+        loading = false;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        loading = false;
+        error = errorMessage(err);
+        emit();
+      });
+    }
+
+    function performUpdate(id, action) {
+      if (!snapshot || pending || loading) return false;
+      // An open restore confirmation blocks other mutations until confirmed or cancelled.
+      if (confirmId !== null) return false;
+      if (['enable', 'disable', 'restore'].indexOf(action) === -1) return false;
+      var known = snapshot.clients.some(function (c) { return c.id === id; });
+      if (!known) return false;
+      pending = { id: id, action: action };
+      rowError = null;
+      confirmId = null;
+      emit();
+      var my = ++epoch;
+      invoke('clients_update', { id: id, action: action }).then(function (r) {
+        if (my !== epoch) return;
+        pending = null;
+        var resp = normalizeClientsResponse(r);
+        snapshot = resp;
+        if (resp.success === false) {
+          rowError = { id: id, message: resp.message || '部分客户端操作未成功' };
+        }
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        pending = null;
+        rowError = { id: id, message: errorMessage(err) };
+        emit();
+      });
+      return true;
+    }
+
+    return {
+      subscribe: subscribe, state: state, refresh: refresh,
+      connect: function (id) { return performUpdate(id, 'enable'); },
+      disconnect: function (id) { return performUpdate(id, 'disable'); },
+      // Restore rewrites the client's config file, so it must be confirmed
+      // through requestRestore/confirmRestore; never auto-enabled.
+      requestRestore: function (id) {
+        if (pending || !snapshot) return false;
+        if (!snapshot.clients.some(function (c) { return c.id === id && c.managed; })) return false;
+        confirmId = id;
+        emit();
+        return true;
+      },
+      cancelRestore: function () {
+        if (confirmId === null) return false;
+        confirmId = null;
+        emit();
+        return true;
+      },
+      confirmRestore: function (id) {
+        if (confirmId !== id) return false;
+        confirmId = null; // close the strip before performing the mutation
+        return performUpdate(id, 'restore');
+      },
+    };
+  }
+
+
+  // ---- Service state -----------------------------------------------------
+  // service_snapshot() / service_action({action:'start'|'stop'}).
+  // Stop only ever targets a desktop-owned child process; an external
+  // gateway is never stopped from here (UI disables it, Rust rejects it).
+
+  var SERVICE_MODES = ['owned', 'external', 'stopped', 'starting', 'error'];
+  function normalizeServiceState(r) {
+    var s = r && typeof r === 'object' ? r : {};
+    var mode = SERVICE_MODES.indexOf(s.mode) !== -1 ? s.mode : null;
+    return { mode: mode, running: s.running === true, message: toStr(s.message) };
+  }
+
+  function serviceView(service) {
+    var s = service && SERVICE_MODES.indexOf(service.mode) !== -1 ? service : null;
+    var mode = s ? s.mode : null;
+    if (mode === null) {
+      return { label: '服务状态未知', tone: 'muted', canStart: false, canStop: false, startTitle: '服务状态未知，请先刷新', stopTitle: '服务状态未知' };
+    }
+    if (mode === 'owned') {
+      if (s.running) {
+        return { label: '托管服务 · 运行中', tone: 'ok', canStart: false, canStop: true, startTitle: '服务已在运行', stopTitle: '停止由桌面启动的网关服务' };
+      }
+      return { label: '托管服务 · 已停止', tone: 'muted', canStart: true, canStop: false, startTitle: '启动桌面托管的网关服务', stopTitle: '服务未在运行' };
+    }
+    if (mode === 'external') {
+      return { label: '外部服务 · 运行中', tone: 'ok', canStart: false, canStop: false, startTitle: '服务已在运行', stopTitle: '外部启动的网关服务不能从这里停止' };
+    }
+    if (mode === 'starting') {
+      return { label: '服务启动中…', tone: 'warn', canStart: false, canStop: false, startTitle: '服务启动中', stopTitle: '服务启动中' };
+    }
+    if (mode === 'stopped') {
+      return { label: '服务已停止', tone: 'muted', canStart: true, canStop: false, startTitle: '启动桌面托管的网关服务', stopTitle: '服务未在运行' };
+    }
+    // error
+    return { label: '服务异常', tone: 'warn', canStart: true, canStop: false, startTitle: '再次尝试启动服务', stopTitle: '服务未在运行' };
+  }
+  function quitTitleFor(service) {
+    var mode = service && SERVICE_MODES.indexOf(service.mode) !== -1 ? service.mode : null;
+    if (mode === 'external') return '退出桌面应用；外部启动的网关服务不受影响';
+    return '退出桌面应用；由本应用启动的网关服务会一并停止';
+  }
+
+  function createServiceController(options) {
+    var invoke = options && options.invoke;
+    if (typeof invoke !== 'function') throw new TypeError('createServiceController: 需要 invoke 函数');
+    var service = null, loading = false, pending = null, error = null;
+    var epoch = 0;
+    var listeners = new Set();
+
+    function state() {
+      return { service: service, loading: loading, pending: pending, error: error };
+    }
+    function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
+    function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
+
+    function refresh() {
+      if (loading || pending) return;
+      loading = true;
+      error = null;
+      emit();
+      var my = ++epoch;
+      invoke('service_snapshot').then(function (r) {
+        if (my !== epoch) return;
+        service = normalizeServiceState(r);
+        loading = false;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        loading = false;
+        error = errorMessage(err);
+        emit();
+      });
+    }
+
+    function action(a) {
+      if (pending || loading || (a !== 'start' && a !== 'stop')) return false;
+      var view = serviceView(service);
+      if ((a === 'start' && !view.canStart) || (a === 'stop' && !view.canStop)) return false;
+      pending = a;
+      error = null;
+      emit();
+      var my = ++epoch;
+      invoke('service_action', { action: a }).then(function (r) {
+        if (my !== epoch) return;
+        service = normalizeServiceState(r);
+        pending = null;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        pending = null;
+        error = errorMessage(err);
+        emit();
+      });
+      return true;
+    }
+
+    return { subscribe: subscribe, state: state, refresh: refresh, action: action };
+  }
+
+
+  // ---- Preview mode (?preview=1 without Tauri) ---------------------------
+  // In-memory fixtures covering every contract command, so the panel is fully
+  // browsable outside Tauri. Never used when window.__TAURI__ is present.
+
+  function createPreviewInvoke() {
+    var rev = 1;
+    var routing = {
+      providers: [
+        { name: 'alpha.example.com', models: ['claude-opus-4-5', 'claude-sonnet-4-5'] },
+        { name: 'beta.example.com', models: ['gemini-3-pro', 'glm-5'] },
+      ],
+      routes: [
+        { scope: 'global', field: 'default', target: 'alpha.example.com,claude-sonnet-4-5', fallback: ['beta.example.com,gemini-3-pro'] },
+        { scope: 'global', field: 'background', target: 'beta.example.com,glm-5', fallback: [] },
+        { scope: 'global', field: 'think', target: 'alpha.example.com,claude-opus-4-5', fallback: [] },
+        { scope: 'opus', field: 'default', target: 'alpha.example.com,claude-opus-4-5', fallback: ['alpha.example.com,claude-sonnet-4-5', 'beta.example.com,gemini-3-pro'] },
+        { scope: 'sonnet', field: 'default', target: 'alpha.example.com,claude-sonnet-4-5', fallback: [] },
+        { scope: 'models', field: 'glm-5', target: 'beta.example.com,glm-5', fallback: [] },
+      ],
+      familyRouting: true,
+      fallbackEnabled: true,
+      revision: 'rev-1',
+    };
+    var usage = {
+      today: {
+        period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
+        inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
+        byProvider: [
+          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000 },
+          { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500 },
+        ],
+        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 }],
+        updatedAt: Date.now() - 3000,
+      },
+      '7d': {
+        period: '7d', totalRequests: 902, successCount: 890, errorCount: 12,
+        inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
+        byProvider: [
+          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000 },
+          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000 },
+        ],
+        byDay: [
+          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 },
+          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000 },
+          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000 },
+        ],
+        updatedAt: Date.now() - 3000,
+      },
+      '30d': {
+        period: '30d', totalRequests: 4120, successCount: 4044, errorCount: 76,
+        inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
+        byProvider: [
+          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000 },
+          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000 },
+        ],
+        byDay: [
+          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 },
+          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000 },
+        ],
+        updatedAt: Date.now() - 3000,
+      },
+    };
+    var clients = {
+      clients: [
+        { id: 'claudeCode', name: 'Claude Code', enabled: true, managed: true, exists: true, activeModel: 'claude-sonnet-4-5', modelAlias: 'claude-sonnet-4-5' },
+        { id: 'codex', name: 'Codex', enabled: true, managed: true, exists: true, activeModel: 'gpt-5-codex', modelAlias: null },
+        { id: 'pi', name: 'Pi', enabled: false, managed: true, exists: true, activeModel: null, modelAlias: null },
+        { id: 'qwenCode', name: 'Qwen Code', enabled: false, managed: false, exists: false, activeModel: null, modelAlias: null },
+        { id: 'opencode', name: 'OpenCode', enabled: true, managed: true, exists: true, activeModel: 'claude-opus-4-5', modelAlias: null },
+      ],
+      success: true,
+      message: null,
+    };
+    var service = { mode: 'owned', running: true, message: '' };
+
+    function copy(v) { return JSON.parse(JSON.stringify(v)); }
+    function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
+    function bump() { rev += 1; routing.revision = 'rev-' + rev; }
+
+    function quotaSnapshot(now) {
+      var h = function (n) { return new Date(now + n * 3600e3).toISOString(); };
+      var all = [
+        { name: 'alpha.example.com', enabled: true, plan: 'Pro', status: 'ready', message: null, updatedAt: now - 5e3, windows: [
+          { label: '五小时', used: 12.3, limit: 45, remaining: 32.7, unit: '次', resetAt: h(3) },
+          { label: '每周', used: 210, limit: 1000, remaining: 790, unit: '次', resetAt: h(74) },
+          { label: '余额', used: null, limit: null, remaining: 8.4, unit: 'USD', resetAt: null }] },
+        { name: 'beta.example.com', enabled: true, plan: null, status: 'ready', message: null, updatedAt: now - 8e3, windows: [
+          { label: '五小时', used: null, limit: 60, remaining: 18, unit: '次', resetAt: h(1.2) }] },
+        { name: 'gamma.example.com', enabled: false, plan: 'Team', status: 'ready', message: null, updatedAt: now - 15e3, windows: [
+          { label: '每月', used: 5, limit: 200, remaining: 195, unit: '次', resetAt: new Date(now - 3600e3).toISOString() }] },
+        { name: 'delta.example.com', enabled: true, plan: null, status: 'unsupported', message: '该提供方未提供额度查询接口', windows: [], updatedAt: null },
+        { name: 'epsilon.example.com', enabled: true, plan: null, status: 'reauth', message: '登录已过期，请重新授权后查看额度', windows: [], updatedAt: null },
+        { name: 'zeta.example.com', enabled: true, plan: null, status: 'cooling', message: '触发限流，冷却中', updatedAt: now - 20e3, windows: [
+          { label: '五小时', used: 58, limit: 60, remaining: 2, unit: '次', resetAt: h(0.5) }] },
+        { name: 'eta.example.com', enabled: true, plan: null, status: 'ready', message: null, updatedAt: null, windows: [
+          { label: '五小时', used: null, limit: null, remaining: null, unit: null, resetAt: null }] },
+      ];
+      return { providers: all, updatedAt: now - 2e3, online: true, error: null };
+    }
+
+    var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
+    return function (cmd, args) {
+      var a = args && typeof args === 'object' ? args : {};
+      if (cmd === 'quota_snapshot') {
+        return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
+      }
+      if (cmd === 'routing_snapshot') return delay(copy(routing));
+      if (cmd === 'routing_save') {
+        var change = a.change && typeof a.change === 'object' ? a.change : {};
+        if (change.revision !== routing.revision) return Promise.reject(new Error(STALE_MSG));
+        if (ROUTING_SCOPES.indexOf(change.scope) === -1) return Promise.reject(new Error('路由范围无效'));
+        if (typeof change.field !== 'string' || !change.field) return Promise.reject(new Error('路由字段无效'));
+        var target = typeof change.target === 'string' && change.target ? change.target : null;
+        var idx = -1;
+        for (var i = 0; i < routing.routes.length; i++) {
+          if (routing.routes[i].scope === change.scope && routing.routes[i].field === change.field) { idx = i; break; }
+        }
+        if (target === null) {
+          if (idx !== -1) routing.routes.splice(idx, 1); // null/empty target clears the override
+        } else {
+          var fallback = Array.isArray(change.fallback)
+            ? change.fallback.filter(function (f) { return typeof f === 'string' && f; })
+            : (idx !== -1 ? routing.routes[idx].fallback : []); // null fallback preserves
+          var entry = { scope: change.scope, field: change.field, target: target, fallback: fallback };
+          if (idx === -1) routing.routes.push(entry); else routing.routes[idx] = entry;
+        }
+        bump();
+        return delay(copy(routing));
+      }
+      if (cmd === 'routing_flags') {
+        if (a.revision !== routing.revision) return Promise.reject(new Error(STALE_MSG));
+        routing.familyRouting = a.familyRouting === true;
+        routing.fallbackEnabled = a.fallbackEnabled === true;
+        bump();
+        return delay(copy(routing));
+      }
+      if (cmd === 'usage_snapshot') {
+        var period = USAGE_PERIODS.indexOf(a.period) !== -1 ? a.period : 'today';
+        return delay(copy(usage[period]));
+      }
+      if (cmd === 'clients_snapshot') return delay(copy(clients));
+      if (cmd === 'clients_update') {
+        var client = null;
+        for (var j = 0; j < clients.clients.length; j++) if (clients.clients[j].id === a.id) { client = clients.clients[j]; break; }
+        if (!client) return Promise.reject(new Error('未知客户端'));
+        if (['enable', 'disable', 'restore'].indexOf(a.action) === -1) return Promise.reject(new Error('客户端操作无效'));
+        if (a.action === 'enable') client.enabled = true;
+        else if (a.action === 'disable') client.enabled = false;
+        else if (a.action === 'restore') { client.enabled = false; client.managed = false; client.activeModel = null; client.modelAlias = null; }
+        return delay(copy(clients));
+      }
+      if (cmd === 'service_snapshot') return delay(copy(service));
+      if (cmd === 'service_action') {
+        if (a.action === 'start') {
+          if (service.mode === 'owned' || service.mode === 'external' || service.mode === 'starting') {
+            return Promise.reject(new Error('服务已在运行或启动中'));
+          }
+          service = { mode: 'owned', running: true, message: '' };
+          return delay(copy(service));
+        }
+        if (a.action === 'stop') {
+          if (service.mode === 'external') return Promise.reject(new Error('外部服务不能从这里停止'));
+          if (service.mode !== 'owned') return Promise.reject(new Error('服务未在运行'));
+          service = { mode: 'stopped', running: false, message: '' };
+          return delay(copy(service));
+        }
+        return Promise.reject(new Error('服务操作无效'));
+      }
+      return Promise.resolve(null);
+    };
+  }
+
+
+  // ---- Exports (pure logic for tests; DOM code is document-guarded) ------
+
+  var QuotaUI = {
+    // quota tab (unchanged contract)
+    normalizeSnapshot: normalizeSnapshot, normalizeProvider: normalizeProvider, normalizeWindow: normalizeWindow,
+    statusMeta: statusMeta, computePercent: computePercent, formatPercent: formatPercent,
+    formatAmount: formatAmount, formatResetTime: formatResetTime, formatTimestamp: formatTimestamp,
+    describeWindow: describeWindow, createController: createController,
+    // shared helpers
+    errorMessage: errorMessage, formatInt: formatInt, formatCompact: formatCompact, formatClock: formatClock,
+    // routing tab
+    ROUTING_SCOPES: ROUTING_SCOPES, ROUTING_SCENARIOS: ROUTING_SCENARIOS, USAGE_PERIODS: USAGE_PERIODS,
+    SCOPE_LABELS: SCOPE_LABELS, SCENARIO_LABELS: SCENARIO_LABELS,
+    routeKey: routeKey, splitKey: splitKey, routeLabel: routeLabel,
+    normalizeRoutingSnapshot: normalizeRoutingSnapshot, findRoute: findRoute,
+    canonicalTarget: canonicalTarget, canonicalFallback: canonicalFallback,
+    createRoutingController: createRoutingController,
+    // usage / clients / service
+    normalizeUsageSnapshot: normalizeUsageSnapshot, createUsageController: createUsageController,
+    normalizeClientsResponse: normalizeClientsResponse, createClientsController: createClientsController,
+    SERVICE_MODES: SERVICE_MODES, normalizeServiceState: normalizeServiceState,
+    serviceView: serviceView, quitTitleFor: quitTitleFor, createServiceController: createServiceController,
+    // preview fixtures (complete contracts, ?preview=1 only)
+    createPreviewInvoke: createPreviewInvoke,
+  };
+  if (typeof globalThis !== 'undefined') globalThis.QuotaUI = QuotaUI;
+
+
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  var REFRESH_PATHS = ['M13.3 8a5.3 5.3 0 1 1-1.55-3.75', 'M13.4 1.6v3h-3'];
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function icon(paths) {
+    var svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('class', 'icon');
+    paths.forEach(function (d) {
+      var p = document.createElementNS(SVG_NS, 'path');
+      p.setAttribute('d', d);
+      svg.appendChild(p);
+    });
+    return svg;
+  }
+  function mkBtn(text, label, onClick) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn';
+    b.textContent = text;
+    if (label) { b.title = label; b.setAttribute('aria-label', label); }
+    b.addEventListener('click', onClick);
+    return b;
+  }
+  function noteEl(text) { return el('div', 'note', text); }
+
+  function buildCard() {
+    var li = el('li', 'card');
+    var head = el('div', 'card-head');
+    var title = el('div', 'card-title');
+    var name = el('span', 'card-name');
+    var badges = el('span', 'card-badges');
+    title.appendChild(name);
+    title.appendChild(badges);
+    var actions = el('div', 'card-actions');
+    var status = el('span', 'status');
+    var refresh = document.createElement('button');
+    refresh.type = 'button';
+    refresh.className = 'btn btn-icon card-refresh';
+    refresh.dataset.refresh = '1';
+    refresh.appendChild(icon(REFRESH_PATHS));
+    actions.appendChild(status);
+    actions.appendChild(refresh);
+    head.appendChild(title);
+    head.appendChild(actions);
+    var message = el('p', 'card-message'); message.hidden = true;
+    var error = el('p', 'card-error'); error.hidden = true;
+    var windows = el('ul', 'windows');
+    var loading = el('p', 'card-loading'); loading.hidden = true;
+    li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(windows); li.appendChild(loading);
+    return { li: li, name: name, badges: badges, status: status, refresh: refresh, message: message, error: error, windows: windows, loading: loading };
+  }
+
+  function buildWindow(win) {
+    var li = el('li', 'window');
+    var label = toStr(win.label) || '用量';
+    var pct = computePercent(win);
+    var pctText = formatPercent(pct);
+    var top = el('div', 'window-top');
+    top.appendChild(el('span', 'window-label', label));
+    top.appendChild(el('span', 'window-pct', pctText || ''));
+    li.appendChild(top);
+    if (pct !== null) {
+      var meter = document.createElement('progress');
+      meter.className = 'meter';
+      meter.setAttribute('max', '100');
+      meter.setAttribute('value', String(Math.round(pct * 100) / 100));
+      meter.setAttribute('data-level', pct >= 90 ? 'high' : 'normal');
+      meter.setAttribute('aria-label', label + ' 已用 ' + pctText);
+      li.appendChild(meter);
+    }
+    var meta = describeWindow(win);
+    if (meta) li.appendChild(el('div', 'window-meta', meta));
+    return li;
+  }
+
+  function detectTauri() {
+    var t = typeof window !== 'undefined' && window.__TAURI__;
+    return t && t.core && typeof t.core.invoke === 'function' ? t : null;
+  }
+
+  function boot() {
+    var previewWanted = typeof location !== 'undefined' && /[?&]preview=1/.test(location.search);
+    if (detectTauri() || previewWanted) { run(detectTauri(), previewWanted); return; }
+
+    var tries = 0;
+    var timer = setInterval(function () {
+      tries += 1;
+      if (detectTauri() || tries >= 12) { clearInterval(timer); run(detectTauri(), previewWanted); }
+    }, 120);
+  }
+
+  function run(tauri, previewWanted) {
+    var mode = tauri ? 'tauri' : previewWanted ? 'preview' : 'missing';
+    var invoke = tauri
+      ? function (cmd, args) { return tauri.core.invoke(cmd, args); }
+      : mode === 'preview' ? createPreviewInvoke() : null;
+    var controller = mode === 'missing' ? null : createController({ invoke: invoke });
+    var routingCtrl = mode === 'missing' ? null : createRoutingController({ invoke: invoke });
+    var usageCtrl = mode === 'missing' ? null : createUsageController({ invoke: invoke });
+    var clientsCtrl = mode === 'missing' ? null : createClientsController({ invoke: invoke });
+    var serviceCtrl = mode === 'missing' ? null : createServiceController({ invoke: invoke });
+    var els = {
+      list: document.getElementById('list'),
+      empty: document.getElementById('empty'),
+      banner: document.getElementById('banner'),
+      count: document.getElementById('provider-count'),
+      updatedAt: document.getElementById('updated-at'),
+      refreshAll: document.getElementById('refresh-all'),
+      openUi: document.getElementById('open-ui'),
+      quit: document.getElementById('quit'),
+      tabs: document.getElementById('tabs'),
+      serviceChip: document.getElementById('service-chip'),
+      serviceText: document.getElementById('service-text'),
+      serviceStart: document.getElementById('service-start'),
+      serviceStop: document.getElementById('service-stop'),
+      serviceRefresh: document.getElementById('service-refresh'),
+      routingRevision: document.getElementById('routing-revision'),
+      routingRefresh: document.getElementById('routing-refresh'),
+      flagFamily: document.getElementById('flag-family'),
+      flagFallback: document.getElementById('flag-fallback'),
+      routingFlagsMsg: document.getElementById('routing-flags-msg'),
+      routingMsg: document.getElementById('routing-msg'),
+      routingScopes: document.getElementById('routing-scopes'),
+      routeChoices: document.getElementById('route-choices'),
+      routingBody: document.getElementById('routing-body'),
+      aliasAdd: document.getElementById('alias-add'),
+      aliasName: document.getElementById('alias-name'),
+      aliasTarget: document.getElementById('alias-target'),
+      aliasAddBtn: document.getElementById('alias-add-btn'),
+      aliasAddMsg: document.getElementById('alias-add-msg'),
+      usageUpdated: document.getElementById('usage-updated'),
+      usageRefresh: document.getElementById('usage-refresh'),
+      usagePeriods: document.getElementById('usage-periods'),
+      usageMsg: document.getElementById('usage-msg'),
+      usageBody: document.getElementById('usage-body'),
+      clientsRefresh: document.getElementById('clients-refresh'),
+      clientsMsg: document.getElementById('clients-msg'),
+      clientsList: document.getElementById('clients-list'),
+    };
+    var cards = new Map();
+
+    function safeCommand(cmd) {
+      if (!invoke) return;
+      try {
+        var r = invoke(cmd);
+        if (r && typeof r.catch === 'function') r.catch(function () {});
+      } catch { /* Never log command payloads. */ }
+    }
+
+    function setBanner(node, text, tone) {
+      node.hidden = !text;
+      node.textContent = text || '';
+      if (tone) node.setAttribute('data-tone', tone); else node.removeAttribute('data-tone');
+    }
+
+    // ---- quota tab (unchanged behavior) ----------------------------------
+
+    function renderBanner(state) {
+      var tone = null, text = null;
+      if (mode === 'missing') { tone = 'error'; text = '无法访问桌面 IPC（window.__TAURI__ 不可用），额度数据不可用。'; }
+      else if (state.fullError) { tone = 'error'; text = '刷新失败，正在显示最后已知数据：' + state.fullError; }
+      else if (state.snapshot && !state.snapshot.online) { tone = 'warn'; text = '网关离线 · 显示最后已知数据'; }
+      else if (state.snapshot && state.snapshot.error) { tone = 'warn'; text = '部分数据获取失败：' + state.snapshot.error; }
+      setBanner(els.banner, text, tone);
+    }
+
+    function updateCard(refs, row) {
+      var p = row.provider;
+      refs.li.dataset.provider = p.name;
+      refs.li.dataset.disabled = String(!p.enabled);
+      refs.li.dataset.stale = String(row.stale);
+      refs.li.setAttribute('aria-busy', String(row.loading));
+      if (refs.name.textContent !== p.name) refs.name.textContent = p.name;
+      refs.badges.textContent = '';
+      if (p.plan) refs.badges.appendChild(el('span', 'badge badge-plan', p.plan));
+      if (!p.enabled) refs.badges.appendChild(el('span', 'badge badge-off', '已停用'));
+      if (row.stale) refs.badges.appendChild(el('span', 'badge badge-stale', '可能过期'));
+      var meta = statusMeta(p.status);
+      refs.status.className = 'status tone-' + meta.tone;
+      refs.status.textContent = meta.label;
+      refs.message.hidden = !p.message;
+      refs.message.textContent = p.message || '';
+      refs.error.hidden = !row.cardError;
+      refs.error.textContent = row.cardError ? '刷新失败：' + row.cardError : '';
+      refs.windows.textContent = '';
+      p.windows.forEach(function (w) { refs.windows.appendChild(buildWindow(w)); });
+      refs.loading.hidden = !row.loading;
+      refs.loading.textContent = row.loading ? '读取中…' : '';
+      refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';
+      refs.refresh.setAttribute('aria-label', '刷新 ' + p.name);
+      refs.refresh.title = '刷新 ' + p.name;
+    }
+
+    function render(state) {
+      els.refreshAll.classList.toggle('is-loading', !!state.loadingAll);
+      els.refreshAll.setAttribute('aria-busy', String(!!state.loadingAll));
+      els.refreshAll.disabled = !!state.loadingAll || mode === 'missing';
+      els.openUi.disabled = mode === 'missing';
+      els.quit.disabled = mode === 'missing';
+      els.count.textContent = state.count === null ? (mode === 'missing' || state.fullError ? '不可用' : '正在读取…')
+        : state.count === 0 && (state.fullError || !state.snapshot.online || state.snapshot.error)
+          ? '服务不可用' : '已配置 ' + state.count + ' 个提供方';
+      var ts = state.snapshot ? formatTimestamp(state.snapshot.updatedAt) : null;
+      els.updatedAt.textContent = ts ? '额度更新于 ' + ts : '—';
+      renderBanner(state);
+      var seen = new Set();
+      state.rows.forEach(function (row) {
+        seen.add(row.provider.name);
+        var refs = cards.get(row.provider.name);
+        if (!refs) { refs = buildCard(); cards.set(row.provider.name, refs); }
+        updateCard(refs, row);
+      });
+      cards.forEach(function (refs, name) {
+        if (!seen.has(name)) { refs.li.remove(); cards.delete(name); }
+      });
+      state.rows.forEach(function (row) { els.list.insertBefore(cards.get(row.provider.name).li, els.empty); });
+      // A missing snapshot or an offline gateway is NOT an empty state; keep
+      // the loading/offline banner instead of claiming no providers exist.
+      els.empty.hidden = state.rows.length !== 0 || !state.snapshot || !state.snapshot.online || !!state.fullError || !!state.snapshot.error;
+      els.list.setAttribute('aria-busy', String(!!state.loadingAll));
+    }
+
+    // ---- service bar ------------------------------------------------------
+
+    function renderService(sState) {
+      var view = serviceView(sState.service);
+      var busy = !!sState.pending || sState.loading;
+      if (sState.error) {
+        els.serviceChip.className = 'status tone-warn';
+        els.serviceText.textContent = '服务操作失败：' + sState.error;
+        els.serviceChip.title = sState.error;
+      } else {
+        els.serviceChip.className = 'status tone-' + view.tone;
+        els.serviceText.textContent = sState.pending === 'start' ? '正在启动服务…'
+          : sState.pending === 'stop' ? '正在停止服务…' : view.label;
+        els.serviceChip.title = sState.service && sState.service.message ? sState.service.message : view.label;
+      }
+      els.serviceStart.disabled = mode === 'missing' || !view.canStart || busy;
+      els.serviceStart.title = view.startTitle;
+      els.serviceStop.disabled = mode === 'missing' || !view.canStop || busy;
+      els.serviceStop.title = view.stopTitle;
+      els.serviceRefresh.disabled = mode === 'missing' || sState.loading || !!sState.pending;
+      els.quit.title = quitTitleFor(sState.service);
+      els.quit.querySelector('span').textContent = sState.service && sState.service.mode === 'owned'
+        ? '退出并停止托管服务' : '退出桌面';
+    }
+
+    // ---- routing tab ------------------------------------------------------
+
+    var activeScope = 'global';
+    var routeRefs = new Map();
+    var lastRoutingRevision = null;
+    var restoreFocus = null;
+
+    function scopeButtons() { return Array.prototype.slice.call(els.routingScopes.querySelectorAll('.scope-btn')); }
+
+    function updateChoices(snapshot) {
+      var seen = {}, out = [];
+      ((snapshot && snapshot.providers) || []).forEach(function (p) {
+        (p.models || []).forEach(function (m) {
+          var v = p.name + ',' + m;
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+      });
+      els.routeChoices.textContent = '';
+      out.forEach(function (v) {
+        var o = document.createElement('option');
+        o.value = v;
+        els.routeChoices.appendChild(o);
+      });
+    }
+
+    function routingKeysForScope(scope, s) {
+      var keys = [];
+      if (scope === 'models') {
+        var seen = {};
+        s.snapshot.routes.forEach(function (rt) {
+          if (rt.scope === 'models' && rt.field && !seen[rt.field]) { seen[rt.field] = true; keys.push(routeKey('models', rt.field)); }
+        });
+        s.draftKeys.forEach(function (k) {
+          var p = splitKey(k);
+          if (p.scope === 'models' && p.field && !seen[p.field]) keys.push(k);
+        });
+      } else {
+        ROUTING_SCENARIOS.forEach(function (f) { keys.push(routeKey(scope, f)); });
+      }
+      return keys;
+    }
+
+    function captureRoutingFocus() {
+      restoreFocus = null;
+      var a = document.activeElement;
+      if (!a || !els.routingBody.contains(a)) return;
+      var root = a.closest ? a.closest('.route') : null;
+      if (!root || !root.dataset.key) return;
+      var kind = null;
+      if (a === root.querySelector('.route-target > .route-input')) kind = 'target';
+      else if (a.closest && a.closest('.fallback-add') && a.tagName === 'INPUT') kind = 'add';
+      if (!kind) return;
+      restoreFocus = { key: root.dataset.key, kind: kind, start: a.selectionStart, end: a.selectionEnd };
+    }
+
+    function restoreRoutingFocus() {
+      if (!restoreFocus) return;
+      var refs = routeRefs.get(restoreFocus.key);
+      var input = refs && (restoreFocus.kind === 'target' ? refs.target : refs.addInput);
+      if (input) {
+        input.focus();
+        if (typeof input.setSelectionRange === 'function') {
+          var len = input.value.length;
+          var s0 = Math.min(restoreFocus.start == null ? len : restoreFocus.start, len);
+          var e0 = Math.min(restoreFocus.end == null ? len : restoreFocus.end, len);
+          try { input.setSelectionRange(s0, e0); } catch { /* non-text inputs */ }
+        }
+      }
+      restoreFocus = null;
+    }
+
+    function renderFallbackChips(refs, key, list) {
+      refs.fbList.textContent = '';
+      list.forEach(function (name, i) {
+        var li = el('li', 'fallback-item');
+        li.appendChild(el('span', 'fallback-order', (i + 1) + '.'));
+        li.appendChild(el('span', 'fallback-name', name));
+        var up = mkBtn('↑', '上移 ' + name, function () { routingCtrl.moveFallback(key, i, -1); });
+        up.disabled = i === 0;
+        var down = mkBtn('↓', '下移 ' + name, function () { routingCtrl.moveFallback(key, i, 1); });
+        down.disabled = i === list.length - 1;
+        var rm = mkBtn('✕', '删除回退 ' + name, function () { routingCtrl.removeFallback(key, i); });
+        li.appendChild(up); li.appendChild(down); li.appendChild(rm);
+        refs.fbList.appendChild(li);
+      });
+    }
+
+    function syncRouteRow(refs, key) {
+      var s = routingCtrl.state();
+      var parts = splitKey(key);
+      var draft = s.draft(key);
+      var snap = s.snapshot;
+      var canonicalT = snap ? canonicalTarget(snap, parts.scope, parts.field) : '';
+      var canonicalF = snap ? canonicalFallback(snap, parts.scope, parts.field) : [];
+      var targetVal = draft ? draft.target : canonicalT;
+      // Never rewrite the value of a focused input; that would drop the draft
+      // or move the caret mid-typing.
+      if (document.activeElement !== refs.target && refs.target.value !== targetVal) refs.target.value = targetVal;
+      refs.unset.hidden = targetVal !== '';
+      var isDirty = !!draft && !s.isClean(key);
+      var saving = s.savingKey === key;
+      refs.saveBtn.disabled = !isDirty || saving || s.flagsSaving || s.loading || mode === 'missing';
+      refs.saveBtn.textContent = saving ? '保存中…' : '保存';
+      refs.saveBtn.setAttribute('aria-busy', String(saving));
+      refs.resetBtn.hidden = !isDirty;
+      refs.root.setAttribute('data-dirty', String(isDirty));
+      var list = draft ? draft.fallback : canonicalF;
+      var sig = JSON.stringify(list);
+      if (refs.lastChips !== sig) { refs.lastChips = sig; renderFallbackChips(refs, key, list); }
+      var msgText = '', tone = null;
+      if (s.saveError && s.saveError.key === key) msgText = s.saveError.message;
+      else if (s.savedFlash && s.savedFlash.key === key) {
+        var c = formatClock(s.savedFlash.at);
+        msgText = c ? '已保存 ' + c : '已保存';
+        tone = 'ok';
+      }
+      refs.msg.textContent = msgText;
+      if (tone) refs.msg.setAttribute('data-tone', tone); else refs.msg.removeAttribute('data-tone');
+    }
+
+    function buildRouteRow(key) {
+      var parts = splitKey(key);
+      var labelText = routeLabel(parts.scope, parts.field);
+      var root = el('div', 'route');
+      root.dataset.key = key;
+      var head = el('div', 'route-head');
+      head.appendChild(el('span', 'route-name', labelText));
+      var unset = el('span', 'badge badge-off route-unset', '未设置');
+      head.appendChild(unset);
+      root.appendChild(head);
+
+      var targetWrap = el('div', 'route-target');
+      var target = document.createElement('input');
+      target.type = 'text';
+      target.className = 'route-input';
+      target.setAttribute('list', 'route-choices');
+      target.placeholder = '提供方,模型（留空清除）';
+      target.setAttribute('aria-label', SCOPE_LABELS[parts.scope] + ' · ' + labelText + ' 目标');
+      var clearBtn = mkBtn('✕', '清除 ' + labelText + '（保存后生效）', function () { routingCtrl.setTarget(key, ''); });
+      clearBtn.className = 'btn btn-icon route-clear';
+      targetWrap.appendChild(target);
+      targetWrap.appendChild(clearBtn);
+      root.appendChild(targetWrap);
+
+      var fb = el('div', 'route-fallback');
+      fb.appendChild(el('span', 'route-fallback-label', '回退顺序'));
+      var fbList = el('ol', 'fallback-list');
+      fb.appendChild(fbList);
+      var fbAdd = el('div', 'fallback-add');
+      var addInput = document.createElement('input');
+      addInput.type = 'text';
+      addInput.className = 'route-input';
+      addInput.setAttribute('list', 'route-choices');
+      addInput.placeholder = '添加回退，如 provider,model';
+      addInput.setAttribute('aria-label', labelText + ' 添加回退');
+      var addBtn = mkBtn('添加', '添加 ' + labelText + ' 回退', submitAdd);
+      fbAdd.appendChild(addInput);
+      fbAdd.appendChild(addBtn);
+      fb.appendChild(fbAdd);
+      root.appendChild(fb);
+
+      var foot = el('div', 'route-foot');
+      var msg = el('span', 'route-msg');
+      foot.appendChild(msg);
+      foot.appendChild(el('span', 'spacer'));
+      var resetBtn = mkBtn('撤销', '撤销未保存的修改', function () { routingCtrl.resetDraft(key); });
+      var saveBtn = mkBtn('保存', '保存 ' + labelText, function () { routingCtrl.saveRow(key); });
+      saveBtn.className = 'btn btn-primary route-save';
+      foot.appendChild(resetBtn);
+      foot.appendChild(saveBtn);
+      root.appendChild(foot);
+
+      function submitAdd() {
+        var r = routingCtrl.addFallback(key, addInput.value);
+        if (r && r.ok === false) {
+          addInput.setAttribute('aria-invalid', 'true');
+          addInput.title = r.message;
+        } else {
+          addInput.value = '';
+          addInput.removeAttribute('aria-invalid');
+          addInput.title = '';
+          addInput.focus();
+        }
+      }
+      // Typing only updates the draft; controller emits refresh status bits,
+      // never the input values themselves.
+      target.addEventListener('input', function () { routingCtrl.setTarget(key, target.value); });
+      addInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); submitAdd(); } });
+      addInput.addEventListener('input', function () { addInput.removeAttribute('aria-invalid'); addInput.title = ''; });
+
+      var refs = { root: root, target: target, unset: unset, fbList: fbList, addInput: addInput, resetBtn: resetBtn, saveBtn: saveBtn, msg: msg, lastChips: null };
+      syncRouteRow(refs, key);
+      return refs;
+    }
+
+    function rebuildRouting() {
+      captureRoutingFocus();
+      els.routingBody.textContent = '';
+      routeRefs.clear();
+      if (!routingCtrl) {
+        els.routingBody.appendChild(noteEl('桌面 IPC 不可用，无法读取路由配置。'));
+        restoreRoutingFocus();
+        return;
+      }
+      var s = routingCtrl.state();
+      if (!s.snapshot) {
+        // Before the first snapshot there is no real empty state to show.
+        els.routingBody.appendChild(noteEl(s.loading ? '正在读取路由配置…' : '路由配置读取失败：' + (s.error || '未知错误')));
+        restoreRoutingFocus();
+        return;
+      }
+      updateChoices(s.snapshot);
+      routingKeysForScope(activeScope, s).forEach(function (key) {
+        var refs = buildRouteRow(key);
+        routeRefs.set(key, refs);
+        els.routingBody.appendChild(refs.root);
+      });
+      lastRoutingRevision = s.snapshot.revision;
+      restoreRoutingFocus();
+    }
+
+    function renderRouting(s) {
+      els.routingRefresh.disabled = mode === 'missing' || s.loading || !!s.savingKey || s.flagsSaving;
+      var snap = s.snapshot;
+      els.routingRevision.textContent = snap ? '修订 ' + (snap.revision || '—') : '';
+      if (snap && !s.flagsSaving) {
+        els.flagFamily.checked = snap.familyRouting;
+        els.flagFallback.checked = snap.fallbackEnabled;
+      }
+      var flagsBlocked = mode === 'missing' || !snap || s.flagsSaving || !!s.savingKey || s.loading;
+      els.flagFamily.disabled = flagsBlocked;
+      els.flagFallback.disabled = flagsBlocked;
+      els.routingFlagsMsg.textContent = s.flagsError || '';
+      var banner = null, tone = null;
+      if (s.error) { banner = '路由配置读取失败：' + s.error; tone = 'error'; }
+      else if (s.saveError) { banner = s.saveError.message + '（未保存的修改已保留）'; tone = 'error'; }
+      setBanner(els.routingMsg, banner, tone);
+      els.aliasAdd.hidden = activeScope !== 'models' || mode === 'missing';
+      if (!snap) { rebuildRouting(); els.routingBody.setAttribute('aria-busy', String(s.loading)); return; }
+      var expected = routingKeysForScope(activeScope, s);
+      var current = Array.from(routeRefs.keys());
+      var same = expected.length === current.length && expected.every(function (k) { return current.indexOf(k) !== -1; });
+      if (!same) rebuildRouting();
+      else {
+        if (snap.revision !== lastRoutingRevision) { updateChoices(snap); lastRoutingRevision = snap.revision; }
+        routeRefs.forEach(function (refs, k) { syncRouteRow(refs, k); });
+      }
+      els.routingBody.setAttribute('aria-busy', String(s.loading));
+    }
+
+    // ---- usage tab --------------------------------------------------------
+
+    function usageNumCell(label, value, fullValue) {
+      var cell = el('div', 'usage-cell');
+      var num = el('span', 'usage-num', value === null ? '—' : String(value));
+      if (fullValue != null) num.title = fullValue;
+      cell.appendChild(num);
+      cell.appendChild(el('span', 'usage-label', label));
+      return cell;
+    }
+
+    function usageTable(titleText, headers, rows, numFrom) {
+      var card = el('div', 'usage-card');
+      card.appendChild(el('div', 'usage-title', titleText));
+      if (!rows.length) {
+        card.appendChild(noteEl('该周期暂无调用记录'));
+        return card;
+      }
+      var table = el('table', 'usage-table');
+      var thead = el('thead');
+      var hr = el('tr');
+      headers.forEach(function (h, i) {
+        var th = el('th', i >= numFrom ? 'num' : null, h);
+        th.setAttribute('scope', 'col');
+        hr.appendChild(th);
+      });
+      thead.appendChild(hr);
+      table.appendChild(thead);
+      var tbody = el('tbody');
+      rows.forEach(function (cells) {
+        var tr = el('tr');
+        cells.forEach(function (c, i) {
+          var td = el('td', i >= numFrom ? 'num' : null, c.text);
+          if (c.title != null) td.title = c.title;
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      card.appendChild(table);
+      return card;
+    }
+
+    function renderUsage(s) {
+      els.usageRefresh.disabled = mode === 'missing' || s.loading;
+      Array.prototype.slice.call(els.usagePeriods.querySelectorAll('.period-btn')).forEach(function (b) {
+        b.setAttribute('aria-pressed', String(b.dataset.period === s.period));
+      });
+      var ts = s.snapshot ? formatTimestamp(s.snapshot.updatedAt) : null;
+      els.usageUpdated.textContent = ts ? '更新于 ' + ts : (s.loading ? '正在读取…' : '');
+      setBanner(els.usageMsg, s.error ? '用量读取失败：' + s.error : null, s.error ? 'error' : null);
+      var body = els.usageBody;
+      body.textContent = '';
+      body.setAttribute('aria-busy', String(s.loading));
+      if (!s.snapshot) {
+        // No snapshot yet: never fabricate an empty state.
+        body.appendChild(noteEl(s.loading ? '正在读取用量…' : (s.error ? '用量读取失败：' + s.error : '尚未读取用量数据')));
+        return;
+      }
+      var u = s.snapshot;
+      var totals = el('div', 'usage-card');
+      totals.appendChild(el('div', 'usage-title', '汇总 · ' + (u.period === 'today' ? '今天' : u.period === '7d' ? '近 7 天' : '近 30 天')));
+      var grid = el('div', 'usage-grid');
+      grid.appendChild(usageNumCell('请求', formatInt(u.totalRequests)));
+      grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
+      grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
+      grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
+      grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
+      grid.appendChild(usageNumCell('缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
+      grid.appendChild(usageNumCell('缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
+      grid.appendChild(usageNumCell('估算条目', formatInt(u.estimatedCount)));
+      totals.appendChild(grid);
+      body.appendChild(totals);
+      body.appendChild(usageTable('按提供方', ['提供方', '请求', '输入', '输出'], u.byProvider.map(function (p) {
+        return [{ text: p.name }, { text: formatInt(p.requests) || '—' }, { text: formatCompact(p.inputTokens) || '—', title: formatInt(p.inputTokens) }, { text: formatCompact(p.outputTokens) || '—', title: formatInt(p.outputTokens) }];
+      }), 1));
+      body.appendChild(usageTable('按日期', ['日期', '请求', '输入', '输出'], u.byDay.map(function (d) {
+        return [{ text: d.name }, { text: formatInt(d.requests) || '—' }, { text: formatCompact(d.inputTokens) || '—', title: formatInt(d.inputTokens) }, { text: formatCompact(d.outputTokens) || '—', title: formatInt(d.outputTokens) }];
+      }), 1));
+    }
+
+    // ---- clients tab ------------------------------------------------------
+
+    var clientRefs = new Map();
+
+    function clientNote(text) {
+      var li = el('li', 'note');
+      li.textContent = text;
+      return li;
+    }
+
+    function rebuildClientActions(refs, c, s) {
+      refs.actions.textContent = '';
+      refs.confirm.textContent = '';
+      if (s.confirmId === c.id) {
+        refs.actions.hidden = true;
+        refs.confirm.hidden = false;
+        refs.confirm.appendChild(el('span', 'client-confirm-text', '恢复会改写「' + c.name + '」的配置并断开 CCR 接管，确认恢复？'));
+        var row = el('div', 'client-confirm-actions');
+        var yes = document.createElement('button');
+        yes.type = 'button'; yes.className = 'btn btn-danger'; yes.textContent = '确认恢复';
+        yes.addEventListener('click', function () { clientsCtrl.confirmRestore(c.id); });
+        var no = document.createElement('button');
+        no.type = 'button'; no.className = 'btn'; no.textContent = '取消';
+        no.addEventListener('click', function () { clientsCtrl.cancelRestore(); });
+        row.appendChild(yes); row.appendChild(no);
+        refs.confirm.appendChild(row);
+        return;
+      }
+      refs.actions.hidden = false;
+      refs.confirm.hidden = true;
+      var blocked = !!s.pending || s.loading || s.confirmId !== null || mode === 'missing';
+      var missing = !c.exists;
+      var missingTitle = missing ? '未找到该客户端的配置文件' : null;
+      var main = document.createElement('button');
+      main.type = 'button';
+      main.className = 'btn';
+      main.textContent = c.enabled ? '断开' : '接入';
+      main.disabled = blocked || missing;
+      main.title = missingTitle || (c.enabled ? '断开该客户端与 CCR 的接入' : '将「' + c.name + '」接入 CCR');
+      main.setAttribute('aria-label', c.name + ' ' + main.textContent);
+      main.addEventListener('click', function () {
+        if (c.enabled) clientsCtrl.disconnect(c.id); else clientsCtrl.connect(c.id);
+      });
+      refs.actions.appendChild(main);
+      if (c.managed) {
+        var r = document.createElement('button');
+        r.type = 'button';
+        r.className = 'btn btn-danger-quiet';
+        r.textContent = '恢复原配置';
+        r.disabled = blocked || missing;
+        r.title = missingTitle || '恢复客户端接入 CCR 前的原始配置（需确认）';
+        r.setAttribute('aria-label', c.name + ' 恢复原配置');
+        r.addEventListener('click', function () { clientsCtrl.requestRestore(c.id); });
+        refs.actions.appendChild(r);
+      }
+    }
+
+    function syncClientRow(refs, c, s) {
+      refs.name.textContent = c.name;
+      refs.idSpan.textContent = c.id;
+      var badgeSig = [c.enabled, c.managed, c.exists].join('|');
+      if (refs.badgeSig !== badgeSig) {
+        refs.badgeSig = badgeSig;
+        refs.badges.textContent = '';
+        refs.badges.appendChild(el('span', 'badge ' + (c.enabled ? 'badge-plan' : 'badge-off'), c.enabled ? '已接入' : '未接入'));
+        if (c.managed) refs.badges.appendChild(el('span', 'badge', '接管'));
+        if (!c.exists) refs.badges.appendChild(el('span', 'badge badge-stale', '配置缺失'));
+      }
+      var metaParts = [];
+      if (c.activeModel) metaParts.push('当前模型 ' + c.activeModel);
+      if (c.modelAlias) metaParts.push('别名 ' + c.modelAlias);
+      if (!c.exists) metaParts.push('未找到配置文件');
+      refs.meta.textContent = metaParts.join(' · ');
+      refs.meta.hidden = metaParts.length === 0;
+      var actionSig = [c.enabled, c.managed, c.exists, s.confirmId, !!s.pending, s.loading].join('|');
+      if (refs.actionSig !== actionSig) {
+        refs.actionSig = actionSig;
+        rebuildClientActions(refs, c, s);
+      }
+      refs.error.textContent = s.rowError && s.rowError.id === c.id ? s.rowError.message : '';
+      refs.root.setAttribute('aria-busy', String(!!s.pending && s.pending.id === c.id));
+      refs.root.dataset.disabled = String(!c.enabled);
+    }
+
+    function buildClientRow() {
+      var li = el('li', 'client');
+      var head = el('div', 'client-head');
+      var nameWrap = el('div');
+      nameWrap.className = 'client-title';
+      var name = el('span', 'client-name');
+      var idSpan = el('span', 'client-id');
+      nameWrap.appendChild(name);
+      nameWrap.appendChild(idSpan);
+      var badges = el('span', 'card-badges');
+      head.appendChild(nameWrap);
+      head.appendChild(badges);
+      li.appendChild(head);
+      var meta = el('p', 'client-meta'); meta.hidden = true;
+      li.appendChild(meta);
+      var actions = el('div', 'client-actions');
+      li.appendChild(actions);
+      var confirm = el('div', 'client-confirm'); confirm.hidden = true;
+      li.appendChild(confirm);
+      var error = el('p', 'client-error');
+      li.appendChild(error);
+      els.clientsList.appendChild(li);
+      return { root: li, name: name, idSpan: idSpan, badges: badges, meta: meta, actions: actions, confirm: confirm, error: error, badgeSig: null, actionSig: null };
+    }
+
+    function renderClients(s) {
+      els.clientsRefresh.disabled = mode === 'missing' || s.loading || !!s.pending;
+      var banner = null, tone = null;
+      if (s.error) { banner = '客户端状态读取失败：' + s.error; tone = 'error'; }
+      else if (s.snapshot && s.snapshot.success === false && s.snapshot.message) { banner = s.snapshot.message; tone = 'error'; }
+      setBanner(els.clientsMsg, banner, tone);
+      els.clientsList.setAttribute('aria-busy', String(s.loading));
+      var note = null;
+      if (!s.snapshot) note = s.loading ? '正在读取客户端…' : (s.error ? '' : '尚未读取客户端状态');
+      else if (!s.snapshot.clients.length) note = '未发现可接入的客户端';
+      var noteLi = els.clientsList.querySelector('.note');
+      if (note) {
+        if (!noteLi) { noteLi = clientNote(''); els.clientsList.insertBefore(noteLi, els.clientsList.firstChild); }
+        noteLi.textContent = note;
+        if (s.error && !s.snapshot) { noteLi.textContent = '客户端状态读取失败：' + s.error; noteLi.setAttribute('data-tone', 'error'); }
+        else noteLi.removeAttribute('data-tone');
+      } else if (noteLi) noteLi.remove();
+      if (!s.snapshot) {
+        clientRefs.forEach(function (refs) { refs.root.remove(); });
+        clientRefs.clear();
+        return;
+      }
+      var seen = new Set();
+      s.snapshot.clients.forEach(function (c) {
+        if (!c.id) return;
+        seen.add(c.id);
+        var refs = clientRefs.get(c.id);
+        if (!refs) { refs = buildClientRow(); clientRefs.set(c.id, refs); }
+        syncClientRow(refs, c, s);
+      });
+      clientRefs.forEach(function (refs, id) {
+        if (!seen.has(id)) { refs.root.remove(); clientRefs.delete(id); }
+      });
+    }
+
+    // ---- tabs -------------------------------------------------------------
+
+    var TAB_IDS = ['quota', 'routing', 'usage', 'clients'];
+    var tabButtons = {};
+    var panels = {};
+    TAB_IDS.forEach(function (id) {
+      tabButtons[id] = document.getElementById('tab-' + id);
+      panels[id] = document.getElementById('panel-' + id);
+    });
+    var activeTab = 'quota';
+    var loadedTabs = { quota: true };
+
+    function maybeLoadTab(name) {
+      if (mode === 'missing' || loadedTabs[name]) return;
+      loadedTabs[name] = true;
+      if (name === 'routing') routingCtrl.refresh();
+      if (name === 'usage') usageCtrl.refresh();
+      if (name === 'clients') clientsCtrl.refresh();
+    }
+
+    function selectTab(name) {
+      if (TAB_IDS.indexOf(name) === -1) return;
+      activeTab = name;
+      TAB_IDS.forEach(function (id) {
+        var on = id === name;
+        tabButtons[id].setAttribute('aria-selected', String(on));
+        tabButtons[id].tabIndex = on ? 0 : -1;
+        panels[id].hidden = !on;
+      });
+      maybeLoadTab(name);
+    }
+
+    els.tabs.addEventListener('keydown', function (event) {
+      var idx = TAB_IDS.indexOf(activeTab);
+      var next = null;
+      if (event.key === 'ArrowRight') next = TAB_IDS[(idx + 1) % TAB_IDS.length];
+      else if (event.key === 'ArrowLeft') next = TAB_IDS[(idx + TAB_IDS.length - 1) % TAB_IDS.length];
+      else if (event.key === 'Home') next = TAB_IDS[0];
+      else if (event.key === 'End') next = TAB_IDS[TAB_IDS.length - 1];
+      if (!next) return;
+      event.preventDefault();
+      selectTab(next);
+      tabButtons[next].focus();
+    });
+    TAB_IDS.forEach(function (id) {
+      tabButtons[id].addEventListener('click', function () { selectTab(id); });
+    });
+
+    // ---- wiring -----------------------------------------------------------
+
+    scopeButtons().forEach(function (b) {
+      b.addEventListener('click', function () {
+        var scope = b.dataset.scope;
+        if (ROUTING_SCOPES.indexOf(scope) === -1) return;
+        activeScope = scope;
+        scopeButtons().forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+        renderRouting(routingCtrl ? routingCtrl.state() : { snapshot: null, loading: false, error: null, flagsSaving: false, flagsError: null, savingKey: null, saveError: null, savedFlash: null, draftKeys: [], draft: function () { return null; }, isClean: function () { return true; } });
+      });
+    });
+    els.flagFamily.addEventListener('change', function () {
+      if (routingCtrl) routingCtrl.setFlag('familyRouting', els.flagFamily.checked);
+    });
+    els.flagFallback.addEventListener('change', function () {
+      if (routingCtrl) routingCtrl.setFlag('fallbackEnabled', els.flagFallback.checked);
+    });
+    els.routingRefresh.addEventListener('click', function () { if (routingCtrl) routingCtrl.refresh(); });
+    els.aliasAddBtn.addEventListener('click', function () {
+      if (!routingCtrl) return;
+      var r = routingCtrl.createAlias(els.aliasName.value, els.aliasTarget.value);
+      if (r && r.ok === false) els.aliasAddMsg.textContent = r.message;
+      else {
+        els.aliasAddMsg.textContent = '';
+        els.aliasName.value = '';
+        els.aliasTarget.value = '';
+        els.aliasName.focus();
+      }
+    });
+    [els.aliasName, els.aliasTarget].forEach(function (input) {
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); els.aliasAddBtn.click(); }
+      });
+    });
+    Array.prototype.slice.call(els.usagePeriods.querySelectorAll('.period-btn')).forEach(function (b) {
+      b.addEventListener('click', function () { if (usageCtrl) usageCtrl.setPeriod(b.dataset.period); });
+    });
+    els.usageRefresh.addEventListener('click', function () { if (usageCtrl) usageCtrl.refresh(); });
+    els.clientsRefresh.addEventListener('click', function () { if (clientsCtrl) clientsCtrl.refresh(); });
+    els.serviceStart.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('start'); });
+    els.serviceStop.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('stop'); });
+    els.serviceRefresh.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.refresh(); });
+
+    if (controller) {
+      controller.subscribe(render);
+      render(controller.state());
+      els.refreshAll.addEventListener('click', function () { controller.refreshAll(); });
+      els.list.addEventListener('click', function (event) {
+        var btn = event.target && event.target.closest ? event.target.closest('[data-refresh]') : null;
+        if (!btn) return;
+        var card = btn.closest('.card');
+        if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
+      });
+      controller.refreshAll();
+    } else {
+      render({ snapshot: null, rows: [], count: null, loadingAll: false, fullError: null });
+    }
+    if (serviceCtrl) {
+      serviceCtrl.subscribe(renderService);
+      renderService(serviceCtrl.state());
+      serviceCtrl.refresh();
+      // Startup finishes asynchronously after the first paint. Keep the local
+      // service controls current without reloading route drafts or other tabs.
+      if (typeof window.setInterval === 'function') {
+        window.setInterval(function () {
+          if (document.visibilityState !== 'hidden') serviceCtrl.refresh();
+        }, 3000);
+      }
+    } else renderService({ service: null, loading: false, pending: null, error: null });
+    if (routingCtrl) {
+      routingCtrl.subscribe(renderRouting);
+      renderRouting(routingCtrl.state());
+    } else renderRouting({ snapshot: null, loading: false, error: null, flagsSaving: false, flagsError: null, savingKey: null, saveError: null, savedFlash: null, draftKeys: [], draft: function () { return null; }, isClean: function () { return true; } });
+    if (usageCtrl) {
+      usageCtrl.subscribe(renderUsage);
+      renderUsage(usageCtrl.state());
+    } else renderUsage({ snapshot: null, loading: false, error: null, period: 'today' });
+    if (clientsCtrl) {
+      clientsCtrl.subscribe(renderClients);
+      renderClients(clientsCtrl.state());
+    } else renderClients({ snapshot: null, loading: false, error: null, pending: null, rowError: null, confirmId: null });
+
+    els.openUi.addEventListener('click', function () { safeCommand('quota_open_ui'); });
+    els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
+    window.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') safeCommand('quota_hide');
+    });
+    // Focus refreshes service status and quota data only; route drafts and
+    // usage/client state must survive native select popups and tab changes.
+    window.addEventListener('focus', function () {
+      if (serviceCtrl) serviceCtrl.refresh();
+      if (activeTab === 'quota' && controller) controller.refreshAll();
+    });
+  }
+
+  if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+    else boot();
+  }
+})();
