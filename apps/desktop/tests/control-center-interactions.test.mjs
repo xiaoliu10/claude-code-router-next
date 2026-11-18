@@ -143,6 +143,19 @@ test('interaction: typing, focus, explicit refresh and tab switch preserve draft
   assert.match(h.id('routing-body').textContent, /已保存/);
 });
 
+test('interaction: background is editable only in global routing, including with legacy family entries', async () => {
+  const h = harness();
+  h.route.routes.push({ scope: 'opus', field: 'background', target: 'alpha,two', fallback: ['alpha,one'] });
+  await flush(); h.id('tab-routing').click(); await flush();
+  const tabs = h.id('panel-routing').querySelectorAll('[data-scope]');
+  for (const scope of ['opus', 'sonnet', 'haiku', 'global']) {
+    tabs.find(t => t.getAttribute('data-scope') === scope).click();
+    const titles = h.id('routing-body').querySelectorAll('.route-name').map(n => n.textContent);
+    assert.ok(titles.includes('默认'));
+    assert.equal(titles.includes('后台'), scope === 'global');
+  }
+});
+
 test('interaction: fallback add fires once, keyboard add, move/remove and explicit save', async () => {
   const h = harness(); await flush(); h.id('tab-routing').click(); await flush();
   const card = h.id('routing-body').children[0];

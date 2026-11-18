@@ -1828,7 +1828,9 @@
           if (p.scope === 'models' && p.field && !seen[p.field]) keys.push(k);
         });
       } else {
-        ROUTING_SCENARIOS.forEach(function (f) { keys.push(routeKey(scope, f)); });
+        ROUTING_SCENARIOS.forEach(function (field) {
+          if (scope === 'global' || field !== 'background') keys.push(routeKey(scope, field));
+        });
       }
       return keys;
     }
