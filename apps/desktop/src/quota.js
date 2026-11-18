@@ -20,8 +20,14 @@
     var n = toNum(v);
     if (n === null) return null;
     var abs = Math.abs(n);
-    if (abs >= 1e8) return (Math.round(n / 1e7) / 10) + '亿';
-    if (abs >= 1e4) return (Math.round(n / 1e3) / 10) + '万';
+    var units = [{ scale: 1e9, suffix: 'B' }, { scale: 1e6, suffix: 'M' }, { scale: 1e3, suffix: 'K' }];
+    for (var i = 0; i < units.length; i++) {
+      var unit = units[i];
+      // Promote values whose two-decimal rounding reaches the next unit.
+      if (abs >= unit.scale || (i < units.length - 1 && abs >= unit.scale - unit.scale / 200000)) {
+        return String(Math.round(n / (unit.scale / 100)) / 100) + unit.suffix;
+      }
+    }
     return formatInt(n);
   }
   function formatClock(ms) {
@@ -226,6 +232,144 @@
     }
 
     return { subscribe: subscribe, state: state, refreshAll: refreshAll, refreshProvider: refreshProvider };
+  }
+
+
+  // ---- Coding Plan quota credentials (quota tab) -------------------------
+  // quota_credentials_status() / quota_credentials_save({name, accessKey?, secretKey?})
+  // Rust lists only providers on ark.cn-beijing.volces.com/api/coding/ (the
+  // same condition as the core adapter) and projects {name, configured} only:
+  // secret values never cross IPC. Omitted input keeps the saved field; an
+  // empty string clears it. Inputs are never prefilled with saved values.
+
+  function normalizeCredentialsStatus(r) {
+    var s = r && typeof r === 'object' ? r : {};
+    var list = Array.isArray(s.providers) ? s.providers : [];
+    var seen = {}, providers = [];
+    list.forEach(function (p) {
+      var o = p && typeof p === 'object' ? p : {};
+      var name = toStr(o.name);
+      if (!name || seen[name]) return;
+      seen[name] = true;
+      providers.push({ name: name, configured: o.configured === true });
+    });
+    return { providers: providers };
+  }
+
+  function createCredentialsController(options) {
+    var invoke = options && options.invoke;
+    if (typeof invoke !== 'function') throw new TypeError('createCredentialsController: 需要 invoke 函数');
+    // Best-effort usage refresh after credentials change; ownership stays with the quota controller.
+    var onSaved = options && typeof options.onSaved === 'function' ? options.onSaved : function () {};
+    var status = null, loading = false, error = null;
+    var openName = null, saving = false, saveError = null, savedFlash = null;
+    var epoch = 0;
+    var listeners = new Set();
+
+    function state() {
+      return { status: status, loading: loading, error: error, openName: openName, saving: saving, saveError: saveError, savedFlash: savedFlash };
+    }
+    function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
+    function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
+    function known(name) {
+      return !!status && status.providers.some(function (p) { return p.name === name; });
+    }
+    function configured(name) {
+      if (!status) return false;
+      for (var i = 0; i < status.providers.length; i++) if (status.providers[i].name === name) return status.providers[i].configured;
+      return false;
+    }
+    function adopt(result) {
+      status = normalizeCredentialsStatus(result);
+      error = null;
+      if (openName !== null && !known(openName)) { openName = null; saveError = null; savedFlash = null; }
+    }
+
+    function refresh() {
+      if (loading || saving) return;
+      loading = true;
+      error = null;
+      emit();
+      var my = ++epoch;
+      invoke('quota_credentials_status').then(function (r) {
+        if (my !== epoch) return;
+        adopt(r);
+        loading = false;
+        emit();
+      }, function (err) {
+        if (my !== epoch) return;
+        loading = false;
+        error = errorMessage(err);
+        emit();
+      });
+    }
+
+    function open(name) {
+      if (saving || !known(name)) return false;
+      openName = name;
+      saveError = null;
+      savedFlash = null;
+      emit();
+      return true;
+    }
+    function close() {
+      if (openName === null || saving) return false;
+      openName = null;
+      saveError = null;
+      savedFlash = null;
+      emit();
+      return true;
+    }
+
+    function performSave(name, args, cleared) {
+      saving = true;
+      saveError = null;
+      savedFlash = null;
+      emit();
+      var my = ++epoch;
+      invoke('quota_credentials_save', args).then(function (r) {
+        if (my !== epoch) return;
+        saving = false;
+        adopt(r);
+        if (openName === name) savedFlash = { name: name, at: Date.now(), cleared: cleared };
+        emit();
+        // The card's usage snapshot is stale once credentials change; refresh it
+        // (best-effort: the Rust quota service applies the 3s attempt dedupe, while this
+        // controller's loading flag collapses concurrent in-flight refreshes).
+        try { onSaved(name); } catch { /* rendering-only hook */ }
+      }, function (err) {
+        if (my !== epoch) return;
+        saving = false;
+        saveError = errorMessage(err);
+        emit();
+      });
+    }
+
+    function save(name, values) {
+      if (saving || openName !== name || !known(name)) return false;
+      var v = values && typeof values === 'object' ? values : {};
+      var ak = typeof v.accessKey === 'string' ? v.accessKey.trim() : '';
+      var sk = typeof v.secretKey === 'string' ? v.secretKey.trim() : '';
+      if (!ak && !sk) {
+        // Blank inputs never overwrite saved credentials; clearing is explicit.
+        saveError = configured(name) ? '留空表示不修改；如需清除已保存凭证请点「清除凭证」' : '请输入 AccessKey ID 和 Secret AccessKey';
+        emit();
+        return false;
+      }
+      var args = { name: name };
+      if (ak) args.accessKey = ak;
+      if (sk) args.secretKey = sk;
+      performSave(name, args, false);
+      return true;
+    }
+
+    function clear(name) {
+      if (saving || openName !== name || !known(name) || !configured(name)) return false;
+      performSave(name, { name: name, accessKey: '', secretKey: '' }, true);
+      return true;
+    }
+
+    return { subscribe: subscribe, state: state, refresh: refresh, open: open, close: close, save: save, clear: clear, configured: configured };
   }
 
 
@@ -535,7 +679,7 @@
 
 
   // ---- Usage tab ---------------------------------------------------------
-  // usage_snapshot({period:'today'|'7d'|'30d'}) -> totals + byProvider/byDay.
+  // usage_snapshot({period:'today'|'7d'|'30d'}) -> totals + byModel/byProvider/byDay.
   // Numbers come from the server summary only; no currency/cost is shown.
 
   function usageRow(x) {
@@ -545,6 +689,8 @@
       requests: toNum(o.requests),
       inputTokens: toNum(o.inputTokens),
       outputTokens: toNum(o.outputTokens),
+      cacheReadTokens: toNum(o.cacheReadTokens),
+      cacheWriteTokens: toNum(o.cacheWriteTokens),
     };
   }
   function normalizeUsageSnapshot(r) {
@@ -559,6 +705,7 @@
       cacheReadTokens: toNum(s.cacheReadTokens),
       cacheWriteTokens: toNum(s.cacheWriteTokens),
       estimatedCount: toNum(s.estimatedCount),
+      byModel: Array.isArray(s.byModel) ? s.byModel.map(usageRow) : [],
       byProvider: Array.isArray(s.byProvider) ? s.byProvider.map(usageRow) : [],
       byDay: Array.isArray(s.byDay) ? s.byDay.map(usageRow) : [],
       updatedAt: toNum(s.updatedAt),
@@ -830,6 +977,7 @@
   // browsable outside Tauri. Never used when window.__TAURI__ is present.
 
   function createPreviewInvoke() {
+    var projectsPreview = typeof ProjectsUI !== 'undefined' ? ProjectsUI.createPreviewProjects() : null;
     var rev = 1;
     var routing = {
       providers: [
@@ -853,36 +1001,39 @@
         period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
         inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
         byProvider: [
-          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000 },
-          { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500 },
+          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
+          { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
         ],
-        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
         updatedAt: Date.now() - 3000,
       },
       '7d': {
         period: '7d', totalRequests: 902, successCount: 890, errorCount: 12,
         inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000 },
-          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000 },
+          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
+          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000 },
-          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000 },
+          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
         ],
         updatedAt: Date.now() - 3000,
       },
       '30d': {
         period: '30d', totalRequests: 4120, successCount: 4044, errorCount: 76,
         inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000 },
-          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000 },
+          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
+          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000 },
+          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
         ],
         updatedAt: Date.now() - 3000,
       },
@@ -899,6 +1050,10 @@
       message: null,
     };
     var service = { mode: 'owned', running: true, message: '' };
+    // Coding Plan credentials preview: fake in-memory values only; the DTO
+    // never carries them, mirroring the Rust projection.
+    var credentials = { providers: [{ name: '火山agent plan', configured: false }] };
+    var credentialKeys = { accessKey: '', secretKey: '' };
 
     function copy(v) { return JSON.parse(JSON.stringify(v)); }
     function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
@@ -921,6 +1076,7 @@
           { label: '五小时', used: 58, limit: 60, remaining: 2, unit: '次', resetAt: h(0.5) }] },
         { name: 'eta.example.com', enabled: true, plan: null, status: 'ready', message: null, updatedAt: null, windows: [
           { label: '五小时', used: null, limit: null, remaining: null, unit: null, resetAt: null }] },
+        { name: '火山agent plan', enabled: true, plan: null, status: 'unavailable', message: '未提供可用额度数据（来源未声明查询能力）', windows: [], updatedAt: null },
       ];
       return { providers: all, updatedAt: now - 2e3, online: true, error: null };
     }
@@ -928,6 +1084,7 @@
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
+      if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
       if (cmd === 'quota_snapshot') {
         return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
       }
@@ -976,6 +1133,17 @@
         else if (a.action === 'restore') { client.enabled = false; client.managed = false; client.activeModel = null; client.modelAlias = null; }
         return delay(copy(clients));
       }
+      if (cmd === 'quota_credentials_status') return delay(copy(credentials));
+      if (cmd === 'quota_credentials_save') {
+        var credEntry = null;
+        for (var k = 0; k < credentials.providers.length; k++) if (credentials.providers[k].name === a.name) { credEntry = credentials.providers[k]; break; }
+        // Keep wording identical to credentials.rs ERR_NOT_FOUND so preview and production match.
+        if (!credEntry) return Promise.reject(new Error('Coding Plan provider is no longer configured; refresh the panel'));
+        if (typeof a.accessKey === 'string') credentialKeys.accessKey = a.accessKey.trim();
+        if (typeof a.secretKey === 'string') credentialKeys.secretKey = a.secretKey.trim();
+        credEntry.configured = !!(credentialKeys.accessKey && credentialKeys.secretKey);
+        return delay(copy(credentials));
+      }
       if (cmd === 'service_snapshot') return delay(copy(service));
       if (cmd === 'service_action') {
         if (a.action === 'start') {
@@ -1006,6 +1174,8 @@
     statusMeta: statusMeta, computePercent: computePercent, formatPercent: formatPercent,
     formatAmount: formatAmount, formatResetTime: formatResetTime, formatTimestamp: formatTimestamp,
     describeWindow: describeWindow, createController: createController,
+    // Coding Plan quota credentials (quota tab)
+    normalizeCredentialsStatus: normalizeCredentialsStatus, createCredentialsController: createCredentialsController,
     // shared helpers
     errorMessage: errorMessage, formatInt: formatInt, formatCompact: formatCompact, formatClock: formatClock,
     // routing tab
@@ -1067,21 +1237,69 @@
     title.appendChild(badges);
     var actions = el('div', 'card-actions');
     var status = el('span', 'status');
+    // Coding Plan credentials affordances; visibility is driven by the
+    // credentials status projection (only matching volces providers).
+    var creds = document.createElement('button');
+    creds.type = 'button';
+    creds.className = 'btn card-creds';
+    creds.setAttribute('data-creds-open', '1');
+    creds.textContent = '用量凭证';
+    creds.title = '配置火山 Coding Plan 用量查询凭证（AK/SK）';
+    creds.hidden = true;
     var refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.className = 'btn btn-icon card-refresh';
     refresh.dataset.refresh = '1';
     refresh.appendChild(icon(REFRESH_PATHS));
     actions.appendChild(status);
+    actions.appendChild(creds);
     actions.appendChild(refresh);
     head.appendChild(title);
     head.appendChild(actions);
     var message = el('p', 'card-message'); message.hidden = true;
     var error = el('p', 'card-error'); error.hidden = true;
+    var credsNote = el('p', 'card-creds-note', '未配置 AK/SK，无法查询套餐用量'); credsNote.hidden = true;
     var windows = el('ul', 'windows');
+    var credsPanel = buildCredsPanel();
     var loading = el('p', 'card-loading'); loading.hidden = true;
-    li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(windows); li.appendChild(loading);
-    return { li: li, name: name, badges: badges, status: status, refresh: refresh, message: message, error: error, windows: windows, loading: loading };
+    li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(credsNote); li.appendChild(windows); li.appendChild(credsPanel.root); li.appendChild(loading);
+    return { li: li, name: name, badges: badges, status: status, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
+  }
+
+  // Inline AK/SK editor in the client-confirm style; buttons are wired by
+  // delegation on the quota list. Password inputs are never prefilled.
+  function buildCredsPanel() {
+    var root = el('div', 'creds-panel'); root.hidden = true;
+    root.appendChild(el('div', 'creds-title', '火山 Coding Plan 用量凭证'));
+    function field(labelText) {
+      var label = el('label', 'creds-field');
+      label.appendChild(el('span', null, labelText));
+      var input = document.createElement('input');
+      input.type = 'password';
+      input.className = 'route-input';
+      input.setAttribute('autocomplete', 'new-password');
+      input.setAttribute('aria-label', labelText);
+      label.appendChild(input);
+      root.appendChild(label);
+      return input;
+    }
+    var ak = field('AccessKey ID');
+    var sk = field('Secret AccessKey');
+    var msg = el('p', 'creds-msg'); msg.hidden = true;
+    root.appendChild(msg);
+    var actions = el('div', 'creds-actions');
+    var saveBtn = mkBtn('保存', '保存用量凭证', function () {});
+    saveBtn.className = 'btn btn-primary';
+    saveBtn.setAttribute('data-creds-save', '1');
+    var clearBtn = mkBtn('清除凭证', '清除已保存的 AK/SK', function () {});
+    clearBtn.className = 'btn btn-danger-quiet';
+    clearBtn.setAttribute('data-creds-clear', '1');
+    clearBtn.hidden = true;
+    var cancelBtn = mkBtn('取消', '关闭凭证面板', function () {});
+    cancelBtn.setAttribute('data-creds-cancel', '1');
+    actions.appendChild(saveBtn); actions.appendChild(clearBtn); actions.appendChild(cancelBtn);
+    root.appendChild(actions);
+    return { root: root, ak: ak, sk: sk, msg: msg, saveBtn: saveBtn, clearBtn: clearBtn, cancelBtn: cancelBtn };
   }
 
   function buildWindow(win) {
@@ -1113,7 +1331,7 @@
   }
 
   function boot() {
-    var previewWanted = typeof location !== 'undefined' && /[?&]preview=1/.test(location.search);
+    var previewWanted = typeof location !== 'undefined' && /(?:^|[?&])preview=1(?:&|$)/.test(location.search);
     if (detectTauri() || previewWanted) { run(detectTauri(), previewWanted); return; }
 
     var tries = 0;
@@ -1129,6 +1347,10 @@
       ? function (cmd, args) { return tauri.core.invoke(cmd, args); }
       : mode === 'preview' ? createPreviewInvoke() : null;
     var controller = mode === 'missing' ? null : createController({ invoke: invoke });
+    var credentialsCtrl = mode === 'missing' ? null : createCredentialsController({
+      invoke: invoke,
+      onSaved: function (name) { if (controller) controller.refreshProvider(name); },
+    });
     var routingCtrl = mode === 'missing' ? null : createRoutingController({ invoke: invoke });
     var usageCtrl = mode === 'missing' ? null : createUsageController({ invoke: invoke });
     var clientsCtrl = mode === 'missing' ? null : createClientsController({ invoke: invoke });
@@ -1171,6 +1393,8 @@
       clientsMsg: document.getElementById('clients-msg'),
       clientsList: document.getElementById('clients-list'),
     };
+    var projectsCtrl = mode === 'missing' ? null : ProjectsUI.createProjectsController({ invoke: invoke });
+    ProjectsUI.mount(document, projectsCtrl);
     var cards = new Map();
 
     function safeCommand(cmd) {
@@ -1223,6 +1447,56 @@
       refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';
       refs.refresh.setAttribute('aria-label', '刷新 ' + p.name);
       refs.refresh.title = '刷新 ' + p.name;
+      syncCardCredentials(refs, p.name, credentialsCtrl ? credentialsCtrl.state() : null);
+    }
+
+    // Credentials affordances follow the credentials status projection, not
+    // the quota snapshot: only Rust-matched Coding Plan providers get them.
+    function syncCardCredentials(refs, name, s) {
+      var matched = !!s && !!s.status && s.status.providers.some(function (p) { return p.name === name; });
+      var configured = matched && s.status.providers.some(function (p) { return p.name === name && p.configured; });
+      var saving = !!s && !!s.saving;
+      refs.creds.hidden = !matched || mode === 'missing';
+      refs.creds.disabled = !matched || saving;
+      refs.credsNote.hidden = !matched || configured;
+      var open = matched && s.openName === name;
+      refs.credsPanel.hidden = !open;
+      if (!open) { refs.credsWasOpen = false; return; }
+      if (!refs.credsWasOpen) {
+        // Opening always starts blank: saved secrets are never echoed.
+        refs.credsAk.value = '';
+        refs.credsSk.value = '';
+        refs.credsWasOpen = true;
+      }
+      refs.credsAk.placeholder = configured ? '已保存，留空则不修改' : '输入 AccessKey ID';
+      refs.credsSk.placeholder = configured ? '已保存，留空则不修改' : '输入 Secret AccessKey';
+      refs.credsAk.disabled = saving;
+      refs.credsSk.disabled = saving;
+      refs.credsSave.disabled = saving;
+      refs.credsSave.textContent = saving ? '保存中…' : '保存';
+      refs.credsClear.hidden = !configured;
+      refs.credsClear.disabled = saving;
+      refs.credsCancel.disabled = saving;
+      var flash = s.savedFlash && s.savedFlash.name === name ? s.savedFlash : null;
+      if (flash && refs.credsFlashStamp !== flash.at) {
+        refs.credsFlashStamp = flash.at;
+        refs.credsAk.value = '';
+        refs.credsSk.value = '';
+      }
+      var text = '', tone = null;
+      if (s.saveError) { text = s.saveError; }
+      else if (flash) {
+        var clock = formatClock(flash.at);
+        text = (flash.cleared ? '已清除' : '已保存') + (clock ? ' ' + clock : '');
+        tone = 'ok';
+      }
+      refs.credsMsg.hidden = !text;
+      refs.credsMsg.textContent = text;
+      if (tone) refs.credsMsg.setAttribute('data-tone', tone); else refs.credsMsg.removeAttribute('data-tone');
+    }
+
+    function renderCredentials(s) {
+      cards.forEach(function (refs, name) { syncCardCredentials(refs, name, s); });
     }
 
     function render(state) {
@@ -1595,6 +1869,10 @@
       grid.appendChild(usageNumCell('请求', formatInt(u.totalRequests)));
       grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
       grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
+      var totalTokens = u.inputTokens === null || u.outputTokens === null ? null : u.inputTokens + u.outputTokens;
+      var totalCell = usageNumCell('总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
+      totalCell.title = '已记录输入 + 输出；缓存独立展示，不重复相加';
+      grid.appendChild(totalCell);
       grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
       grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
       grid.appendChild(usageNumCell('缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
@@ -1602,12 +1880,20 @@
       grid.appendChild(usageNumCell('估算条目', formatInt(u.estimatedCount)));
       totals.appendChild(grid);
       body.appendChild(totals);
-      body.appendChild(usageTable('按提供方', ['提供方', '请求', '输入', '输出'], u.byProvider.map(function (p) {
-        return [{ text: p.name }, { text: formatInt(p.requests) || '—' }, { text: formatCompact(p.inputTokens) || '—', title: formatInt(p.inputTokens) }, { text: formatCompact(p.outputTokens) || '—', title: formatInt(p.outputTokens) }];
-      }), 1));
-      body.appendChild(usageTable('按日期', ['日期', '请求', '输入', '输出'], u.byDay.map(function (d) {
-        return [{ text: d.name }, { text: formatInt(d.requests) || '—' }, { text: formatCompact(d.inputTokens) || '—', title: formatInt(d.inputTokens) }, { text: formatCompact(d.outputTokens) || '—', title: formatInt(d.outputTokens) }];
-      }), 1));
+      totals.appendChild(noteEl('总 tokens = 已记录输入 + 输出；缓存读写独立展示。'));
+      function tokenRow(m) {
+        var rowTotal = m.inputTokens === null || m.outputTokens === null ? null : m.inputTokens + m.outputTokens;
+        return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
+          { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
+          { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
+          { text: (formatCompact(m.cacheReadTokens) || '—') + ' / ' + (formatCompact(m.cacheWriteTokens) || '—'),
+            title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') },
+          { text: formatCompact(rowTotal) || '—', title: formatInt(rowTotal) }];
+      }
+      var tokenHeaders = ['请求', '输入', '输出', '缓存（读 / 写）', '总 tokens'];
+      body.appendChild(usageTable('按模型', ['模型'].concat(tokenHeaders), u.byModel.map(tokenRow), 1));
+      body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
+      body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
     }
 
     // ---- clients tab ------------------------------------------------------
@@ -1756,7 +2042,7 @@
 
     // ---- tabs -------------------------------------------------------------
 
-    var TAB_IDS = ['quota', 'routing', 'usage', 'clients'];
+    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects'];
     var tabButtons = {};
     var panels = {};
     TAB_IDS.forEach(function (id) {
@@ -1772,6 +2058,7 @@
       if (name === 'routing') routingCtrl.refresh();
       if (name === 'usage') usageCtrl.refresh();
       if (name === 'clients') clientsCtrl.refresh();
+      if (name === 'projects') projectsCtrl.refresh();
     }
 
     function selectTab(name) {
@@ -1850,14 +2137,32 @@
       render(controller.state());
       els.refreshAll.addEventListener('click', function () { controller.refreshAll(); });
       els.list.addEventListener('click', function (event) {
-        var btn = event.target && event.target.closest ? event.target.closest('[data-refresh]') : null;
-        if (!btn) return;
-        var card = btn.closest('.card');
-        if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
+        var target = event.target && event.target.closest ? event.target : null;
+        if (!target) return;
+        var btn = target.closest('[data-refresh]');
+        if (btn) {
+          var card = btn.closest('.card');
+          if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
+          return;
+        }
+        if (!credentialsCtrl) return;
+        var credsCard = target.closest('.card');
+        if (!credsCard || !credsCard.dataset.provider) return;
+        var name = credsCard.dataset.provider;
+        if (target.closest('[data-creds-open]')) credentialsCtrl.open(name);
+        else if (target.closest('[data-creds-cancel]')) credentialsCtrl.close();
+        else if (target.closest('[data-creds-save]')) {
+          var refs = cards.get(name);
+          if (refs) credentialsCtrl.save(name, { accessKey: refs.credsAk.value, secretKey: refs.credsSk.value });
+        } else if (target.closest('[data-creds-clear]')) credentialsCtrl.clear(name);
       });
       controller.refreshAll();
     } else {
       render({ snapshot: null, rows: [], count: null, loadingAll: false, fullError: null });
+    }
+    if (credentialsCtrl) {
+      credentialsCtrl.subscribe(renderCredentials);
+      credentialsCtrl.refresh();
     }
     if (serviceCtrl) {
       serviceCtrl.subscribe(renderService);
@@ -1894,6 +2199,7 @@
     window.addEventListener('focus', function () {
       if (serviceCtrl) serviceCtrl.refresh();
       if (activeTab === 'quota' && controller) controller.refreshAll();
+      if (activeTab === 'quota' && credentialsCtrl) credentialsCtrl.refresh();
     });
   }
 

@@ -335,6 +335,7 @@ test("usage: normalizeUsageSnapshot whitelists contract fields only", () => {
   const u = Q.normalizeUsageSnapshot({
     period: "7d", totalRequests: 10, successCount: 8, errorCount: 2,
     inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
+    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, secret: "sekret" }],
     byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, cost: 9.9 }],
     byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50 }],
     updatedAt: 123, secret: "x",
@@ -342,8 +343,9 @@ test("usage: normalizeUsageSnapshot whitelists contract fields only", () => {
   assert.deepEqual(plain(u), {
     period: "7d", totalRequests: 10, successCount: 8, errorCount: 2,
     inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
-    byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50 }],
-    byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50 }],
+    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6 }],
+    byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null }],
+    byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null }],
     updatedAt: 123,
   })
   assert.equal(JSON.stringify(u).includes("cost"), false, "no fabricated cost fields")
@@ -563,8 +565,20 @@ test("service: refresh failure surfaces error without fabricating state", async 
 test("format helpers: formatInt/formatCompact/formatClock stay pure", () => {
   assert.equal(Q.formatInt(1234567), "1,234,567")
   assert.equal(Q.formatInt(null), null)
-  assert.equal(Q.formatCompact(123456789), "1.2亿")
-  assert.equal(Q.formatCompact(12345), "1.2万")
+  assert.equal(Q.formatCompact(123456789), "123.46M")
+  assert.equal(Q.formatCompact(12345), "12.35K")
+  assert.equal(Q.formatCompact(90205000), "90.21M")
+  assert.equal(Q.formatCompact(380000000), "380M")
+  assert.equal(Q.formatCompact(1234567890), "1.23B")
+  assert.equal(Q.formatCompact(999994), "999.99K")
+  assert.equal(Q.formatCompact(999995), "1M")
+  assert.equal(Q.formatCompact(999995000), "1B")
+  assert.equal(Q.formatCompact(1000), "1K")
+  assert.equal(Q.formatCompact(1005), "1.01K")
+  assert.equal(Q.formatCompact(1005000), "1.01M")
+  assert.equal(Q.formatCompact(1005000000), "1.01B")
+  assert.equal(Q.formatCompact(0), "0")
+  assert.equal(Q.formatCompact(NaN), null)
   assert.equal(Q.formatCompact(999), "999")
   assert.equal(Q.formatCompact(null), null)
   const t = new Date(2026, 10, 17, 9, 5, 3).getTime()

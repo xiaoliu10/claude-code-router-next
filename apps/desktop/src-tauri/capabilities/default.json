@@ -17,6 +17,13 @@
     "allow-usage-snapshot",
     "allow-clients-snapshot",
     "allow-clients-update",
+    "allow-projects-snapshot",
+    "allow-projects-add",
+    "allow-projects-save",
+    "allow-projects-takeover",
+    "allow-projects-delete",
+    "allow-quota-credentials-status",
+    "allow-quota-credentials-save",
     "allow-service-snapshot",
     "allow-service-action"
   ]
