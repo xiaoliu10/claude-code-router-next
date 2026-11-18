@@ -360,6 +360,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
       { name: '2026-11-18', requests: 1, inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
       { name: '2026-11-16', requests: 1, inputTokens: 900, outputTokens: 400, cacheReadTokens: 0, cacheWriteTokens: 0 },
       { name: '2026-11-17', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      { name: '2026-11-19', requests: 1, inputTokens: 100, outputTokens: null, cacheReadTokens: 0, cacheWriteTokens: 0 },
     ], updatedAt: 1 }) });
   await openUsage(h);
   const body = h.id('usage-body');
@@ -373,7 +374,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   // Daily chart: ascending dates, visible labels, and no fabricated zero bar.
   const dayCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
   const bars = dayCard.querySelectorAll('.usage-bar');
-  assert.equal(bars.length, 3);
+  assert.equal(bars.length, 4);
   assert.ok(bars[0].title.startsWith('2026-11-16'), 'bars ordered by date ascending');
   assert.equal(bars[0].style.height, '100%');
   assert.equal(bars[0].title.includes('输入 900（900）'), true);
@@ -382,8 +383,9 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(bars[1].style.height, '0%', 'zero-token days have no filled bar');
   assert.equal(bars[2].title.startsWith('2026-11-18'), true);
   assert.equal(bars[2].style.height, '12%', 'smaller days scale relative to the max');
-  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-11-16', '2026-11-17', '2026-11-18']);
-  assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), ['1.3K', '0', '150']);
+  assert.equal(bars[3].style.height, '0%', 'unknown totals have no filled bar');
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19']);
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), ['1.3K', '0', '150', '—']);
   // Model chart: ranked by effective (cache-aware) input+output desc, capped at 10, exact values in title.
   const modelCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('模型 Top 10'));
   const rows = modelCard.querySelectorAll('.usage-hbar-row');
