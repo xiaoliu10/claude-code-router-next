@@ -17,6 +17,7 @@ fn main() {
             "projects_save",
             "projects_takeover",
             "projects_delete",
+            "provider_add",
             "quota_credentials_status",
             "quota_credentials_save",
             "service_snapshot",

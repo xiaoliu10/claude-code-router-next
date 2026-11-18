@@ -23,6 +23,7 @@
     "allow-projects-save",
     "allow-projects-takeover",
     "allow-projects-delete",
+    "allow-provider-add",
     "allow-quota-credentials-status",
     "allow-quota-credentials-save",
     "allow-service-snapshot",

@@ -4,6 +4,7 @@ mod credentials;
 mod lifecycle;
 mod popup;
 mod projects;
+mod providers;
 mod quota;
 mod settings;
 mod tray;
@@ -36,6 +37,7 @@ pub fn run() {
             projects::projects_save,
             projects::projects_takeover,
             projects::projects_delete,
+            providers::provider_add,
             credentials::quota_credentials_status,
             credentials::quota_credentials_save,
             lifecycle::service_snapshot,
@@ -61,6 +63,7 @@ pub fn run() {
                     app.manage(quota::QuotaService::new(Some(client.clone())));
                     app.manage(control::ControlService::new(Some(client.clone())));
                     app.manage(projects::ProjectsService::new(Some(client.clone())));
+                    app.manage(providers::ProvidersService::new(Some(client.clone())));
                     app.manage(credentials::CredentialsService::new(Some(client.clone())));
                     let resources = app.path().resource_dir().ok();
                     let bundle = lifecycle::RuntimeBundle::detect(resources.as_deref());
@@ -77,6 +80,7 @@ pub fn run() {
                     app.manage(quota::QuotaService::new(None));
                     app.manage(control::ControlService::new(None));
                     app.manage(projects::ProjectsService::new(None));
+                    app.manage(providers::ProvidersService::new(None));
                     app.manage(credentials::CredentialsService::new(None));
                     eprintln!("Invalid CCR connection settings: {e}");
                     tray::install_offline(app.handle(), e.clone())?;
