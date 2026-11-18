@@ -62,14 +62,21 @@ test('protected tuple parameters are kept by omission or explicitly replaced wit
   assert.equal(rows(h).length, 0);
   assert.match(h.id('provider-transformer-summary').textContent, /custom → second/);
   assert.equal(h.id('provider-transformer-add').hidden, true);
+  h.id('provider-transformer-replace').click();
+  assert.equal(h.id('provider-transformer-confirm').hidden, false);
+  h.id('provider-transformer-keep').click();
+  assert.equal(h.id('provider-transformer-confirm').hidden, true);
+  assert.equal(h.id('provider-transformer-add').hidden, true);
   submit(h); await flush();
   assert.ok(!Object.hasOwn(payload(h, 'provider_update'), 'transformer'));
   await edit(h);
-  h.id('provider-transformer-replace').click(); h.id('provider-transformer-add').click();
+  h.id('provider-transformer-replace').click();
+  h.id('provider-transformer-confirm-replace').click(); h.id('provider-transformer-add').click();
   submit(h); await flush();
   assert.deepEqual(plain(payload(h, 'provider_update').transformer), { use: ['first'] });
   await edit(h);
-  h.id('provider-transformer-replace').click(); submit(h); await flush();
+  h.id('provider-transformer-replace').click();
+  h.id('provider-transformer-confirm-replace').click(); submit(h); await flush();
   assert.equal(payload(h, 'provider_update').transformer, null);
 });
 

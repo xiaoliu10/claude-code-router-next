@@ -1655,6 +1655,9 @@
     var protectedPanel = document.getElementById('provider-transformer-protected');
     var summary = document.getElementById('provider-transformer-summary');
     var replace = document.getElementById('provider-transformer-replace');
+    var confirmPanel = document.getElementById('provider-transformer-confirm');
+    var keep = document.getElementById('provider-transformer-keep');
+    var confirmReplace = document.getElementById('provider-transformer-confirm-replace');
     var names = [], keepProtected = false;
 
     function input(label, cls) {
@@ -1702,6 +1705,8 @@
     function reset() {
       rows.textContent = summary.textContent = '';
       protectedPanel.hidden = true;
+      confirmPanel.hidden = true;
+      replace.hidden = false;
       keepProtected = false;
       add.hidden = false;
       add.disabled = true;
@@ -1709,6 +1714,16 @@
     }
     add.addEventListener('click', function () { addRow('').focus(); });
     replace.addEventListener('click', function () {
+      replace.hidden = true;
+      confirmPanel.hidden = false;
+      keep.focus();
+    });
+    keep.addEventListener('click', function () {
+      confirmPanel.hidden = true;
+      replace.hidden = false;
+      replace.focus();
+    });
+    confirmReplace.addEventListener('click', function () {
       keepProtected = false;
       protectedPanel.hidden = true;
       add.hidden = false;
@@ -1719,7 +1734,7 @@
       if (!Array.isArray(chain) || !chain.every(function (name) { return typeof name === 'string'; })) throw new Error();
       keepProtected = entry.transformerProtected === true;
       if (keepProtected) {
-        summary.textContent = '已保留现有转换器和参数。替换会移除整条链中的原有参数。' + chain.join(' → ');
+        summary.textContent = '已保留现有转换器和参数。' + chain.join(' → ');
         protectedPanel.hidden = false;
         add.hidden = true;
       } else chain.forEach(addRow);

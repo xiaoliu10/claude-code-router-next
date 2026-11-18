@@ -61,7 +61,12 @@
           <legend>转换器</legend>
           <div id="provider-transformer-protected" hidden>
             <p id="provider-transformer-summary"></p>
-            <button id="provider-transformer-replace" class="btn" type="button">替换整条转换器链</button>
+            <button id="provider-transformer-replace" class="btn" type="button">替换供应商转换器链</button>
+            <div id="provider-transformer-confirm" hidden>
+              <p>保存后将替换此供应商的转换器和参数。各模型的转换器配置会保留。</p>
+              <button id="provider-transformer-keep" class="btn" type="button">保留现有配置</button>
+              <button id="provider-transformer-confirm-replace" class="btn" type="button">确认替换</button>
+            </div>
           </div>
           <div id="provider-transformer-rows"></div>
           <button id="provider-transformer-add" class="btn" type="button">添加转换器</button>
