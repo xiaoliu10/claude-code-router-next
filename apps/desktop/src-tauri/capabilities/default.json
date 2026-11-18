@@ -15,6 +15,7 @@
     "allow-routing-save",
     "allow-routing-flags",
     "allow-usage-snapshot",
+    "allow-usage-records",
     "allow-clients-snapshot",
     "allow-clients-update",
     "allow-projects-snapshot",
