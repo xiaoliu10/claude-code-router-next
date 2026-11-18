@@ -28,6 +28,7 @@ test('provider_get opens a labeled, prefilled editor and clears the key on dismi
   assert.equal(h.id('provider-form-title').textContent, '编辑供应商');
   assert.equal(h.id('provider-add-save').textContent, '保存修改');
   assert.equal(h.id('provider-name').value, entry.name);
+  assert.equal(h.id('provider-name').readOnly, true);
   assert.equal(h.id('provider-base-url').value, entry.baseUrl);
   assert.equal(h.id('provider-models').value, 'one\ntwo');
   assert.equal(key.value, '');
@@ -43,17 +44,30 @@ test('provider_get opens a labeled, prefilled editor and clears the key on dismi
 });
 
 test('provider_get managed entry shows the plugin note and cannot submit', async () => {
-  const h = editHarness({ provider_get: () => ({ ...entry, managed: true }) }); await openEdit(h);
-  assert.equal(h.id('provider-add-save').disabled, true);
-  assert.equal(h.id('provider-add-error').textContent, '系统托管的供应商请在对应插件卡片中管理');
-  submit(h); assert.equal(updates(h).length, 0);
+  for (const provider_get of [() => Promise.reject('PROVIDER_MANAGED'), () => ({ ...entry, baseUrl: 'https://example.com/?token=test-secret', managed: true })]) {
+    const h = editHarness({ provider_get }); await openEdit(h);
+    assert.equal(h.id('provider-add-save').disabled, true);
+    assert.equal(h.id('provider-base-url').value, '');
+    assert.equal(h.id('provider-models').value, '');
+    assert.equal(h.id('provider-add-error').textContent, '系统托管的供应商请在对应插件卡片中管理');
+    submit(h); assert.equal(updates(h).length, 0);
+  }
+  const h = editHarness({ provider_get: () => Promise.reject('PROVIDER_MANAGED') }); await openEdit(h);
   h.id('provider-add-cancel').click(); h.id('provider-add-open').click();
   assert.equal(h.id('provider-name').value, '');
   assert.equal(h.id('provider-add-save').disabled, false);
   assert.equal(h.id('provider-form-title').textContent, '添加供应商');
 });
 
-test('provider_update omits a blank key and refreshes renamed card and routing choices while retaining drafts', async () => {
+test('unsafe endpoint details from an older bridge never populate the URL input', async () => {
+  const h = editHarness({ provider_get: () => ({ ...entry, baseUrl: 'https://example.com/?version=test-secret' }) });
+  await openEdit(h);
+  assert.equal(h.id('provider-add-form').hidden, true);
+  assert.equal(h.id('provider-base-url').value, '');
+  assert.doesNotMatch(h.id('provider-add-status').textContent, /test-secret/);
+});
+
+test('provider_update omits a blank key and refreshes the card and routing choices while retaining drafts', async () => {
   let name = entry.name, models = entry.models, revision = '1';
   const h = editHarness({
     quota_snapshot: () => ({ online: true, providers: [{ name }] }),
@@ -67,21 +81,21 @@ test('provider_update omits a blank key and refreshes renamed card and routing c
   h.id('provider-name').value = 'Renamed'; h.id('provider-models').value = 'three';
   submit(h); submit(h); await flush();
   assert.deepEqual(JSON.parse(JSON.stringify(updates(h))), [{ cmd: 'provider_update', args: {
-    name: entry.name, provider: { name: 'Renamed', baseUrl: entry.baseUrl, models: ['three'], transformer: null },
+    name: entry.name, provider: { name: entry.name, baseUrl: entry.baseUrl, models: ['three'] },
   } }]);
-  assert.equal(h.calls.filter(c => c.cmd === 'quota_snapshot').at(-1).args.provider, 'Renamed');
-  assert.equal(editButton(h).getAttribute('aria-label'), '编辑 Renamed');
+  assert.equal(h.calls.filter(c => c.cmd === 'quota_snapshot').at(-1).args.provider, entry.name);
+  assert.equal(editButton(h).getAttribute('aria-label'), '编辑 example.com');
   assert.equal(h.id('list').querySelectorAll('.card-edit').length, 1);
   assert.equal(h.id('provider-add-status').textContent, '已更新供应商');
   assert.equal(h.id('provider-add-form').hidden, true);
   h.id('tab-routing').click();
   const choices = h.id('route-choices').children.map(option => option.value);
-  assert.deepEqual(choices, ['Renamed,three']);
+  assert.deepEqual(choices, ['example.com,three']);
   assert.equal(h.id('routing-body').querySelector('.route-input').value, 'example.com,one');
   assert.ok(!h.calls.some(c => c.cmd === 'routing_save'));
 });
 
-test('provider_update validates fields, refocuses the duplicate name and sends a replacement key', async () => {
+test('provider_update validates fields, reports duplicate names and sends a replacement key', async () => {
   let failure = 'PROVIDER_DUPLICATE';
   const h = editHarness({ provider_update: () => failure ? Promise.reject(failure) : { name: entry.name } }); await openEdit(h);
   const key = h.id('provider-api-key');
@@ -90,7 +104,7 @@ test('provider_update validates fields, refocuses the duplicate name and sends a
   assert.equal(updates(h).length, 0);
   key.value = 'test-key'; submit(h); await flush();
   assert.match(h.id('provider-add-error').textContent, /名称已存在/);
-  assert.equal(h.doc.activeElement, h.id('provider-name'));
+  assert.equal(h.doc.activeElement, h.id('provider-add-save'));
   failure = 'PROVIDER_SAVE_UNCONFIRMED'; submit(h); await flush();
   assert.equal(h.id('provider-add-error').textContent, '暂时无法确认保存结果，请刷新后再决定是否重试');
   failure = new Error('test-key'); submit(h); await flush();

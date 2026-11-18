@@ -11,7 +11,7 @@ const payload = (h, command) => h.calls.filter(c => c.cmd === command).at(-1).ar
 function transformerHarness(extra = {}, overrides = {}) {
   return harness({
     quota_snapshot: () => ({ online: true, providers: [{ name: detail.name }] }),
-    provider_transformers: () => ({ names: ['first', 'second'] }),
+    provider_transformers: () => ({ names: ['first', 'second'], parameterizedNames: ['second'] }),
     provider_get: () => ({ ...detail, ...extra }),
     provider_add: () => ({ name: detail.name }),
     provider_update: () => ({ name: detail.name }),
@@ -30,7 +30,9 @@ test('add serializes ordered transformer names and tuples with text and JSON par
   const add = h.id('provider-transformer-add'); add.click(); add.click();
   const field = rows(h)[0].querySelector('select');
   assert.deepEqual(field.children.map(o => o.value), ['first', 'second']);
-  const row = rows(h)[1]; row.querySelector('.transformer-name').value = 'second';
+  const row = rows(h)[1]; const name = row.querySelector('.transformer-name');
+  assert.equal(button(row, '添加参数').disabled, true);
+  name.value = 'second'; name.fire('change');
   for (const [name, value, type] of [['mode', '123', '文本'], ['flags', '[true,42]', 'JSON']]) {
     button(row, '添加参数').click();
     const param = row.querySelectorAll('.transformer-param').at(-1);
@@ -54,6 +56,34 @@ test('edit prefills known and foreign names, removes rows and sends null for an 
   while (rows(h).length) button(rows(h)[0], '移除').click();
   submit(h); await flush();
   assert.equal(payload(h, 'provider_update').transformer, null);
+});
+
+test('model edits omit both absent and unchanged simple chains', async () => {
+  for (const transformer of [null, { use: ['first', 'custom'] }]) {
+    const h = transformerHarness({ transformer }); await edit(h);
+    h.id('provider-models').value = 'changed'; submit(h); await flush();
+    assert.ok(!Object.hasOwn(payload(h, 'provider_update'), 'transformer'));
+  }
+});
+
+test('switching to an instance-only transformer blocks a tuple until its parameters are removed', async () => {
+  const h = transformerHarness({ transformer: { use: ['second'] } }); await edit(h);
+  const row = rows(h)[0], name = row.querySelector('.transformer-name');
+  button(row, '添加参数').click();
+  name.value = 'first'; name.fire('change');
+  assert.equal(button(row, '添加参数').disabled, true);
+  submit(h); await flush();
+  assert.match(h.id('provider-add-error').textContent, /不支持参数/);
+  assert.ok(!h.calls.some(c => c.cmd === 'provider_update'));
+  button(row.querySelector('.transformer-param'), '移除').click();
+  submit(h); await flush();
+  assert.deepEqual(plain(payload(h, 'provider_update').transformer), { use: ['first'] });
+});
+
+test('legacy catalog names can only be used without parameters', async () => {
+  const h = transformerHarness({}, { provider_transformers: () => ({ names: ['OpenAI'] }) });
+  await edit(h); h.id('provider-transformer-add').click();
+  assert.equal(button(rows(h)[0], '添加参数').disabled, true);
 });
 
 test('protected tuple parameters are kept by omission or explicitly replaced with a fresh chain', async () => {
@@ -83,6 +113,7 @@ test('protected tuple parameters are kept by omission or explicitly replaced wit
 test('an unavailable transformer catalog falls back to free text and retries on the next open', async () => {
   const h = transformerHarness({}, { provider_transformers: () => Promise.reject(new Error('test-key')) });
   await edit(h); h.id('provider-transformer-add').click();
+  assert.equal(button(rows(h)[0], '添加参数').disabled, true);
   const name = rows(h)[0].querySelector('input'); name.value = 'custom';
   assert.doesNotMatch(h.id('panel-quota').textContent, /test-key/);
   submit(h); await flush();
