@@ -69,6 +69,18 @@ import AdmZip from "adm-zip";
 import { query as queryUsage, querySummary as queryUsageSummary, clear as clearUsage } from "./usage-store";
 import { listAnthropicCompatibleModels } from "./models";
 
+// A tuple calls `new` on the registry value. Probe its constructor capability
+// without executing plugin code or requiring default constructor options.
+function isTransformerConstructor(value: unknown): boolean {
+  if (typeof value !== "function") return false;
+  try {
+    Reflect.construct(Object, [], value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The model list a client should see: models whose circuit is open are hidden.
  *
@@ -275,6 +287,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       ([name, transformer]: any) => ({
         name,
         endpoint: transformer.endPoint || null,
+        supportsParameters: isTransformerConstructor(transformer),
       })
     );
     return { transformers: transformerList };

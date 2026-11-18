@@ -51,11 +51,26 @@
         <button id="provider-add-open" class="btn" type="button" aria-expanded="false" aria-controls="provider-add-form">添加供应商</button>
       </div>
       <p class="hint">读取服务端额度快照，不会重置任何额度。</p>
-      <form id="provider-add-form" class="provider-form card" aria-label="添加供应商" autocomplete="off" novalidate hidden>
+      <form id="provider-add-form" class="provider-form card" aria-labelledby="provider-form-title" autocomplete="off" novalidate hidden>
+        <h2 id="provider-form-title">添加供应商</h2>
         <label>供应商名称<input id="provider-name" class="route-input" type="text" placeholder="example.com" required></label>
         <label>API 地址<input id="provider-base-url" class="route-input" type="url" placeholder="https://example.com/v1/chat/completions" spellcheck="false" required></label>
         <label>API 密钥<input id="provider-api-key" class="route-input" type="password" autocomplete="new-password" spellcheck="false" required></label>
         <label>模型 ID（用换行或逗号分隔）<textarea id="provider-models" class="route-input" rows="2" spellcheck="false" required></textarea></label>
+        <fieldset id="provider-transformers" class="provider-transformers">
+          <legend>转换器</legend>
+          <div id="provider-transformer-protected" hidden>
+            <p id="provider-transformer-summary"></p>
+            <button id="provider-transformer-replace" class="btn" type="button">替换供应商转换器链</button>
+            <div id="provider-transformer-confirm" hidden>
+              <p>保存后将替换此供应商的转换器和参数。各模型的转换器配置会保留。</p>
+              <button id="provider-transformer-keep" class="btn" type="button">保留现有配置</button>
+              <button id="provider-transformer-confirm-replace" class="btn" type="button">确认替换</button>
+            </div>
+          </div>
+          <div id="provider-transformer-rows"></div>
+          <button id="provider-transformer-add" class="btn" type="button">添加转换器</button>
+        </fieldset>
         <div class="provider-form-actions">
           <span id="provider-add-error" class="inline-msg" role="alert"></span>
           <button id="provider-add-cancel" class="btn" type="button">取消</button>
