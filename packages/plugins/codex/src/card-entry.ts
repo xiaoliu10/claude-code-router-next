@@ -248,6 +248,28 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   let reconcileFailed = false;
   let confirmDisconnect = false;
   let confirmReset = false;
+  // The disconnect confirmation renders as a centered modal appended to
+  // document.body — never inside the card, whose .glass-card backdrop-filter
+  // would become the fixed overlay's containing block and clip it to the
+  // card. render() rebuilds the overlay idempotently (remove-then-append);
+  // cancel/confirm re-render without it and unmount removes it outright.
+  let confirmOverlay: HTMLElement | null = null;
+  const cancelDisconnectConfirm = (): void => {
+    // An action in flight keeps the dialog open: the same no-op semantics as
+    // the disabled cancel button.
+    if (action || !confirmDisconnect) return;
+    confirmDisconnect = false;
+    render();
+  };
+  const onConfirmKeydown = (event: { key?: string }): void => {
+    if (event?.key === "Escape") cancelDisconnectConfirm();
+  };
+  const removeConfirmOverlay = (): void => {
+    if (!confirmOverlay) return;
+    confirmOverlay.remove();
+    confirmOverlay = null;
+    document.removeEventListener("keydown", onConfirmKeydown);
+  };
   // The confirmation is an idempotent intent: a transport failure keeps the
   // same credit target so a user retry re-issues the same confirmation.
   // Reset credits: read-only background listing; null = surface absent. The
@@ -280,6 +302,9 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   const BADGE_BASE = "inline-flex items-center rounded-lg border px-2.5 py-0.5 text-[10px] font-bold transition-colors";
   const BADGE_OUTLINE = "border-white/10 text-foreground bg-white/5";
   const BADGE_SECONDARY = "border-white/5 bg-white/5 text-muted-foreground";
+  // Body-level confirm modal vocabulary (host stylesheet utilities).
+  const CONFIRM_OVERLAY_CLASS = "fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4";
+  const CONFIRM_TITLE_ID = "codex-disconnect-confirm-title";
 
   const node = <K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): HTMLElementTagNameMap[K] => {
     const result = document.createElement(tag);
@@ -871,10 +896,18 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
     }
 
     if (confirmDisconnect) {
-      const panel = styled("div", "glass-card mt-3 max-w-lg space-y-3 rounded-2xl p-5");
+      // Centered modal on document.body (see the state block above). The old
+      // overlay is removed first so repeated in-place renders never stack.
+      removeConfirmOverlay();
+      const overlay = styled("div", CONFIRM_OVERLAY_CLASS);
+      const panel = styled("div", "glass-card max-w-lg space-y-3 rounded-2xl p-5");
       panel.setAttribute("role", "dialog");
+      panel.setAttribute("aria-modal", "true");
+      panel.setAttribute("aria-labelledby", CONFIRM_TITLE_ID);
+      const title = styled("h3", "text-sm font-semibold tracking-tight text-foreground", t("disconnect_title"));
+      title.setAttribute("id", CONFIRM_TITLE_ID);
       panel.append(
-        styled("h3", "text-sm font-semibold tracking-tight text-foreground", t("disconnect_title")),
+        title,
         styled("p", "text-xs text-muted-foreground", t("disconnect_warning")),
       );
       const footer = styled("div", "flex justify-end gap-2");
@@ -882,7 +915,17 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
       button(footer, action ? t("working") : t("disconnect"), () => { if (confirmDisconnect) void run("disconnect"); },
         loading || action !== null || props.disabled, "destructive", "h-8 text-xs");
       panel.append(footer);
-      el.append(panel);
+      overlay.append(panel);
+      // Backdrop clicks (the overlay itself, not the panel) cancel; Escape on
+      // document does the same. Both are no-ops while an action is in flight.
+      overlay.onclick = (event?: { target?: unknown }) => {
+        if (event?.target === overlay) cancelDisconnectConfirm();
+      };
+      document.body.append(overlay);
+      confirmOverlay = overlay;
+      document.addEventListener("keydown", onConfirmKeydown);
+    } else {
+      removeConfirmOverlay();
     }
 
     if (confirmReset) {
@@ -906,6 +949,7 @@ export function mount(el: HTMLElement, props: PluginCardMountProps): void {
   mounted.set(el, () => {
     alive = false;
     confirmDisconnect = false;
+    removeConfirmOverlay();
     unsubscribeHost?.(); unsubscribeHost = null;
     void session?.cancel().catch(() => {});
     // Visual disposal only. The shared management lease deliberately stays

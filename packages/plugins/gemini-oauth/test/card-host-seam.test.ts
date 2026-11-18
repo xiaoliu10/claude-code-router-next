@@ -24,7 +24,7 @@ class El {
   checked = false;
   style = { cssText: "" };
   attrs: Record<string, string> = {};
-  onclick?: () => void;
+  onclick?: (event?: { target?: unknown }) => void;
   onchange?: () => void;
   firstChild: El | null = null;
   constructor(tag: string) { this.tag = tag; }
@@ -69,7 +69,18 @@ function deferred<T = any>() {
 }
 
 function seamHarness() {
-  vi.stubGlobal("document", { createElement: (tag: string) => new El(tag), createElementNS: () => new El("svg") as any });
+  const documentListeners = new Map<string, Array<(event?: { key?: string }) => void>>();
+  const body = new El("body");
+  vi.stubGlobal("document", {
+    createElement: (tag: string) => new El(tag), createElementNS: () => new El("svg") as any,
+    body,
+    addEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
+    },
+    removeEventListener: (type: string, listener: (event?: { key?: string }) => void) => {
+      documentListeners.set(type, (documentListeners.get(type) ?? []).filter(l => l !== listener));
+    },
+  });
   vi.stubGlobal("window", { open: vi.fn() });
   const host = new El("div");
   const status = { configured: true, connected: true, kind: "antigravity", email: "user@example.test", project: "p", tier: "paid", modelsCount: 2 };
@@ -117,7 +128,7 @@ function seamHarness() {
   };
   const controller = createPluginCardAreaController(bridge);
   return {
-    host, controller, calls, refreshConfig, disabled, fetches, blobs, revoked, defers,
+    host, controller, calls, refreshConfig, disabled, fetches, blobs, revoked, defers, body,
     acquireManagement: () => (lock ? null : (lock = true, release)),
     get releases() { return releaseCount; },
     get imports() { return imports; },
@@ -145,14 +156,14 @@ describe("real host controller × real card seam", () => {
 
     // Open the consent dialog: it must survive disabled flips (same instance).
     cardEl.click(en.reconnect);
-    expect(cardEl.text()).toContain(en.risk);
+    expect(seam.body.text()).toContain(en.risk); // dialogs live on document.body
 
     seam.disabled.value = true;
     seam.controller.notifyHostChange();
     expect(cardEl.button(en.sync).disabled).toBe(true);
     expect(cardEl.button(en.reconnect).disabled).toBe(true);
     expect(cardEl.text()).toContain(en.other_edit);
-    expect(cardEl.text()).toContain(en.risk); // in-place re-render, not a remount
+    expect(seam.body.text()).toContain(en.risk); // in-place re-render, not a remount
     expect(seam.calls).toEqual(["/status", "/quota"]); // no remount status read, nothing cancelled
     expect(seam.releases).toBe(0);
     expect(seam.imports).toBe(1);
@@ -160,9 +171,10 @@ describe("real host controller × real card seam", () => {
     seam.disabled.value = false;
     seam.controller.notifyHostChange();
     expect(cardEl.button(en.sync).disabled).toBe(false);
-    expect(cardEl.text()).toContain(en.risk);
+    expect(seam.body.text()).toContain(en.risk);
     seam.controller.dispose();
     expect(seam.host.children).toHaveLength(0);
+    expect(seam.body.children).toHaveLength(0); // disposal removes the body overlay too
   });
 
   it("a deferred sync outlives dispose; the lease blocks saves until reconciliation finishes, then releases", async () => {
@@ -200,8 +212,8 @@ describe("real host controller × real card seam", () => {
     const cardEl = seam.host.children[0];
     seam.defers.disconnect = deferred();
     cardEl.click(en.disconnect); // opens confirm dialog
-    expect(cardEl.text()).toContain(en.disconnect_warning);
-    cardEl.click(en.disconnect); // confirm → POST /disconnect
+    expect(seam.body.text()).toContain(en.disconnect_warning); // modal lives on document.body
+    seam.body.click(en.disconnect); // confirm → POST /disconnect
     await tick();
     expect(seam.calls).toContain("/disconnect");
     // The lease is held: a second acquire (an attempted save) gets null.
