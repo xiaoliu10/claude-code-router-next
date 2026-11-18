@@ -384,7 +384,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(bars[2].style.height, '12%', 'smaller days scale relative to the max');
   assert.ok(dayCard.querySelector('.usage-chart-axis').textContent.includes('2026-11-16'));
   assert.ok(dayCard.querySelector('.usage-chart-axis').textContent.includes('2026-11-18'));
-  // Model chart: ranked by input+output desc, capped at 10, exact values in title.
+  // Model chart: ranked by effective (cache-aware) input+output desc, capped at 10, exact values in title.
   const modelCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('模型 Top 10'));
   const rows = modelCard.querySelectorAll('.usage-hbar-row');
   assert.equal(rows.length, 10);
