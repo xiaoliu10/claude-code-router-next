@@ -1,4 +1,5 @@
 mod api;
+mod control;
 mod lifecycle;
 mod popup;
 mod quota;
@@ -20,27 +21,49 @@ pub fn run() {
             popup::quota_snapshot,
             popup::quota_hide,
             popup::quota_open_ui,
-            popup::quota_quit
+            popup::quota_quit,
+            control::routing_snapshot,
+            control::routing_save,
+            control::routing_flags,
+            control::usage_snapshot,
+            control::clients_snapshot,
+            control::clients_update,
+            lifecycle::service_snapshot,
+            lifecycle::service_action
         ])
         .setup(|app| {
             popup::install(app.handle())?;
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            // The main window is the local control center: the same local
+            // quota.html as the popup, no remote Web UI navigation. Navigation
+            // and new-window rules mirror the popup so no remote page can load.
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("quota.html".into()))
                 .title("Claude Code Router")
                 .inner_size(1200.0, 800.0)
                 .min_inner_size(800.0, 600.0)
                 .visible(false)
+                .on_navigation(popup::trusted_url)
+                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
                 .build()?;
             match settings::ConnectionSettings::from_environment().and_then(|settings| {
                 api::AdminClient::new(settings.clone()).map(|client| (settings, client))
             }) {
                 Ok((settings, client)) => {
                     app.manage(quota::QuotaService::new(Some(client.clone())));
-                    let controller = tray::Controller::install(app.handle(), settings, client)?;
+                    app.manage(control::ControlService::new(Some(client.clone())));
+                    let resources = app.path().resource_dir().ok();
+                    let bundle = lifecycle::RuntimeBundle::detect(resources.as_deref());
+                    let controller =
+                        tray::Controller::install(app.handle(), settings, client, bundle)?;
                     app.manage(Arc::clone(&controller));
                     controller.start();
+                    // The local control center is valid regardless of gateway
+                    // state (it shows the live service status), so show it once.
+                    let handle = app.handle().clone();
+                    let _ = app.run_on_main_thread(move || tray::open_window(&handle));
                 }
                 Err(e) => {
                     app.manage(quota::QuotaService::new(None));
+                    app.manage(control::ControlService::new(None));
                     eprintln!("Invalid CCR connection settings: {e}");
                     tray::install_offline(app.handle(), e.clone())?;
                     if let Some(window) = app.get_webview_window("main") {
@@ -66,15 +89,12 @@ pub fn run() {
                 }
                 return;
             }
+            // Closing the main control-center window ends the desktop. The exit
+            // hook below stops a desktop-owned gateway; an external gateway is
+            // never stopped.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.app_handle().tray_by_id("ccr-tray").is_some() && window.hide().is_ok() {
-                    if let Some(controller) =
-                        window.app_handle().try_state::<Arc<tray::Controller>>()
-                    {
-                        controller.mark_user_hidden();
-                    }
-                    api.prevent_close();
-                }
+                api.prevent_close();
+                window.app_handle().exit(0);
             }
         })
         .build(tauri::generate_context!());

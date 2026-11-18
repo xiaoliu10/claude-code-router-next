@@ -20,6 +20,7 @@ import { version } from "../../package.json";
 import { exec, spawn } from "child_process";
 import { promisify } from "util";
 import {cleanupPidFile, isServiceRunning} from "./processCheck";
+import { registerServiceRoutes } from "./service-routes";
 
 // Function to interpolate environment variables in config values
 const interpolateEnvVars = (obj: any): any => {
@@ -225,23 +226,16 @@ export const run = async (args: string[] = []) => {
   const server = await getServer();
   const app = server.app;
 
-  app.post('/api/update/perform', async () => {
-    return await performUpdate();
-  })
-
-  app.get('/api/update/check', async () => {
-    return await checkForUpdates(version);
-  })
-
-  app.post("/api/restart", async () => {
-    setTimeout(async () => {
-      spawn("ccr", ["restart"], {
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-    }, 100);
-
-    return { success: true, message: "Service restart initiated" }
+  registerServiceRoutes(app, {
+    managed: process.env.CCR_DESKTOP_MANAGED === "1",
+    version,
+    checkUpdate: checkForUpdates,
+    performUpdate,
+    restart: () => {
+      setTimeout(() => {
+        spawn("ccr", ["restart"], { detached: true, stdio: "ignore" }).unref();
+      }, 100);
+    },
   });
 
   // await server.start() to ensure it starts successfully and keep process alive.

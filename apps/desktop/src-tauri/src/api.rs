@@ -2,7 +2,8 @@
 use crate::settings::ConnectionSettings;
 use reqwest::{header::HeaderValue, redirect::Policy, Client, Method};
 use serde_json::{json, Value};
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::sync::{Mutex, MutexGuard};
 
 #[derive(Clone, Debug, PartialEq, Hash)]
 pub struct TrayProvider {
@@ -25,6 +26,7 @@ pub struct AdminClient {
     client: Client,
     base_url: String,
     api_key: Option<HeaderValue>,
+    writes: Arc<Mutex<()>>,
 }
 
 impl AdminClient {
@@ -58,7 +60,12 @@ impl AdminClient {
             client,
             base_url: settings.base_url,
             api_key,
+            writes: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub(crate) async fn write_guard(&self) -> MutexGuard<'_, ()> {
+        self.writes.lock().await
     }
 
     async fn request(
@@ -71,7 +78,7 @@ impl AdminClient {
             .await
     }
 
-    async fn request_with_timeout(
+    pub(crate) async fn request_with_timeout(
         &self,
         method: Method,
         path: &str,
@@ -102,7 +109,7 @@ impl AdminClient {
         Ok(response)
     }
 
-    async fn get_json(&self, path: &str) -> Result<Value, String> {
+    pub(crate) async fn get_json(&self, path: &str) -> Result<Value, String> {
         self.request(Method::GET, path, None)
             .await?
             .json::<Value>()
@@ -172,6 +179,40 @@ impl AdminClient {
         Ok(self.snapshot_from_config(&config).await)
     }
 
+    /// POST the full config, require success confirmation, then read the
+    /// persisted document back. The gateway may normalize the saved config
+    /// (managed-provider presets, plugin protectors), so callers verify their
+    /// specific mutation on the readback instead of comparing digests.
+    pub(crate) async fn post_config_and_readback(&self, config: &Value) -> Result<Value, String> {
+        let posted = self
+            .request_with_timeout(
+                Method::POST,
+                "/api/config",
+                Some(config),
+                Duration::from_secs(20),
+            )
+            .await?;
+        let saved = posted
+            .json::<Value>()
+            .await
+            .map_err(|_| "POST /api/config returned invalid JSON".to_string())?;
+        if saved.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err("POST /api/config did not confirm success".into());
+        }
+        self.config().await
+    }
+
+    /// POST to an allowlist-built mutation path and parse the JSON response.
+    /// Callers must project allowlisted fields only: some responses embed the
+    /// raw config.
+    pub(crate) async fn post_json_and_parse(&self, path: &str) -> Result<Value, String> {
+        self.request_with_timeout(Method::POST, path, None, Duration::from_secs(20))
+            .await?
+            .json::<Value>()
+            .await
+            .map_err(|_| format!("POST {path} returned invalid JSON"))
+    }
+
     async fn snapshot_from_config(&self, config: &Value) -> TraySnapshot {
         let current_default = default_value(config);
         let quota = self
@@ -202,6 +243,7 @@ impl AdminClient {
         if provider.trim().is_empty() || provider.contains(',') || model.trim().is_empty() {
             return Err("Invalid default model selection".into());
         }
+        let _write = self.write_guard().await;
         // Never use a snapshot/cached config to write credentials or resurrect removed models.
         let mut config = self.config().await?;
         if !providers(&config)
@@ -265,7 +307,7 @@ fn default_value(config: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn providers(config: &Value) -> Vec<TrayProvider> {
+pub(crate) fn providers(config: &Value) -> Vec<TrayProvider> {
     let mut result = Vec::new();
     let mut names = HashSet::new();
     if let Some(entries) = config.get("Providers").and_then(Value::as_array) {
@@ -372,27 +414,28 @@ fn compact(value: f64) -> String {
         .to_string()
 }
 
+/// Shared test transport: real ephemeral loopback sockets answering a fixed
+/// reply sequence. Never reaches the user's CCR port or config directory.
 #[cfg(test)]
-mod tests {
+pub(crate) mod mock {
     use super::*;
     use std::{
         io::{Read, Write},
-        net::{TcpListener, TcpStream},
+        net::TcpListener,
         sync::{Arc, Mutex},
         thread,
     };
 
-    const MOCK_TIMEOUT: Duration = Duration::from_secs(10);
+    pub(crate) const MOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-    // Real ephemeral loopback sockets; never reaches the user's CCR port/config directory.
-    struct Mock {
-        base_url: String,
+    pub(crate) struct Mock {
+        pub(crate) base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
     impl Mock {
-        fn new(replies: Vec<(u16, String)>) -> Self {
+        pub(crate) fn new(replies: Vec<(u16, String)>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -478,14 +521,14 @@ mod tests {
                 worker: Some(worker),
             }
         }
-        fn client(&self) -> AdminClient {
+        pub(crate) fn client(&self) -> AdminClient {
             AdminClient::new(ConnectionSettings {
                 base_url: self.base_url.clone(),
                 api_key: Some("test-admin-key".into()),
             })
             .unwrap()
         }
-        async fn finish(mut self) -> Vec<String> {
+        pub(crate) async fn finish(mut self) -> Vec<String> {
             // Tokio tests use a current-thread runtime. Never block its reactor while a
             // client task may still need to send bytes or receive the final response.
             let worker = self.worker.take().unwrap();
@@ -497,6 +540,39 @@ mod tests {
                 .into_inner()
                 .unwrap()
         }
+    }
+
+    pub(crate) fn response(value: Value) -> (u16, String) {
+        (200, value.to_string())
+    }
+
+    pub(crate) fn config() -> Value {
+        json!({"APIKEY":"$ADMIN", "Providers":[{"name":"alpha", "models":["one","two"], "api_key":"${UPSTREAM}", "custom":{"nested":[1,{"key":"$SECRET"}]}}], "Router":{"default":"alpha,one", "families":{"claude":{"default":"other,model"}}}, "Clients":{"pi":{"key":"$PI"}}, "unknown":{"deep":[true,null,2]}})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mock::{config, response, Mock, MOCK_TIMEOUT};
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        thread,
+    };
+
+    #[tokio::test]
+    async fn cloned_clients_share_the_write_gate() {
+        let client = AdminClient::new(ConnectionSettings {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: None,
+        })
+        .unwrap();
+        let sibling = client.clone();
+        let held = client.write_guard().await;
+        assert!(sibling.writes.try_lock().is_err());
+        drop(held);
+        assert!(sibling.writes.try_lock().is_ok());
     }
 
     #[tokio::test]
@@ -538,13 +614,6 @@ mod tests {
         let requests = mock.finish().await;
         sender.await.unwrap();
         assert_eq!(requests, [expected]);
-    }
-
-    fn response(value: Value) -> (u16, String) {
-        (200, value.to_string())
-    }
-    fn config() -> Value {
-        json!({"APIKEY":"$ADMIN", "Providers":[{"name":"alpha", "models":["one","two"], "api_key":"${UPSTREAM}", "custom":{"nested":[1,{"key":"$SECRET"}]}}], "Router":{"default":"alpha,one", "families":{"claude":{"default":"other,model"}}}, "Clients":{"pi":{"key":"$PI"}}, "unknown":{"deep":[true,null,2]}})
     }
 
     #[tokio::test]
