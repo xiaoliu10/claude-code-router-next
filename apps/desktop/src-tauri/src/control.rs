@@ -34,6 +34,7 @@ const CLIENT_ACTIONS: [&str; 3] = ["enable", "disable", "restore"];
 /// Usage periods offered by the panel; anything else is rejected before any request.
 const USAGE_PERIODS: [&str; 3] = ["today", "7d", "30d"];
 const MAX_PROVIDER_BUCKETS: usize = 50;
+const MAX_MODEL_BUCKETS: usize = 100;
 const MAX_DAY_BUCKETS: usize = 62;
 const MAX_ALIAS_LENGTH: usize = 64;
 
@@ -92,6 +93,8 @@ pub struct UsageBucket {
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -106,6 +109,7 @@ pub struct UsageSnapshot {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub estimated_count: u64,
+    pub by_model: Vec<UsageBucket>,
     pub by_provider: Vec<UsageBucket>,
     pub by_day: Vec<UsageBucket>,
     pub updated_at: String,
@@ -770,6 +774,8 @@ fn buckets(summary: &Value, key: &str, cap: usize, sort_desc: bool) -> Vec<Usage
             requests: counter(value, "count"),
             input_tokens: counter(value, "inputTokens"),
             output_tokens: counter(value, "outputTokens"),
+            cache_read_tokens: counter(value, "cacheReadInputTokens"),
+            cache_write_tokens: counter(value, "cacheCreationInputTokens"),
         })
         .filter(|bucket| !bucket.name.is_empty())
         .collect();
@@ -783,7 +789,7 @@ fn buckets(summary: &Value, key: &str, cap: usize, sort_desc: bool) -> Vec<Usage
 }
 
 /// Whitelisted counters only: aggregates like avgTtft/avgTokensPerSecond and
-/// non-whitelisted buckets (byModel/byClient) are never projected.
+/// non-whitelisted buckets (byClient) are never projected.
 fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, String> {
     if !summary.is_object() {
         return Err(ERR_USAGE.into());
@@ -798,6 +804,7 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
         cache_read_tokens: counter(summary, "totalCacheReadInputTokens"),
         cache_write_tokens: counter(summary, "totalCacheCreationInputTokens"),
         estimated_count: counter(summary, "estimatedCount"),
+        by_model: buckets(summary, "byModel", MAX_MODEL_BUCKETS, true),
         by_provider: buckets(summary, "byProvider", MAX_PROVIDER_BUCKETS, true),
         by_day: buckets(summary, "byDay", MAX_DAY_BUCKETS, false),
         updated_at: rfc3339(OffsetDateTime::now_utc()),
@@ -1267,7 +1274,8 @@ mod tests {
                 "$SECRET": {"count": 1}
             },
             "byDay": {"2026-11-17": {"count": 9}, "2026-11-16": {"count": 3}},
-            "byModel": {"secret-model": {"count": 4}}
+            "byModel": {"model-a": {"count": 4, "inputTokens": 12, "outputTokens": 3, "cacheReadInputTokens": 9, "cacheCreationInputTokens": 2, "secret": "sekret"}},
+            "byClient": {"secret-client": {"count": 4}}
         });
         let snapshot = usage_snapshot_from(&summary, "7d").unwrap();
         assert_eq!(snapshot.period, "7d");
@@ -1282,12 +1290,16 @@ mod tests {
         assert_eq!(snapshot.by_day.first().unwrap().name, "2026-11-16");
         let rendered = serialized(&snapshot);
         assert!(!rendered.contains("avgTtft"));
-        assert!(!rendered.contains("byModel"));
-        assert!(!rendered.contains("secret-model"));
+        assert_eq!(snapshot.by_model[0].name, "model-a");
+        assert_eq!(snapshot.by_model[0].cache_read_tokens, 9);
+        assert_eq!(snapshot.by_model[0].cache_write_tokens, 2);
+        assert!(!rendered.contains("byClient"));
+        assert!(!rendered.contains("secret-client"));
+        assert!(!rendered.contains("sekret"));
         assert!(snapshot.updated_at.contains('T'));
 
         // Bucket counts are capped for the compact panel.
-        let mut overflowing = json!({ "byProvider": {}, "byDay": {} });
+        let mut overflowing = json!({ "byProvider": {}, "byDay": {}, "byModel": {} });
         let providers = overflowing["byProvider"].as_object_mut().unwrap();
         for index in 0..(MAX_PROVIDER_BUCKETS + 10) {
             providers.insert(format!("p{index:03}"), json!({ "count": index }));
@@ -1296,7 +1308,18 @@ mod tests {
         for index in 0..(MAX_DAY_BUCKETS + 10) {
             days.insert(format!("2026-01-{index:02}"), json!({ "count": index }));
         }
+        for index in 0..(MAX_MODEL_BUCKETS + 10) {
+            overflowing["byModel"]
+                .as_object_mut()
+                .unwrap()
+                .insert(format!("m{index:03}"), json!({"count": index}));
+        }
         let snapshot = usage_snapshot_from(&overflowing, "30d").unwrap();
+        assert_eq!(snapshot.by_model.len(), MAX_MODEL_BUCKETS);
+        assert_eq!(
+            snapshot.by_model[0].requests,
+            (MAX_MODEL_BUCKETS + 9) as u64
+        );
         assert_eq!(snapshot.by_provider.len(), MAX_PROVIDER_BUCKETS);
         assert_eq!(snapshot.by_day.len(), MAX_DAY_BUCKETS);
     }

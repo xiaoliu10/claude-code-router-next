@@ -275,7 +275,7 @@ body {
   .shell > header, .shell > .service-bar, .shell > .tabs, .shell > .panel, .shell > .footer {
     width: 100%; max-width: 780px; margin-left: auto; margin-right: auto;
   }
-  .usage-grid { grid-template-columns: repeat(8, 1fr); }
+  .usage-grid { grid-template-columns: repeat(5, 1fr); }
   #routing-body { display: grid; grid-template-columns: 1fr 1fr; align-content: start; }
 }
 
