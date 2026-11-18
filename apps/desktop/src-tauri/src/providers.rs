@@ -45,6 +45,30 @@ fn identifier(value: &str) -> Result<&str, &'static str> {
     Ok(value)
 }
 
+// Check the raw query: returning the original URL also returns its original bytes.
+fn safe_version_query(query: &str) -> bool {
+    let Some((key, value)) = query.split_once('=') else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match key {
+        "version" => {
+            value.split('.').count() <= 3
+                && value.split('.').all(|part| part.len() <= 3 && digits(part))
+        }
+        "api-version" => {
+            let date = value.strip_suffix("-preview").unwrap_or(value);
+            date.len() == 10
+                && date.as_bytes()[4] == b'-'
+                && date.as_bytes()[7] == b'-'
+                && date.split('-').all(digits)
+                && time::Date::parse(date, &time::format_description::well_known::Iso8601::DATE)
+                    .is_ok()
+        }
+        _ => false,
+    }
+}
+
 fn endpoint(value: &str) -> Result<&str, &'static str> {
     let value = bounded_text(value, 2048)?;
     // The URL parser repairs missing slashes, empty authorities and backslashes.
@@ -61,6 +85,9 @@ fn endpoint(value: &str) -> Result<&str, &'static str> {
         || value.contains('\\')
         || value.chars().any(char::is_whitespace)
         || url.fragment().is_some()
+        || value
+            .split_once('?')
+            .is_some_and(|(_, query)| !safe_version_query(query))
     {
         return Err(ERR_INVALID);
     }
@@ -125,11 +152,8 @@ impl TransformerChange {
         match self {
             Self::Keep => (),
             Self::Set(chain) => {
-                if !matches!(
-                    entry.get("transformer"),
-                    None | Some(Value::Object(_)) | Some(Value::Null)
-                ) {
-                    return Err(ERR_UNAVAILABLE);
+                if !entry["transformer"].is_object() {
+                    entry["transformer"] = json!({});
                 }
                 entry["transformer"]["use"] = json!(chain);
             }
@@ -143,10 +167,9 @@ impl TransformerChange {
                         }
                     }
                     None => (),
-                    Some(Value::Null) => {
+                    Some(_) => {
                         fields.remove("transformer");
                     }
-                    Some(_) => return Err(ERR_UNAVAILABLE),
                 }
             }
         }
@@ -214,7 +237,6 @@ impl ProviderInput {
     }
 
     fn apply(&self, entry: &mut Value) -> Result<(), &'static str> {
-        entry["name"] = json!(self.name);
         entry["api_base_url"] = json!(self.base_url);
         entry["models"] = json!(self.models);
         if !self.api_key.is_empty() {
@@ -237,12 +259,71 @@ pub struct ProviderDetails {
     transformer_protected: bool,
 }
 
+// The runtime also treats aliases on a plugin's fixed origin and chain as managed.
+fn has_managed_transport(entry: &Value) -> bool {
+    let Some(chain) = entry["transformer"]["use"].as_array() else {
+        return false;
+    };
+    ["api_base_url", "baseUrl"]
+        .iter()
+        .filter_map(|field| entry[*field].as_str())
+        .filter_map(|base| reqwest::Url::parse(base).ok())
+        .any(|url| {
+            let plugin = match url.host_str() {
+                Some("chatgpt.com")
+                    if url.path() == "/backend-api/codex"
+                        || url.path().starts_with("/backend-api/codex/") =>
+                {
+                    "codex"
+                }
+                Some("daily-cloudcode-pa.googleapis.com") => "gemini-oauth",
+                Some("copilot.tencent.com" | "www.workbuddy.ai" | "www.codebuddy.ai") => {
+                    "workbuddy"
+                }
+                _ => return false,
+            };
+            chain.iter().any(|item| {
+                item == plugin
+                    || item["name"] == plugin
+                    || item.get(0).is_some_and(|name| name == plugin)
+            })
+        })
+}
+
 fn is_managed(entry: &Value) -> bool {
-    entry["ccr_managed"] == true
-        || entry["api_key"]
-            .as_str()
-            .is_some_and(|key| key.starts_with("ccr-managed-"))
-        || entry["name"] == "ccr"
+    // Plugin config flags exist in both raw (snake_case) and legacy camelCase forms.
+    const FLAGS: &[&str] = &[
+        "ccr_managed",
+        "pluginManaged",
+        "workbuddyManaged",
+        "codex_managed",
+        "codexManaged",
+        "gemini_oauth_managed",
+        "geminiOauthManaged",
+        "grok_managed",
+        "grokManaged",
+        "kiro_managed",
+        "kiroManaged",
+        "qoder_managed",
+        "qoderManaged",
+        "cursor_managed",
+        "cursorManaged",
+    ];
+    let workbuddy_site =
+        |key: &str| matches!(entry[key].as_str(), Some("workbuddy" | "workbuddy-ai"));
+    entry["name"] == "ccr"
+        || FLAGS.iter().any(|key| entry[*key] == true)
+        || ["api_key", "apiKey"].iter().any(|key| {
+            entry[*key]
+                .as_str()
+                .is_some_and(|key| key.starts_with("ccr-managed-"))
+        })
+        || (workbuddy_site("name") && workbuddy_site("workbuddy_kind"))
+        || (entry["name"] == "gemini-oauth"
+            && ["gemini_oauth_kind", "geminiOauthKind"]
+                .iter()
+                .any(|field| entry[*field] == "antigravity"))
+        || has_managed_transport(entry)
 }
 
 fn selector(name: &Option<Value>) -> Result<&str, &'static str> {
@@ -267,12 +348,7 @@ fn same_name(entry: &Value, folded: &str) -> bool {
         .is_some_and(|name| name.trim().to_lowercase() == folded)
 }
 
-fn confirm_saved(
-    verified: &Value,
-    expected: &Value,
-    name: &str,
-    old_name: Option<&str>,
-) -> Result<(), &'static str> {
+fn confirm_saved(verified: &Value, expected: &Value, name: &str) -> Result<(), &'static str> {
     let entries = verified[crate::api::provider_list_key(verified)]
         .as_array()
         .ok_or(ERR_UNCONFIRMED)?;
@@ -286,18 +362,14 @@ fn confirm_saved(
     {
         return Err(ERR_UNCONFIRMED);
     }
-    if let Some(old_name) = old_name {
-        let old_folded = old_name.to_lowercase();
-        if old_folded != folded && entries.iter().any(|p| same_name(p, &old_folded)) {
-            return Err(ERR_UNCONFIRMED);
-        }
-    }
     Ok(())
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderTransformers {
     names: Vec<String>,
+    parameterized_names: Vec<String>,
 }
 
 pub struct ProvidersService {
@@ -331,14 +403,16 @@ impl ProvidersService {
         if entries.iter().any(|entry| same_name(entry, &folded)) {
             return Err(ERR_DUPLICATE);
         }
-        let mut entry = json!({});
+        self.validate_transformer_parameters(&provider.transformer)
+            .await?;
+        let mut entry = json!({"name": provider.name});
         provider.apply(&mut entry)?;
         entries.push(entry.clone());
         let verified = client
             .post_config_and_readback(&config)
             .await
             .map_err(|_| ERR_UNCONFIRMED)?;
-        confirm_saved(&verified, &entry, &provider.name, None)?;
+        confirm_saved(&verified, &entry, &provider.name)?;
         Ok(SavedProvider {
             name: provider.name,
         })
@@ -351,16 +425,48 @@ impl ProvidersService {
             .await
             .map_err(|_| ERR_UNAVAILABLE)?;
         let mut seen = HashSet::new();
-        let names = response["transformers"]
-            .as_array()
-            .ok_or(ERR_UNAVAILABLE)?
-            .iter()
-            .filter_map(|entry| transformer_name(&entry["name"]))
-            .filter(|name| seen.insert(*name))
-            .take(64)
-            .map(str::to_owned)
-            .collect();
-        Ok(ProviderTransformers { names })
+        let mut catalog = ProviderTransformers {
+            names: Vec::new(),
+            parameterized_names: Vec::new(),
+        };
+        for item in response["transformers"].as_array().ok_or(ERR_UNAVAILABLE)? {
+            let Some(name) = transformer_name(&item["name"]) else {
+                continue;
+            };
+            if !seen.insert(name) {
+                continue;
+            }
+            catalog.names.push(name.to_owned());
+            if item["name"] == name && item["supportsParameters"] == true {
+                catalog.parameterized_names.push(name.to_owned());
+            }
+            if catalog.names.len() == 64 {
+                break;
+            }
+        }
+        Ok(catalog)
+    }
+
+    async fn validate_transformer_parameters(
+        &self,
+        change: &TransformerChange,
+    ) -> Result<(), &'static str> {
+        let TransformerChange::Set(chain) = change else {
+            return Ok(());
+        };
+        let mut tuples = chain.iter().filter_map(Value::as_array).peekable();
+        if tuples.peek().is_some() {
+            let catalog = self.transformers().await?;
+            if !tuples.all(|tuple| {
+                catalog
+                    .parameterized_names
+                    .iter()
+                    .any(|name| tuple[0] == name.as_str())
+            }) {
+                return Err(ERR_INVALID);
+            }
+        }
+        Ok(())
     }
 
     async fn get(&self, name: Option<Value>) -> Result<ProviderDetails, &'static str> {
@@ -371,6 +477,9 @@ impl ProvidersService {
             .as_array()
             .ok_or(ERR_UNAVAILABLE)?;
         let entry = &entries[entry_index(entries, name)?];
+        if is_managed(entry) {
+            return Err(ERR_MANAGED);
+        }
         let base_url = endpoint(entry["api_base_url"].as_str().ok_or(ERR_UNAVAILABLE)?)
             .map_err(|_| ERR_UNAVAILABLE)?;
         let models =
@@ -382,7 +491,7 @@ impl ProvidersService {
             name: name.to_owned(),
             base_url: base_url.to_owned(),
             models,
-            managed: is_managed(entry),
+            managed: false,
         })
     }
 
@@ -402,6 +511,9 @@ impl ProvidersService {
         if is_managed(&entries[index]) {
             return Err(ERR_MANAGED);
         }
+        if provider.name != name {
+            return Err(ERR_INVALID);
+        }
         let folded = provider.name.to_lowercase();
         if entries
             .iter()
@@ -410,12 +522,14 @@ impl ProvidersService {
         {
             return Err(ERR_DUPLICATE);
         }
+        self.validate_transformer_parameters(&provider.transformer)
+            .await?;
         provider.apply(&mut entries[index])?;
         let verified = client
             .post_config_and_readback(&config)
             .await
             .map_err(|_| ERR_UNCONFIRMED)?;
-        confirm_saved(&verified, &config[key][index], &provider.name, Some(name))?;
+        confirm_saved(&verified, &config[key][index], &provider.name)?;
         Ok(SavedProvider {
             name: provider.name,
         })
@@ -494,7 +608,7 @@ mod tests {
         let mut expected = vec!["Example".to_owned()];
         expected.extend((1..64).map(|n| n.to_string()));
         let result = serde_json::to_value(service.transformers().await.unwrap()).unwrap();
-        assert_eq!(result, json!({"names":expected}));
+        assert_eq!(result, json!({"names":expected,"parameterizedNames":[]}));
         for _ in 0..2 {
             assert_eq!(service.transformers().await.err(), Some(ERR_UNAVAILABLE));
         }
@@ -515,6 +629,7 @@ mod tests {
         let verified = json!({"Providers":[expected]});
         let mock = Mock::new(vec![
             response(json!({"Providers":[]})),
+            response(json!({"transformers":[{"name":"second","supportsParameters":true}]})),
             response(json!({"success":true})),
             response(verified.clone()),
             response(verified.clone()),
@@ -529,7 +644,7 @@ mod tests {
         );
         let requests = mock.finish().await;
         let posted: Value =
-            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+            serde_json::from_str(requests[2].split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(posted, verified);
     }
 
@@ -599,11 +714,17 @@ mod tests {
             let mut mismatch = expected.clone();
             mismatch["transformer"] = json!({"use":["different"]});
             for (readback, confirmed) in [(expected.clone(), true), (mismatch, false)] {
-                let mock = Mock::new(vec![
-                    response(json!({"providers":[prior]})),
+                let mut responses = vec![response(json!({"providers":[prior]}))];
+                if provider["transformer"] == new_use {
+                    responses.push(response(
+                        json!({"transformers":[{"name":"new","supportsParameters":true}]}),
+                    ));
+                }
+                responses.extend([
                     response(json!({"success":true})),
                     response(json!({"providers":[readback]})),
                 ]);
+                let mock = Mock::new(responses);
                 let service = ProvidersService::new(Some(mock.client()));
                 let result = service
                     .update(Some(json!("Example")), Some(provider.clone()))
@@ -617,10 +738,120 @@ mod tests {
                     }
                 );
                 let requests = mock.finish().await;
-                let posted: Value =
-                    serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+                let posted: Value = serde_json::from_str(
+                    requests[requests.len() - 2]
+                        .split_once("\r\n\r\n")
+                        .unwrap()
+                        .1,
+                )
+                .unwrap();
                 assert_eq!(posted, json!({"providers":[expected]}));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn tuples_require_positive_current_catalog_capability_before_post() {
+        for catalog in [
+            response(json!({"transformers":[{"name":"OpenAI","supportsParameters":false}]})),
+            response(json!({"transformers":[{"name":"OpenAI"}]})),
+            response(json!({"transformers":[{"name":"OpenAI","supportsParameters":"true"}]})),
+            response(json!({"transformers":[]})),
+            (500, "test-secret".into()),
+        ] {
+            for editing in [false, true] {
+                let mut provider = input();
+                provider["transformer"] = json!({"use":[["OpenAI",{}]]});
+                let mock = Mock::new(vec![
+                    response(json!({"Providers":if editing {vec![entry()]} else {vec![]}})),
+                    catalog.clone(),
+                ]);
+                let service = ProvidersService::new(Some(mock.client()));
+                let result = if editing {
+                    service.update(Some(json!("Example")), Some(provider)).await
+                } else {
+                    service.add(Some(provider)).await
+                };
+                assert_eq!(
+                    result.unwrap_err(),
+                    if catalog.0 == 500 {
+                        ERR_UNAVAILABLE
+                    } else {
+                        ERR_INVALID
+                    }
+                );
+                assert!(mock
+                    .finish()
+                    .await
+                    .iter()
+                    .all(|req| req.starts_with("GET ")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn untouched_chain_keeps_parameters_saved_after_get() {
+        for old in [None, Some(json!({"use":["custom"]}))] {
+            let mut original = entry();
+            if let Some(transformer) = old {
+                original["transformer"] = transformer;
+            }
+            let mut fresh = original.clone();
+            fresh["transformer"] = json!({"use":[["custom",{"key":"test-secret"}]]});
+            let mut expected = fresh.clone();
+            expected["models"] = json!(["changed"]);
+            let mock = Mock::new(vec![
+                response(json!({"Providers":[original]})),
+                response(json!({"Providers":[fresh]})),
+                response(json!({"success":true})),
+                response(json!({"Providers":[expected]})),
+            ]);
+            let service = ProvidersService::new(Some(mock.client()));
+            let mut provider = input();
+            service.get(Some(json!("Example"))).await.unwrap();
+            provider["models"] = json!(["changed"]);
+            service
+                .update(Some(json!("Example")), Some(provider))
+                .await
+                .unwrap();
+            let requests = mock.finish().await;
+            let posted: Value =
+                serde_json::from_str(requests[2].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(posted["Providers"][0], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_protects_malformed_transformer_until_explicit_replacement_or_removal() {
+        for replacement in [json!({"use":["OpenAI"]}), Value::Null] {
+            let mut prior = entry();
+            prior["transformer"] = json!("test-secret");
+            let mut expected = entry();
+            if !replacement.is_null() {
+                expected["transformer"] = replacement.clone();
+            }
+            let config = json!({"Providers":[prior]});
+            let mock = Mock::new(vec![
+                response(config.clone()),
+                response(config),
+                response(json!({"success":true})),
+                response(json!({"Providers":[expected]})),
+            ]);
+            let service = ProvidersService::new(Some(mock.client()));
+            let summary =
+                serde_json::to_value(service.get(Some(json!("Example"))).await.unwrap()).unwrap();
+            assert_eq!(summary["transformerProtected"], true);
+            assert!(!summary.to_string().contains("test-secret"));
+            let mut provider = input();
+            provider["transformer"] = replacement;
+            service
+                .update(Some(json!("Example")), Some(provider))
+                .await
+                .unwrap();
+            let requests = mock.finish().await;
+            let posted: Value =
+                serde_json::from_str(requests[2].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(posted["Providers"][0], expected);
         }
     }
 
@@ -667,35 +898,106 @@ mod tests {
 
     #[tokio::test]
     async fn get_projects_only_edit_fields_and_detects_all_managed_markers() {
-        for (field, value, managed) in [
-            ("ccr_managed", json!(false), false),
-            ("ccr_managed", json!(true), true),
-            ("api_key", json!("ccr-managed-test-key"), true),
-            ("name", json!("ccr"), true),
+        for (field, value) in [
+            ("name", json!("ccr")),
+            ("api_key", json!("ccr-managed-test")),
+            ("apiKey", json!("ccr-managed-test")),
+            ("ccr_managed", json!(true)),
+            ("pluginManaged", json!(true)),
+            ("workbuddyManaged", json!(true)),
+            ("gemini_oauth_managed", json!(true)),
+            ("geminiOauthManaged", json!(true)),
+            ("kiro_managed", json!(true)),
+            ("kiroManaged", json!(true)),
+            ("codex_managed", json!(true)),
+            ("codexManaged", json!(true)),
+            ("qoder_managed", json!(true)),
+            ("qoderManaged", json!(true)),
+            ("cursor_managed", json!(true)),
+            ("cursorManaged", json!(true)),
+            ("grok_managed", json!(true)),
+            ("grokManaged", json!(true)),
+            ("workbuddy_kind", json!("workbuddy-ai")),
         ] {
             let mut original = entry();
-            original[field] = value;
-            original["transformer"] =
-                json!({"model-a": {"use": [["custom", {"token":"test-key"}]]}});
-            let name = original["name"].clone();
-            let mock = Mock::new(vec![response(json!({"providers":[original]}))]);
-            let service = ProvidersService::new(Some(mock.client()));
-            let details = service.get(Some(name.clone())).await.unwrap();
-            assert_eq!(
-                serde_json::to_value(details).unwrap(),
-                json!({"name":name,
-                "baseUrl":original["api_base_url"], "models":original["models"], "managed":managed})
-            );
-            assert_eq!(mock.finish().await.len(), 1);
-            if managed {
-                let mock = Mock::new(vec![response(json!({"Providers":[original]}))]);
-                let service = ProvidersService::new(Some(mock.client()));
-                assert_eq!(
-                    service.update(Some(name), Some(input())).await.unwrap_err(),
-                    ERR_MANAGED
-                );
-                assert_eq!(mock.finish().await.len(), 1);
+            if field == "workbuddy_kind" {
+                original["name"] = json!("workbuddy");
             }
+            original[field] = value;
+            original["api_base_url"] = json!("https://example.com/?api_key=test-secret");
+            let name = original["name"].clone();
+            let config = json!({"providers":[original]});
+            let mock = Mock::new(vec![response(config.clone()), response(config)]);
+            let service = ProvidersService::new(Some(mock.client()));
+            assert_eq!(
+                service.get(Some(name.clone())).await.err(),
+                Some(ERR_MANAGED)
+            );
+            assert_eq!(
+                service.update(Some(name), Some(input())).await.unwrap_err(),
+                ERR_MANAGED
+            );
+            assert!(mock
+                .finish()
+                .await
+                .iter()
+                .all(|req| req.starts_with("GET /api/config ")));
+        }
+    }
+
+    #[test]
+    fn legacy_managed_kinds_and_runtime_transport_aliases_are_read_only() {
+        for field in ["gemini_oauth_kind", "geminiOauthKind"] {
+            assert!(is_managed(
+                &json!({"name":"gemini-oauth", field:"antigravity"})
+            ));
+        }
+        for (base, plugin) in [
+            ("https://chatgpt.com/backend-api/codex/responses", "codex"),
+            ("https://daily-cloudcode-pa.googleapis.com/", "gemini-oauth"),
+            ("https://www.workbuddy.ai/", "workbuddy"),
+        ] {
+            assert!(is_managed(
+                &json!({"name":"alias","api_base_url":base,"transformer":{"use":[plugin]}})
+            ));
+            assert!(!is_managed(
+                &json!({"name":"alias","api_base_url":base,"transformer":{"use":["OpenAI"]}})
+            ));
+        }
+        assert!(!is_managed(
+            &json!({"name":"gemini-oauth","api_key":"ordinary"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_never_serializes_opaque_query_values() {
+        for (query, allowed) in [
+            ("version=1", true),
+            ("api-version=2024-10-21-preview", true),
+            ("api_key=test-secret", false),
+            ("version=test-secret", false),
+            ("version=1&token=test-secret", false),
+            ("api-version=2024-02-30", false),
+            ("version=%74est-secret", false),
+            ("unknown=1", false),
+        ] {
+            let mut original = entry();
+            original["api_base_url"] = json!(format!("https://example.com/v1?{query}"));
+            let mock = Mock::new(vec![response(json!({"Providers":[original]}))]);
+            let service = ProvidersService::new(Some(mock.client()));
+            let result = service.get(Some(json!("Example"))).await;
+            if allowed {
+                assert_eq!(
+                    serde_json::to_value(result.unwrap()).unwrap()["baseUrl"],
+                    original["api_base_url"]
+                );
+            } else {
+                assert_eq!(
+                    serde_json::to_value(result).unwrap(),
+                    json!({"Err":ERR_UNAVAILABLE})
+                );
+            }
+            mock.finish().await;
         }
     }
 
@@ -705,11 +1007,11 @@ mod tests {
             let mut provider = input();
             provider.as_object_mut().unwrap().remove("apiKey");
             let mut original = json!({"providers":[{
-                "name":"original", "api_base_url":"https://example.com/v1", "models":["original-model"],
+                "name":"Example", "api_base_url":"https://example.com/v1", "models":["original-model"],
                 "api_key":"test-key", "quota_token":"test-key", "quota_sec_token":"test-key",
                 "quotaAccessKey":"test-key", "quotaSecretKey":"test-key", "enabled":false,
                 "proxy":{"port":8080}, "transformer":{"original-model":{"use":[["custom",{"key":"test-key"}]]}}
-            }, {"name":"other"}], "Router":{"default":"original,original-model"}});
+            }, {"name":"other"}], "Router":{"default":"Example,original-model"}});
             if let Some(key) = key {
                 provider["apiKey"] = json!(key);
                 if !key.is_empty() {
@@ -728,7 +1030,7 @@ mod tests {
             let client = mock.client();
             let service = ProvidersService::new(Some(client.clone()));
             let guard = client.write_guard().await;
-            let update = service.update(Some(json!(" original ")), Some(provider));
+            let update = service.update(Some(json!(" Example ")), Some(provider));
             tokio::pin!(update);
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(20), &mut update)
@@ -753,27 +1055,20 @@ mod tests {
 
     #[tokio::test]
     async fn update_checks_duplicate_names_excluding_the_located_entry() {
-        for name in ["Example", "EXAMPLE"] {
-            let original = json!({"Providers":[entry() ]});
-            let mut expected = original.clone();
-            expected["Providers"][0]["name"] = json!(name);
+        for name in ["Renamed", "EXAMPLE"] {
+            let original = json!({"Providers":[entry()], "Router":{"default":"Example,model-a"}});
             let mut provider = input();
             provider["name"] = json!(name);
-            let mock = Mock::new(vec![
-                response(original),
-                response(json!({"success":true})),
-                response(expected),
-            ]);
+            let mock = Mock::new(vec![response(original)]);
             let service = ProvidersService::new(Some(mock.client()));
             assert_eq!(
                 service
                     .update(Some(json!("Example")), Some(provider))
                     .await
-                    .unwrap()
-                    .name,
-                name
+                    .unwrap_err(),
+                ERR_INVALID
             );
-            assert_eq!(mock.finish().await.len(), 3);
+            assert!(mock.finish().await[0].starts_with("GET /api/config "));
         }
         let mock = Mock::new(vec![response(
             json!({"Providers":[entry(), {"name":" eXamPle ", "enabled":false}]}),
@@ -790,9 +1085,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_requires_the_expected_fields_one_new_entry_and_no_old_entry() {
-        let mut original = entry();
-        original["name"] = json!("original");
+    async fn update_requires_the_expected_fields_and_one_matching_entry() {
+        let original = entry();
         let mut changed_key = entry();
         changed_key["api_key"] = json!("");
         let mut changed_models = entry();
@@ -800,7 +1094,6 @@ mod tests {
         let mut changed_url = entry();
         changed_url["api_base_url"] = json!("https://example.com");
         for verified in [
-            json!([entry(), original]),
             json!([entry(), entry()]),
             json!([]),
             json!([changed_key]),
@@ -824,7 +1117,7 @@ mod tests {
                 let service = ProvidersService::new(Some(mock.client()));
                 assert_eq!(
                     service
-                        .update(Some(json!("original")), Some(provider))
+                        .update(Some(json!("Example")), Some(provider))
                         .await
                         .unwrap_err(),
                     ERR_UNCONFIRMED

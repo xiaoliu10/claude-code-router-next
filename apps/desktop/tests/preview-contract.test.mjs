@@ -189,36 +189,54 @@ test("preview: provider_add returns only the name and updates safe quota and rou
   assert.doesNotMatch(JSON.stringify([added, quota, routing]), /test-key|https:\/\/example\.com/)
 })
 
-test('preview: provider_get projects editable fields and provider_update renames the same card', async () => {
+test('preview: provider_get projects editable fields and provider_update preserves its name', async () => {
   const invoke = Q.createPreviewInvoke()
   const provider = { name: 'example.com', baseUrl: 'https://example.com/v1', models: ['one'] }
   await invoke('provider_add', { provider: { ...provider, apiKey: 'test-key' } })
   const detail = await invoke('provider_get', { name: provider.name })
   assert.deepEqual(JSON.parse(JSON.stringify(detail)), { ...provider, managed: false, transformer: null, transformerProtected: false })
-  const change = { ...provider, name: 'Renamed', models: ['two'] }
+  await assert.rejects(invoke('provider_update', { name: provider.name, provider: { ...provider, name: 'Renamed' } }), /PROVIDER_INVALID/)
+  const change = { ...provider, models: ['two'] }
   const updated = await invoke('provider_update', { name: provider.name, provider: change })
   assert.deepEqual({ ...updated }, { name: change.name })
   assert.deepEqual(JSON.parse(JSON.stringify(await invoke('provider_get', updated))), { ...change, managed: false, transformer: null, transformerProtected: false })
-  await assert.rejects(invoke('provider_get', { name: provider.name }), /PROVIDER_UNAVAILABLE/)
   const quota = await invoke('quota_snapshot')
   assert.ok(quota.providers.some(p => p.name === change.name))
-  assert.ok(!quota.providers.some(p => p.name === provider.name))
+  assert.equal(quota.providers.filter(p => p.name === provider.name).length, 1)
   const routes = await invoke('routing_snapshot')
   assert.deepEqual(JSON.parse(JSON.stringify(routes.providers.at(-1))), { name: change.name, models: change.models })
 })
 
 test('preview: provider_get summarizes protected tuples and omitted transformer keeps the chain', async () => {
   const invoke = Q.createPreviewInvoke()
-  const { names } = await invoke('provider_transformers')
-  assert.ok(names.length)
+  const { parameterizedNames } = await invoke('provider_transformers')
+  assert.ok(parameterizedNames.includes('customparams'))
   const provider = { name: 'example.com', baseUrl: 'https://example.com', models: ['one'] }
-  const transformer = { use: [[names[0], { value: 'test-key' }]] }
+  const transformer = { use: [[parameterizedNames[0], { value: 'test-key' }]] }
   const target = await invoke('provider_add', { provider: { ...provider, apiKey: 'test-key', transformer } })
   await invoke('provider_update', { ...target, provider })
   const summary = await invoke('provider_get', target)
   assert.equal(summary.transformerProtected, true)
-  assert.deepEqual(JSON.parse(JSON.stringify(summary.transformer)), { use: [names[0]] })
+  assert.deepEqual(JSON.parse(JSON.stringify(summary.transformer)), { use: [parameterizedNames[0]] })
   assert.doesNotMatch(JSON.stringify(summary), /test-key/)
+})
+
+test('preview: rejects unsafe URLs, instance-only tuples and managed edits', async () => {
+  const invoke = Q.createPreviewInvoke()
+  const provider = { name: 'safe', baseUrl: 'https://example.com/?version=1', apiKey: 'test-key', models: ['one'] }
+  for (const query of ['api_key=test-secret', 'version=test-secret', 'api-version=2024-02-30', 'version=1&key=test-secret']) {
+    await assert.rejects(invoke('provider_add', { provider: { ...provider, baseUrl: `https://example.com/?${query}` } }), /PROVIDER_INVALID/)
+  }
+  const transformer = { use: [['OpenAI', {}]] }
+  for (const invalid of [transformer, { use: [['unknown', {}]] }, { use: [['customparams', []]] }, { use: [{}] }, { use: [] }, null]) {
+    await assert.rejects(invoke('provider_add', { provider: { ...provider, transformer: invalid } }), /PROVIDER_INVALID/)
+  }
+  await invoke('provider_add', { provider })
+  await assert.rejects(invoke('provider_update', { name: provider.name, provider: { ...provider, transformer } }), /PROVIDER_INVALID/)
+  const managed = { ...provider, name: 'managed', apiKey: 'ccr-managed-test' }
+  await invoke('provider_add', { provider: managed })
+  await assert.rejects(invoke('provider_get', { name: managed.name }), /PROVIDER_MANAGED/)
+  await assert.rejects(invoke('provider_update', { name: managed.name, provider: managed }), /PROVIDER_MANAGED/)
 })
 
 test("preview: routing_snapshot has the complete routing contract", async () => {

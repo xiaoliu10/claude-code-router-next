@@ -264,6 +264,17 @@
   }
 
 
+  function safeVersionQuery(endpoint) {
+    var start = endpoint.indexOf('?');
+    if (start < 0) return true;
+    var query = endpoint.slice(start + 1);
+    if (/^version=\d{1,3}(?:\.\d{1,3}){0,2}$/.test(query)) return true;
+    var match = /^api-version=(\d{4}-\d{2}-\d{2})(?:-preview)?$/.exec(query);
+    if (!match) return false;
+    var date = new Date(match[1] + 'T00:00:00Z');
+    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === match[1];
+  }
+
   function providerInputError(provider, editing) {
     function validText(value, maxBytes) {
       return typeof value === 'string' && value.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
@@ -274,7 +285,7 @@
     if (!validText(provider.baseUrl, 2048)) return 'baseUrl';
     var endpoint = provider.baseUrl.trim();
     var authority = /^https?:\/\/([^/?#]+)/i.exec(endpoint);
-    if (!authority || authority[1].includes('@') || /[\\#\s]/.test(endpoint)) return 'baseUrl';
+    if (!safeVersionQuery(endpoint) || !authority || authority[1].includes('@') || /[\\#\s]/.test(endpoint)) return 'baseUrl';
     try { if (!new URL(endpoint).hostname) return 'baseUrl'; } catch { return 'baseUrl'; }
     var keepKey = editing && (provider.apiKey === undefined || provider.apiKey === '');
     if (!keepKey && !validText(provider.apiKey, 4096)) return 'apiKey';
@@ -1345,6 +1356,7 @@
       return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false, transformer: null, transformerProtected: false }];
     }));
 
+    var previewCatalog = { names: ['OpenAI', 'customparams'], parameterizedNames: ['customparams'] };
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
@@ -1353,9 +1365,10 @@
       if (cmd === 'quota_snapshot') {
         return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
       }
-      if (cmd === 'provider_transformers') return delay({ names: ['anthropic', 'openai'] });
+      if (cmd === 'provider_transformers') return delay(copy(previewCatalog));
       if (cmd === 'provider_get') {
         var detail = providerDetails.get(a.name);
+        if (detail && detail.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
         return detail ? delay(copy(detail)) : Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
       }
       if (cmd === 'provider_add' || cmd === 'provider_update') {
@@ -1366,6 +1379,7 @@
         var previous = editing && providerDetails.get(a.name);
         if (editing && !previous) return Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
         if (previous && previous.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
+        if (editing && name !== a.name) return Promise.reject(new Error('PROVIDER_INVALID'));
         var row = editing && quotaProviders.find(function (p) { return p.name === a.name; });
         if (quotaProviders.some(function (p) { return p !== row && p.name.toLowerCase() === name.toLowerCase(); })) {
           return Promise.reject(new Error('PROVIDER_DUPLICATE'));
@@ -1376,20 +1390,24 @@
         var transformerProtected = previous ? previous.transformerProtected : false;
         if (provider.transformer !== undefined) {
           var chain = provider.transformer === null ? [] : provider.transformer.use;
-          if (!Array.isArray(chain)) return Promise.reject(new Error('PROVIDER_INVALID'));
+          var validName = function (value) {
+            return typeof value === 'string' && value.trim() && Array.from(value.trim()).length <= 64 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+          };
+          if (provider.transformer === null ? !editing :
+              Object.keys(provider.transformer).length !== 1 || !Array.isArray(chain) || !chain.length || chain.length > 8 || chain.some(function (item) {
+                if (!Array.isArray(item)) return !validName(item);
+                return item.length !== 2 || !validName(item[0]) || !previewCatalog.parameterizedNames.includes(item[0].trim()) ||
+                  !item[1] || typeof item[1] !== 'object' || Array.isArray(item[1]) || new TextEncoder().encode(JSON.stringify(item[1])).length > 2048;
+              })) return Promise.reject(new Error('PROVIDER_INVALID'));
           transformerProtected = chain.some(Array.isArray);
-          transformer = chain.length ? { use: chain.map(function (item) { return Array.isArray(item) ? item[0] : item; }) } : null;
+          transformer = chain.length ? { use: chain.map(function (item) { return (Array.isArray(item) ? item[0] : item).trim(); }) } : null;
         }
-        if (editing) providerDetails.delete(a.name);
         providerDetails.set(name, { name: name, baseUrl: provider.baseUrl.trim(), models: models, managed: managed,
           transformer: transformer, transformerProtected: transformerProtected });
-        if (row) row.name = name;
-        else quotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
+        if (!row) quotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
         var route = editing && routing.providers.find(function (p) { return p.name === a.name; });
-        if (route) { route.name = name; route.models = models; }
+        if (route) route.models = models;
         else if (!row || row.enabled) routing.providers.push({ name: name, models: models });
-        var credential = editing && credentials.providers.find(function (p) { return p.name === a.name; });
-        if (credential) credential.name = name;
         bump();
         return delay({ name: name });
       }
@@ -1661,7 +1679,7 @@
     var confirmPanel = document.getElementById('provider-transformer-confirm');
     var keep = document.getElementById('provider-transformer-keep');
     var confirmReplace = document.getElementById('provider-transformer-confirm-replace');
-    var names = [], keepProtected = false;
+    var names = [], parameterizedNames = [], originalChain = [], keepProtected = false, confirmedReplacement = false;
 
     function input(label, cls) {
       var field = el('input', 'route-input ' + cls);
@@ -1701,7 +1719,12 @@
       row.appendChild(mkBtn('移除', '移除转换器', function () { row.remove(); }));
       var params = el('div', 'transformer-params');
       row.appendChild(params);
-      row.appendChild(mkBtn('添加参数', null, function () { addParam(params); }));
+      var addParameter = mkBtn('添加参数', null, function () { addParam(params); });
+      function syncParameterButton() { addParameter.disabled = !parameterizedNames.includes(field.value.trim()); }
+      field.addEventListener('input', syncParameterButton);
+      field.addEventListener('change', syncParameterButton);
+      syncParameterButton();
+      row.appendChild(addParameter);
       rows.appendChild(row);
       return field;
     }
@@ -1714,6 +1737,9 @@
       add.hidden = false;
       add.disabled = true;
       names = [];
+      parameterizedNames = [];
+      originalChain = [];
+      confirmedReplacement = false;
     }
     add.addEventListener('click', function () { addRow('').focus(); });
     replace.addEventListener('click', function () {
@@ -1728,6 +1754,7 @@
     });
     confirmReplace.addEventListener('click', function () {
       keepProtected = false;
+      confirmedReplacement = true;
       protectedPanel.hidden = true;
       add.hidden = false;
       add.focus();
@@ -1735,6 +1762,7 @@
     function prefill(entry) {
       var chain = entry.transformer && entry.transformer.use || [];
       if (!Array.isArray(chain) || !chain.every(function (name) { return typeof name === 'string'; })) throw new Error();
+      originalChain = chain;
       keepProtected = entry.transformerProtected === true;
       if (keepProtected) {
         summary.textContent = '已保留现有转换器和参数。' + chain.join(' → ');
@@ -1751,7 +1779,9 @@
         var name = field.value.trim();
         if (!name) return invalid(field, '请输入转换器名称。');
         var params = Object.create(null);
-        for (var pair of row.querySelectorAll('.transformer-param')) {
+        var pairs = row.querySelectorAll('.transformer-param');
+        if (pairs.length && !parameterizedNames.includes(name)) return invalid(field, '此转换器不支持参数，请移除参数或选择其他转换器。');
+        for (var pair of pairs) {
           var key = pair.querySelector('.param-key');
           var paramName = key.value.trim();
           if (!paramName || paramName in params) return invalid(key, '请输入唯一的参数名。');
@@ -1763,6 +1793,7 @@
         }
         use.push(Object.keys(params).length ? [name, params] : name);
       }
+      if (editing && !confirmedReplacement && use.length === originalChain.length && use.every(function (item, i) { return item === originalChain[i]; })) return true;
       if (use.length) provider.transformer = { use: use };
       else if (editing) provider.transformer = null;
       return true;
@@ -1772,6 +1803,7 @@
       disable: function (disabled) { section.disabled = disabled; },
       setNames: function (result) {
         names = result && Array.isArray(result.names) ? result.names.filter(function (n) { return typeof n === 'string' && n.trim(); }) : [];
+        parameterizedNames = result && Array.isArray(result.parameterizedNames) ? result.parameterizedNames.filter(function (n) { return names.includes(n); }) : [];
         add.disabled = false;
       },
     };
@@ -1791,7 +1823,7 @@
     };
     var invalidMessages = {
       name: '请输入供应商名称，不能包含逗号或控制字符。',
-      baseUrl: '请输入完整的 HTTP 或 HTTPS 地址，不能包含账号、密码或片段。',
+      baseUrl: '请输入完整的 HTTP 或 HTTPS 地址，不能包含账号、密码或片段；查询参数仅支持版本号。',
       apiKey: '请输入有效的 API 密钥。', models: '请输入 1 至 256 个有效的模型 ID。',
     };
     var saving = false, loading = false, managed = false, editName = null;
@@ -1827,6 +1859,8 @@
       loading = name !== null;
       trigger = button;
       title.textContent = loading ? '编辑供应商' : '添加供应商';
+      fields.name.readOnly = loading;
+      fields.name.title = loading ? '名称用于路由，创建后不可修改。' : '';
       fields.apiKey.required = !loading;
       fields.apiKey.placeholder = loading ? '已保存，留空则不修改' : '';
       status.textContent = '';
@@ -1847,19 +1881,26 @@
         var results = await Promise.all([invoke('provider_get', { name: name }), catalog]);
         var entry = results[0];
         if (id !== readId) return;
-        if (!entry || entry.name !== name || typeof entry.baseUrl !== 'string' || !Array.isArray(entry.models)
+        if (entry && entry.managed === true) throw new Error('PROVIDER_MANAGED');
+        if (!entry || entry.name !== name || typeof entry.baseUrl !== 'string' || !safeVersionQuery(entry.baseUrl) || !Array.isArray(entry.models)
             || !entry.models.every(function (m) { return typeof m === 'string'; }) || typeof entry.managed !== 'boolean') throw new Error();
         fields.name.value = entry.name;
         fields.baseUrl.value = entry.baseUrl;
         fields.models.value = entry.models.join('\n');
         transformers.prefill(entry);
-        managed = entry.managed;
         loading = false;
         syncControls();
-        if (managed) { error.textContent = managedNote; cancel.focus(); }
-        else fields.name.focus();
-      } catch {
+        fields.baseUrl.focus();
+      } catch (err) {
         if (id !== readId) return;
+        if ((typeof err === 'string' ? err : err && err.message) === 'PROVIDER_MANAGED') {
+          managed = true;
+          loading = false;
+          syncControls();
+          error.textContent = managedNote;
+          cancel.focus();
+          return;
+        }
         close(true);
         status.textContent = '暂时无法读取供应商，请刷新后重试。';
       }
@@ -1877,7 +1918,7 @@
       var editing = editName !== null;
       var models = fields.models.value.split(/[\r\n,]/).map(function (m) { return m.trim(); }).filter(Boolean);
       var provider = {
-        name: fields.name.value.trim(), baseUrl: fields.baseUrl.value.trim(),
+        name: editing ? editName : fields.name.value.trim(), baseUrl: fields.baseUrl.value.trim(),
         models: Array.from(new Set(models)),
       };
       if (!editing || fields.apiKey.value !== '') provider.apiKey = fields.apiKey.value;
@@ -1904,7 +1945,7 @@
         var code = typeof err === 'string' ? err : err && err.message;
         var duplicate = code === 'PROVIDER_DUPLICATE';
         var message = editing ? '更新供应商失败，请检查输入后重试。' : '添加供应商失败，请检查输入后重试。';
-        if (duplicate) message = '供应商名称已存在，请使用其他名称。';
+        if (duplicate) message = editing ? '供应商名称已存在，请先解决配置中的重复名称。' : '供应商名称已存在，请使用其他名称。';
         if (code === 'PROVIDER_INVALID') message = '供应商信息无效，请检查输入后重试。';
         if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = editing ? '暂时无法确认保存结果，请刷新后再决定是否重试' : '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
         if (editing && code === 'PROVIDER_MANAGED') { managed = !form.hidden; message = managedNote; fields.apiKey.value = ''; }
@@ -1912,7 +1953,7 @@
         if (form.hidden) status.textContent = message;
         else {
           error.textContent = message;
-          if (duplicate || code === 'PROVIDER_INVALID') fields.name.focus();
+          if (!editing && (duplicate || code === 'PROVIDER_INVALID')) fields.name.focus();
           else (managed ? cancel : save).focus();
         }
         return;
