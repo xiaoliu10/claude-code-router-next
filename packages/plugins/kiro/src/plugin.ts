@@ -8,7 +8,7 @@ import { createKiroManagedRuntime } from "./managed-runtime";
 
 export const manifest = {
   name: "kiro",
-  version: "0.1.2",
+  version: "0.1.3",
   coreApi: "1",
   description:
     "Kiro subscription provider (AWS Builder ID, IAM Identity Center and the Kiro portal): sign-in, model management, usage and chat.",
