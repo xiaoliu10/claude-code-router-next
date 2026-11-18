@@ -125,7 +125,7 @@ test("preview: usage_records paginates with cross-page totals, error and estimat
   const empty = await previewCall(invoke, "usage_records", { period: "today", page: 99, pageSize: 20 })
   assert.equal(empty.records.length, 0, "out-of-range page yields no records")
 
-  for (const period of ["7d", "30d"]) {
+  for (const period of ["7d", "30d", "all"]) {
     const page = await previewCall(invoke, "usage_records", { period })
     for (const k of RECORDS_PAGE_KEYS) assert.ok(k in page, `${period}: missing ${k}`)
     assert.equal(page.period, period)
@@ -307,7 +307,7 @@ test("preview: routing_flags toggles both flags and returns a fresh snapshot", a
 
 test("preview: usage_snapshot covers today/7d/30d with complete summaries", async () => {
   const invoke = Q.createPreviewInvoke()
-  for (const period of ["today", "7d", "30d"]) {
+  for (const period of ["today", "7d", "30d", "all"]) {
     assertUsageSnapshot(await previewCall(invoke, "usage_snapshot", { period }), period, period)
   }
   const fallback = await previewCall(invoke, "usage_snapshot", { period: "bogus" })

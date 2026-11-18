@@ -271,7 +271,7 @@ body {
 .usage-cell[data-metric="output"] { background: #fefce8; color: #854d0e; }
 .usage-cell[data-metric="cache-read"] { background: #ecfdf5; color: #065f46; }
 .usage-cell[data-metric="cache-write"] { background: #f0fdfa; color: #115e59; }
-.usage-cell[data-metric="estimated"] { background: #fff7ed; color: #9a3412; }
+.usage-cell[data-metric="cache-hit"] { background: #ecfeff; color: #155e75; }
 .usage-cell[data-metric="ttft"] { background: #faf5ff; color: #6b21a8; }
 .usage-cell[data-metric="speed"] { background: #fdf2f8; color: #9d174d; }
 .usage-num { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }

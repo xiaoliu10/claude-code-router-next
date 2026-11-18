@@ -172,6 +172,31 @@ test('interaction: fallback add fires once, keyboard add, move/remove and explic
   assert.deepEqual(Array.from(h.calls.find(c => c.cmd === 'routing_save').args.change.fallback), ['alpha,two']);
 });
 
+test('usage summary shows token cache hit rate for each selected period', async () => {
+  const totals = {
+    '7d': { inputTokens: 10000, cacheReadTokens: 8000, cacheWriteTokens: 2000 },
+    today: { inputTokens: 3000, cacheReadTokens: 6000, cacheWriteTokens: 1000 },
+    '30d': { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+  };
+  const h = harness({ usage_snapshot: ({ period }) => ({ period, ...totals[period] }) });
+  await openUsage(h);
+  const readRate = () => h.id('usage-body').querySelectorAll('.usage-cell')
+    .find(cell => cell.dataset.metric === 'cache-hit').querySelector('.usage-num').textContent;
+  assert.equal(readRate(), '80.0%');
+  assert.doesNotMatch(h.id('usage-body').querySelector('.usage-grid').textContent, /估算条目/);
+  for (const [period, expected] of [['today', '60.0%'], ['30d', '—']]) {
+    h.id('usage-periods').children.find(button => button.dataset.period === period).click();
+    await flush();
+    assert.equal(readRate(), expected);
+  }
+  totals.today.cacheReadTokens = 0;
+  h.id('usage-periods').children[0].click(); await flush();
+  assert.equal(readRate(), '0.0%');
+  totals.today.cacheReadTokens = null;
+  h.id('usage-refresh').click(); await flush();
+  assert.equal(readRate(), '—');
+});
+
 test('interaction: usage totals and model/provider/date cache preserve exact counts across periods', async () => {
   const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250,
     byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-input', outputTokens: 100 }],
@@ -276,7 +301,7 @@ async function openUsage(h) { await flush(); h.id('tab-usage').click(); await fl
 test('interaction: opening usage loads the seven-day chart and matching records by default', async () => {
   const h = harness({ usage_snapshot: ({ period }) => ({ period, byDay: Array.from({ length: 7 }, (_, i) => ({
     name: `2026-11-${11 + i}`, inputTokens: 100 + i, outputTokens: 10,
-  })) }) });
+  })).concat(period === 'all' ? [{ name: '2026-09-01', inputTokens: 1000, outputTokens: 250 }] : []) }) });
   await openUsage(h);
   assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_snapshot' || c.cmd === 'usage_records')), [
     { cmd: 'usage_snapshot', args: { period: '7d' } },
@@ -286,6 +311,12 @@ test('interaction: opening usage loads the seven-day chart and matching records 
   assert.deepEqual(selected.map(button => button.dataset.period), ['7d']);
   assert.match(h.id('usage-body').textContent, /汇总 · 近 7 天/);
   assert.equal(h.id('usage-body').querySelectorAll('.usage-bar').length, 7);
+  h.id('usage-periods').children.find(button => button.dataset.period === 'all').click(); await flush();
+  assert.match(h.id('usage-body').textContent, /汇总 · 全部/);
+  assert.ok(h.id('usage-body').querySelectorAll('.usage-day-date').some(n => n.textContent === '2026-09-01'));
+  const dateTable = h.id('usage-body').querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
+  assert.match(dateTable.querySelector('tbody').textContent, /2026-09-01/);
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'all', page: 1, pageSize: 20 });
 });
 
 test('interaction: records pager walks pages, resets on period switch, shows page/total info', async () => {

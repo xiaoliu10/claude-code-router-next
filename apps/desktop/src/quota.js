@@ -452,7 +452,8 @@
 
   var ROUTING_SCOPES = ['global', 'opus', 'sonnet', 'haiku', 'models'];
   var ROUTING_SCENARIOS = ['default', 'background', 'think', 'longContext', 'extendedContext', 'webSearch', 'image'];
-  var USAGE_PERIODS = ['today', '7d', '30d'];
+  var USAGE_PERIOD_LABELS = { today: '今天', '7d': '近 7 天', '30d': '近 30 天', all: '全部' };
+  var USAGE_PERIODS = Object.keys(USAGE_PERIOD_LABELS);
   var DEFAULT_USAGE_PERIOD = '7d';
   var SCOPE_LABELS = { global: '全局', opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', models: '模型别名' };
   var SCENARIO_LABELS = { default: '默认', background: '后台', think: '思考', longContext: '长上下文', extendedContext: '扩展上下文', webSearch: '网页搜索', image: '图像' };
@@ -749,7 +750,7 @@
 
 
   // ---- Usage tab ---------------------------------------------------------
-  // usage_snapshot({period:'today'|'7d'|'30d'}) -> totals + byModel/byProvider/byDay.
+  // usage_snapshot({period:'today'|'7d'|'30d'|'all'}) -> totals + byModel/byProvider/byDay.
   // Numbers come from the server summary only; no currency/cost is shown.
 
   function usageRow(x) {
@@ -826,7 +827,7 @@
 
 
   // ---- Usage records -----------------------------------------------------
-  // usage_records({period:'today'|'7d'|'30d',page,pageSize}) -> paged,
+  // usage_records({period:'today'|'7d'|'30d'|'all',page,pageSize}) -> paged,
   // whitelisted projections of individual calls. The server never sends
   // responseBody/sessionId/keys; normalizeRecord re-enforces that whitelist
   // on the client before anything renders.
@@ -1264,6 +1265,11 @@
         updatedAt: Date.now() - 3000,
       },
     };
+    var olderDay = { name: '2026-09-01', requests: 1, inputTokens: 1000, outputTokens: 250, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    usage.all = Object.assign({}, usage['30d'], {
+      period: 'all', totalRequests: 4121, successCount: 4045, inputTokens: 28601000, outputTokens: 7100250,
+      byDay: [olderDay].concat(usage['30d'].byDay),
+    });
     var clients = {
       clients: [
         { id: 'claudeCode', name: 'Claude Code', enabled: true, managed: true, exists: true, activeModel: 'claude-sonnet-4-5', modelAlias: 'claude-sonnet-4-5' },
@@ -1290,7 +1296,7 @@
       { original: 'claude-opus-4-5', model: 'glm-5', upstream: 'glm-5-air' },
       { original: 'gpt-5-codex', model: 'gpt-5-codex', upstream: null },
     ];
-    var RECORD_COUNTS = { today: 45, '7d': 132, '30d': 260 };
+    var RECORD_COUNTS = { today: 45, '7d': 132, '30d': 260, all: 320 };
     function previewRecords(period) {
       var n = RECORD_COUNTS[period] || 45;
       var records = [];
@@ -1321,7 +1327,7 @@
     }
     var recordsCache = null;
     function recordsFor(period) {
-      if (!recordsCache) recordsCache = { today: previewRecords('today'), '7d': previewRecords('7d'), '30d': previewRecords('30d') };
+      if (!recordsCache) recordsCache = { today: previewRecords('today'), '7d': previewRecords('7d'), '30d': previewRecords('30d'), all: previewRecords('all') };
       return recordsCache[period] || recordsCache.today;
     }
 
@@ -2525,7 +2531,7 @@
       }
       var u = s.snapshot;
       var totals = el('div', 'usage-card');
-      totals.appendChild(el('div', 'usage-title', '汇总 · ' + (u.period === 'today' ? '今天' : u.period === '7d' ? '近 7 天' : '近 30 天')));
+      totals.appendChild(el('div', 'usage-title', '汇总 · ' + USAGE_PERIOD_LABELS[u.period]));
       var grid = el('div', 'usage-grid');
       grid.appendChild(usageNumCell('requests', '请求', formatInt(u.totalRequests)));
       grid.appendChild(usageNumCell('success', '成功', formatInt(u.successCount)));
@@ -2539,7 +2545,13 @@
       grid.appendChild(usageNumCell('output', '输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
       grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
       grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
-      grid.appendChild(usageNumCell('estimated', '估算条目', formatInt(u.estimatedCount)));
+      var effectiveInput = effectiveInputTokens(u.inputTokens, u.cacheReadTokens, u.cacheWriteTokens);
+      var hitRate = effectiveInput > 0 && u.cacheReadTokens !== null
+        ? ((u.cacheReadTokens / effectiveInput) * 100).toFixed(1) + '%'
+        : null;
+      var cacheHitCell = usageNumCell('cache-hit', '缓存命中率', hitRate);
+      cacheHitCell.title = '缓存读取 tokens ÷ 有效输入 tokens';
+      grid.appendChild(cacheHitCell);
       grid.appendChild(usageNumCell('ttft', '平均 TTFT', formatMs(u.avgTtftMs)));
       grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
