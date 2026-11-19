@@ -75,6 +75,7 @@ async function startStubRegistry(
 
 function buildPluginTarball(opts: {
   pluginName?: string;
+  packageName?: string;
   version?: string;
   coreApi?: string;
   entry?: boolean;
@@ -85,8 +86,8 @@ function buildPluginTarball(opts: {
   const inner = join(root, "package", "dist");
   mkdirSync(inner, { recursive: true });
   writeFileSync(join(root, "package", "package.json"), JSON.stringify({
-    name: `ccr-provider-${name}`,
-    version: "1.0.0",
+    name: opts.packageName ?? `ccr-provider-${name}`,
+    version: opts.version ?? "1.0.0",
   }));
   writeFileSync(join(inner, "plugin.json"), JSON.stringify({
     name,
@@ -232,6 +233,71 @@ describe("POST /api/plugins/install", () => {
     expect(res.json()).toEqual({ ok: false, error: "plugins_json_corrupted" });
     expect(readFileSync(join(pluginsDir, "plugins.json"), "utf8")).toBe(original);
     expect(existsSync(join(pluginsDir, "corrupt"))).toBe(false);
+  });
+});
+
+describe("POST /api/plugins/install-pinned", () => {
+  const name = "ccr-provider-fixture";
+  const installed = { name: "fixture", version: "1.0.0" };
+  async function setup(archive: Parameters<typeof buildPluginTarball>[0] = {}) {
+    const registry = await startStubRegistry();
+    // latest intentionally points to the older release. A bare pack would fetch it.
+    const versions = Object.fromEntries(["1.0.0", "1.1.0-beta.2"].map(version => [version, {
+      name, version, dist: { tarball: `${registry.url}/${version}.tgz` },
+    }]));
+    registry.entries[name] = { json: { name, "dist-tags": { latest: "1.0.0" }, versions } };
+    registry.entries["1.0.0.tgz"] = { body: buildPluginTarball({}) };
+    registry.entries["1.1.0-beta.2.tgz"] = { body: buildPluginTarball({ version: "1.1.0-beta.2", packageName: name, ...archive }) };
+    const app = buildApp({ registry: registry.url });
+    const post = (payload: Record<string, unknown>) => app.inject({
+      method: "POST", url: "/api/plugins/install-pinned", headers: { host: "localhost:3456" }, payload,
+    });
+    expect((await post({ name, version: "1.0.0", installed: null })).statusCode).toBe(200);
+    return post;
+  }
+  const update = { name, version: "1.1.0-beta.2", installed };
+  it("packs the exact prerelease and accepts only one competing replacement", async () => {
+    const post = await setup();
+    const replies = await Promise.all([post(update), post(update)]);
+    expect(replies.map(r => r.statusCode).sort()).toEqual([200, 409]);
+    expect(JSON.parse(readFileSync(join(configDir, "plugins/fixture/plugin.json"), "utf8")).version).toBe(update.version);
+  });
+  it.each([
+    { version: "1.0.0" }, { packageName: "other-package" }, { pluginName: "redirected" },
+  ])("rejects a different packed identity or version %j before replacement", async archive => {
+    const post = await setup(archive);
+    const res = await post(update);
+    expect(res.statusCode).toBe(409);
+    expect(existsSync(join(configDir, "plugins/redirected"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(configDir, "plugins/fixture/plugin.json"), "utf8"))).toMatchObject(installed);
+    expect(records()).toEqual([{ name: "fixture", enabled: true, source: name }]);
+  });
+  it.each(["other-source", "other-manifest", "build-only", "missing-target", "corrupt-records"])("refuses a changed on-disk target: %s", async change => {
+    const post = await setup();
+    const dir = join(configDir, "plugins/fixture");
+    const recordFile = join(configDir, "plugins/plugins.json");
+    const expected = { ...installed };
+    if (change === "other-source") writeFileSync(recordFile, JSON.stringify([{ name: "fixture", enabled: true, source: "other" }]));
+    if (change === "other-manifest") writeFileSync(join(dir, "plugin.json"), JSON.stringify({ ...installed, name: "other" }));
+    if (change === "build-only") {
+      expected.version = update.version + "+oldbuild";
+      writeFileSync(join(dir, "plugin.json"), JSON.stringify(expected));
+    }
+    if (change === "missing-target") rmSync(dir, { recursive: true });
+    if (change === "corrupt-records") writeFileSync(recordFile, "corrupt");
+    const before = readFileSync(recordFile, "utf8");
+    const manifest = existsSync(dir) ? readFileSync(join(dir, "plugin.json"), "utf8") : null;
+    expect((await post({ ...update, installed: expected })).statusCode).toBe(409);
+    expect(readFileSync(recordFile, "utf8")).toBe(before);
+    expect(existsSync(dir) ? readFileSync(join(dir, "plugin.json"), "utf8") : null).toBe(manifest);
+  });
+  it("rejects ranges, incomplete targets and unconfirmed overwrites", async () => {
+    const post = await setup();
+    for (const bad of [{ ...update, version: "latest" }, { ...update, version: "^1.1.0" },
+      { ...update, installed: { version: "1.0.0" } }, { ...update, installed: undefined }]) {
+      expect((await post(bad)).statusCode).toBe(400);
+    }
+    expect((await post({ ...update, installed: null, force: true })).statusCode).toBe(409);
   });
 });
 

@@ -220,6 +220,11 @@ export interface LLMProvider {
   /** Optional Volcengine account Secret Access Key paired with quotaAccessKey.
    *  Never projected into desktop DTOs, logs, or error messages. */
   quotaSecretKey?: string;
+  /** Optional LiteLLM personal access token for the relay GET /user/info
+   *  budget API (self-user budget behind a LiteLLM proxy). The inference
+   *  apiKey is normally route-restricted by such relays, so this separate
+   *  token is required. Never projected into desktop DTOs, logs, or errors. */
+  quotaLitellmToken?: string;
   transformer?: {
     [key: string]: {
       use?: Transformer[];
@@ -268,6 +273,8 @@ export interface ConfigProvider {
   quota_token?: string;
   /** Optional sec_token for the Aliyun Bailian console official quota API (efm-fe 3.5.613 format) */
   quota_sec_token?: string;
+  /** Optional LiteLLM personal access token for the relay GET /user/info budget API */
+  quota_litellm_token?: string;
   transformer: {
     use?: string[] | Array<any>[];
   } & {

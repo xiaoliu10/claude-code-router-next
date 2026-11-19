@@ -1210,6 +1210,75 @@ class VolcengineCodingPlanQuotaAdapter extends BaseQuotaAdapter {
   }
 }
 
+
+// ============================== LiteLLM relays ==============================
+
+// LiteLLM proxy relays expose the signed-in user's budget through
+// GET /user/info (UserInfoResponse): the "user_info" row carries spend,
+// max_budget, budget_duration and budget_reset_at. spend is the CURRENT
+// budget window when budget_duration is set (LiteLLM resets the counter per
+// window) and lifetime spend otherwise — either way max_budget/spend is the
+// pair the relay enforces, so both are projected onto the shared balance
+// window (limit/used) with the USD denomination LiteLLM computes spend in.
+export function parseLitellmUserBudgetUsage(payload: any): ProviderQuotaResult | null {
+  const row =
+    payload && typeof payload.user_info === "object" && payload.user_info !== null
+      ? payload.user_info
+      : payload;
+  if (!row || typeof row !== "object") return null;
+  const number = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  const maxBudget = number(row.max_budget) ?? number(row.maxBudget);
+  if (maxBudget === undefined || maxBudget <= 0) return null;
+  const result: ProviderQuotaResult = {
+    totalBalance: maxBudget,
+    currency: "USD",
+  };
+  const spend = number(row.spend);
+  if (spend !== undefined && spend >= 0) result.usedBalance = spend;
+  const resetAt = [row.budget_reset_at, row.budgetResetAt].find(
+    (value): value is string =>
+      typeof value === "string" && Number.isFinite(Date.parse(value))
+  );
+  if (resetAt) result.resetTime7d = resetAt;
+  return result;
+}
+
+class LitellmUserBudgetQuotaAdapter extends BaseQuotaAdapter {
+  async queryQuota(
+    provider: LLMProvider,
+    timeoutMs: number,
+    proxyUrl?: string
+  ): Promise<ProviderQuotaResult | null> {
+    const record = provider as unknown as Record<string, unknown>;
+    const token = [record.quotaLitellmToken, record.quota_litellm_token].find(
+      (value): value is string => typeof value === "string" && value.trim().length > 0
+    );
+    if (!token) return null;
+    // Trim defensively: a padded PAT (routine paste artifact) would otherwise
+    // reach the Authorization header verbatim and fail relay auth silently.
+    const credential = token.trim();
+    // The budget API lives on the relay origin itself, not on the inference
+    // path: strip any /v1/... suffix from the configured baseUrl.
+    let origin: string;
+    try {
+      origin = new URL(provider.baseUrl).origin;
+    } catch {
+      return null;
+    }
+    const payload = await this.fetchJson(
+      origin + "/user/info",
+      provider,
+      timeoutMs,
+      proxyUrl,
+      credential
+    );
+    if (!payload) return null;
+    const result = parseLitellmUserBudgetUsage(payload);
+    return result && this.hasQuotaData(result) ? result : null;
+  }
+}
+
 const deepSeekQuotaAdapter = new DeepSeekQuotaAdapter();
 const openRouterQuotaAdapter = new OpenRouterQuotaAdapter();
 const siliconFlowQuotaAdapter = new SiliconFlowQuotaAdapter();
@@ -1220,8 +1289,20 @@ const xfyunCodingPlanQuotaAdapter = new XfyunCodingPlanQuotaAdapter();
 const kimiCodingPlanQuotaAdapter = new KimiCodingPlanQuotaAdapter();
 const miniMaxCodingPlanQuotaAdapter = new MiniMaxCodingPlanQuotaAdapter();
 const volcengineCodingPlanQuotaAdapter = new VolcengineCodingPlanQuotaAdapter();
+const litellmUserBudgetQuotaAdapter = new LitellmUserBudgetQuotaAdapter();
 
-export function getQuotaAdapter(baseUrl: string): QuotaAdapter | null {
+export function getQuotaAdapter(baseUrl: string, provider?: LLMProvider): QuotaAdapter | null {
+  // Field-based detection first: generic LiteLLM relays have no fixed public
+  // hostname, so the LiteLLM user-budget adapter is opted in per provider via
+  // its quota_litellm_token / quotaLitellmToken config field.
+  const record = provider as unknown as Record<string, unknown> | undefined;
+  const litellmToken = record
+    ? [record.quotaLitellmToken, record.quota_litellm_token].find(
+        (value): value is string => typeof value === "string" && value.trim().length > 0
+      )
+    : undefined;
+  if (litellmToken) return litellmUserBudgetQuotaAdapter;
+
   const hostname = getHostname(baseUrl);
   if (!hostname) return null;
 

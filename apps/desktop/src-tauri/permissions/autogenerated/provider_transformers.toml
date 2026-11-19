@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-provider-transformers"
+description = "Enables the provider_transformers command without any pre-configured scope."
+commands.allow = ["provider_transformers"]
+
+[[permission]]
+identifier = "deny-provider-transformers"
+description = "Denies the provider_transformers command without any pre-configured scope."
+commands.deny = ["provider_transformers"]

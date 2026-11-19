@@ -264,7 +264,18 @@
   }
 
 
-  function providerInputError(provider) {
+  function safeVersionQuery(endpoint) {
+    var start = endpoint.indexOf('?');
+    if (start < 0) return true;
+    var query = endpoint.slice(start + 1);
+    if (/^version=\d{1,3}(?:\.\d{1,3}){0,2}$/.test(query)) return true;
+    var match = /^api-version=(\d{4}-\d{2}-\d{2})(?:-preview)?$/.exec(query);
+    if (!match) return false;
+    var date = new Date(match[1] + 'T00:00:00Z');
+    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === match[1];
+  }
+
+  function providerInputError(provider, editing) {
     function validText(value, maxBytes) {
       return typeof value === 'string' && value.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
         && new TextEncoder().encode(value.trim()).length <= maxBytes;
@@ -274,9 +285,10 @@
     if (!validText(provider.baseUrl, 2048)) return 'baseUrl';
     var endpoint = provider.baseUrl.trim();
     var authority = /^https?:\/\/([^/?#]+)/i.exec(endpoint);
-    if (!authority || authority[1].includes('@') || /[\\#\s]/.test(endpoint)) return 'baseUrl';
+    if (!safeVersionQuery(endpoint) || !authority || authority[1].includes('@') || /[\\#\s]/.test(endpoint)) return 'baseUrl';
     try { if (!new URL(endpoint).hostname) return 'baseUrl'; } catch { return 'baseUrl'; }
-    if (!validText(provider.apiKey, 4096)) return 'apiKey';
+    var keepKey = editing && (provider.apiKey === undefined || provider.apiKey === '');
+    if (!keepKey && !validText(provider.apiKey, 4096)) return 'apiKey';
     var models = provider.models;
     if (!Array.isArray(models) || !models.length || models.length > 256 || !models.every(validId)) return 'models';
     if (new Set(models.map(function (m) { return m.trim(); })).size !== models.length) return 'models';
@@ -1321,12 +1333,12 @@
 
     function copy(v) { return JSON.parse(JSON.stringify(v)); }
     function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
+    var pluginsPreview = typeof PluginsUI !== 'undefined' ? PluginsUI.createPreviewPlugins(function (v) { return delay(copy(v)); }) : null;
     function bump() { rev += 1; routing.revision = 'rev-' + rev; }
 
-    var addedQuotaProviders = [];
-    function quotaSnapshot(now) {
+    function previewQuotaProviders(now) {
       var h = function (n) { return new Date(now + n * 3600e3).toISOString(); };
-      var all = [
+      return [
         { name: 'alpha.example.com', enabled: true, plan: 'Pro', status: 'ready', message: null, updatedAt: now - 5e3, windows: [
           { label: '五小时', used: 12.3, limit: 45, remaining: 32.7, unit: '次', resetAt: h(3) },
           { label: '每周', used: 210, limit: 1000, remaining: 790, unit: '次', resetAt: h(74) },
@@ -1343,25 +1355,65 @@
           { label: '五小时', used: null, limit: null, remaining: null, unit: null, resetAt: null }] },
         { name: '火山agent plan', enabled: true, plan: null, status: 'unavailable', message: '未提供可用额度数据（来源未声明查询能力）', windows: [], updatedAt: null },
       ];
-      return { providers: all.concat(copy(addedQuotaProviders)), updatedAt: now - 2e3, online: true, error: null };
     }
+    var quotaProviders = previewQuotaProviders(Date.now());
+    var providerDetails = new Map(quotaProviders.map(function (row) {
+      var route = routing.providers.find(function (p) { return p.name === row.name; });
+      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false, transformer: null, transformerProtected: false }];
+    }));
 
+    var previewCatalog = { names: ['OpenAI', 'customparams'], parameterizedNames: ['customparams'] };
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
       if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
+      if (cmd.indexOf('plugin_') === 0 && pluginsPreview) return pluginsPreview.invoke(cmd, a);
       if (cmd === 'quota_snapshot') {
-        return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
+        return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
       }
-      if (cmd === 'provider_add') {
+      if (cmd === 'provider_transformers') return delay(copy(previewCatalog));
+      if (cmd === 'provider_get') {
+        var detail = providerDetails.get(a.name);
+        if (detail && detail.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
+        return detail ? delay(copy(detail)) : Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
+      }
+      if (cmd === 'provider_add' || cmd === 'provider_update') {
+        var editing = cmd === 'provider_update';
         var provider = a.provider;
-        if (providerInputError(provider)) return Promise.reject(new Error('PROVIDER_INVALID'));
+        if (providerInputError(provider, editing)) return Promise.reject(new Error('PROVIDER_INVALID'));
         var name = provider.name.trim();
-        if (quotaSnapshot(Date.now()).providers.some(function (p) { return p.name.toLowerCase() === name.toLowerCase(); })) {
+        var previous = editing && providerDetails.get(a.name);
+        if (editing && !previous) return Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
+        if (previous && previous.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
+        if (editing && name !== a.name) return Promise.reject(new Error('PROVIDER_INVALID'));
+        var row = editing && quotaProviders.find(function (p) { return p.name === a.name; });
+        if (quotaProviders.some(function (p) { return p !== row && p.name.toLowerCase() === name.toLowerCase(); })) {
           return Promise.reject(new Error('PROVIDER_DUPLICATE'));
         }
-        routing.providers.push({ name: name, models: provider.models.map(function (m) { return m.trim(); }) });
-        addedQuotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
+        var models = provider.models.map(function (m) { return m.trim(); });
+        var managed = name === 'ccr' || (provider.apiKey || '').trim().startsWith('ccr-managed-');
+        var transformer = previous ? previous.transformer : null;
+        var transformerProtected = previous ? previous.transformerProtected : false;
+        if (provider.transformer !== undefined) {
+          var chain = provider.transformer === null ? [] : provider.transformer.use;
+          var validName = function (value) {
+            return typeof value === 'string' && value.trim() && Array.from(value.trim()).length <= 64 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+          };
+          if (provider.transformer === null ? !editing :
+              Object.keys(provider.transformer).length !== 1 || !Array.isArray(chain) || !chain.length || chain.length > 8 || chain.some(function (item) {
+                if (!Array.isArray(item)) return !validName(item);
+                return item.length !== 2 || !validName(item[0]) || !previewCatalog.parameterizedNames.includes(item[0].trim()) ||
+                  !item[1] || typeof item[1] !== 'object' || Array.isArray(item[1]) || new TextEncoder().encode(JSON.stringify(item[1])).length > 2048;
+              })) return Promise.reject(new Error('PROVIDER_INVALID'));
+          transformerProtected = chain.some(Array.isArray);
+          transformer = chain.length ? { use: chain.map(function (item) { return (Array.isArray(item) ? item[0] : item).trim(); }) } : null;
+        }
+        providerDetails.set(name, { name: name, baseUrl: provider.baseUrl.trim(), models: models, managed: managed,
+          transformer: transformer, transformerProtected: transformerProtected });
+        if (!row) quotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
+        var route = editing && routing.providers.find(function (p) { return p.name === a.name; });
+        if (route) route.models = models;
+        else if (!row || row.enabled) routing.providers.push({ name: name, models: models });
         bump();
         return delay({ name: name });
       }
@@ -1438,6 +1490,7 @@
             return Promise.reject(new Error('服务已在运行或启动中'));
           }
           service = { mode: 'owned', running: true, message: '' };
+          if (pluginsPreview) pluginsPreview.start();
           return delay(copy(service));
         }
         if (a.action === 'stop') {
@@ -1539,6 +1592,9 @@
     creds.textContent = '用量凭证';
     creds.title = '配置火山 Coding Plan 用量查询凭证（AK/SK）';
     creds.hidden = true;
+    var edit = el('button', 'btn card-edit', '编辑');
+    edit.type = 'button';
+    edit.setAttribute('aria-controls', 'provider-add-form');
     var refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.className = 'btn btn-icon card-refresh';
@@ -1546,6 +1602,7 @@
     refresh.appendChild(icon(REFRESH_PATHS));
     actions.appendChild(status);
     actions.appendChild(creds);
+    actions.appendChild(edit);
     actions.appendChild(refresh);
     head.appendChild(title);
     head.appendChild(actions);
@@ -1556,7 +1613,7 @@
     var credsPanel = buildCredsPanel();
     var loading = el('p', 'card-loading'); loading.hidden = true;
     li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(credsNote); li.appendChild(windows); li.appendChild(credsPanel.root); li.appendChild(loading);
-    return { li: li, name: name, badges: badges, status: status, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
+    return { li: li, name: name, badges: badges, status: status, edit: edit, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
   }
 
   // Inline AK/SK editor in the client-confirm style; buttons are wired by
@@ -1618,9 +1675,150 @@
     return li;
   }
 
+  function mountTransformerEditor() {
+    var section = document.getElementById('provider-transformers');
+    var rows = document.getElementById('provider-transformer-rows');
+    var add = document.getElementById('provider-transformer-add');
+    var protectedPanel = document.getElementById('provider-transformer-protected');
+    var summary = document.getElementById('provider-transformer-summary');
+    var replace = document.getElementById('provider-transformer-replace');
+    var confirmPanel = document.getElementById('provider-transformer-confirm');
+    var keep = document.getElementById('provider-transformer-keep');
+    var confirmReplace = document.getElementById('provider-transformer-confirm-replace');
+    var names = [], parameterizedNames = [], originalChain = [], keepProtected = false, confirmedReplacement = false;
+
+    function input(label, cls) {
+      var field = el('input', 'route-input ' + cls);
+      field.setAttribute('aria-label', label);
+      field.placeholder = label;
+      return field;
+    }
+    function select(label, cls, options) {
+      var field = el('select', 'route-input ' + cls);
+      field.setAttribute('aria-label', label);
+      options.forEach(function (value) {
+        var option = el('option', null, value);
+        option.value = value;
+        field.appendChild(option);
+      });
+      return field;
+    }
+    function addParam(params) {
+      var pair = el('div', 'transformer-param');
+      var key = input('参数名', 'param-key');
+      pair.appendChild(key);
+      pair.appendChild(select('参数值类型', 'param-type', ['文本', 'JSON']));
+      var value = input('参数值', 'param-value');
+      value.setAttribute('autocomplete', 'off');
+      value.spellcheck = false;
+      pair.appendChild(value);
+      pair.appendChild(mkBtn('移除', '移除参数', function () { pair.remove(); }));
+      params.appendChild(pair);
+      key.focus();
+    }
+    function addRow(name) {
+      var row = el('div', 'transformer-row');
+      var field = names.length && (!name || names.includes(name))
+        ? select('转换器名称', 'transformer-name', names) : input('转换器名称', 'transformer-name');
+      field.value = name || names[0] || '';
+      row.appendChild(field);
+      row.appendChild(mkBtn('移除', '移除转换器', function () { row.remove(); }));
+      var params = el('div', 'transformer-params');
+      row.appendChild(params);
+      var addParameter = mkBtn('添加参数', null, function () { addParam(params); });
+      function syncParameterButton() { addParameter.disabled = !parameterizedNames.includes(field.value.trim()); }
+      field.addEventListener('input', syncParameterButton);
+      field.addEventListener('change', syncParameterButton);
+      syncParameterButton();
+      row.appendChild(addParameter);
+      rows.appendChild(row);
+      return field;
+    }
+    function reset() {
+      rows.textContent = summary.textContent = '';
+      protectedPanel.hidden = true;
+      confirmPanel.hidden = true;
+      replace.hidden = false;
+      keepProtected = false;
+      add.hidden = false;
+      add.disabled = true;
+      names = [];
+      parameterizedNames = [];
+      originalChain = [];
+      confirmedReplacement = false;
+    }
+    add.addEventListener('click', function () { addRow('').focus(); });
+    replace.addEventListener('click', function () {
+      replace.hidden = true;
+      confirmPanel.hidden = false;
+      keep.focus();
+    });
+    keep.addEventListener('click', function () {
+      confirmPanel.hidden = true;
+      replace.hidden = false;
+      replace.focus();
+    });
+    confirmReplace.addEventListener('click', function () {
+      keepProtected = false;
+      confirmedReplacement = true;
+      protectedPanel.hidden = true;
+      add.hidden = false;
+      add.focus();
+    });
+    function prefill(entry) {
+      var chain = entry.transformer && entry.transformer.use || [];
+      if (!Array.isArray(chain) || !chain.every(function (name) { return typeof name === 'string'; })) throw new Error();
+      originalChain = chain;
+      keepProtected = entry.transformerProtected === true;
+      if (keepProtected) {
+        summary.textContent = '已保留现有转换器和参数。' + chain.join(' → ');
+        protectedPanel.hidden = false;
+        add.hidden = true;
+      } else chain.forEach(addRow);
+    }
+    function writeTo(provider, editing, error) {
+      if (keepProtected) return true;
+      function invalid(field, message) { error.textContent = message; field.focus(); return false; }
+      var use = [];
+      for (var row of rows.children) {
+        var field = row.querySelector('.transformer-name');
+        var name = field.value.trim();
+        if (!name) return invalid(field, '请输入转换器名称。');
+        var params = Object.create(null);
+        var pairs = row.querySelectorAll('.transformer-param');
+        if (pairs.length && !parameterizedNames.includes(name)) return invalid(field, '此转换器不支持参数，请移除参数或选择其他转换器。');
+        for (var pair of pairs) {
+          var key = pair.querySelector('.param-key');
+          var paramName = key.value.trim();
+          if (!paramName || paramName in params) return invalid(key, '请输入唯一的参数名。');
+          var value = pair.querySelector('.param-value');
+          if (pair.querySelector('.param-type').value === 'JSON') {
+            try { params[paramName] = JSON.parse(value.value); }
+            catch { return invalid(value, '请输入有效的 JSON 值。'); }
+          } else params[paramName] = value.value;
+        }
+        use.push(Object.keys(params).length ? [name, params] : name);
+      }
+      if (editing && !confirmedReplacement && use.length === originalChain.length && use.every(function (item, i) { return item === originalChain[i]; })) return true;
+      if (use.length) provider.transformer = { use: use };
+      else if (editing) provider.transformer = null;
+      return true;
+    }
+    return {
+      reset: reset, prefill: prefill, writeTo: writeTo,
+      disable: function (disabled) { section.disabled = disabled; },
+      setNames: function (result) {
+        names = result && Array.isArray(result.names) ? result.names.filter(function (n) { return typeof n === 'string' && n.trim(); }) : [];
+        parameterizedNames = result && Array.isArray(result.parameterizedNames) ? result.parameterizedNames.filter(function (n) { return names.includes(n); }) : [];
+        add.disabled = false;
+      },
+    };
+  }
+
   function mountProviderForm(invoke, onSaved) {
     var open = document.getElementById('provider-add-open');
     var form = document.getElementById('provider-add-form');
+    var title = document.getElementById('provider-form-title');
     var cancel = document.getElementById('provider-add-cancel');
     var save = document.getElementById('provider-add-save');
     var error = document.getElementById('provider-add-error');
@@ -1631,75 +1829,145 @@
     };
     var invalidMessages = {
       name: '请输入供应商名称，不能包含逗号或控制字符。',
-      baseUrl: '请输入完整的 HTTP 或 HTTPS 地址，不能包含账号、密码或片段。',
+      baseUrl: '请输入完整的 HTTP 或 HTTPS 地址，不能包含账号、密码或片段；查询参数仅支持版本号。',
       apiKey: '请输入有效的 API 密钥。', models: '请输入 1 至 256 个有效的模型 ID。',
     };
-    var saving = false;
+    var saving = false, loading = false, managed = false, editName = null;
+    var trigger = open, readId = 0;
+    var transformers = mountTransformerEditor();
+    var managedNote = '系统托管的供应商请在对应插件卡片中管理';
 
     function close(restoreFocus) {
       if (form.hidden) return;
       Object.values(fields).forEach(function (field) { field.value = ''; });
       error.textContent = '';
+      transformers.reset();
       form.hidden = true;
-      open.setAttribute('aria-expanded', 'false');
-      if (restoreFocus) open.focus();
+      trigger.setAttribute('aria-expanded', 'false');
+      if (restoreFocus) trigger.focus();
+      trigger = open;
+      editName = null;
+      loading = managed = false;
+      readId++;
     }
-    function setSaving(busy) {
-      saving = busy;
-      Object.values(fields).forEach(function (field) { field.disabled = busy; });
-      form.setAttribute('aria-busy', String(busy));
-      open.disabled = !invoke || busy;
-      cancel.disabled = save.disabled = busy;
-      save.textContent = busy ? '正在保存…' : '保存';
+    function syncControls() {
+      Object.values(fields).forEach(function (field) { field.disabled = saving || loading || managed; });
+      transformers.disable(saving || loading || managed);
+      form.setAttribute('aria-busy', String(saving || loading));
+      open.disabled = !invoke || saving;
+      cancel.disabled = saving;
+      save.disabled = saving || loading || managed;
+      save.textContent = saving ? '正在保存…' : editName !== null ? '保存修改' : '保存';
+    }
+    function show(name, button) {
+      close(false);
+      editName = name;
+      loading = name !== null;
+      trigger = button;
+      title.textContent = loading ? '编辑供应商' : '添加供应商';
+      fields.name.readOnly = loading;
+      fields.name.title = loading ? '名称用于路由，创建后不可修改。' : '';
+      fields.apiKey.required = !loading;
+      fields.apiKey.placeholder = loading ? '已保存，留空则不修改' : '';
+      status.textContent = '';
+      form.hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      transformers.reset();
+      syncControls();
+      var id = ++readId;
+      return invoke('provider_transformers').catch(function () { return null; }).then(function (result) {
+        if (id === readId) transformers.setNames(result);
+      });
+    }
+    async function edit(name, button) {
+      if (!invoke || saving) return;
+      var catalog = show(name, button);
+      var id = readId;
+      try {
+        var results = await Promise.all([invoke('provider_get', { name: name }), catalog]);
+        var entry = results[0];
+        if (id !== readId) return;
+        if (entry && entry.managed === true) throw new Error('PROVIDER_MANAGED');
+        if (!entry || entry.name !== name || typeof entry.baseUrl !== 'string' || !safeVersionQuery(entry.baseUrl) || !Array.isArray(entry.models)
+            || !entry.models.every(function (m) { return typeof m === 'string'; }) || typeof entry.managed !== 'boolean') throw new Error();
+        fields.name.value = entry.name;
+        fields.baseUrl.value = entry.baseUrl;
+        fields.models.value = entry.models.join('\n');
+        transformers.prefill(entry);
+        loading = false;
+        syncControls();
+        fields.baseUrl.focus();
+      } catch (err) {
+        if (id !== readId) return;
+        if ((typeof err === 'string' ? err : err && err.message) === 'PROVIDER_MANAGED') {
+          managed = true;
+          loading = false;
+          syncControls();
+          error.textContent = managedNote;
+          cancel.focus();
+          return;
+        }
+        close(true);
+        status.textContent = '暂时无法读取供应商，请刷新后重试。';
+      }
     }
     open.disabled = !invoke;
     open.addEventListener('click', function () {
-      if (!form.hidden) { close(true); return; }
-      status.textContent = '';
-      form.hidden = false;
-      open.setAttribute('aria-expanded', 'true');
+      if (!form.hidden && editName === null) { close(true); return; }
+      show(null, open);
       fields.name.focus();
     });
     cancel.addEventListener('click', function () { close(true); });
     form.addEventListener('submit', async function (event) {
       event.preventDefault();
-      if (!invoke || saving || form.hidden) return;
+      if (!invoke || saving || loading || managed || form.hidden) return;
+      var editing = editName !== null;
       var models = fields.models.value.split(/[\r\n,]/).map(function (m) { return m.trim(); }).filter(Boolean);
       var provider = {
-        name: fields.name.value.trim(), baseUrl: fields.baseUrl.value.trim(),
-        apiKey: fields.apiKey.value.trim(), models: Array.from(new Set(models)),
+        name: editing ? editName : fields.name.value.trim(), baseUrl: fields.baseUrl.value.trim(),
+        models: Array.from(new Set(models)),
       };
-      var invalid = providerInputError(provider);
+      if (!editing || fields.apiKey.value !== '') provider.apiKey = fields.apiKey.value;
+      var invalid = providerInputError(provider, editing);
       if (invalid) {
         error.textContent = invalidMessages[invalid];
         fields[invalid].focus();
         return;
       }
+      if (!transformers.writeTo(provider, editing, error)) return;
+      if (provider.apiKey !== undefined) provider.apiKey = provider.apiKey.trim();
       error.textContent = '';
-      setSaving(true);
+      saving = true;
+      syncControls();
       var name = provider.name;
       var saved;
       try {
-        var request = invoke('provider_add', { provider: provider });
+        var request = editing ? invoke('provider_update', { name: editName, provider: provider }) : invoke('provider_add', { provider: provider });
         provider = null;
         saved = await request;
-        if (!saved || saved.name !== name) throw new Error();
+        if (!saved || saved.name !== name) throw new Error('PROVIDER_SAVE_UNCONFIRMED');
       } catch (err) {
-        setSaving(false);
+        saving = false;
         var code = typeof err === 'string' ? err : err && err.message;
         var duplicate = code === 'PROVIDER_DUPLICATE';
-        var message = duplicate ? '供应商名称已存在，请使用其他名称。' : '添加供应商失败，请检查输入后重试。';
-        if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
+        var message = editing ? '更新供应商失败，请检查输入后重试。' : '添加供应商失败，请检查输入后重试。';
+        if (duplicate) message = editing ? '供应商名称已存在，请先解决配置中的重复名称。' : '供应商名称已存在，请使用其他名称。';
+        if (code === 'PROVIDER_INVALID') message = '供应商信息无效，请检查输入后重试。';
+        if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = editing ? '暂时无法确认保存结果，请刷新后再决定是否重试' : '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
+        if (editing && code === 'PROVIDER_MANAGED') { managed = !form.hidden; message = managedNote; fields.apiKey.value = ''; }
+        syncControls();
         if (form.hidden) status.textContent = message;
         else {
           error.textContent = message;
-          (duplicate ? fields.name : save).focus();
+          if (!editing && (duplicate || code === 'PROVIDER_INVALID')) fields.name.focus();
+          else (managed ? cancel : save).focus();
         }
         return;
       }
-      setSaving(false);
+      saving = false;
+      syncControls();
       close(true);
-      status.textContent = '供应商已添加。';
+      status.textContent = editing ? '已更新供应商' : '供应商已添加。';
       onSaved(saved.name);
     });
     // A tray window can be hidden and reused without unloading its document.
@@ -1707,6 +1975,7 @@
     document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') close(false); });
     return {
       close: close,
+      edit: edit,
       escape: function () {
         if (form.hidden) return false;
         if (!saving) close(true);
@@ -1786,6 +2055,7 @@
     };
     var projectsCtrl = mode === 'missing' ? null : ProjectsUI.createProjectsController({ invoke: invoke });
     ProjectsUI.mount(document, projectsCtrl);
+    var pluginsPanel = PluginsUI.mount(document, invoke);
     var cards = new Map();
 
     function safeCommand(cmd) {
@@ -1838,6 +2108,7 @@
       refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';
       refs.refresh.setAttribute('aria-label', '刷新 ' + p.name);
       refs.refresh.title = '刷新 ' + p.name;
+      refs.edit.setAttribute('aria-label', '编辑 ' + p.name);
       syncCardCredentials(refs, p.name, credentialsCtrl ? credentialsCtrl.state() : null);
     }
 
@@ -1922,6 +2193,7 @@
     // ---- service bar ------------------------------------------------------
 
     function renderService(sState) {
+      pluginsPanel.serviceChanged(sState);
       var view = serviceView(sState.service);
       var busy = !!sState.pending || sState.loading;
       if (sState.error) {
@@ -2673,7 +2945,7 @@
 
     // ---- tabs -------------------------------------------------------------
 
-    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects'];
+    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects', 'plugins'];
     var tabButtons = {};
     var panels = {};
     TAB_IDS.forEach(function (id) {
@@ -2704,11 +2976,13 @@
       if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); }
       if (name === 'clients') clientsCtrl.refresh();
       if (name === 'projects') projectsCtrl.refresh();
+      if (name === 'plugins') pluginsPanel.load();
     }
 
     function selectTab(name) {
       if (TAB_IDS.indexOf(name) === -1) return;
       if (name !== 'quota') providerForm.close(false);
+      if (name !== 'plugins') pluginsPanel.cancel(false);
       activeTab = name;
       TAB_IDS.forEach(function (id) {
         var on = id === name;
@@ -2797,10 +3071,12 @@
           if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
           return;
         }
+        var providerCard = target.closest('.card');
+        if (!providerCard || !providerCard.dataset.provider) return;
+        var name = providerCard.dataset.provider;
+        var edit = target.closest('.card-edit');
+        if (edit) { providerForm.edit(name, edit); return; }
         if (!credentialsCtrl) return;
-        var credsCard = target.closest('.card');
-        if (!credsCard || !credsCard.dataset.provider) return;
-        var name = credsCard.dataset.provider;
         if (target.closest('[data-creds-open]')) credentialsCtrl.open(name);
         else if (target.closest('[data-creds-cancel]')) credentialsCtrl.close();
         else if (target.closest('[data-creds-save]')) {
@@ -2849,7 +3125,7 @@
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
       if (event.key === 'Escape' && !event.isComposing) {
-        if (providerForm.escape()) event.preventDefault();
+        if (providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
         else safeCommand('quota_hide');
       }
     });

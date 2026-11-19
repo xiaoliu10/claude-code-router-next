@@ -162,9 +162,15 @@ body {
 
 /* Manual API provider (quota tab) */
 .provider-form { margin: 0 14px 8px; display: grid; gap: 8px; min-height: 0; overflow-y: auto; }
+.provider-form h2 { margin: 0; font-size: 13px; }
 .provider-form label { display: grid; gap: 3px; min-width: 0; font-size: 12px; }
 .provider-form .route-input { width: 100%; }
 .provider-form textarea { resize: vertical; }
+.provider-transformers { min-width: 0; margin: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+.transformer-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; margin-bottom: 8px; }
+.transformer-params { grid-column: 1 / -1; }
+.transformer-row > .btn:last-child { justify-self: start; }
+.transformer-param { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.5fr) auto; gap: 4px; margin-top: 4px; }
 .provider-form-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; }
 .provider-form-actions .inline-msg { flex: 1 1 10em; }
 #provider-add-status:empty { margin: 0; }
@@ -345,7 +351,7 @@ body {
 .btn-danger:active { background: #b32e24; }
 
 /* Coding Plan quota credentials: inline AK/SK editor on matching quota cards */
-.card-creds { padding: 2px 8px; font-size: 11.5px; }
+.card-edit, .card-creds { padding: 2px 8px; font-size: 11.5px; }
 .card-creds-note { margin: 6px 0 0; font-size: 11px; color: var(--warn); overflow-wrap: anywhere; }
 .creds-panel {
   margin-top: 8px; padding: 8px; border-radius: 8px;
@@ -395,3 +401,9 @@ body {
   .project-routes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .project-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+#plugins-list > li { flex-shrink: 0; min-width: 0; }
+.plugins-card-title, .plugins-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.plugins-actions { margin-top: 8px; }
+.plugins-confirm { margin: 0 14px 8px; }
+.plugins-confirm .card-message { margin-top: 0; }

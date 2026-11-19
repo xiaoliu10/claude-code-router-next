@@ -8,17 +8,20 @@
  * upsert plugins.json. Nothing hot-loads; callers restart via the existing
  * POST /api/restart flow.
  *
+ * POST /api/plugins/install-pinned additionally requires the confirmed release
+ * and the previous install identity (null for a new install).
+ *
  * GET /api/plugins/catalog — npm registry search for installable provider
  * plugins (marker keyword), merged/deduped, with installed state. Registry
  * failures degrade to an empty list + warning, never a 500.
  *
- * Both routes are LOCAL-ONLY (socket-address identity + loopback Origin/Host
+ * Marketplace routes are LOCAL-ONLY (socket-address identity + loopback Origin/Host
  * pinning, mirroring the workbuddy admin-route guard) on top of the normal
  * CCR auth pipeline. Responses never include npm stderr, registry URLs or any
  * credential material.
  */
 import type { FastifyInstance } from "fastify";
-import { gt, valid } from "semver";
+import { gt } from "semver";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -26,6 +29,9 @@ import {
   PLUGIN_NAME_PATTERN,
   PluginInstallError,
   installPluginFromNpm,
+  npmSourceName,
+  isExactPluginVersion,
+  type PinnedPluginInstall,
   readPluginRecords,
   type PluginInstallErrorCode,
 } from "@wengine-ai/claude-code-router-shared";
@@ -47,6 +53,8 @@ export interface CatalogEntry {
   version: string;
   installed: boolean;
   installedVersion: string | null;
+  /** Manifest id when the recorded npm source identifies this package. */
+  installedName?: string;
   /**
    * Present only when npm offers a newer valid semantic version than the
    * installed manifest. Local preview builds and a stale search index must
@@ -148,14 +156,10 @@ export async function buildPluginCatalog(
   // loses its `updateAvailable` affordance (the visible version would then
   // read from the local manifest only, making an update undetectable).
   // Scoped names keep their leading "@", so the split must ignore index 0.
-  const packageNameOf = (source: string): string => {
-    const at = source.indexOf("@", source.startsWith("@") ? 1 : 0);
-    return at > 0 ? source.slice(0, at) : source;
-  };
   const recordBySource = new Map(
     records
       .filter((r): r is typeof r & { source: string } => typeof r.source === "string" && r.source !== "")
-      .map((r) => [packageNameOf(r.source), r])
+      .map((r) => [npmSourceName(r.source), r])
   );
   // Installed manifest version comes from the plugin payload, not npm.
   const installedVersion = (name: string): string | null => {
@@ -182,7 +186,8 @@ export async function buildPluginCatalog(
         ...entry,
         installed,
         installedVersion: manifestVersion,
-        ...(installed && manifestVersion !== null && valid(manifestVersion) && valid(entry.version) && gt(entry.version, manifestVersion)
+        ...(record?.source && npmSourceName(record.source) === entry.name ? { installedName: record.name } : {}),
+        ...(installed && manifestVersion !== null && isExactPluginVersion(manifestVersion) && isExactPluginVersion(entry.version) && gt(entry.version, manifestVersion)
           ? { updateAvailable: true }
           : {}),
       };
@@ -255,6 +260,7 @@ export function installErrorStatus(code: PluginInstallErrorCode | "install_faile
   switch (code) {
     case "invalid_spec":
       return 400;
+    case "install_target_changed":
     case "already_installed":
     case "plugins_json_corrupted":
       return 409;
@@ -347,17 +353,26 @@ export function registerPluginMarketRoutes(
     }
   });
 
-  app.post("/api/plugins/install", async (req: any, reply: any) => {
+  const install = (pinned: boolean) => async (req: any, reply: any) => {
     if (!assertLocalMarketplaceRequest(req, app, configuredPort)) {
       return deny(reply, 403, "local_only");
     }
-    const body = (req.body ?? {}) as { name?: unknown; spec?: unknown; force?: unknown };
+    const body = req.body ?? {};
     const rawSpec = body.name ?? body.spec;
     const force = body.force === true;
+    let expected: PinnedPluginInstall | undefined;
+    if (pinned) {
+      const { version, installed } = body;
+      if (!isExactPluginVersion(version) || (installed !== null &&
+          (!installed || typeof installed.name !== "string" || !PLUGIN_NAME_PATTERN.test(installed.name) ||
+           !isExactPluginVersion(installed.version)))) return deny(reply, 400, "invalid_spec");
+      expected = { version, installed };
+    }
     try {
       const result = await installPluginFromNpm({
         spec: rawSpec as string,
         configDir: deps.configDir,
+        pinned: expected,
         force,
         registry: deps.registry,
         timeoutMs: deps.npmTimeoutMs,
@@ -386,5 +401,8 @@ export function registerPluginMarketRoutes(
       app.log?.error?.(`plugin install crashed: ${error?.message ?? error}`);
       return deny(reply, 500, "install_failed");
     }
-  });
+  };
+  app.post("/api/plugins/install", install(false));
+  // Older gateways must fail closed instead of silently ignoring the pin.
+  app.post("/api/plugins/install-pinned", install(true));
 }
