@@ -281,6 +281,7 @@ export function buildRequestBody(
 
   const contents: any[] = [];
   const toolResponses = request.messages.filter((item) => item.role === "tool");
+  const strictToolSignatures = /(?:^|\/)gemini-[34](?:[.-]|$)/i.test(request.model);
 
 
   request.messages
@@ -296,7 +297,7 @@ export function buildRequestBody(
       }
       const parts: any[] = [];
       const signature = role === "model" ? replaySignature(message.thinking?.signature) : undefined;
-      const strictCalls = /^gemini-[34](?:[.-]|$)/i.test(request.model) && !!message.tool_calls?.length;
+      const strictCalls = strictToolSignatures && !!message.tool_calls?.length;
       if (typeof message.content === "string") {
         const part: any = { text: message.content };
         if (signature && !strictCalls) {
