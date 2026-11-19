@@ -29,6 +29,11 @@ pub struct AdminClient {
     writes: Arc<Mutex<()>>,
 }
 
+/// Admin request errors contain only the fixed operation and status code.
+pub(crate) fn admin_auth_failed(error: &str) -> bool {
+    error.ends_with("returned HTTP 401") || error.ends_with("returned HTTP 403")
+}
+
 impl AdminClient {
     pub fn new(settings: ConnectionSettings) -> Result<Self, String> {
         // Revalidate public settings so hand-built values cannot send credentials off-host.
@@ -362,6 +367,9 @@ fn quota_lines(response: &Value, current_default: Option<&str>) -> Result<Vec<St
     else {
         return Ok(Vec::new());
     };
+    if let Some(plan) = quota.get("stepPlan") {
+        return Ok(crate::quota::step_plan_tray_lines(plan));
+    }
     let number = |name: &str| {
         quota
             .get(name)
@@ -810,6 +818,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn step_plan_tray_preserves_coding_and_credit_semantics() {
+        let lines = |plan| {
+            quota_lines(
+                &json!({"quotas":[{"provider":"alpha","stepPlan":plan,"used5h":55,"limit5h":100}]}),
+                Some("alpha,one"),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            lines(
+                json!({"state":"stale","family":"coding","name":"Legacy","allowed":false,"windows":[{"id":"five_hour","limited":true,"usedPercent":0}, {"id":"weekly","limited":false}]})
+            ),
+            ["Legacy · stale · blocked", "5h used 0%", "7d unlimited"]
+        );
+        assert_eq!(
+            lines(
+                json!({"state":"partial","family":"coding","windows":[{"id":"weekly","limited":true}]})
+            ),
+            ["Step Plan · partial", "7d used —"]
+        );
+        assert_eq!(lines(json!({"state":"partial","family":"token","creditBuckets":[{"type":"topup","total":"12345678901234567890","remaining":"1.2300","expiresAt":1000}]})), ["Step Plan · partial", "topup Credit · 1.2300 / 12345678901234567890 remaining · used — · expires 1970-01-01T00:00:01Z"]);
+    }
     #[test]
     fn quota_unknown_zero_invalid_and_other_provider_values_are_not_fabricated() {
         let lines = |quota| quota_lines(&json!({"quotas":[quota]}), Some("alpha,one")).unwrap();

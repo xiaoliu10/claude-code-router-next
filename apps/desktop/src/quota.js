@@ -67,6 +67,25 @@
     var s = w && typeof w === 'object' ? w : {};
     return { label: toStr(s.label), used: toNum(s.used), limit: toNum(s.limit), remaining: toNum(s.remaining), unit: toStr(s.unit), resetAt: toStr(s.resetAt) };
   }
+  function normalizeStepPlan(s) {
+    var state = ['known', 'partial', 'stale'].includes(s.state) ? s.state : 'unavailable';
+    if (state === 'unavailable') s = {};
+    var family = ['coding', 'token'].includes(s.family) ? s.family : 'none';
+    return {
+      state: state, family: family, name: toStr(s.name), observedAt: toNum(s.observedAt),
+      allowed: typeof s.allowed === 'boolean' ? s.allowed : null,
+      windows: family === 'coding' && Array.isArray(s.windows) ? s.windows.filter(function (w) {
+        return w && ['five_hour', 'weekly'].includes(w.id) && typeof w.limited === 'boolean';
+      }).map(function (w) {
+        return { id: w.id, limited: w.limited, usedPercent: toNum(w.usedPercent), resetsAt: toNum(w.resetsAt) };
+      }) : [],
+      creditBuckets: family === 'token' && Array.isArray(s.creditBuckets) ? s.creditBuckets.filter(function (b) {
+        return b && ['subscription', 'topup'].includes(b.type);
+      }).map(function (b) {
+        return { type: b.type, total: toStr(b.total), remaining: toStr(b.remaining), usedPercent: toNum(b.usedPercent), resetsAt: toNum(b.resetsAt), expiresAt: toNum(b.expiresAt) };
+      }) : [],
+    };
+  }
   function normalizeProvider(p) {
     var s = p && typeof p === 'object' ? p : {};
     return {
@@ -75,6 +94,7 @@
       plan: toStr(s.plan),
       status: typeof s.status === 'string' ? s.status : null,
       message: toStr(s.message),
+      ...(s.stepPlan ? { stepPlan: normalizeStepPlan(s.stepPlan) } : {}),
       windows: Array.isArray(s.windows) ? s.windows.map(normalizeWindow) : [],
       updatedAt: toNum(s.updatedAt),
     };
@@ -195,15 +215,18 @@
     }
 
     function applyMerged(result) {
-
-
       var next = normalizeSnapshot(result);
       var prev = snapshot;
+      // Rust serializes refreshes, but IPC responses can land in a different order.
+      if (prev && next.updatedAt !== null && prev.updatedAt !== null && next.updatedAt < prev.updatedAt &&
+          next.providers.some(function (p) { return p.stepPlan; })) return;
       if (prev) {
         next.providers = next.providers.map(function (p) {
           var f = flags.get(p.name);
 
-          return f && f.loading ? (findProvider(prev.providers, p.name) || p) : p;
+          if (!f || !f.loading) return p;
+          var old = findProvider(prev.providers, p.name);
+          return old && !old.stepPlan && !p.stepPlan ? old : p;
         });
       }
       snapshot = next;
@@ -1539,10 +1562,13 @@
   }
 
   function buildWindow(win) {
-    var li = el('li', 'window');
     var label = toStr(win.label) || '用量';
     var pct = computePercent(win);
-    var pctText = formatPercent(pct);
+    return buildQuotaMeter(label, pct, formatPercent(pct) || '', describeWindow(win));
+  }
+
+  function buildQuotaMeter(label, pct, pctText, meta) {
+    var li = el('li', 'window');
     var top = el('div', 'window-top');
     top.appendChild(el('span', 'window-label', label));
     top.appendChild(el('span', 'window-pct', pctText || ''));
@@ -1551,14 +1577,32 @@
       var meter = document.createElement('progress');
       meter.className = 'meter';
       meter.setAttribute('max', '100');
-      meter.setAttribute('value', String(Math.round(pct * 100) / 100));
+      meter.setAttribute('value', String(pct));
       meter.setAttribute('data-level', pct >= 90 ? 'high' : 'normal');
-      meter.setAttribute('aria-label', label + ' 已用 ' + pctText);
+      meter.setAttribute('aria-label', label + ' 已用');
       li.appendChild(meter);
     }
-    var meta = describeWindow(win);
     if (meta) li.appendChild(el('div', 'window-meta', meta));
     return li;
+  }
+
+  function renderStepPlanWindows(list, plan) {
+    function append(label, pct, unlimited, details, resetsAt, expiresAt) {
+      var resets = formatTimestamp(resetsAt), expires = formatTimestamp(expiresAt);
+      if (resets) details.push('重置 ' + resets);
+      if (expires) details.push('到期 ' + expires);
+      var usage = unlimited ? '无限额' : pct === null ? '—' : '已用 ' + pct + '%';
+      list.appendChild(buildQuotaMeter(label, unlimited ? null : pct, usage, details.join(' · ')));
+    }
+    plan.windows.forEach(function (w) {
+      append(w.id === 'five_hour' ? '5 小时' : '7 天', w.usedPercent, !w.limited, [], w.resetsAt, null);
+    });
+    var topups = 0;
+    plan.creditBuckets.forEach(function (b) {
+      var label = b.type === 'subscription' ? '月度订阅 Credit' : '加油包 ' + (++topups) + ' Credit';
+      var details = ['剩余 ' + (b.remaining || '—') + ' / 总量 ' + (b.total || '—') + ' Credit'];
+      append(label, b.usedPercent, false, details, b.resetsAt, b.expiresAt);
+    });
   }
 
   function detectTauri() {
@@ -1654,7 +1698,7 @@
       var tone = null, text = null;
       if (mode === 'missing') { tone = 'error'; text = '无法访问桌面 IPC（window.__TAURI__ 不可用），额度数据不可用。'; }
       else if (state.fullError) { tone = 'error'; text = '刷新失败，正在显示最后已知数据：' + state.fullError; }
-      else if (state.snapshot && !state.snapshot.online) { tone = 'warn'; text = '网关离线 · 显示最后已知数据'; }
+      else if (state.snapshot && !state.snapshot.online) { tone = 'warn'; text = state.snapshot.error || '网关离线 · 显示最后已知数据'; }
       else if (state.snapshot && state.snapshot.error) { tone = 'warn'; text = '部分数据获取失败：' + state.snapshot.error; }
       setBanner(els.banner, text, tone);
     }
@@ -1667,18 +1711,30 @@
       refs.li.setAttribute('aria-busy', String(row.loading));
       if (refs.name.textContent !== p.name) refs.name.textContent = p.name;
       refs.badges.textContent = '';
-      if (p.plan) refs.badges.appendChild(el('span', 'badge badge-plan', p.plan));
+      var plan = p.stepPlan;
+      var planName = plan ? plan.name || 'Step Plan' : p.plan;
+      if (planName) refs.badges.appendChild(el('span', 'badge badge-plan', planName));
       if (!p.enabled) refs.badges.appendChild(el('span', 'badge badge-off', '已停用'));
       if (row.stale) refs.badges.appendChild(el('span', 'badge badge-stale', '可能过期'));
       var meta = statusMeta(p.status);
+      if (plan && plan.state === 'partial') meta = { label: '部分数据', tone: 'warn' };
+      if (plan && plan.state === 'stale') meta = { label: '数据已陈旧', tone: 'warn' };
       refs.status.className = 'status tone-' + meta.tone;
       refs.status.textContent = meta.label;
-      refs.message.hidden = !p.message;
-      refs.message.textContent = p.message || '';
+      var message = p.message;
+      if (plan) {
+        var details = [];
+        if (plan.allowed !== null) details.push(plan.allowed ? '账户可用' : '账户不可用');
+        if (plan.observedAt !== null) details.push('观测于 ' + formatTimestamp(plan.observedAt));
+        message = details.join(' · ');
+      }
+      refs.message.hidden = !message;
+      refs.message.textContent = message || '';
       refs.error.hidden = !row.cardError;
       refs.error.textContent = row.cardError ? '刷新失败：' + row.cardError : '';
       refs.windows.textContent = '';
-      p.windows.forEach(function (w) { refs.windows.appendChild(buildWindow(w)); });
+      if (plan) renderStepPlanWindows(refs.windows, plan);
+      else p.windows.forEach(function (w) { refs.windows.appendChild(buildWindow(w)); });
       refs.loading.hidden = !row.loading;
       refs.loading.textContent = row.loading ? '读取中…' : '';
       refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';

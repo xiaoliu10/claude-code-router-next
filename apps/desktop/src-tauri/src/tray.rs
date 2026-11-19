@@ -723,6 +723,9 @@ impl Controller {
                     return;
                 }
                 v.online = false;
+                if crate::api::admin_auth_failed(&e) {
+                    v.snapshot = None;
+                }
                 v.status = format!("API unavailable: {e}");
             }),
         }
@@ -763,6 +766,9 @@ impl Controller {
                 Err(e) => controller.update(|v| {
                     v.switching = false;
                     v.online = false;
+                    if crate::api::admin_auth_failed(&e) {
+                        v.snapshot = None;
+                    }
                     v.status = format!("Switch failed: {e} — Refresh to retry");
                 }),
             }

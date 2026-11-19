@@ -381,6 +381,28 @@ export interface ProviderQuotaConfig {
   limit7d?: number;
 }
 
+export interface StepPlanQuotaSnapshot {
+  state: 'known' | 'partial' | 'stale' | 'unavailable';
+  family: 'token' | 'coding' | 'none';
+  name: string | null;
+  observedAt: number | null;
+  allowed: boolean | null;
+  windows: Array<{
+    id: 'five_hour' | 'weekly';
+    limited: boolean;
+    usedPercent: number | null;
+    resetsAt: number | null;
+  }>;
+  creditBuckets: Array<{
+    type: 'subscription' | 'topup';
+    total: string;
+    remaining: string;
+    usedPercent: number | null;
+    resetsAt: number | null;
+    expiresAt: number | null;
+  }>;
+}
+
 // Provider quota usage response from server
 export interface ProviderQuotaUsage {
   provider: string;
@@ -396,6 +418,7 @@ export interface ProviderQuotaUsage {
   type7d?: 'rateLimit' | 'balance';
   /** Currency for balance display (e.g. "CNY", "USD") */
   currency?: string;
+  stepPlan?: StepPlanQuotaSnapshot;
 }
 
 export interface ProviderQuotaResponse {

@@ -11,6 +11,7 @@ import { TokenizerService } from "../services/tokenizer";
 import { getAllRateLimitInfo, initRateLimitPersistence } from "../services/rate-limit";
 import { getAllQuotaResults, initQuotaStorePersistence } from "../services/quota-store";
 import { pollPluginQuota, PLUGIN_QUOTA_INLINE_BUDGET_MS } from "../services/plugin-quota";
+import { StepPlanQuotaCache, type StepPlanQuota } from "../services/step-plan-quota";
 import { isQuotaWindowExpired } from "../services/rate-limit";
 import { findInvalidProxyUrls } from "../services/proxy";
 import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
@@ -87,6 +88,7 @@ function listAvailableModels(config: any) {
 
 interface ProviderQuotaUsage {
   provider: string;
+  stepPlan?: StepPlanQuota;
   used5h: number;
   used7d: number;
   limit5h?: number;
@@ -903,11 +905,14 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     }
   });
 
+  const stepPlanCache = new StepPlanQuotaCache();
   // Get provider quota usage (5h and 7d windows)
   _app.get("/api/providers/quota", async (req: any, reply: any) => {
     try {
       const config = await readConfigFile();
       const providers = config.Providers || [];
+      // Start this alongside managed plugin polling so their deadlines do not add up.
+      const stepPlansPending = stepPlanCache.poll(providers, { get: key => config[key] });
 
       // Managed plugin runtimes that expose the fetchQuota seam: poll on
       // demand here as well as from the periodic active-probe loop. The
@@ -1027,6 +1032,12 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
         if (typeof stored.resetTime7d === 'string' && !storeReset7dExpired) {
           quota.reset7d = stored.resetTime7d;
         }
+      }
+
+      const stepPlans = await stepPlansPending;
+      for (const row of quotas) {
+        const snapshot = stepPlans.get(row.provider);
+        if (snapshot) row.stepPlan = snapshot;
       }
 
       return {

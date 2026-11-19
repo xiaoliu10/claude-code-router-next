@@ -330,3 +330,17 @@ test("controller: a successful per-card apply clears fullError from an earlier f
 test("controller: missing invoke throws (production must not silently mock)", () => {
   assert.throws(() => Q.createController({}))
 })
+
+test('controller: refresh of another card clears a revoked Step Plan before an older result lands', async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createController({ invoke: ipc.fn })
+  const merged = (updatedAt, state) => snap([prov('step', { stepPlan: { state, family: 'token', name: 'Previous account' } }), prov('other')], { updatedAt })
+  c.refreshAll(); ipc.resolve(0, merged(1, 'known')); await flush()
+  c.refreshProvider('step'); c.refreshProvider('other')
+  ipc.resolve(2, merged(3, 'unavailable')); await flush()
+  const account = () => rowByName(c.state().rows, 'step').provider.stepPlan
+  assert.equal(account().name, null)
+  ipc.resolve(1, merged(2, 'known')); await flush()
+  assert.equal(account().state, 'unavailable')
+  assert.equal(account().name, null)
+})
