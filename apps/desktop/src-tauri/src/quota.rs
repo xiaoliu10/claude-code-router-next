@@ -68,7 +68,7 @@ enum Adapter {
 struct ConfiguredProvider {
     row: ProviderQuota,
     adapter: Adapter,
-    local_limits: [bool; 2],
+    local_limits: [bool; 3],
 }
 
 pub struct QuotaService {
@@ -165,6 +165,7 @@ fn configured(config: &Value) -> Vec<ConfiguredProvider> {
                 local_limits: [
                     !entry["quota"]["limit5h"].is_null(),
                     !entry["quota"]["limit7d"].is_null(),
+                    !entry["quota"]["limit30d"].is_null(),
                 ],
             })
         })
@@ -453,11 +454,11 @@ fn measured(
         reset_at,
     }
 }
-fn aggregate_windows(value: &Value, local_limits: [bool; 2]) -> Vec<QuotaWindow> {
-    ["5h", "7d"]
+fn aggregate_windows(value: &Value, local_limits: [bool; 3]) -> Vec<QuotaWindow> {
+    [("5h", "5 小时"), ("7d", "7 天"), ("30d", "30 天")]
         .into_iter()
         .enumerate()
-        .filter_map(|(index, slot)| {
+        .filter_map(|(index, (slot, slot_label))| {
             let limit = number(&value[format!("limit{slot}")]).filter(|n| *n > 0.0)?;
             let kind = value[format!("type{slot}")].as_str();
             if local_limits[index] && kind.is_none() {
@@ -482,8 +483,12 @@ fn aggregate_windows(value: &Value, local_limits: [bool; 2]) -> Vec<QuotaWindow>
             };
             let label = if kind == Some("balance") {
                 "余额"
-            } else {
+            } else if kind.is_none() {
+                // Untyped samples include generic x-ratelimit-* merges with no
+                // real window duration — keep the generic label.
                 "配额"
+            } else {
+                slot_label
             };
             Some(measured(label.into(), used, limit, unit, reset(raw_reset)))
         })
@@ -773,22 +778,34 @@ mod tests {
     }
     #[test]
     fn local_counts_and_config_limits_are_not_upstream_available_quota() {
-        assert!(aggregate_windows(&json!({"used5h": 800, "used7d": 1200}), [false; 2]).is_empty());
-        assert!(aggregate_windows(&json!({"used5h": 0, "limit5h": 100}), [true, false]).is_empty());
+        assert!(aggregate_windows(&json!({"used5h": 800, "used7d": 1200}), [false; 3]).is_empty());
+        assert!(aggregate_windows(&json!({"used5h": 0, "limit5h": 100}), [true, false, false]).is_empty());
         let windows = aggregate_windows(
             &json!({"used7d": 0, "limit7d": 25, "type7d": "balance", "currency":"USD"}),
-            [false; 2],
+            [false; 3],
         );
         assert_eq!(windows[0].label, "余额");
         assert!(windows[0].used.is_none());
         assert!(windows[0].remaining.is_none());
         let rate = aggregate_windows(
             &json!({"used5h": 34, "limit5h": 100, "type5h":"rateLimit"}),
-            [false; 2],
+            [false; 3],
         );
         assert_eq!(rate[0].used, Some(34.0));
         assert_eq!(rate[0].remaining, Some(66.0));
-        assert_eq!(rate[0].label, "配额");
+        assert_eq!(rate[0].label, "5 小时");
+        let untyped = aggregate_windows(
+            &json!({"used5h": 34, "limit5h": 100}),
+            [false; 3],
+        );
+        assert_eq!(untyped[0].label, "配额");
+        let monthly = aggregate_windows(
+            &json!({"used30d": 14.6, "limit30d": 100, "type30d":"rateLimit"}),
+            [false; 3],
+        );
+        assert_eq!(monthly[0].label, "30 天");
+        assert_eq!(monthly[0].limit, Some(100.0));
+        assert_eq!(monthly[0].remaining, Some(85.4));
         assert!(
             adapter_windows(Adapter::Codex, &json!({"primary":{"windowSeconds":18000}})).is_empty()
         );

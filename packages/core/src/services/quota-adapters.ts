@@ -12,6 +12,12 @@ export interface ProviderQuotaResult {
   currency?: string;
   resetTime?: string;
   resetTime7d?: string;
+  /** Explicit limit for the monthly (30d) window, when the endpoint exposes one. */
+  limitMonthly?: number;
+  /** Spend/usage inside the monthly (30d) window. */
+  usedMonthlyBalance?: number;
+  /** ISO timestamp at which the monthly window resets. */
+  resetTimeMonthly?: string;
 }
 
 export interface QuotaAdapter {
@@ -71,7 +77,10 @@ abstract class BaseQuotaAdapter implements QuotaAdapter {
       result.remainingBalance !== undefined ||
       result.usedDailyBalance !== undefined ||
       result.limitDaily !== undefined ||
-      result.resetTime !== undefined
+      result.resetTime !== undefined ||
+      result.limitMonthly !== undefined ||
+      result.usedMonthlyBalance !== undefined ||
+      result.resetTimeMonthly !== undefined
     );
   }
 }
@@ -1102,8 +1111,8 @@ function rfc3986Encode(value: string): string {
  *
  * Only percentages are available (no absolute counts), so each window maps to
  * limit=100 / used=Percent with no currency, which admin-routes classifies as
- * a rateLimit quota. session fills the 5h slot, weekly the 7d slot; monthly
- * has no UI slot and is intentionally not mapped. A reclaimed/unsubscribed
+ * a rateLimit quota. session fills the 5h slot, weekly the 7d slot, and
+ * monthly the 30d slot. A reclaimed/unsubscribed
  * plan returns Status without QuotaUsage — that is "no data", not an error.
  */
 function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | null {
@@ -1119,7 +1128,7 @@ function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | nul
   const result: ProviderQuotaResult = {};
   for (const window of quotaUsage) {
     const level = window?.Level;
-    if (level !== "session" && level !== "weekly") continue;
+    if (level !== "session" && level !== "weekly" && level !== "monthly") continue;
 
     const percent = parseOptionalNumber(window?.Percent);
     if (percent === undefined) continue;
@@ -1139,6 +1148,10 @@ function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | nul
       result.limitDaily = 100;
       result.usedDailyBalance = percent;
       if (resetIso) result.resetTime = resetIso;
+    } else if (level === "monthly") {
+      result.limitMonthly = 100;
+      result.usedMonthlyBalance = percent;
+      if (resetIso) result.resetTimeMonthly = resetIso;
     } else {
       result.totalBalance = 100;
       result.usedBalance = percent;
@@ -1146,9 +1159,11 @@ function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | nul
     }
   }
 
-  // limit/reset fields are only ever set alongside a used value, so the two
-  // used slots fully decide whether any window was mapped.
-  return result.usedDailyBalance !== undefined || result.usedBalance !== undefined
+  // limit/reset fields are only ever set alongside a used value, so the used
+  // slots fully decide whether any window was mapped.
+  return result.usedDailyBalance !== undefined ||
+    result.usedBalance !== undefined ||
+    result.usedMonthlyBalance !== undefined
     ? result
     : null;
 }
