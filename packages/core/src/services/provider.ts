@@ -116,6 +116,7 @@ export class ProviderService {
           quotaToken: (providerConfig as any).quota_token,
           quotaSecToken: (providerConfig as any).quota_sec_token,
           quotaLitellmToken: (providerConfig as any).quota_litellm_token,
+          quotaFramework: (providerConfig as any).quota_framework,
           transformer: providerConfig.transformer ? transformer : undefined,
           cacheMode: providerConfig.cache_mode || 'exclusive',
           enabled: providerConfig.enabled !== false,
