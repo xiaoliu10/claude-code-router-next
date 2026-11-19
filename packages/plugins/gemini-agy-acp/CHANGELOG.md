@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.3 — 2026-11-19
+
+Restyle the management card to match the other provider cards: the host settings page stylesheet (Tailwind utilities plus the custom glass-card rule) now drives the look, with the shared container, header, badge variants and section styling. Setup instructions are collapsed by default. The authentication badge identifies API-key billing.
+
+管理卡片样式与其他供应商卡片对齐：改用宿主设置页样式表（Tailwind 工具类与自定义 glass-card 规则），容器、头部、徽章与分区样式保持一致。配置说明默认折叠，认证徽章标明使用 API key 计费。
+
 ## 0.0.2 — 2026-11-19
 
 Ship a read-only management card. The settings page reports a card load failure for every enabled plugin without one, so the previous release showed a misleading reinstall hint. The card explains the local opt-in contract and requires no network access.
