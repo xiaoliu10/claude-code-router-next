@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getQuotaAdapter,
   parseAliyunTokenPlanUsage,
+  parseLitellmUserBudgetUsage,
 } from "../services/quota-adapters";
 import type { LLMProvider } from "../types/llm";
 
@@ -728,5 +729,129 @@ describe("ZhipuQuotaAdapter quota fetch (gzip/identity regression)", () => {
     const adapter = getQuotaAdapter("https://api.deepseek.com/chat/completions");
     await adapter!.queryQuota({ name: "ds", baseUrl: "https://api.deepseek.com/chat/completions", apiKey: "k", models: [] } as LLMProvider, 5000);
     expect((capturedInit!.headers as Record<string, string>)["Accept-Encoding"]).toBe("identity");
+  });
+});
+describe("parseLitellmUserBudgetUsage", () => {
+  const base = {
+    spend: 3.25,
+    max_budget: 100,
+    budget_duration: "1mo",
+    budget_reset_at: "2026-12-01T00:00:00Z",
+  };
+
+  it("reads the nested user_info row and projects the balance window", () => {
+    expect(parseLitellmUserBudgetUsage({ user_id: "u1", user_info: base, keys: [], teams: [] })).toEqual({
+      totalBalance: 100,
+      currency: "USD",
+      usedBalance: 3.25,
+      resetTime7d: "2026-12-01T00:00:00Z",
+    });
+  });
+
+  it("accepts a flat row and camelCase keys", () => {
+    expect(parseLitellmUserBudgetUsage({ maxBudget: 40, spend: 0, budgetResetAt: "2026-11-01T00:00:00Z" })).toEqual({
+      totalBalance: 40,
+      currency: "USD",
+      usedBalance: 0,
+      resetTime7d: "2026-11-01T00:00:00Z",
+    });
+  });
+
+  it("keeps the limit without spend or an invalid reset", () => {
+    expect(parseLitellmUserBudgetUsage({ max_budget: 10 })).toEqual({
+      totalBalance: 10,
+      currency: "USD",
+    });
+    expect(
+      parseLitellmUserBudgetUsage({ max_budget: 10, spend: 2, budget_reset_at: "not-a-date" })
+    ).toEqual({ totalBalance: 10, currency: "USD", usedBalance: 2 });
+    expect(
+      parseLitellmUserBudgetUsage({ max_budget: 10, spend: -1, budget_reset_at: 42 })
+    ).toEqual({ totalBalance: 10, currency: "USD" });
+  });
+
+  it("returns null without a positive max_budget", () => {
+    expect(parseLitellmUserBudgetUsage(null)).toBeNull();
+    expect(parseLitellmUserBudgetUsage({ user_info: { spend: 5 } })).toBeNull();
+    expect(parseLitellmUserBudgetUsage({ user_info: { max_budget: 0, spend: 0 } })).toBeNull();
+  });
+});
+
+describe("getQuotaAdapter LiteLLM field dispatch", () => {
+  const relay = "https://relay.example.com/v1/messages";
+
+  it("matches only when the provider carries a LiteLLM quota token", () => {
+    expect(getQuotaAdapter(relay)).toBeNull();
+    expect(getQuotaAdapter(relay, makeProvider({ baseUrl: relay, quotaToken: undefined }))).toBeNull();
+    const snake = makeProvider({ baseUrl: relay, quotaToken: undefined });
+    (snake as unknown as Record<string, unknown>).quota_litellm_token = "  pat-token  ";
+    expect(getQuotaAdapter(relay, snake)).not.toBeNull();
+    expect(
+      getQuotaAdapter(relay, makeProvider({ baseUrl: relay, quotaToken: undefined, quotaLitellmToken: "pat" }))
+    ).not.toBeNull();
+  });
+
+  it("the LiteLLM field dispatch wins over a baseUrl hostname match", () => {
+    const withToken = makeProvider({
+      baseUrl: "https://api.deepseek.com/chat/completions",
+      quotaToken: undefined,
+      quotaLitellmToken: "pat",
+    });
+    const hostOnly = getQuotaAdapter(withToken.baseUrl);
+    expect(hostOnly).not.toBeNull();
+    expect(getQuotaAdapter(withToken.baseUrl, withToken)).not.toBe(hostOnly);
+  });
+});
+
+describe("LitellmUserBudgetQuotaAdapter", () => {
+  function provider(): LLMProvider {
+    const p = makeProvider({
+      name: "relay",
+      baseUrl: "https://relay.example.com/v1/messages",
+      apiKey: "sk-virtual-key",
+      quotaToken: undefined,
+      quotaLitellmToken: "  pat-token  ",
+    });
+    return p;
+  }
+
+  it("queries the relay /user/info with the LiteLLM token and parses the budget", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          user_id: "u1",
+          user_info: { spend: 3.25, max_budget: 100, budget_duration: "1mo", budget_reset_at: "2026-12-01T00:00:00Z" },
+          keys: [],
+          teams: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const p = provider();
+    const adapter = getQuotaAdapter(p.baseUrl, p);
+    expect(adapter).not.toBeNull();
+    expect(await adapter!.queryQuota(p, 1000)).toEqual({
+      totalBalance: 100,
+      currency: "USD",
+      usedBalance: 3.25,
+      resetTime7d: "2026-12-01T00:00:00Z",
+    });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(String(url)).toBe("https://relay.example.com/user/info");
+    // The padded paste artifact must be trimmed before reaching the header.
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer pat-token");
+    expect((init.headers as Record<string, string>)["Accept-Encoding"]).toBe("identity");
+  });
+
+  it("returns null when the relay rejects the budget query or the payload has no budget", async () => {
+    globalThis.fetch = vi.fn(async () => new Response("{}", { status: 403 })) as unknown as typeof fetch;
+    const p = provider();
+    const adapter = getQuotaAdapter(p.baseUrl, p)!;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ user_id: "u1", user_info: { spend: 5 } }), { status: 200 })
+    ) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
   });
 });
