@@ -66,8 +66,12 @@ export interface UnifiedMessage {
   };
 }
 
+// Kept off the JSON wire when forwarding unified tools to other providers.
+export const builtinWebSearch = Symbol("builtinWebSearch");
+
 // 统一的工具定义接口
 export interface UnifiedTool {
+  [builtinWebSearch]?: true;
   type: "function";
   function: {
     name: string;
