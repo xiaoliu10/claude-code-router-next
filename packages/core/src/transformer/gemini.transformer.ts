@@ -27,6 +27,12 @@ export class GeminiTransformer implements Transformer {
         headers: {
           "x-goog-api-key": provider.apiKey,
           Authorization: undefined,
+          // undici does not transparently gunzip responses fetched through a
+          // ProxyAgent (see BaseQuotaAdapter): a gzipped body arrives with no
+          // usable Content-Type, the gateway's JSON validation fails on the
+          // gzip magic and serves mangled binary as a 400. Ask the upstream
+          // for an uncompressed payload so the proxy path behaves like direct.
+          "Accept-Encoding": "identity",
         },
       },
     };
