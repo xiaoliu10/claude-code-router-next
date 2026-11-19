@@ -1,5 +1,6 @@
 import { ChatCompletion } from "openai/resources";
 import {
+  builtinWebSearch,
   LLMProvider,
   UnifiedChatRequest,
   UnifiedMessage,
@@ -488,6 +489,7 @@ export class AnthropicTransformer implements Transformer {
 
   private convertAnthropicToolsToUnified(tools: any[]): UnifiedTool[] {
     return tools.map((tool) => ({
+      ...(/^web_search_\d{8}$/.test(tool.type) ? { [builtinWebSearch]: true as const } : {}),
       type: "function",
       function: {
         name: tool.name,

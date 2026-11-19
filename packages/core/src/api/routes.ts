@@ -4,7 +4,7 @@ import {
   FastifyRequest,
   FastifyReply,
 } from "fastify";
-import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
+import { builtinWebSearch, RegisterProviderRequest, LLMProvider, type UnifiedTool } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
@@ -130,6 +130,7 @@ export function normalizeResponsesBody(body: any): void {
         // Codex web_search tool
         if (tool.type === "web_search") {
           return {
+            [builtinWebSearch]: true,
             type: "function",
             function: {
               name: "web_search",
@@ -403,9 +404,9 @@ async function handleTransformerEndpoint(
 
     return result;
   } catch (error: any) {
-    // ProjectRoutingError must propagate directly — it is a configuration
-    // error, not a transient upstream failure. No retry, no fallback.
-    if (error instanceof ProjectRoutingError) {
+    // Retrying a deterministic routing or tool-choice error could execute a
+    // different tool on the fallback provider. Return the local error directly.
+    if (error instanceof ProjectRoutingError || error?.code === "invalid_gemini_tool_choice") {
       throw error;
     }
     // Double-check: retry the same model once before falling back.
@@ -957,6 +958,13 @@ async function processRequestTransformers(
   // Deep clone the request body to preserve original messages for caching
   // and to ensure thinking blocks are not lost when switching between models
   let requestBody = JSON.parse(JSON.stringify(body));
+  // The JSON clone deliberately omits internal symbols. Restore tool ownership
+  // for this attempt without exposing it in any provider’s JSON payload.
+  if (Array.isArray(body.tools)) {
+    body.tools.forEach((tool: UnifiedTool, index: number) => {
+      if (tool?.[builtinWebSearch]) requestBody.tools[index][builtinWebSearch] = true;
+    });
+  }
 
   // Normalize per-request "cch=xxx;" hash in billing header system messages.
   // Claude Code injects a rotating hash (cch=...) that changes every request,
