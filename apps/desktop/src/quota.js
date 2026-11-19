@@ -2969,11 +2969,29 @@
       });
     });
 
+    // While the usage tab stays open, periodically refresh snapshot + records
+    // so long sessions see fresh totals. Entering the tab always loads once;
+    // leaving clears the timer. Tests/preview can shorten the interval via
+    // window.__CCR_USAGE_REFRESH_MS__.
+    var usageTimer = null;
+    function stopUsageAutoRefresh() {
+      if (usageTimer) { clearInterval(usageTimer); usageTimer = null; }
+    }
+    function startUsageAutoRefresh() {
+      stopUsageAutoRefresh();
+      if (!usageCtrl || !recordsCtrl) return;
+      var ms = 30000;
+      if (typeof window !== 'undefined' && window.__CCR_USAGE_REFRESH_MS__ > 0) ms = Number(window.__CCR_USAGE_REFRESH_MS__);
+      usageTimer = setInterval(function () { usageCtrl.refresh(); recordsCtrl.refresh(); }, ms);
+      // Tests/embedded runs must not be kept alive by the polling timer.
+      if (usageTimer && typeof usageTimer.unref === 'function') usageTimer.unref();
+    }
+
     function maybeLoadTab(name) {
       if (mode === 'missing' || loadedTabs[name]) return;
       loadedTabs[name] = true;
       if (name === 'routing') routingCtrl.refresh();
-      if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); }
+      if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); startUsageAutoRefresh(); }
       if (name === 'clients') clientsCtrl.refresh();
       if (name === 'projects') projectsCtrl.refresh();
       if (name === 'plugins') pluginsPanel.load();
@@ -2984,6 +3002,10 @@
       if (name !== 'quota') providerForm.close(false);
       if (name !== 'plugins') pluginsPanel.cancel(false);
       activeTab = name;
+      // Polling lifecycle lives here (maybeLoadTab early-returns once a tab
+      // has loaded, so a re-entry must still resume the timer).
+      if (name === 'usage') startUsageAutoRefresh();
+      else stopUsageAutoRefresh();
       TAB_IDS.forEach(function (id) {
         var on = id === name;
         tabButtons[id].setAttribute('aria-selected', String(on));
