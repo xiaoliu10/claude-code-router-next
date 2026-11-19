@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { after, before, test } from 'node:test';
-import { createTransport, probeVersion, syncModelOptions } from '../src/transport.mjs';
+import { createTransport, isolatedEnvironment, probeVersion, syncModelOptions } from '../src/transport.mjs';
 
 const input = { model: 'Gemini Model', thinking: 'xhigh', prompt: '你好', onText() {} };
 const variables = { GEMINI_API_KEY: 'fixture-value', AGY_TEST_PARENT_ONLY: 'not-for-child',
@@ -284,6 +284,21 @@ test('model sync spawns one bounded temp worker and reads the advertised model o
   await rejects(syncModelOptions({ binary, apiKey: ' ' }), 'invalid_config', 400);
   assert.deepEqual((await events()).map(record => record.event),
     ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+});
+
+test('the isolated worker environment forwards only standard proxy variables', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-env-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const previous = new Map(['HTTPS_PROXY', 'GEMINI_API_KEY', 'AWS_SECRET_ACCESS_KEY'].map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  process.env.HTTPS_PROXY = 'http://127.0.0.1:7897';
+  process.env.GEMINI_API_KEY = 'fixture-value';
+  process.env.AWS_SECRET_ACCESS_KEY = 'fixture-value';
+  const { env } = await isolatedEnvironment(root);
+  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:7897');
+  assert.equal(env.GEMINI_API_KEY, undefined);
+  assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
+  assert.equal(env.HOME, join(root, 'home'));
 });
 
 test('model sync is bounded and fails closed on protocol deviations', async t => {

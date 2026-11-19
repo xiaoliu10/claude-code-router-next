@@ -64,7 +64,7 @@ function stubApp(port = 43781) {
   return { app, call };
 }
 
-async function activate(t, { local, fixtureMode } = {}) {
+async function activate(t, { local, fixtureMode, host } = {}) {
   const configDir = await mkdtemp(join(tmpdir(), 'agy-admin-'));
   t.after(() => rm(configDir, { recursive: true, force: true }));
   if (local !== undefined) await writeFile(sidecarPath(configDir), JSON.stringify(local));
@@ -72,7 +72,7 @@ async function activate(t, { local, fixtureMode } = {}) {
   const registrars = [];
   const transports = [];
   const ctx = {
-    host: { configDir },
+    host: { configDir, ...host },
     log: { info() {}, warn() {} },
     registerTransformer() {},
     registerManagedRuntime(value) { runtime = value; },
@@ -306,6 +306,44 @@ test('model sync failures map to stable non-401 codes', async t => {
   const { status, body: reported } = await wrong.call('POST', SYNC_URL, { body: {} });
   assert.equal(status, 400);
   assert.equal(reported.error, 'acp_unsupported_option');
+});
+
+test('model sync registers discovered models on the provider entry and leaves Router untouched', async t => {
+  const writes = [];
+  const reloaded = [];
+  const config = { Providers: [{ name, api_key: `ccr-managed-${name}`, models: ['stale-model'] }, { name: 'other', models: ['keep'] }],
+    Router: { default: `${name},stale-model`, enableFallback: false } };
+  const p = await activate(t, { fixtureMode: 'ok', host: {
+    readConfig: async () => JSON.parse(JSON.stringify(config)),
+    writeConfig: async next => { writes.push(next); },
+    reloadRuntime: async next => { reloaded.push(next); },
+  } });
+  await p.call('POST', CONNECT_URL, { body: { binary: p.fixture.binary } });
+  const { status, body: reported } = await p.call('POST', SYNC_URL, { body: {} });
+  assert.equal(status, 200);
+  assert.equal(writes.length, 1);
+  assert.deepEqual(writes[0].Providers[0].models, reported.models.map(model => model.id));
+  assert.deepEqual(writes[0].Providers[1].models, ['keep']);
+  assert.deepEqual(writes[0].Router, config.Router);
+  assert.equal(writes[0].Providers[0].api_key, `ccr-managed-${name}`);
+  assert.equal(reloaded.length, 1);
+  assert.equal(reloaded[0], writes[0]);
+});
+
+test('model sync rolls back the provider entry when the config write fails', async t => {
+  const config = { Providers: [{ name, models: ['stale-model'] }], Router: { default: `${name},stale-model` } };
+  let writes = 0;
+  const p = await activate(t, { fixtureMode: 'ok', host: {
+    readConfig: async () => JSON.parse(JSON.stringify(config)),
+    writeConfig: async () => { writes += 1; if (writes === 1) throw Error('disk full'); },
+  } });
+  await p.call('POST', CONNECT_URL, { body: { binary: p.fixture.binary } });
+  const { status, body: reported } = await p.call('POST', SYNC_URL, { body: {} });
+  assert.equal(status, 500);
+  assert.equal(reported.error, 'agy_config_write_failed');
+  assert.ok(writes >= 2, 'rollback write attempted after the failed write');
+  const saved = await p.sidecar();
+  assert.deepEqual(saved.models.map(model => model.id), ['m2', 'default'], 'sidecar keeps synced models for the next attempt');
 });
 
 test('admin routes answer a constant 503 envelope while no service is wired', async t => {

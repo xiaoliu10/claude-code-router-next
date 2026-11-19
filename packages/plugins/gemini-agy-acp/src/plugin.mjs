@@ -174,6 +174,28 @@ export async function activateWithTransport(ctx, createTransport) {
     return status();
   }
 
+  // Register the discovered models on the provider entry so the router
+  // accepts them, mirroring the codex plugin's sync semantics: models only,
+  // Router untouched, best-effort rollback on a failed write.
+  async function registerProviderModels(models) {
+    const { readConfig, writeConfig, reloadRuntime } = ctx.host;
+    if (typeof readConfig !== 'function' || typeof writeConfig !== 'function') return;
+    const config = await readConfig();
+    const provider = Array.isArray(config?.Providers) ? config.Providers.find(entry => entry?.name === NAME) : undefined;
+    if (!provider) return;
+    const previous = JSON.stringify(config);
+    const ids = models.map(model => model.id);
+    if (JSON.stringify(provider.models ?? []) === JSON.stringify(ids)) return;
+    provider.models = ids;
+    try {
+      await writeConfig(config);
+      await reloadRuntime?.(config);
+    } catch (error) {
+      try { await writeConfig(JSON.parse(previous)); } catch { /* original failure is reported below */ }
+      throw failure('agy_config_write_failed', 500);
+    }
+  }
+
   async function syncModels() {
     const { raw } = await readSidecar(configDir);
     const settings = enabledSettings(raw);
@@ -185,6 +207,7 @@ export async function activateWithTransport(ctx, createTransport) {
     const modelsSyncedAt = Date.now();
     await writeSidecar(configDir, { models, modelsSyncedAt, version });
     cache.invalidate();
+    await registerProviderModels(models);
     return { models, modelsSyncedAt, version };
   }
 

@@ -37,7 +37,11 @@ function supportedVersion(version) {
   return major > 1 || (major === 1 && (minor > 5 || (minor === 5 && (patch > 1 || (patch === 1 && !prerelease)))));
 }
 
-async function isolatedEnvironment(root) {
+// The CLI honors the standard proxy variables for its own upstream calls;
+// forward whichever are set in the CCR process (isolated otherwise).
+const PROXY_ENV_VARS = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
+
+export async function isolatedEnvironment(root) {
   const dirs = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'runtime', 'work']
     .map(name => [name, join(root, name)]));
   await Promise.all(Object.values(dirs).map(path => mkdir(path, { mode: 0o700 })));
@@ -47,6 +51,10 @@ async function isolatedEnvironment(root) {
     APPDATA: dirs.config, LOCALAPPDATA: dirs.data, TMPDIR: dirs.tmp, TEMP: dirs.tmp, TMP: dirs.tmp,
     PATH: '/usr/bin:/bin', LANG: 'C',
   };
+  for (const name of PROXY_ENV_VARS) {
+    const value = process.env[name];
+    if (value) env[name] = value;
+  }
   if (process.platform === 'win32') {
     env.SystemRoot = process.env.SystemRoot;
     env.PATH = join(env.SystemRoot, 'System32');
