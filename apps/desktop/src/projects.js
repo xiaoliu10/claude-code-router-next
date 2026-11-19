@@ -360,11 +360,22 @@
     // Refresh never rebases dirty drafts onto a newer revision. Only an
     // acknowledged mutation for that same project advances its draft revision.
     function adopt(result, acknowledgedId) {
+      // Compare drafts to their previous snapshot before adopting external edits.
+      var cleanClients = new Set();
+      drafts.forEach(function (draft, id) {
+        // The outstanding write has changed the baseline for this project.
+        // Compare its latest edits with the acknowledged response below.
+        if (id === acknowledgedId) return;
+        var previous = findProject(id);
+        if (isClean(id)) drafts.delete(id);
+        else if (previous && sameSet(draft.clients, previous.takeoverClients)) cleanClients.add(id);
+      });
       snapshot = normalizeProjectsSnapshot(result);
       error = null;
       Array.from(drafts.keys()).forEach(function (id) {
         var p = findProject(id), d = drafts.get(id);
         if (!p) { d.staleExternally = true; return; }
+        if (cleanClients.has(id)) d.clients = p.takeoverClients.slice();
         if (isClean(id)) { drafts.delete(id); return; }
         if (id === acknowledgedId) d.baseRev = p.revision;
         d.staleExternally = p.revision !== d.baseRev;
