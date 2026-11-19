@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { after, before, test } from 'node:test';
-import { createTransport } from '../src/transport.mjs';
+import { createTransport, probeVersion, syncModelOptions } from '../src/transport.mjs';
 
 const input = { model: 'Gemini Model', thinking: 'xhigh', prompt: '你好', onText() {} };
 const variables = { GEMINI_API_KEY: 'fixture-value', AGY_TEST_PARENT_ONLY: 'not-for-child',
@@ -42,7 +42,7 @@ async function setup(t, mode = 'ok', config = {}) {
       }
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
-  return { transport, events };
+  return { transport, events, binary, dir };
 }
 
 function rejects(promise, code, statusCode) {
@@ -230,4 +230,67 @@ test('close waits for active startup, cancels a prompt, and reaps idle children'
     await transport.close();
     for (const { root } of await events()) if (root) assert.equal(existsSync(root), false);
   });
+});
+
+test('retireExisting drops pooled workers and the next run respawns fresh', async t => {
+  const { transport, events } = await setup(t, 'ok', { maxWorkers: 1 });
+  await transport.run(input);
+  await transport.retireExisting();
+  await transport.run(input);
+  assert.equal((await events()).filter(record => record.event === 'spawn').length, 2);
+  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+});
+
+test('worker start logs one bounded line with binary path and CLI version only', async t => {
+  const lines = [];
+  const { transport } = await setup(t, 'ok', { log: { info: message => lines.push(message) } });
+  await transport.run(input);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /agy 1\.5\.1/);
+  assert.match(lines[0], /binary: /);
+  assert.doesNotMatch(lines[0], /fixture-value|你好|prompt/);
+});
+
+test('an explicit pool apiKey overrides the environment capture at start', async t => {
+  process.env.GEMINI_API_KEY = 'test-key';
+  const { transport } = await setup(t, 'ok', { apiKey: 'fixture-value' });
+  try {
+    await transport.run(input);
+  } finally { process.env.GEMINI_API_KEY = variables.GEMINI_API_KEY; }
+  assert.throws(() => createTransport({ binary: join('x', 'y'), authMethod: 'gemini-api-key', apiKey: '  ' }),
+    { code: 'acp_invalid_config' });
+  assert.throws(() => createTransport({ binary: join('x', 'y'), authMethod: 'gemini-api-key', apiKey: 5 }),
+    { code: 'acp_invalid_config' });
+});
+
+test('probeVersion validates one binary in isolation without spawning ACP', async t => {
+  const { binary, events } = await setup(t);
+  assert.equal(await probeVersion(binary), '1.5.1');
+  assert.deepEqual((await events()).map(record => record.event), ['version']);
+  for (const invalid of ['agy', '/x/\0y', 42]) {
+    await assert.rejects(probeVersion(invalid), { code: 'acp_invalid_config' });
+  }
+  assert.deepEqual((await events()).map(record => record.event), ['version']);
+});
+
+test('model sync spawns one bounded temp worker and reads the advertised model options', async t => {
+  const { binary, events } = await setup(t);
+  assert.deepEqual(await syncModelOptions({ binary, apiKey: 'fixture-value' }),
+    { models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }], version: '1.5.1' });
+  assert.deepEqual((await events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+  await rejects(syncModelOptions({ binary, apiKey: 'fixture-value', authMethod: 'consumer-login' }),
+    'invalid_config', 400);
+  await rejects(syncModelOptions({ binary, apiKey: ' ' }), 'invalid_config', 400);
+  assert.deepEqual((await events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+});
+
+test('model sync is bounded and fails closed on protocol deviations', async t => {
+  const hanging = await setup(t, 'hang-version');
+  await rejects(syncModelOptions({ binary: hanging.binary, apiKey: 'fixture-value' }), 'timeout', 504);
+  const wrong = await setup(t, 'wrong-category');
+  await rejects(syncModelOptions({ binary: wrong.binary, apiKey: 'fixture-value' }), 'unsupported_option', 400);
+  const old = await setup(t, 'old');
+  await rejects(probeVersion(old.binary), 'unsupported_version', 502);
 });

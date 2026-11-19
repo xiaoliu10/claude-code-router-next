@@ -1,6 +1,6 @@
 {
   "name": "gemini-agy-acp",
-  "version": "0.0.3",
+  "version": "0.1.0",
   "coreApi": "1",
-  "description": "Experimental local Antigravity CLI provider for text-only chat over ACP stdio. Requires explicit opt-in and Gemini API key authentication."
+  "description": "Experimental local Antigravity CLI provider for text-only chat over ACP stdio, with card-driven connect, disconnect, status and model sync over local-only admin routes. Requires explicit opt-in and Gemini API key authentication."
 }
