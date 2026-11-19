@@ -50,14 +50,14 @@ export function StepPlanQuotaCard({ snapshot }: { snapshot: StepPlanQuotaSnapsho
     <section aria-label={title} className="w-full space-y-2 rounded-xl border border-white/10 p-3 text-xs [overflow-wrap:anywhere]">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <span className="font-semibold text-foreground">{title}</span>
-        {typeof name === "string" && name && <bdi className="text-muted-foreground">{name}</bdi>}
+        {renderUsage && typeof name === "string" && name && <bdi className="text-muted-foreground">{name}</bdi>}
       </div>
       <div className="space-y-1 text-muted-foreground">
         {stateLabel && <div className="font-medium text-foreground">{stateLabel}</div>}
         {renderUsage && typeof allowed === "boolean" && (
           <div>{allowed ? t("providers.step_plan.allowed") : t("providers.step_plan.blocked")}</div>
         )}
-        <StepPlanTime label="providers.step_plan.observed" value={observedAt} />
+        {renderUsage && <StepPlanTime label="providers.step_plan.observed" value={observedAt} />}
       </div>
       {renderUsage && family === "token" && Array.isArray(creditBuckets) && creditBuckets.map((bucket, index) => {
         if (bucket?.type !== "subscription" && bucket?.type !== "topup") return null;

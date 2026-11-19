@@ -11,6 +11,9 @@ vi.mock("../ccr/config", async importOriginal => ({
   ...await importOriginal<typeof import("../ccr/config")>(), readConfigFile: vi.fn(),
 }));
 
+const proxyFetch = vi.hoisted(() => vi.fn());
+vi.mock("undici", async load => ({ ...await load<typeof import("undici")>(), fetch: proxyFetch }));
+
 const base = "https://api.stepfun.com/step_plan/v1";
 const provider = { name: "sample", api_key: "fixture-key", api_base_url: `${base}/chat/completions` };
 const unavailable = { state: "unavailable", family: "none", observedAt: null, name: null, allowed: null, windows: [], creditBuckets: [] };
@@ -23,13 +26,13 @@ const token = {
   quota: { state: "known", allowed: true, reason: "private-marker", windows: [], credit_buckets: [
     bucket,
     { ...bucket, type: "topup", total: "7.00", remaining: "7.00", used_percent: 0, expires_at_ms: now + 2000 },
-    { ...bucket, type: "topup", total: "3", remaining: "1", used_percent: null, expires_at_ms: now - 2000 },
+    { ...bucket, type: "topup", total: "3", remaining: "1", used_percent: null, expires_at_ms: now + 40_000 },
   ] },
 };
 const coding = {
   ...token, plan: { name: null, state: "known", family: "coding" },
   quota: { state: "known", allowed: false, windows: [
-    { id: "five_hour", limited: true, used_percent: 0, resets_at_ms: now + 5000 },
+    { id: "five_hour", limited: true, used_percent: 0, resets_at_ms: now + 125_000 },
     { id: "weekly", limited: false, used_percent: null, resets_at_ms: null },
   ], credit_buckets: [] },
 };
@@ -43,6 +46,7 @@ describe("Step Plan display quota", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(now);
     vi.stubGlobal("fetch", upstream.mockReset());
+    proxyFetch.mockReset();
     cache = new StepPlanQuotaCache();
   });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
@@ -67,7 +71,7 @@ describe("Step Plan display quota", () => {
         creditBuckets: [
           { type: "subscription", total: "9007199254740993.125", remaining: "0", usedPercent: 100, resetsAt: null, expiresAt: now + 8000 },
           { type: "topup", total: "7.00", remaining: "7.00", usedPercent: 0, resetsAt: null, expiresAt: now + 2000 },
-          { type: "topup", total: "3", remaining: "1", usedPercent: null, resetsAt: null, expiresAt: now - 2000 },
+          { type: "topup", total: "3", remaining: "1", usedPercent: null, resetsAt: null, expiresAt: now + 40_000 },
         ],
       });
       const [url, options] = upstream.mock.calls[0];
@@ -78,7 +82,7 @@ describe("Step Plan display quota", () => {
       upstream.mockResolvedValueOnce(Response.json(coding));
       expect((await getRow()).stepPlan).toEqual({
         state: "known", family: "coding", name: null, allowed: false, observedAt: now, creditBuckets: [],
-        windows: [{ id: "five_hour", limited: true, usedPercent: 0, resetsAt: now + 5000 },
+        windows: [{ id: "five_hour", limited: true, usedPercent: 0, resetsAt: now + 125_000 },
           { id: "weekly", limited: false, usedPercent: null, resetsAt: null }],
       });
       expect(getQuotaAdapter(provider.api_base_url)).toBeNull();
@@ -86,6 +90,44 @@ describe("Step Plan display quota", () => {
       expect(health.getState(provider.name, "healthy-model")).toBeUndefined();
     } finally {
       health.recover(provider.name, "open-model");
+      await app.close();
+    }
+  });
+
+  it("drops expired and reset credit buckets during the cache TTL", async () => {
+    upstream.mockResolvedValueOnce(Response.json(token));
+    expect((await read())?.creditBuckets).toHaveLength(3);
+    vi.setSystemTime(now + 2000);
+    expect(await read()).toMatchObject({ state: "partial", allowed: null, creditBuckets: [
+      { type: "subscription" }, { type: "topup", total: "3" },
+    ] });
+    expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts Step Plan while managed quota polling is still pending", async () => {
+    const app = Fastify();
+    vi.mocked(readConfigFile).mockResolvedValue({ Providers: [provider] });
+    let completePlugin!: () => void;
+    const managed = { name: "parallel-plugin" };
+    const pluginRegistry = {
+      registerAllRoutes: () => {},
+      getManagedRuntimeFor: () => ({ fetchQuota: () => new Promise(resolve => {
+        completePlugin = () => resolve(null);
+      }) }),
+    };
+    Object.assign(app, { _server: { pluginRegistry, providerService: { getProviders: () => [managed] } } });
+    try {
+      await registerAdminRoutes({ app, pluginRegistry }, {});
+      upstream.mockImplementationOnce(async () => {
+        queueMicrotask(() => completePlugin());
+        return Response.json(token);
+      });
+      const started = performance.now();
+      const result = await app.inject({ method: "GET", url: "/api/providers/quota" });
+      expect(performance.now() - started).toBeLessThan(2000);
+      expect(result.statusCode).toBe(200);
+      expect(result.json().quotas[0].stepPlan.family).toBe("token");
+    } finally {
       await app.close();
     }
   });
@@ -111,8 +153,10 @@ describe("Step Plan display quota", () => {
     upstream.mockImplementation(async () => Response.json(token));
     await cache.poll([provider], config);
     expect(upstream.mock.calls[0][1]).not.toHaveProperty("dispatcher");
-    await cache.poll([{ ...provider, proxy_enabled: true }], config);
-    expect(upstream.mock.calls[1][1]).toHaveProperty("dispatcher", getProxyDispatcher(proxy));
+    proxyFetch.mockResolvedValueOnce(Response.json(token));
+    expect((await cache.poll([{ ...provider, proxy_enabled: true }], config)).get(provider.name)?.family).toBe("token");
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(proxyFetch).toHaveBeenCalledWith(`${base}/usage`, expect.objectContaining({ dispatcher: getProxyDispatcher(proxy) }));
   });
 
   it("coalesces concurrent requests, reuses the settled result, and invalidates old in-flight identities", async () => {

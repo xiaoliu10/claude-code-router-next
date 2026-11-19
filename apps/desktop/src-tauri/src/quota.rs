@@ -217,6 +217,11 @@ impl QuotaService {
             cache.attempts.insert(provider.clone(), now());
             cache.online = false;
             cache.error = Some("无法连接本地 CCR，显示上次已知数据（可能过期）".into());
+            for row in &mut cache.providers {
+                if row.step_plan.is_some() {
+                    *row = project_step_plan(row.clone(), &Value::Null);
+                }
+            }
             return Ok(cache.clone());
         };
         let rows = configured(&config);

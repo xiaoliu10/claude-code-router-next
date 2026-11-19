@@ -911,6 +911,8 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     try {
       const config = await readConfigFile();
       const providers = config.Providers || [];
+      // Start this alongside managed plugin polling so their deadlines do not add up.
+      const stepPlansPending = stepPlanCache.poll(providers, { get: key => config[key] });
 
       // Managed plugin runtimes that expose the fetchQuota seam: poll on
       // demand here as well as from the periodic active-probe loop. The
@@ -1032,7 +1034,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
         }
       }
 
-      const stepPlans = await stepPlanCache.poll(providers, { get: key => config[key] });
+      const stepPlans = await stepPlansPending;
       for (const [provider, snapshot] of stepPlans) {
         const row = quotaMap.get(provider);
         if (row) row.stepPlan = snapshot;

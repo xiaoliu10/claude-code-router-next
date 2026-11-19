@@ -261,6 +261,8 @@ export function Providers() {
           setQuotaUsages(quotaResult.value.quotas || []);
           anySuccess = true;
         } else {
+          // Only the gateway can confirm which credential owns a cached snapshot.
+          setQuotaUsages(rows => rows.filter(row => !row.stepPlan));
           console.error("Failed to fetch provider quota:", quotaResult.reason);
         }
         if (anySuccess) lastSuccessAt = Date.now();

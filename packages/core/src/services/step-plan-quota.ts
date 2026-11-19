@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { fetch as proxyFetch } from "undici";
 import type { ConfigProvider } from "../types/llm";
 import { getProxyDispatcher, resolveProviderProxyUrl } from "./proxy";
 
@@ -103,7 +104,7 @@ function decodeStepPlanQuota(value: unknown): StepPlanQuota {
 }
 
 // Bound bytes before parsing, including chunked responses without Content-Length.
-async function readSnapshot(response: Response): Promise<StepPlanQuota> {
+async function readSnapshot(response: Response | Awaited<ReturnType<typeof proxyFetch>>): Promise<StepPlanQuota> {
   if (!response.body) return unavailable();
   const reader = response.body.getReader();
   const chunks: Buffer[] = [];
@@ -167,9 +168,19 @@ export class StepPlanQuotaCache {
       await entry.pending;
       // A concurrent request may have removed this provider or changed its credentials.
       if (this.entries.get(provider.name) !== entry) return;
+      const now = Date.now();
+      if (entry.snapshot.state === "stale" && now - entry.receivedAt > MAX_STALE_MS) entry.snapshot = unavailable();
       const { snapshot } = entry;
-      if (snapshot.state === "stale" && Date.now() - entry.receivedAt > MAX_STALE_MS) entry.snapshot = unavailable();
-      snapshots.set(provider.name, entry.snapshot);
+      // Cache entries can cross a billing boundary between refreshes. Suppress
+      // expired balances and reset windows until the upstream supplies new ones.
+      const creditBuckets = snapshot.creditBuckets.filter(bucket =>
+        (bucket.expiresAt === null || bucket.expiresAt > now) && (bucket.resetsAt === null || bucket.resetsAt > now));
+      const windows = snapshot.windows.filter(window => window.resetsAt === null || window.resetsAt > now);
+      const crossedBoundary = windows.length !== snapshot.windows.length || creditBuckets.length !== snapshot.creditBuckets.length;
+      const current: StepPlanQuota = crossedBoundary
+        ? { ...snapshot, state: snapshot.state === "stale" ? "stale" : "partial", allowed: null, windows, creditBuckets }
+        : snapshot;
+      return snapshots.set(provider.name, current);
     }));
     return snapshots;
   }
@@ -177,11 +188,14 @@ export class StepPlanQuotaCache {
   private async refresh(entry: Entry, key: string, proxy?: string): Promise<void> {
     let delay = TTL_MS;
     try {
-      const response = await fetch(`${BASE}/usage`, {
-        method: "GET", redirect: "error", signal: AbortSignal.timeout(TIMEOUT_MS),
+      const request = {
+        method: "GET", redirect: "error" as const, signal: AbortSignal.timeout(TIMEOUT_MS),
         headers: { Accept: "application/json", "Accept-Encoding": "identity", Authorization: `Bearer ${key}` },
-        ...(proxy && { dispatcher: getProxyDispatcher(proxy) }),
-      });
+      };
+      // Pair the npm ProxyAgent with its own fetch to preserve response headers.
+      const response = proxy
+        ? await proxyFetch(`${BASE}/usage`, { ...request, dispatcher: getProxyDispatcher(proxy) })
+        : await fetch(`${BASE}/usage`, request);
       if (response.ok) {
         entry.snapshot = await readSnapshot(response);
         entry.receivedAt = Date.now();
