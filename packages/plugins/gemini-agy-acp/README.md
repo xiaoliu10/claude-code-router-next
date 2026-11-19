@@ -6,6 +6,14 @@ Experimental local provider for CCR 2.3.2433 (provider plugin API 1). A text cha
 
 **启用与计费。** 本插件为实验原型，默认关闭。仅使用可信的本地 `agy` 程序和有权使用的 Gemini API 密钥。CLI 会收到对话内容，并可能将其发送到 Google 服务。调用受 API 密钥的配额、计费和使用条款约束。CLI 以 CCR 进程的系统用户身份运行。插件不支持个人订阅、浏览器 OAuth 或账号轮换。测试仅使用模拟进程，尚未验证真实账号、费用或上游服务。
 
+## Install from npm
+
+Run the following in the isolated CCR instance described below. Installing the package leaves the transport disabled until the operator enables it.
+
+```sh
+ccr plugin add @wengine-ai/ccr-provider-gemini-agy-acp@0.0.1
+```
+
 ## Build and install locally
 
 Use Node 20+ and this checkout's `packages/cli/dist/cli.js` (build the host with `pnpm build:cli` in a development checkout if needed). From the repository root, install into a disposable CCR configuration directory. The CLI copies the `dist` payload and records the plugin in that directory's `plugins/plugins.json`. Installing alone leaves the ACP transport disabled.
