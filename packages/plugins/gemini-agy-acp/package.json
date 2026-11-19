@@ -1,0 +1,17 @@
+{
+  "name": "@wengine-ai/ccr-provider-gemini-agy-acp",
+  "version": "0.0.1",
+  "description": "Experimental text-only CCR provider for the local Antigravity CLI over ACP.",
+  "license": "MIT",
+  "keywords": ["ccr-provider-plugin", "antigravity", "acp"],
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "main": "dist/plugin.js",
+  "files": ["dist", "CHANGELOG.md"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}
