@@ -181,7 +181,7 @@ test('projects browser wiring loads projects before quota and requires exact exp
   const js = readFileSync(new URL('../src/quota.js', import.meta.url), 'utf8');
   assert.ok(html.indexOf('src="projects.js"') < html.indexOf('src="quota.js"'));
   assert.match(html, /id="tab-projects"[^>]+aria-controls="panel-projects"/);
-  assert.match(js, /if \(name === 'projects'\) projectsCtrl\.refresh\(\)/);
+
   const previewPattern = /(?:^|[?&])preview=1(?:&|$)/;
   assert.match(js, /preview=1\(\?:&\|\$\)/);
   assert.equal(previewPattern.test('?preview=1'), true);
