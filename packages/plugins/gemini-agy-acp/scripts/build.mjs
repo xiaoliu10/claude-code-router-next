@@ -12,6 +12,8 @@ await mkdir(new URL('src/', dist), { recursive: true });
 for (const file of modules) {
   await copyFile(new URL(`src/${file}`, root), new URL(`src/${file}`, dist));
 }
+if (!modules.includes('card.mjs')) throw new Error('Missing management card source.');
+await copyFile(new URL('src/card.mjs', root), new URL('card.js', dist));
 await writeFile(new URL('plugin.js', dist), "export { activate } from './src/plugin.mjs';\n");
 await copyFile(new URL('plugin.json', root), new URL('plugin.json', dist));
 // The installed directory has no module-typed package above plugin.js.

@@ -15,7 +15,7 @@ test('built plugin.js activates in a standalone Node process under a temporary H
   const destination = join(configDir, 'plugins', 'gemini-agy-acp');
   await mkdir(source);
   await mkdir(join(source, 'src'));
-  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/chat.mjs', 'src/plugin.mjs']) {
+  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/chat.mjs', 'src/card.mjs', 'src/plugin.mjs']) {
     await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
   }
   await writeFile(join(source, 'src', 'transport.mjs'), `
@@ -31,6 +31,7 @@ test('built plugin.js activates in a standalone Node process under a temporary H
   const manifest = JSON.parse(await readFile(join(destination, 'plugin.json')));
   assert.equal(manifest.name, 'gemini-agy-acp');
   assert.equal(manifest.coreApi, '1');
+  assert.equal((await readFile(join(destination, 'card.js'), 'utf8')).includes('export default'), true);
   await writeFile(join(configDir, 'gemini-agy-acp.json'), JSON.stringify({
     binary: '/test/fixture', enabled: true, authMethod: 'gemini-api-key',
   }));
