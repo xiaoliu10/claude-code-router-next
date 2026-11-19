@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -86,8 +87,10 @@ test('fails closed during version, initialization, auth, and option negotiation'
     ['old', 'unsupported_version', 502, 'spawn'], ['prerelease', 'unsupported_version', 502, 'spawn'],
     ['long-version', 'output_limit', 502, 'spawn'], ['v2', 'protocol_error', 502, 'authenticate'],
     ['no-key-method', 'auth_required', 401, 'authenticate'], ['terminal-auth', 'auth_required', 401, 'authenticate'],
+    ['env-auth', 'auth_required', 401, 'session/new'],
     ['auth-failure', 'auth_required', 401, 'session/new'], ['no-thinking', 'unsupported_option', 400, 'session/prompt'],
     ['ignored-option', 'unsupported_option', 400, 'session/prompt'],
+    ['wrong-category', 'unsupported_option', 400, 'session/set_config_option'],
   ]) await t.test(mode, async t => {
     const { transport, events } = await setup(t, mode);
     await rejects(transport.run(input), code, statusCode);
@@ -98,8 +101,11 @@ test('fails closed during version, initialization, auth, and option negotiation'
 test('rejects missing key, oversized prompt, unsupported model and effort', async t => {
   const { transport, events } = await setup(t);
   delete process.env.GEMINI_API_KEY;
-  try { await rejects(transport.run(input), 'auth_required', 401); }
-  finally { process.env.GEMINI_API_KEY = variables.GEMINI_API_KEY; }
+  try {
+    const missing = await setup(t);
+    await rejects(missing.transport.run(input), 'auth_required', 401);
+    assert.deepEqual(await missing.events(), []);
+  } finally { process.env.GEMINI_API_KEY = variables.GEMINI_API_KEY; }
   await rejects(transport.run({ ...input, prompt: 'あ'.repeat(350000) }), 'input_limit', 413);
   assert.deepEqual(await events(), []);
   for (const overrides of [{ model: 'unavailable' }, { thinking: 'max' }]) {
@@ -116,7 +122,17 @@ test('pool grants two leases by default, rejects overload and replaces cancelled
   await waitForEvent(events, 'session/prompt');
   controllers.forEach(c => c.abort());
   await Promise.all(pending);
-  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+  // Cancellation settles before the OS has necessarily reaped the workers.
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    try {
+      assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+      break;
+    } catch (error) {
+      if (error.code !== 'acp_busy' || Date.now() >= deadline) throw error;
+      await delay(10);
+    }
+  }
   await transport.close();
   await rejects(transport.run(input), 'closed', 503);
 });
@@ -129,6 +145,40 @@ test('reaps a probe aborted during startup and never spawns ACP', async t => {
   controller.abort();
   await pending;
   assert.deepEqual((await events()).map(record => record.event), ['version']);
+});
+
+test('deadline settles even if an exited version probe has not emitted close', async t => {
+  const { transport } = await setup(t, 'ok', { timeoutMs: 20000, maxWorkers: 1 });
+  const emit = ChildProcess.prototype.emit;
+  const schedule = globalThis.setTimeout;
+  let expire, releaseClose, intercepted = true;
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => {
+    if (ms === 20000) expire = fn;
+    return schedule(fn, ms, ...args);
+  });
+  t.mock.method(ChildProcess.prototype, 'emit', function(event, ...args) {
+    if (intercepted && event === 'close' && this.spawnargs.includes('--version')) {
+      releaseClose = () => emit.call(this, event, ...args);
+      queueMicrotask(expire);
+      return true;
+    }
+    return emit.call(this, event, ...args);
+  });
+  const safeguard = AbortSignal.timeout(4000);
+  try {
+    await Promise.race([rejects(transport.run(input), 'timeout', 504), new Promise((_, reject) =>
+      safeguard.addEventListener('abort', () => reject(new Error('Deadline waited for close')), { once: true }))]);
+    assert.equal(typeof releaseClose, 'function');
+    await rejects(transport.run(input), 'busy', 503);
+  } finally { intercepted = false; releaseClose?.(); }
+});
+
+test('all workers use the key captured at provider activation', async t => {
+  const { transport } = await setup(t);
+  process.env.GEMINI_API_KEY = 'test-key';
+  try {
+    await Promise.all([transport.run(input), transport.run(input)]);
+  } finally { process.env.GEMINI_API_KEY = variables.GEMINI_API_KEY; }
 });
 
 test('request deadline covers startup and active prompt', async t => {

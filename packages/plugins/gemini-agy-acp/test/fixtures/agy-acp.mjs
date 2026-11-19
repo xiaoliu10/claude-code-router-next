@@ -38,7 +38,7 @@ if (argv[0] === '--version') {
   let promptId;
   let denied = new Set();
   function configOptions() {
-    const options = [{ id: 'agentModel', category: 'model', type: 'select', currentValue: model, options: [
+    const options = [{ id: mode === 'wrong-category' ? 'model' : 'agentModel', category: mode === 'wrong-category' ? 'mode' : 'model', type: 'select', currentValue: model, options: [
       { group: 'all', name: 'All', options: [{ value: 'm2', name: 'Gemini Model' }, { value: 'default', name: 'Default' }] },
     ] }];
     if (model === 'm2' && mode !== 'no-thinking') options.push({
@@ -69,7 +69,8 @@ if (argv[0] === '--version') {
       assert.deepEqual(params.clientCapabilities, {});
       if (mode !== 'hang-init') reply({ protocolVersion: mode === 'v2' ? 2 : 1, agentCapabilities: {},
         authMethods: [{ id: 'consumer' }, ...(mode === 'no-key-method' ? [] : [{ id: 'gemini-api-key',
-          ...(mode === 'terminal-auth' && { type: 'terminal' }) }])] });
+          ...(mode === 'terminal-auth' && { type: 'terminal' }),
+          ...(mode === 'env-auth' && { type: 'env_var' }) }])] });
     } else if (method === 'authenticate') {
       assert.deepEqual(params, { methodId: 'gemini-api-key' });
       if (mode === 'auth-failure') {

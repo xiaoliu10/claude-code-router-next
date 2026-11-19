@@ -24,9 +24,16 @@ it.skipIf(process.platform === 'win32')('routes text chat through the installed 
     const pkg = join(dir, 'source');
     for (const file of ['scripts', 'src', 'package.json', 'plugin.json']) await cp(join(source, file), join(pkg, file), { recursive: true });
     execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: pkg });
-    await mkdir(join(dir, 'plugins'));
-    await cp(join(pkg, 'dist'), join(dir, 'plugins', name), { recursive: true });
-    await writeFile(join(dir, 'plugins', 'plugins.json'), JSON.stringify([{ name, enabled: true }]));
+    const cli = process.env.CCR_TEST_PACKAGED_CLI;
+    if (cli) {
+      execFileSync(process.execPath, [cli, 'plugin', 'add', pkg, '--yes'], {
+        cwd: dir, env: { HOME: dir, CCR_CONFIG_DIR: dir, PATH: process.env.PATH },
+      });
+    } else {
+      await mkdir(join(dir, 'plugins'));
+      await cp(join(pkg, 'dist'), join(dir, 'plugins', name), { recursive: true });
+      await writeFile(join(dir, 'plugins', 'plugins.json'), JSON.stringify([{ name, enabled: true }]));
+    }
     const binary = join(dir, 'fixture.mjs');
     await writeFile(binary, '#!' + process.execPath + '\n' + await readFile(join(source, 'test/fixtures/agy-acp.mjs'), 'utf8'), { mode: 0o700 });
     await writeFile(join(dir, 'mode'), 'ok');

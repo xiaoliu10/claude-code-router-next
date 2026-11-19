@@ -55,7 +55,7 @@ To opt in, the local operator writes `$CCR_CONFIG_DIR/gemini-agy-acp.json` befor
 }
 ```
 
-Supply `GEMINI_API_KEY` through the isolated CCR process environment. Keep it out of request headers, JSON files, transcripts and source control. The only supported method is `gemini-api-key`. A missing key or unsupported auth method fails the request. Changes to the sidecar file take effect on the next activation.
+Supply `GEMINI_API_KEY` through the isolated CCR process environment. Keep it out of request headers, JSON files, transcripts and source control. The only supported method is `gemini-api-key`. A missing key or unsupported auth method fails the request. The provider captures the API key and sidecar settings at activation. Restart the isolated CCR host with the updated environment to rotate the key for every worker.
 
 ## Text chat
 
@@ -78,6 +78,8 @@ Use `/v1/chat/completions` or CCR's `/v1/messages` endpoint. CCR handles Anthrop
 Each request gets a fresh ACP session. A single user string is passed directly. Multiple turns become an ordered JSON text transcript in one ACP prompt. Role labels in that transcript do not establish separate privileged system instructions inside the CLI. The adapter accepts `system`, `user`, `assistant` and text blocks. Tool definitions, tool calls/results, named roles and non-text content fail explicitly. The model is matched against the provider catalog and passed intact to the transport. Optional OpenAI `reasoning_effort` or CCR-normalized Anthropic effort selects an advertised thinking option. `xhigh` can match an advertised Extra tier. An unavailable explicit selection fails. Omitting effort leaves the CLI's selection unchanged.
 
 Non-streaming requests return one OpenAI chat completion. Streaming emits role and text deltas, a finish reason, then `[DONE]` on success. Failures before the first text use HTTP errors. A failure after partial output terminates the stream with an error. The host limits output to 1 MiB of text and 8192 nonempty deltas per response. Token usage, sampling controls, caller token limits, structured output and persistent multi-turn ACP sessions are unsupported. Do not depend on token accounting or these controls in this prototype.
+
+The protocol fixture follows Google's documented ACP v1 invocation, API-key method ID, and session selectors. This prototype handles the protocol-driven authentication method (omitted type or `agent`) and rejects other method types before opening a session. The fixture is synthetic. The exact handshake for a production CLI build still needs verification.
 
 Local tests use synthetic text, credentials and subprocess fixtures. Live CLI authentication, model availability, actual sandbox guarantees, provider billing, production load and compatibility with other CCR versions remain unverified. CCR 2.3.2433 has no plugin shutdown callback. The transport retires idle workers and bounds each request.
 

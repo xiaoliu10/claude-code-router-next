@@ -8,7 +8,7 @@ const selectorIds = {
 function select(options, category, requested) {
   if (!Array.isArray(options)) throw new AcpError('unsupported_option');
   const selectors = options.filter(option => option?.type === 'select' && (
-    option.category === category || selectorIds[category].includes(option.id)
+    option.category == null ? selectorIds[category].includes(option.id) : option.category === category
   ));
   if (selectors.length !== 1) throw new AcpError('unsupported_option');
   const [selector] = selectors;

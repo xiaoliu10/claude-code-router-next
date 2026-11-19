@@ -132,18 +132,31 @@ class Worker {
   async run(request, apiKey, timeoutMs) {
     clearTimeout(this.idleTimer);
     this.rpc?.resetBudget();
-    const abort = () => this.retire(new AcpError('cancelled'));
+    // A caller's deadline is independent of the OS closing the child's pipes.
+    let stopRequest;
+    const interrupted = new Promise((_, reject) => { stopRequest = reject; });
+    const interrupt = code => {
+      const error = new AcpError(code);
+      stopRequest(error);
+      this.retire(error);
+    };
+    const abort = () => interrupt('cancelled');
     request.signal?.addEventListener('abort', abort, { once: true });
-    const timeout = setTimeout(() => this.retire(new AcpError('timeout')), timeoutMs);
+    const timeout = setTimeout(() => interrupt('timeout'), timeoutMs);
     this.task = this.turn(request, apiKey);
     try {
-      const result = await this.task;
+      const result = await Promise.race([this.task, interrupted]);
       this.check();
-      if (this.sessions.size >= MAX_SESSIONS) await this.retire(new AcpError('closed'));
+      if (this.sessions.size >= MAX_SESSIONS) this.retire(new AcpError('closed'));
       else this.idleTimer = setTimeout(() => this.retire(new AcpError('closed')), IDLE_MS).unref();
       return result;
     } catch (error) {
-      await this.retire(error instanceof AcpError ? error : new AcpError('worker_failed'));
+      const reaped = this.retire(error instanceof AcpError ? error : new AcpError('worker_failed'));
+      // Keep failed workers in the pool until retirement finishes. The caller
+      // can still time out while waiting for cleanup of an earlier error.
+      if (error?.code !== 'acp_timeout' && error?.code !== 'acp_cancelled') {
+        await Promise.race([reaped, interrupted]);
+      }
       throw this.failure;
     } finally {
       this.task = null;
@@ -158,6 +171,8 @@ class Worker {
     clearTimeout(this.idleTimer);
     this.rpc?.stop(error);
     const child = this.child;
+    child?.stdin.destroy();
+    child?.stdout.destroy();
     if (child?.pid) {
       // POSIX workers own a fresh process group, including any CLI helpers.
       try {
@@ -186,6 +201,9 @@ export function createTransport({ binary, authMethod, timeoutMs = 60_000, maxWor
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || authMethod !== AUTH_METHOD ||
       !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000 ||
       !Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8) throw new AcpError('invalid_config');
+  // The host reads settings once per activation. Capture credentials at the
+  // same boundary so every worker in this pool has one billing identity.
+  const apiKey = process.env.GEMINI_API_KEY;
   const workers = new Set();
   let closed = false;
   return {
@@ -198,7 +216,6 @@ export function createTransport({ binary, authMethod, timeoutMs = 60_000, maxWor
           (thinking != null && (typeof thinking !== 'string' || !thinking || thinking.length > 128)) ||
           typeof onText !== 'function') throw new AcpError('invalid_request');
       if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) throw new AcpError('input_limit');
-      const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey?.trim()) throw new AcpError('auth_required');
       let worker = [...workers].find(candidate => !candidate.task && !candidate.failure);
       if (!worker) {
