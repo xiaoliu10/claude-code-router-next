@@ -26,7 +26,7 @@ it('keeps the client search schema alongside other functions at the Messages gat
   const [url, init] = upstream.mock.calls[0];
   expect(String(url)).toContain(model + ':generateContent');
   expect(JSON.parse(String(init.body)).tools[0].functionDeclarations.map((f: any) => [f.name, f.parametersJsonSchema])).toEqual(tools.map(t => [t.name, t.input_schema]));
-  upstream.mockResolvedValueOnce(Response.json({error:{message:'fixture rejection'}},{status:400}));
+  upstream.mockImplementation(async () => Response.json({error:{message:'fixture rejection'}},{status:400}));
   const rejected = await send();
   expect(rejected.statusCode).toBe(400);
   expect(rejected.json().error.message).toBe('fixture rejection');
