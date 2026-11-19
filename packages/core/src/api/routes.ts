@@ -378,7 +378,7 @@ async function handleTransformerEndpoint(
       if (provider?.baseUrl && response?.headers) {
         captureRateLimitHeaders(providerName, provider.baseUrl, response.headers);
       }
-    } catch {}
+    } catch { /* Header accounting is best effort. */ }
 
     // Process response transformer chain
     let finalResponse = await processResponseTransformers(
@@ -399,7 +399,7 @@ async function handleTransformerEndpoint(
       if (providerName && model) {
         getHealthStore().recordSuccess(providerName, model);
       }
-    } catch {}
+    } catch { /* Preserve the successful response if accounting fails. */ }
 
     return result;
   } catch (error: any) {
@@ -830,7 +830,7 @@ async function handleFallback(
             if (provider?.baseUrl && response?.headers) {
               captureRateLimitHeaders(fbProviderName, provider.baseUrl, response.headers);
             }
-          } catch {}
+          } catch { /* Header accounting is best effort. */ }
 
           // Process response transformer chain — propagate codex flags so the
           // fallback response also gets Responses API conversion when needed.
@@ -1290,6 +1290,7 @@ async function sendProviderAttempt(
   }
 
   const managedRequest = config.__ccrManagedRequest;
+  const dispatchedModel = managedRequest?.model ?? requestBody.model;
   let response: Response;
   const dispatchUpstream = () => sendUnifiedRequest(
     url,
@@ -1346,10 +1347,10 @@ async function sendProviderAttempt(
       throw error;
     }
     fastify.log.error(
-      `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
+      `[provider_response_error] Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${errorText}`,
     );
     const error = createApiError(
-      `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
+      `Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${errorText}`,
       response.status,
       "provider_response_error"
     );
@@ -1364,7 +1365,7 @@ async function sendProviderAttempt(
     const isStreamRequest = requestBody.stream === true;
     // DEBUG: log response metadata to diagnose why empty responses bypass checks
     fastify.log.info(
-      `[hidden-error-check] provider=${provider.name} model=${requestBody.model} stream=${requestBody.stream} isStreamRequest=${isStreamRequest} contentType=${contentType} ok=${response.ok} status=${response.status} hasBody=${!!response.body}`
+      `[hidden-error-check] provider=${provider.name} model=${dispatchedModel} stream=${requestBody.stream} isStreamRequest=${isStreamRequest} contentType=${contentType} ok=${response.ok} status=${response.status} hasBody=${!!response.body}`
     );
     // For non-streaming requests, always validate the response body regardless
     // of content-type. Some providers return 200 with empty body or non-JSON
@@ -1412,12 +1413,12 @@ async function sendProviderAttempt(
               throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody), undefined, managedRequest);
             }
             fastify.log.error(
-              `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
+              `[provider_response_error] Hidden error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${bodyText}`,
             );
             // Classify as rate-limit when error text contains relevant keywords
             const isRateLimit = isRateLimitError(bodyText);
             const error = createApiError(
-              `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
+              `Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${bodyText}`,
               // Promote to 400 to trigger fallback and correct usage logging
               400,
               "provider_response_error"
@@ -1439,7 +1440,7 @@ async function sendProviderAttempt(
         // the empty response to the client, which would cause a different error.
         if (e instanceof SyntaxError) {
           fastify.log.warn(
-            `[provider_response_error] Empty or malformed JSON response from provider(${provider.name},${requestBody.model}: 200): "${bodyText}"`
+            `[provider_response_error] Empty or malformed JSON response from provider(${provider.name},${dispatchedModel}: 200): "${bodyText}"`
           );
           const error = createApiError(
             `API returned an empty or malformed response (HTTP 200) from ${provider.name} — check for a proxy or gateway intercepting the request`,
