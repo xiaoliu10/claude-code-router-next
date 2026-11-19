@@ -119,7 +119,11 @@
       <div class="panel-head"><h1>项目</h1><span id="projects-count" class="count"></span><span class="spacer"></span><button id="projects-refresh" class="btn" type="button" title="刷新列表；保留未保存的修改">刷新</button></div>
       <p class="hint">项目路由独立保存；接管客户端需单独应用。</p>
       <div id="projects-msg" class="banner" role="status" aria-live="polite" hidden></div>
-      <div class="projects-picker"><label for="projects-select">当前项目</label><select id="projects-select" class="route-input" aria-label="选择项目"></select></div>
+      <div class="projects-picker"><label for="projects-select">当前项目</label>
+        <div class="project-combo"><input id="projects-select" class="route-input" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="projects-options" autocomplete="off" placeholder="搜索项目名或路径">
+          <div class="project-popup" id="projects-popup" hidden><div id="projects-options" role="listbox" aria-label="项目列表"></div><div id="projects-no-match" role="status" hidden>没有匹配的项目</div></div>
+        </div>
+      </div>
       <div id="projects-body" class="list"></div>
     </section>
 
