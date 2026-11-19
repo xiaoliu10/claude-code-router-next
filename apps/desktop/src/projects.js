@@ -973,25 +973,36 @@
       if (picker.disabled) popup.hidden = true;
       picker.setAttribute('aria-expanded', String(!popup.hidden));
       picker.removeAttribute('aria-activedescendant');
-      options.textContent = '';
       var dirty = new Set(s ? s.dirtyIds : []);
       function label(p) { return p.path + (dirty.has(p.id) ? ' · 未保存' : ''); }
       if (popup.hidden) {
+        options.textContent = '';
+        matches = [];
         var current = projects.find(function (p) { return p.id === s.selectedId; });
         picker.value = current ? label(current) : '';
         return;
       }
       var query = picker.value.trim().toLowerCase();
-      matches = projects.filter(function (p) { return p.path.toLowerCase().includes(query); });
+      var results = projects.filter(function (p) { return p.path.toLowerCase().includes(query); });
+      // Refresh can arrive between mousedown and mouseup on the same option.
+      if (results.length !== matches.length || results.some(function (p, i) { return p.id !== matches[i].id; })) {
+        options.textContent = '';
+        results.forEach(function (p, index) {
+          var row = el('div');
+          row.setAttribute('role', 'option'); row.setAttribute('id', 'project-option-' + index);
+          row.addEventListener('mousedown', function (event) { event.preventDefault(); });
+          row.addEventListener('click', function () { choose(p.id); });
+          options.appendChild(row);
+        });
+      }
+      matches = results;
       if (!matches.some(function (p) { return p.id === activeId; })) activeId = matches.length ? matches[0].id : null;
       noMatch.hidden = !!matches.length;
       matches.forEach(function (p, index) {
-        var active = activeId === p.id, row = el('div', active ? 'project-option active' : 'project-option', label(p));
-        row.setAttribute('role', 'option'); row.setAttribute('id', 'project-option-' + index);
+        var active = activeId === p.id, row = options.children[index], text = label(p);
+        if (row.textContent !== text) row.textContent = text;
+        row.className = active ? 'project-option active' : 'project-option';
         row.setAttribute('aria-selected', String(s.selectedId === p.id));
-        row.addEventListener('mousedown', function (event) { event.preventDefault(); });
-        row.addEventListener('click', function () { choose(p.id); });
-        options.appendChild(row);
         if (active) picker.setAttribute('aria-activedescendant', row.getAttribute('id'));
       });
     }
@@ -1020,6 +1031,7 @@
         if (row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
       } else if (event.key === 'Escape' && !popup.hidden) {
         event.preventDefault(); closePicker();
+        picker.setSelectionRange(0, picker.value.length);
       } else if (event.key === 'Enter' && !popup.hidden) {
         event.preventDefault(); if (activeId !== null) choose(activeId);
       }

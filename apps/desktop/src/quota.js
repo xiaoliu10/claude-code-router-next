@@ -2643,7 +2643,7 @@
     els.openUi.addEventListener('click', function () { safeCommand('quota_open_ui'); });
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') safeCommand('quota_hide');
+      if (event.key === 'Escape' && !event.defaultPrevented) safeCommand('quota_hide');
     });
     // Focus refreshes service status and quota data only; route drafts and
     // usage/client state must survive native select popups and tab changes.

@@ -59,6 +59,38 @@ test('project search filters paths, preserves selection on cancel, handles IME a
   assert.equal(picker.value, '/real/Beta'); assert.equal(h.id('projects-popup').hidden, true);
 });
 
+test('project picker keeps a pressed option through refresh and updates changed results', async () => {
+  const { h, state } = await start();
+  const picker = h.id('projects-select'), options = h.id('projects-options');
+  picker.fire('focus');
+  const pressed = options.children[1];
+  pressed.fire('mousedown');
+  h.id('projects-refresh').fire('click'); await flush();
+  assert.ok(options.children[1] === pressed, 'refresh must preserve the pointer target');
+  pressed.fire('click');
+  assert.equal(picker.value, '/real/Beta');
+
+  picker.fire('focus');
+  state.projects.shift(); state.projects[0].path = '/renamed/Beta';
+  h.id('projects-refresh').fire('click'); await flush();
+  assert.deepEqual(options.children.map(n => n.textContent), ['/renamed/Beta']);
+  assert.equal(options.children[0].getAttribute('aria-selected'), 'true');
+});
+
+test('project picker Escape cancels only the open search and selects the label for fresh typing', async () => {
+  const { h } = await start();
+  const picker = h.id('projects-select');
+  picker.focus(); picker.fire('focus'); picker.value = 'bet'; picker.fire('input');
+  picker.fire('keydown', { key: 'Escape' });
+  assert.equal(h.id('projects-popup').hidden, true);
+  assert.equal(h.doc.activeElement, picker);
+  assert.equal(picker.value, '/real/Alpha');
+  assert.deepEqual([picker.selectionStart, picker.selectionEnd], [0, picker.value.length]);
+  assert.equal(h.calls.filter(c => c.cmd === 'quota_hide').length, 0);
+  picker.fire('keydown', { key: 'Escape' });
+  assert.equal(h.calls.filter(c => c.cmd === 'quota_hide').length, 1);
+});
+
 test('projects interaction: local-only edits, refresh, focus and switching retain independent route and takeover drafts', async () => {
   const { h } = await start(); toggle(h, '使用全局路由', false);
   const input = type(h, '默认 目标', 'alpha,two'); input.setSelectionRange(3, 3);
