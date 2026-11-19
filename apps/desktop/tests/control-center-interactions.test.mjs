@@ -417,3 +417,45 @@ test('interaction: charts and records fall back to the shared empty note when a 
   assert.equal(numCell('平均 TTFT').textContent, '—');
   assert.equal(numCell('生成速度').textContent, '—');
 });
+
+test('Step Plan card preserves exact Credit and replaces account data on each refresh', async () => {
+  const observedAt = new Date(2026, 9, 1, 8).getTime();
+  const day = 86400000;
+  const plan = {
+    state: 'partial', family: 'token', name: 'Token Plus', observedAt, allowed: true, windows: [],
+    creditBuckets: [
+      { type: 'subscription', total: '9007199254740993.0100', remaining: '0', usedPercent: 100, expiresAt: observedAt + 30 * day },
+      { type: 'topup', total: '100.00', remaining: '99.75', usedPercent: 0.25, resetsAt: observedAt + day, expiresAt: observedAt + 2 * day },
+      { type: 'topup', total: '20', remaining: '20', usedPercent: null, expiresAt: observedAt + 4 * day },
+    ],
+  };
+  let current = plan;
+  const h = harness({ quota_snapshot: () => ({ providers: [{ name: 'step', status: current.state === 'unavailable' ? 'unavailable' : 'ready', stepPlan: current }], online: true }) });
+  await flush();
+  const card = h.id('list').querySelector('.card');
+  const windows = () => card.querySelectorAll('.window');
+  const refresh = async next => { current = next; h.id('refresh-all').click(); await flush(); };
+  assert.match(card.textContent, /Token Plus.*部分数据.*账户可用.*观测于 10月1日/s);
+  assert.equal(windows().length, 3);
+  assert.match(windows()[0].textContent, /月度订阅 Credit.*已用 100%.*剩余 0 \/ 总量 9007199254740993\.0100 Credit.*到期 10月31日/);
+  assert.doesNotMatch(windows()[0].textContent, /重置/);
+  assert.match(windows()[1].textContent, /加油包 1 Credit.*已用 0\.25%.*99\.75.*100\.00.*重置 10月2日.*到期 10月3日/);
+  assert.equal(windows()[1].querySelector('progress').value, '0.25');
+  assert.match(windows()[2].textContent, /加油包 2 Credit—.*到期 10月5日/);
+  assert.equal(windows()[2].querySelector('progress'), null);
+  const coding = { state: 'stale', family: 'coding', name: 'Legacy', observedAt, allowed: false, windows: [
+    { id: 'five_hour', limited: true, usedPercent: 0, resetsAt: observedAt + day },
+    { id: 'weekly', limited: false, usedPercent: null },
+  ] };
+  await refresh(coding);
+  assert.match(card.textContent, /Legacy.*数据已陈旧.*账户不可用.*5 小时已用 0%.*重置.*7 天无限额/s);
+  assert.doesNotMatch(card.textContent, /Token Plus|Credit/);
+  assert.equal(windows()[0].querySelector('progress').value, '0');
+  assert.equal(windows()[1].querySelector('progress'), null);
+  await refresh({ ...coding, windows: [{ id: 'weekly', limited: true, usedPercent: null }] });
+  assert.equal(windows()[0].textContent, '7 天—');
+  await refresh({ state: 'unavailable', family: 'none' });
+  assert.match(card.textContent, /不可用/);
+  assert.doesNotMatch(card.textContent, /Token Plus|Credit|Legacy|7 天|账户可用|观测于/);
+  assert.equal(windows().length, 0);
+});

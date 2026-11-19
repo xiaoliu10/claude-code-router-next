@@ -1,5 +1,6 @@
 //! Read-only quota projection. Config and upstream payloads never cross the IPC boundary.
-use crate::api::AdminClient;
+mod step_plan;
+use crate::api::{admin_auth_failed, AdminClient};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -7,6 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
+use step_plan::StepPlan;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::{sync::Mutex, task::JoinSet};
 
@@ -29,6 +31,8 @@ pub struct ProviderQuota {
     status: QuotaStatus,
     message: Option<String>,
     windows: Vec<QuotaWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_plan: Option<StepPlan>,
     updated_at: Option<u64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -159,6 +163,7 @@ fn configured(config: &Value) -> Vec<ConfiguredProvider> {
                     status: QuotaStatus::Unavailable,
                     message: None,
                     windows: vec![],
+                    step_plan: None,
                     updated_at: None,
                 },
                 adapter,
@@ -195,7 +200,17 @@ impl QuotaService {
         }
         cache.attempts.insert(provider.clone(), stamp);
         let config = match &self.client {
-            Some(client) => client.config().await.ok(),
+            Some(client) => match client.config().await {
+                Ok(config) => Some(config),
+                Err(error) if admin_auth_failed(&error) => {
+                    cache.providers.clear();
+                    cache.attempts.clear();
+                    cache.online = false;
+                    cache.error = Some("本地 CCR 认证失败，请检查连接凭证".into());
+                    return Ok(cache.clone());
+                }
+                Err(_) => None,
+            },
             None => None,
         };
         let Some(config) = config else {
@@ -250,6 +265,23 @@ impl QuotaService {
                 match refreshed.iter().find(|r| r.name == entry.row.name) {
                     Some(row) => preserve_stale(row.clone(), previous),
                     None => {
+                        // A per-card aggregate read can also revoke another Step Plan account.
+                        if let Some(result) = aggregate
+                            .as_ref()
+                            .filter(|_| entry.adapter == Adapter::Aggregate)
+                        {
+                            let plan = result
+                                .as_ref()
+                                .ok()
+                                .and_then(|v| aggregate_row(v, &entry.row.name))
+                                .and_then(|q| q.get("stepPlan"));
+                            if let Some(plan) = plan {
+                                return project_step_plan(entry.row, plan);
+                            }
+                            if previous.is_some_and(|p| p.step_plan.is_some()) {
+                                return entry.row;
+                            }
+                        }
                         let mut row = previous.cloned().unwrap_or(entry.row.clone());
                         row.enabled = entry.row.enabled;
                         row
@@ -275,6 +307,10 @@ impl QuotaService {
     }
 }
 fn preserve_stale(mut row: ProviderQuota, previous: Option<&ProviderQuota>) -> ProviderQuota {
+    // The gateway owns Step Plan staleness and credential invalidation. Never merge account samples.
+    if row.step_plan.is_some() || previous.is_some_and(|old| old.step_plan.is_some()) {
+        return row;
+    }
     if matches!(
         row.status,
         QuotaStatus::Unavailable | QuotaStatus::Reauth | QuotaStatus::Cooling
@@ -290,6 +326,23 @@ fn preserve_stale(mut row: ProviderQuota, previous: Option<&ProviderQuota>) -> P
     }
     row
 }
+fn aggregate_row<'a>(value: &'a Value, provider: &str) -> Option<&'a Value> {
+    value["quotas"]
+        .as_array()?
+        .iter()
+        .find(|q| q["provider"].as_str() == Some(provider))
+}
+fn project_step_plan(mut row: ProviderQuota, raw: &Value) -> ProviderQuota {
+    let plan = StepPlan::project(raw);
+    row.updated_at = plan.observed_at;
+    row.status = if plan.state == "unavailable" {
+        QuotaStatus::Unavailable
+    } else {
+        QuotaStatus::Ready
+    };
+    row.step_plan = Some(plan);
+    row
+}
 async fn refresh(
     client: &AdminClient,
     entry: ConfiguredProvider,
@@ -299,12 +352,10 @@ async fn refresh(
     if entry.adapter == Adapter::Aggregate {
         match aggregate {
             Some(Ok(value)) if value["quotas"].is_array() => {
-                if let Some(quota) = value["quotas"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|q| q["provider"].as_str() == Some(&row.name))
-                {
+                if let Some(quota) = aggregate_row(value, &row.name) {
+                    if let Some(raw) = quota.get("stepPlan") {
+                        return project_step_plan(row, raw);
+                    }
                     row.windows = aggregate_windows(quota, entry.local_limits);
                 }
                 row.status = if row.windows.is_empty() {
@@ -453,6 +504,10 @@ fn measured(
         reset_at,
     }
 }
+pub(crate) fn step_plan_tray_lines(value: &Value) -> Vec<String> {
+    StepPlan::project(value).tray_lines()
+}
+
 fn aggregate_windows(value: &Value, local_limits: [bool; 2]) -> Vec<QuotaWindow> {
     ["5h", "7d"]
         .into_iter()
@@ -754,6 +809,63 @@ mod tests {
         assert!(stale.error.is_some());
         assert_eq!(stale.providers[0].windows[0].used, Some(40.0));
         assert_eq!(stale.updated_at, snapshot.updated_at);
+    }
+    #[tokio::test]
+    async fn step_plan_replaces_accounts_and_clears_on_auth_failure() {
+        use crate::api::mock::{response, Mock as Sequence};
+        let config = response(json!({"Providers":[{"name":"step"},{"name":"other"}]}));
+        let exact = "9007199254740993.0100";
+        let token = json!({"state":"partial","family":"token","name":"Plus","observedAt":123,"allowed":true,
+        "account":{"id":"SECRET"},"creditBuckets":[
+            {"type":"subscription","total":exact,"remaining":"0","usedPercent":100,"expiresAt":456,"id":"SECRET"},
+            {"type":"topup","total":"3.00","remaining":"1.21","resetsAt":456,"expiresAt":678},
+            {"type":"topup","total":"2","remaining":"2","usedPercent":0,"expiresAt":789},
+            {"type":"topup","total":"SECRET","remaining":"9"}
+        ]});
+        let mut unavailable = token.clone();
+        unavailable["state"] = json!("unavailable");
+        let aggregate = |plan| {
+            response(
+                json!({"quotas":[{"provider":"step","stepPlan":plan,"used5h":5,"limit5h":10}]}),
+            )
+        };
+        let mock = Sequence::new(vec![
+            config.clone(),
+            aggregate(token.clone()),
+            config.clone(),
+            aggregate(unavailable),
+            config.clone(),
+            aggregate(token),
+            (403, "SECRET".into()),
+        ]);
+        let service = QuotaService::new(Some(mock.client()));
+        let first = service.snapshot(None).await.unwrap();
+        let row = serde_json::to_value(&first.providers[0]).unwrap();
+        assert_eq!(row["windows"], json!([]));
+        assert_eq!(row["updatedAt"], 123);
+        let buckets = row["stepPlan"]["creditBuckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0]["total"], exact);
+        assert_eq!(buckets[1]["usedPercent"], Value::Null);
+        assert_eq!(buckets[2]["expiresAt"], 789);
+        assert!(!row.to_string().contains("SECRET"));
+        service.cache.lock().await.attempts.clear();
+        let cleared = service.snapshot(Some("other".into())).await.unwrap();
+        let plan = serde_json::to_value(&cleared.providers[0]).unwrap();
+        assert_eq!(
+            plan["stepPlan"],
+            json!({"state":"unavailable","family":"none","name":null,"allowed":null,"observedAt":null,"creditBuckets":[],"windows":[]})
+        );
+        service.cache.lock().await.attempts.clear();
+        assert_eq!(
+            service.snapshot(None).await.unwrap().providers[0].status,
+            QuotaStatus::Ready
+        );
+        service.cache.lock().await.attempts.clear();
+        let rejected = service.snapshot(None).await.unwrap();
+        assert!(rejected.providers.is_empty());
+        assert!(!rejected.online);
+        mock.finish().await;
     }
     #[test]
     fn all_configured_rows_in_order_without_models_or_enabled_filter() {
