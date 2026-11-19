@@ -964,17 +964,72 @@
     function tempInput(label, key, disabled) {
       return input(label, buffers.get(key) || '', function (v) { buffers.set(key, v); }, disabled, key);
     }
+    var popup = doc.getElementById('projects-popup'), options = doc.getElementById('projects-options');
+    var noMatch = doc.getElementById('projects-no-match');
+    var activeId = null, matches = [];
+    function updatePicker(s) {
+      var projects = s && s.snapshot ? s.snapshot.projects : [];
+      picker.disabled = !projects.length;
+      if (picker.disabled) popup.hidden = true;
+      picker.setAttribute('aria-expanded', String(!popup.hidden));
+      picker.removeAttribute('aria-activedescendant');
+      options.textContent = '';
+      var dirty = new Set(s ? s.dirtyIds : []);
+      function label(p) { return p.path + (dirty.has(p.id) ? ' · 未保存' : ''); }
+      if (popup.hidden) {
+        var current = projects.find(function (p) { return p.id === s.selectedId; });
+        picker.value = current ? label(current) : '';
+        return;
+      }
+      var query = picker.value.trim().toLowerCase();
+      matches = projects.filter(function (p) { return p.path.toLowerCase().includes(query); });
+      if (!matches.some(function (p) { return p.id === activeId; })) activeId = matches.length ? matches[0].id : null;
+      noMatch.hidden = !!matches.length;
+      matches.forEach(function (p, index) {
+        var active = activeId === p.id, row = el('div', active ? 'project-option active' : 'project-option', label(p));
+        row.setAttribute('role', 'option'); row.setAttribute('id', 'project-option-' + index);
+        row.setAttribute('aria-selected', String(s.selectedId === p.id));
+        row.addEventListener('mousedown', function (event) { event.preventDefault(); });
+        row.addEventListener('click', function () { choose(p.id); });
+        options.appendChild(row);
+        if (active) picker.setAttribute('aria-activedescendant', row.getAttribute('id'));
+      });
+    }
+    function openPicker() {
+      if (!popup.hidden || picker.disabled) return;
+      popup.hidden = false; picker.value = ''; activeId = controller.state().selectedId;
+      updatePicker(controller.state());
+    }
+    function closePicker() { popup.hidden = true; updatePicker(controller && controller.state()); }
+    function choose(id) { closePicker(); localError = ''; controller.select(id); }
+    picker.addEventListener('focus', openPicker);
+    picker.addEventListener('click', openPicker);
+    picker.addEventListener('blur', closePicker);
+    picker.addEventListener('input', function () {
+      popup.hidden = false; activeId = null; updatePicker(controller.state());
+    });
+    picker.addEventListener('keydown', function (event) {
+      if (event.isComposing || event.keyCode === 229 || picker.disabled) return;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault(); openPicker();
+        var index = matches.findIndex(function (p) { return p.id === activeId; });
+        if (index < 0) return;
+        var next = Math.max(0, Math.min(matches.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
+        activeId = matches[next].id; updatePicker(controller.state());
+        var row = options.children[next];
+        if (row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+      } else if (event.key === 'Escape' && !popup.hidden) {
+        event.preventDefault(); closePicker();
+      } else if (event.key === 'Enter' && !popup.hidden) {
+        event.preventDefault(); if (activeId !== null) choose(activeId);
+      }
+    });
     function render() {
       var s = controller && controller.state();
       refresh.disabled = !s || s.loading || !!s.pending;
       count.textContent = s && s.snapshot ? '已配置 ' + s.snapshot.projects.length + ' 个项目' : s && s.loading ? '正在读取…' : '';
       var projects = s && s.snapshot ? s.snapshot.projects : [];
-      picker.textContent = '';
-      projects.forEach(function (p) {
-        var option = el('option', '', p.path + (s.dirtyIds.indexOf(p.id) !== -1 ? ' · 未保存' : ''));
-        option.value = p.id; picker.appendChild(option);
-      });
-      picker.value = s && s.selectedId || ''; picker.disabled = !projects.length;
+      updatePicker(s);
       var p = s && projects.find(function (x) { return x.id === s.selectedId; });
       var d = p && s.draft(p.id), router = p && s.effectiveRouter(p.id);
       var global = p && (d ? d.useGlobal : p.useGlobal);
@@ -1161,7 +1216,6 @@
       if (apply) apply.disabled = busy || sameSet(d ? d.clients : p.takeoverClients, p.takeoverClients);
     }
     refresh.addEventListener('click', function () { if (controller) { localError = ''; controller.refresh(); } });
-    picker.addEventListener('change', function () { if (controller) { localError = ''; controller.select(picker.value); } });
     if (controller) controller.subscribe(render);
     render();
   }
