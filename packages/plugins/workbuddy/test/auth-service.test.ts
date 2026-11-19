@@ -165,6 +165,9 @@ describe("WorkBuddy import flow", () => {
     expect(init.headers["User-Agent"]).toBe("CLI/2.0.0 WorkBuddy/5.5.6");
     expect(init.headers["X-Domain"]).toBe("copilot.tencent.com");
     expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+    // The gateway dispatcher path once served gzip with null encoding headers;
+    // discovery must always request identity so JSON parsing cannot break.
+    expect(init.headers["Accept-Encoding"]).toBe("identity");
 
     const written = configs.get("current");
     const managed = written.Providers.find((p: any) => p.name === "workbuddy");
