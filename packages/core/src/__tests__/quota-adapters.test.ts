@@ -3,6 +3,7 @@ import {
   getQuotaAdapter,
   parseAliyunTokenPlanUsage,
   parseLitellmUserBudgetUsage,
+  parseOneApiBillingUsage,
 } from "../services/quota-adapters";
 import type { LLMProvider } from "../types/llm";
 
@@ -852,6 +853,125 @@ describe("LitellmUserBudgetQuotaAdapter", () => {
     globalThis.fetch = vi.fn(async () =>
       new Response(JSON.stringify({ user_id: "u1", user_info: { spend: 5 } }), { status: 200 })
     ) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+  });
+});
+
+describe("parseOneApiBillingUsage", () => {
+  it("combines subscription and usage into a USD balance window", () => {
+    expect(
+      parseOneApiBillingUsage(
+        { object: "billing_subscription", hard_limit_usd: 42.5, access_until: 1798761600, has_payment_method: true },
+        { object: "list", total_usage: 1250 }
+      )
+    ).toEqual({
+      totalBalance: 42.5,
+      currency: "USD",
+      usedBalance: 12.5,
+      resetTime7d: new Date(1798761600 * 1000).toISOString(),
+    });
+  });
+
+  it("treats an unlimited fallback cap as unqueryable at the cutoff", () => {
+    expect(parseOneApiBillingUsage({ hard_limit_usd: 20000000 }, { total_usage: 300 })).toBeNull();
+    expect(parseOneApiBillingUsage({ hard_limit_usd: 9999999.99 }, { total_usage: 300 })).toEqual({
+      totalBalance: 9999999.99,
+      currency: "USD",
+      usedBalance: 3,
+    });
+  });
+
+  it("returns null without a usable cap", () => {
+    expect(parseOneApiBillingUsage(null, null)).toBeNull();
+    expect(parseOneApiBillingUsage({ hard_limit_usd: -1 }, { total_usage: "x" })).toBeNull();
+    // The parse layer tolerates a missing usage payload (cap-only); the
+    // adapter-level guard rejects one-sided failures before calling it.
+    expect(parseOneApiBillingUsage({ hard_limit_usd: 10 }, null)).toEqual({
+      totalBalance: 10,
+      currency: "USD",
+    });
+  });
+});
+
+describe("getQuotaAdapter framework dispatch", () => {
+  const relay = "https://relay.example.com/v1/messages";
+
+  it("selects the litellm adapter via quota_framework", () => {
+    expect(getQuotaAdapter(relay, makeProvider({ baseUrl: relay, quotaFramework: "litellm" }))).not.toBeNull();
+  });
+
+  it("selects the OpenAI-billing adapter for newapi and one-api aliases", () => {
+    for (const framework of ["newapi", "new-api", "oneapi", "One-API"]) {
+      expect(getQuotaAdapter(relay, makeProvider({ baseUrl: relay, quotaFramework: framework }))).not.toBeNull();
+    }
+  });
+
+  it("the framework selector wins over a hostname match, unknown values fall through", () => {
+    const host = "https://api.deepseek.com/chat/completions";
+    const hostOnly = getQuotaAdapter(host);
+    expect(hostOnly).not.toBeNull();
+    expect(getQuotaAdapter(host, makeProvider({ baseUrl: host, quotaFramework: "oneapi" }))).not.toBe(hostOnly);
+    expect(getQuotaAdapter(host, makeProvider({ baseUrl: host, quotaFramework: "unknown-relay" }))).toBe(hostOnly);
+  });
+});
+
+describe("OpenAiBillingQuotaAdapter", () => {
+  function billingProvider(): LLMProvider {
+    return makeProvider({
+      name: "relay",
+      baseUrl: "https://relay.example.com/v1/messages",
+      apiKey: "sk-relay-key",
+      quotaToken: undefined,
+      quotaFramework: "newapi",
+    });
+  }
+
+  it("queries subscription and usage with the relay key and combines the window", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ hard_limit_usd: 42.5, access_until: 1798761600 }),
+        { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ total_usage: 1250 }), { status: 200 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const p = billingProvider();
+    const adapter = getQuotaAdapter(p.baseUrl, p);
+    expect(adapter).not.toBeNull();
+    expect(await adapter!.queryQuota(p, 1000)).toEqual({
+      totalBalance: 42.5,
+      currency: "USD",
+      usedBalance: 12.5,
+      resetTime7d: new Date(1798761600 * 1000).toISOString(),
+    });
+    const [subUrl, subInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const [usageUrl] = fetchMock.mock.calls[1] as unknown as [string];
+    expect(String(subUrl)).toBe("https://relay.example.com/v1/dashboard/billing/subscription");
+    expect(String(usageUrl)).toBe("https://relay.example.com/v1/dashboard/billing/usage?start_date=2000-01-01&end_date=2037-12-31");
+    expect((subInit.headers as Record<string, string>).Authorization).toBe("Bearer sk-relay-key");
+  });
+
+  it("returns null unless BOTH billing endpoints succeed, keeping the last full sample", async () => {
+    const p = billingProvider();
+    const adapter = getQuotaAdapter(p.baseUrl, p)!;
+    const ok = (body: unknown) =>
+      new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    const subscription = { hard_limit_usd: 10, access_until: 1798761600 };
+    // Both fail → null.
+    globalThis.fetch = vi.fn(async () => new Response("{}", { status: 404 })) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+    // Cap arrives but usage fails → null (never a spend-less exhausted reset).
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce(ok(subscription))
+      .mockResolvedValueOnce(new Response("{}", { status: 503 })) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+    // Usage arrives but the cap fails → null.
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 503 }))
+      .mockResolvedValueOnce(ok({ total_usage: 100 })) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+    // A 200 usage body without a numeric total_usage is incomplete → null.
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce(ok(subscription))
+      .mockResolvedValueOnce(ok({ object: "list", daily_costs: [] })) as unknown as typeof fetch;
     expect(await adapter.queryQuota(p, 1000)).toBeNull();
   });
 });
