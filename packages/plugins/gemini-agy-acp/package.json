@@ -1,0 +1,13 @@
+{
+  "name": "@wengine-ai/ccr-provider-gemini-agy-acp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/plugin.js",
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}

@@ -1,0 +1,166 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { activateWithTransport } from '../src/plugin.mjs';
+
+const name = 'gemini-agy-acp';
+const provider = { name, apiKey: `ccr-managed-${name}`, models: ['model-1', 'model-high'] };
+const settings = { enabled: true, binary: '/path/to/local/fixture', authMethod: 'gemini-api-key' };
+const body = { model: 'model-1', messages: [{ role: 'user', content: 'hello' }] };
+const end = { stopReason: 'end_turn' };
+
+async function activate(t, local, run = t.mock.fn(async () => end)) {
+  const configDir = await mkdtemp(join(tmpdir(), 'agy-plugin-'));
+  t.after(() => rm(configDir, { recursive: true, force: true }));
+  if (local !== undefined) await writeFile(join(configDir, `${name}.json`), JSON.stringify(local));
+  let transformer, runtime;
+  const factory = t.mock.fn(() => ({ run, async close() {} }));
+  await activateWithTransport({ host: { configDir }, registerTransformer(cls) { transformer = new cls(); },
+    registerManagedRuntime(value) { runtime = value; } }, factory);
+  const attempt = t.mock.fn(() => { throw Error('Unexpected HTTP attempt'); });
+  t.after(() => assert.equal(attempt.mock.callCount(), 0));
+  const dispatch = (requestBody = body, req = { body: requestBody }, config = {}) =>
+    runtime.dispatchRequest({ requestBody, req, config, provider, attempt });
+  return { dispatch, factory, run, runtime, transformer };
+}
+
+test('reserved provider name is exact and the plugin remains disabled until local opt-in', async t => {
+  for (const local of [undefined, {}, { ...settings, enabled: 'true' }, { ...settings, enabled: false }]) {
+    const p = await activate(t, local);
+    assert.equal(p.runtime.isManaged(provider), true);
+    for (const other of ['gemini-oauth', 'Gemini-agy-acp', 'gemini-agy-acp-2']) {
+      assert.equal(p.runtime.isManaged({ ...provider, name: other }), false);
+    }
+    assert.equal(p.transformer.name, name);
+    const req = { body, enableFallback: true };
+    assert.throws(() => p.transformer.transformRequestIn(body, provider, { req }), { code: 'agy_disabled' });
+    assert.equal(req.enableFallback, false);
+    await assert.rejects(p.dispatch(), { code: 'agy_disabled' });
+    assert.equal(p.factory.mock.callCount(), 0);
+    assert.equal((await p.runtime.probeAccountState()).available, false);
+    await assert.rejects(p.runtime.signRequest({}), { code: 'agy_http_disabled' });
+  }
+});
+
+test('only absolute local binary, API-key auth and bounded worker settings are accepted', async t => {
+  for (const overrides of [{ binary: 'agy' }, { authMethod: 'consumer-login' }, { timeoutMs: 0 }, { maxWorkers: 20 }]) {
+    const p = await activate(t, { ...settings, ...overrides });
+    const req = { enableFallback: true, body };
+    await assert.rejects(p.dispatch(body, req), { code: 'agy_config_invalid' });
+    assert.equal(req.enableFallback, false);
+    assert.equal(p.factory.mock.callCount(), 0);
+  }
+});
+
+test('aggregate passes ordered text, exact model and separate effort, disregards client process settings', async t => {
+  const run = t.mock.fn(async ({ onText }) => { onText('first'); onText(' second'); return { stopReason: 'max_tokens' }; });
+  const p = await activate(t, settings, run);
+  const request = { model: 'model-high', binary: 'untrusted-binary', authMethod: 'consumer-login', api_key: 'test-key',
+    reasoning_effort: 'high', messages: [{ role: 'system', content: 'Instruction' }, ...body.messages,
+      { role: 'assistant', content: 'Previous' }, { role: 'user', content: [{ type: 'text', text: 'Next' }] }] };
+  const req = { body: request, enableFallback: true };
+  const transformed = p.transformer.transformRequestIn(request, provider, { req });
+  const response = await (await p.dispatch(transformed.body, req)).json();
+  assert.deepEqual(response.choices, [{ index: 0, message: { role: 'assistant', content: 'first second' }, finish_reason: 'length' }]);
+  assert.equal(response.model, request.model);
+  assert.equal(response.object, 'chat.completion');
+  const input = run.mock.calls[0].arguments[0];
+  assert.equal(input.model, 'model-high');
+  assert.equal(input.thinking, 'high');
+  assert.deepEqual(JSON.parse(input.prompt.split('\n')[1]), [...request.messages.slice(0, 3), { role: 'user', content: 'Next' }]);
+  assert.deepEqual(Object.keys(input).sort(), ['model', 'onText', 'prompt', 'signal', 'thinking']);
+  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 1, timeoutMs: 60000 }]);
+  assert.equal(req.enableFallback, false);
+  await p.dispatch({ ...body, reasoning: { effort: 'max' } }, { body: { ...body, output_config: { effort: 'xhigh' } } });
+  assert.equal(run.mock.calls[1].arguments[0].thinking, 'xhigh');
+});
+
+test('rejects unsupported original/normalized content and out-of-catalog model before ACP', async t => {
+  const p = await activate(t, settings);
+  for (const extra of [{ tools: [{}] }, { tool_choice: 'auto' }, { functions: [{}] }, { modalities: ['audio'] },
+    { system: [{ type: 'image' }] }, { messages: [{ role: 'assistant', tool_calls: [], content: '' }] },
+    { messages: [{ role: 'tool', content: 'result' }] }, { messages: [{ role: 'developer', content: 'x' }] },
+    { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }, { type: 'image_url' }] }] }]) {
+    const invalid = { ...body, ...extra };
+    assert.throws(() => p.transformer.transformRequestIn(body, provider, { req: { body: invalid } }), { code: 'agy_unsupported_request' });
+    await assert.rejects(p.dispatch(invalid), { code: 'agy_unsupported_request' });
+  }
+  for (const extra of [{ model: 'model' }, { reasoning_effort: 'other' }]) {
+    await assert.rejects(p.dispatch({ ...body, ...extra }), { statusCode: 400 });
+  }
+  assert.throws(() => p.transformer.transformRequestIn(body, { ...provider, apiKey: 'test-key' }, {}), { code: 'agy_provider_config_invalid' });
+  assert.equal(p.run.mock.callCount(), 0);
+});
+
+test('OpenAI SSE exposes incremental text before completion and finishes once', async t => {
+  let finish;
+  const p = await activate(t, settings, async ({ onText }) => {
+    onText('first'); await new Promise(resolve => { finish = resolve; }); onText('second'); return end;
+  });
+  const response = await p.dispatch({ ...body, stream: true });
+  const reader = response.body.getReader();
+  const next = async () => new TextDecoder().decode((await reader.read()).value);
+  const chunk = async () => JSON.parse((await next()).slice(6));
+  assert.match(response.headers.get('content-type'), /event-stream/);
+  const first = await chunk();
+  assert.equal(first.object, 'chat.completion.chunk');
+  assert.deepEqual(first.choices[0].delta, { role: 'assistant' });
+  assert.deepEqual((await chunk()).choices[0].delta, { content: 'first' });
+  finish();
+  assert.deepEqual((await chunk()).choices[0].delta, { content: 'second' });
+  assert.equal((await chunk()).choices[0].finish_reason, 'stop');
+  assert.equal(await next(), 'data: [DONE]\n\n');
+  assert.equal((await reader.read()).done, true);
+});
+
+test('early errors preserve safe codes/status and late failures end the stream explicitly', async t => {
+  const failed = () => { throw Object.assign(new Error('secret stderr'), { statusCode: 401, code: 'auth_required' }); };
+  const p = await activate(t, settings, failed);
+  for (const stream of [false, true]) {
+    await assert.rejects(p.dispatch({ ...body, stream }), { message: 'auth_required', code: 'auth_required', statusCode: 401, nonRetryable: true });
+  }
+  const late = await activate(t, settings, ({ onText }) => { onText('text'); failed(); });
+  const sse = await (await late.dispatch({ ...body, stream: true })).text();
+  assert.match(sse, /"error":\{"code":"auth_required"/);
+  assert.doesNotMatch(sse, /secret stderr|\[DONE\]/);
+});
+
+test('aggregate AND stream bound both bytes and tiny-frame count', async t => {
+  for (const oversize of [true, false]) {
+    const p = await activate(t, settings, async ({ onText }) => {
+      if (oversize) onText('x'.repeat(1024 * 1024 + 1));
+      else for (let i = 0; i < 8193; i++) onText('x');
+      return end;
+    });
+    await assert.rejects(p.dispatch(body), { code: 'agy_output_limit' });
+    if (oversize) await assert.rejects(p.dispatch({ ...body, stream: true }), { code: 'agy_output_limit' });
+    else assert.match(await (await p.dispatch({ ...body, stream: true })).text(), /"code":"agy_output_limit"/);
+  }
+});
+
+test('Fastify socket disconnect, request abort and stream cancellation abort the same transport run', async t => {
+  for (const source of ['socket', 'aborted', 'reader']) {
+    const raw = Object.assign(new EventEmitter(), { socket: new EventEmitter() });
+    let signal;
+    const p = await activate(t, settings, async input => {
+      signal = input.signal;
+      input.onText('started');
+      await new Promise((resolve, reject) => signal.addEventListener('abort', reject, { once: true }));
+    });
+    const req = { body, raw };
+    const result = p.dispatch({ ...body, stream: source === 'reader' }, req);
+    raw.emit('close');
+    assert.equal(signal.aborted, false);
+    if (source === 'reader') await (await result).body.cancel();
+    else {
+      if (source === 'socket') raw.socket.emit('close'); else raw.emit('aborted');
+      await assert.rejects(result, { code: 'agy_cancelled' });
+    }
+    assert.equal(signal.aborted, true);
+    assert.equal(raw.listenerCount('aborted'), 0);
+    assert.equal(raw.socket.listenerCount('close'), 0);
+  }
+});
