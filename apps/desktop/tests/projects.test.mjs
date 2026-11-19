@@ -72,6 +72,28 @@ test('projects refresh preserves dirty draft and original revision; stale save c
   c.resetDraft('a'); assert.equal(c.state().isClean('a'), true); assert.equal(c.state().actionError, null);
 });
 
+test('takeover acknowledgement preserves a toggle reverted while the request is pending', async () => {
+  const { c, calls } = await setup();
+  c.setTakeoverClient('a', 'pi', true); c.applyTakeover('a');
+  c.setTakeoverClient('a', 'pi', false);
+  const response = snapshot(); response.projects[0].takeoverClients.push('pi'); response.projects[0].revision = 'a2';
+  calls[1].resolve(response); await flush();
+  const state = c.state();
+  assert.equal(state.draft('a').baseRev, 'a2');
+  assert.deepEqual(plain(state.draft('a').clients), ['claudeCode']);
+  assert.equal(state.isClean('a'), false); assert.equal(state.savedFlash, null);
+});
+
+test('route acknowledgement preserves a return to global routing while save is pending', async () => {
+  const { c, calls } = await setup();
+  c.setUseGlobal('a', false); c.save('a'); c.setUseGlobal('a', true);
+  const response = snapshot(); Object.assign(response.projects[0], { useGlobal: false, router: calls[1].args.change.router, revision: 'a2' });
+  calls[1].resolve(response); await flush();
+  const state = c.state();
+  assert.equal(state.draft('a').baseRev, 'a2'); assert.equal(state.draft('a').useGlobal, true);
+  assert.equal(state.isRouterDirty('a'), true); assert.equal(state.savedFlash, null);
+});
+
 test('projects failed save retains all drafts and scopes errors to the original project', async () => {
   const { c, calls } = await setup(); c.setUseGlobal('a', false); c.save('a'); c.select('b');
   calls[1].reject(new Error('APIKEY=sensitive upstream body')); await flush();

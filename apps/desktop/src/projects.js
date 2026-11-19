@@ -363,6 +363,9 @@
       // Compare drafts to their previous snapshot before adopting external edits.
       var cleanClients = new Set();
       drafts.forEach(function (draft, id) {
+        // The outstanding write has changed the baseline for this project.
+        // Compare its latest edits with the acknowledged response below.
+        if (id === acknowledgedId) return;
         var previous = findProject(id);
         if (isClean(id)) drafts.delete(id);
         else if (previous && sameSet(draft.clients, previous.takeoverClients)) cleanClients.add(id);
