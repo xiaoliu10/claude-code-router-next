@@ -47,6 +47,12 @@ export interface ProviderQuotaFigures {
   totalBalance?: number;
   /** ISO timestamp at which the 7d window resets. */
   resetTime7d?: string;
+  /** Explicit limit for the monthly (30d) window, when exposed. */
+  limitMonthly?: number;
+  /** Spend inside the monthly (30d) window. */
+  usedMonthlyBalance?: number;
+  /** ISO timestamp at which the monthly window resets. */
+  resetTimeMonthly?: string;
   /** Currency code; when absent the UI renders the figures as rate-limit units. */
   currency?: string;
 }

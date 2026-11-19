@@ -451,7 +451,7 @@ export function ProviderList({ providers, providerIds, healthStates, quotaUsages
                 </div>
               )}
               
-              {quota && (quota.used5h > 0 || quota.used7d > 0 || quota.limit5h !== undefined || quota.limit7d !== undefined) && (
+              {quota && (quota.used5h > 0 || quota.used7d > 0 || (quota.used30d ?? 0) > 0 || quota.limit5h !== undefined || quota.limit7d !== undefined || quota.limit30d !== undefined) && (
                 <div className="space-y-2 py-1 max-w-md">
                   <QuotaProgressBar
                     label={quota.type5h === 'balance' ? t("providers.quota_balance") : t("providers.quota_5h")}
@@ -471,6 +471,17 @@ export function ProviderList({ providers, providerIds, healthStates, quotaUsages
                     currency={quota.currency}
                     t={t}
                   />
+                  {(quota.used30d !== undefined || quota.limit30d !== undefined) && (
+                    <QuotaProgressBar
+                      label={quota.type30d === 'balance' ? t("providers.quota_balance") : t("providers.quota_30d")}
+                      used={quota.used30d ?? 0}
+                      limit={quota.limit30d}
+                      resetTime={quota.limit30d ? quota.reset30d : undefined}
+                      isBalance={quota.type30d === 'balance'}
+                      currency={quota.currency}
+                      t={t}
+                    />
+                  )}
                 </div>
               )}
               
