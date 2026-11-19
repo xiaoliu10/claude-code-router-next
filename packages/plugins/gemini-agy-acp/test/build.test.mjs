@@ -2,6 +2,52 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+
+test('build fails without destroying the previous dist when the card source is missing', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-card-guard-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, 'source');
+  await mkdir(join(source, 'src'), { recursive: true });
+  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/transport.mjs', 'src/card.mjs', 'src/chat.mjs', 'src/plugin.mjs']) {
+    await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
+  }
+  execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: source });
+  const packaged = await readFile(join(source, 'dist', 'card.js'), 'utf8');
+  await rm(join(source, 'src', 'card.mjs'));
+  try {
+    execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: source, encoding: 'utf8' });
+    assert.fail('build must fail without the card source');
+  } catch (error) {
+    assert.match(String(error.stderr), /Missing management card source/);
+  }
+  assert.equal(await readFile(join(source, 'dist', 'card.js'), 'utf8'), packaged);
+});
+
+test('management card mounts from a DOM stub, localizes the badge and unmounts cleanly', async () => {
+  const source = await readFile(new URL('../src/card.mjs', import.meta.url), 'utf8');
+  // The card must stay free of imports and browser/network escape hatches.
+  assert.doesNotMatch(source, /(^|[^\w.])import\s|fetch\(|XMLHttpRequest|innerHTML|eval\(|new Function/);
+  const card = (await import('../src/card.mjs')).default;
+  for (const locale of ['en', 'zh']) for (const disabled of [false, true]) {
+    const events = [];
+    const make = () => ({ style: {}, className: '', textContent: '', children: [],
+      append(...kids) { this.children.push(...kids); },
+      remove() { events.push('remove'); },
+      replaceChildren() { this.children.length = 0; events.push('clear'); } });
+    const previous = globalThis.document;
+    globalThis.document = { createElement: () => make() };
+    try {
+      const host = make();
+      card.mount(host, { locale, disabled, plugin: { name: 'gemini-agy-acp', version: '0.0.2' } });
+      assert.equal(host.children.length, 1);
+      const badge = host.children[0].children[0].children[1];
+      assert.match(badge.textContent, disabled ? /Disabled|未启用/ : /Enabled|已启用/);
+      card.unmount(host);
+      assert.deepEqual(events, ['remove', 'clear']);
+      assert.equal(host.children.length, 0);
+    } finally { globalThis.document = previous; }
+  }
+});
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 

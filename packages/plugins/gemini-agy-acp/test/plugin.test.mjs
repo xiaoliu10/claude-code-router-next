@@ -21,7 +21,8 @@ async function activate(t, local, run = t.mock.fn(async () => end)) {
   const factory = t.mock.fn(() => ({ run, async close() {} }));
   await activateWithTransport({ host: { configDir }, registerTransformer(cls) { transformer = new cls(); },
     registerManagedRuntime(value) { runtime = value; }, registerUiCard }, factory);
-  assert.deepEqual(registerUiCard.mock.calls.at(-1)?.arguments, [{ cardPath: 'card.js' }]);
+  assert.equal(registerUiCard.mock.callCount(), 1);
+  assert.deepEqual(registerUiCard.mock.calls[0].arguments, [{ cardPath: 'card.js' }]);
   const attempt = t.mock.fn(() => { throw Error('Unexpected HTTP attempt'); });
   t.after(() => assert.equal(attempt.mock.callCount(), 0));
   const dispatch = (requestBody = body, req = { body: requestBody }, config = {}) =>
