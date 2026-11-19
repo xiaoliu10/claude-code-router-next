@@ -31,6 +31,12 @@ describe("isQuotaWindowExpired", () => {
 });
 
 describe("captureRateLimitHeaders stores samples the quota merge consumes", () => {
+  it("reads rate limits from npm undici response headers", async () => {
+    const { Headers } = await import("undici");
+    const headers = new Headers({ "x-ratelimit-remaining": "17" });
+    captureRateLimitHeaders("proxy-sample", "https://example.com", headers);
+    expect(getAllRateLimitInfo().find(row => row.provider === "proxy-sample")?.remaining).toBe(17);
+  });
   it("captures x-ratelimit headers into the provider store", () => {
     captureRateLimitHeaders("quota-expiry-fixture", "https://example.invalid/v1/messages", {
       "x-ratelimit-remaining-tokens": "40",

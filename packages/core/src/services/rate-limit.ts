@@ -51,7 +51,7 @@ export function captureRateLimitHeaders(
   void apiBaseUrl;
 
   const getHeader = (name: string): string | null => {
-    if (headers instanceof Headers) {
+    if (typeof headers.get === 'function') {
       return headers.get(name);
     }
     // Case-insensitive lookup for plain objects

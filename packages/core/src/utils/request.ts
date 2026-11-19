@@ -1,6 +1,7 @@
 import { UnifiedChatRequest } from "../types/llm";
 import { getProxyDispatcher } from "../services/proxy";
 import { maskHeaders } from "./debug-log";
+import { fetch as proxyFetch } from "undici";
 
 export function sendUnifiedRequest(
   url: URL | string,
@@ -32,7 +33,7 @@ export function sendUnifiedRequest(
     combinedSignal = timeoutSignal;
   }
 
-  const fetchOptions: RequestInit = {
+  const fetchOptions = {
     method: "POST",
     headers: headers,
     body: JSON.stringify(request),
@@ -42,11 +43,7 @@ export function sendUnifiedRequest(
     ...(config.redirect ? { redirect: config.redirect } : {}),
   };
 
-  if (config.dispatcher) {
-    (fetchOptions as any).dispatcher = config.dispatcher;
-  } else if (config.httpsProxy) {
-    (fetchOptions as any).dispatcher = getProxyDispatcher(config.httpsProxy);
-  }
+  const dispatcher = config.dispatcher ?? (config.httpsProxy ? getProxyDispatcher(config.httpsProxy) : undefined);
   logger?.debug(
     {
       reqId: context.req.id,
@@ -57,7 +54,15 @@ export function sendUnifiedRequest(
     },
     "final request"
   );
-  return fetch(typeof url === "string" ? url : url.toString(), fetchOptions);
+  const endpoint = url.toString();
+  if (config.httpsProxy && !config.dispatcher) {
+    // The npm ProxyAgent and Node's built-in fetch can speak different
+    // dispatcher protocols. Pair the agent with its own fetch to retain
+    // response headers (including Content-Type and Content-Encoding).
+    // SAFETY: consumers use the standard Response headers, body and clone API.
+    return proxyFetch(endpoint, { ...fetchOptions, headers: Object.fromEntries(headers), dispatcher }) as unknown as Promise<Response>;
+  }
+  return fetch(endpoint, { ...fetchOptions, dispatcher } as RequestInit);
 }
 
 // Strip credentials from a proxy URL before it lands in logs. Returns undefined
