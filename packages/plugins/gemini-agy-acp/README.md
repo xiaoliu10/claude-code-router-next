@@ -11,7 +11,7 @@ Experimental local provider for CCR 2.3.2433 (provider plugin API 1). A text cha
 Run the following in the isolated CCR instance described below. Installing the package leaves the transport disabled until the operator enables it.
 
 ```sh
-ccr plugin add @wengine-ai/ccr-provider-gemini-agy-acp@0.0.1
+ccr plugin add @wengine-ai/ccr-provider-gemini-agy-acp@0.0.2
 ```
 
 ## Build and install locally

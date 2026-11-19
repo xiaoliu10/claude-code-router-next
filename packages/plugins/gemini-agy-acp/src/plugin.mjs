@@ -56,6 +56,9 @@ export async function activateWithTransport(ctx, createTransport) {
     }
   }
   ctx.registerTransformer(AgyTransformer);
+  // Read-only management card; the UI renders a hard failure for enabled
+  // plugins that ship none, so this prototype must always declare one.
+  ctx.registerUiCard?.({ cardPath: 'card.js' });
   ctx.registerManagedRuntime({
     name: NAME,
     // Claim this exact reserved name even on a malformed entry, so it fails
