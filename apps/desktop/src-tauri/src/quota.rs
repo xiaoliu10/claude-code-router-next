@@ -5,8 +5,9 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
-    time::{SystemTime, UNIX_EPOCH},
+    collections::{hash_map::RandomState, HashMap, HashSet},
+    hash::BuildHasher,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use step_plan::StepPlan;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -50,8 +51,6 @@ pub struct QuotaSnapshot {
     updated_at: u64,
     online: bool,
     error: Option<String>,
-    #[serde(skip)]
-    attempts: HashMap<Option<String>, u64>,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SourceError {
@@ -73,12 +72,31 @@ struct ConfiguredProvider {
     row: ProviderQuota,
     adapter: Adapter,
     local_limits: [bool; 2],
+    step_plan_fingerprint: u64,
+}
+
+const REFRESH_THROTTLE_MS: u64 = 3_000;
+// Managed-card reads can reuse a Step Plan observation for at most the gateway's stale window.
+const STEP_PLAN_REUSE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy)]
+struct StepPlanIdentity {
+    fingerprint: u64,
+    cached_at: Instant,
+}
+
+struct QuotaCache {
+    snapshot: QuotaSnapshot,
+    attempts: HashMap<Option<String>, u64>,
+    step_plan_identities: HashMap<String, StepPlanIdentity>,
 }
 
 pub struct QuotaService {
     client: Option<AdminClient>,
+    // A per-service key lets us compare raw config without retaining credentials or endpoints.
+    step_plan_hasher: RandomState,
     // Holding this lock through refresh gives all callers one shared in-flight refresh.
-    cache: Mutex<QuotaSnapshot>,
+    cache: Mutex<QuotaCache>,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -112,7 +130,7 @@ fn live(value: &Value) -> bool {
         .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
         .is_some_and(|date| date.unix_timestamp_nanos() > now() as i128 * 1_000_000)
 }
-fn configured(config: &Value) -> Vec<ConfiguredProvider> {
+fn configured(config: &Value, step_plan_hasher: &RandomState) -> Vec<ConfiguredProvider> {
     let mut seen = HashSet::new();
     config["Providers"]
         .as_array()
@@ -123,10 +141,12 @@ fn configured(config: &Value) -> Vec<ConfiguredProvider> {
             if name.contains(',') || name.trim() != name || !seen.insert(name.clone()) {
                 return None;
             }
-            let key = entry["api_key"]
+            let credential = entry["api_key"]
                 .as_str()
-                .or_else(|| entry["apiKey"].as_str())
-                .unwrap_or("");
+                .or_else(|| entry["apiKey"].as_str());
+            let endpoint = entry["api_base_url"].as_str();
+            let enabled = entry["enabled"] != false;
+            let key = credential.unwrap_or("");
             let flag = |a: &str, b: &str| entry[a] == true || entry[b] == true;
             let adapter = match name.as_str() {
                 "codex-subscription"
@@ -158,7 +178,7 @@ fn configured(config: &Value) -> Vec<ConfiguredProvider> {
             Some(ConfiguredProvider {
                 row: ProviderQuota {
                     name,
-                    enabled: entry["enabled"] != false,
+                    enabled,
                     plan: None,
                     status: QuotaStatus::Unavailable,
                     message: None,
@@ -171,43 +191,80 @@ fn configured(config: &Value) -> Vec<ConfiguredProvider> {
                     !entry["quota"]["limit5h"].is_null(),
                     !entry["quota"]["limit7d"].is_null(),
                 ],
+                step_plan_fingerprint: step_plan_hasher.hash_one((credential, endpoint, enabled)),
             })
         })
         .collect()
 }
+impl QuotaCache {
+    fn throttled(&self, provider: &Option<String>, stamp: u64) -> bool {
+        self.attempts
+            .get(provider)
+            .is_some_and(|at| stamp.saturating_sub(*at) < REFRESH_THROTTLE_MS)
+    }
+
+    fn invalidate_step_plans(&mut self, rows: &[ConfiguredProvider], stamp: u64) {
+        self.snapshot.providers.retain_mut(|row| {
+            if row.step_plan.is_none() {
+                return true;
+            }
+            let current = rows.iter().find(|entry| entry.row.name == row.name);
+            if current.is_some_and(|entry| {
+                self.step_plan_identities.get(&row.name).is_some_and(|old| {
+                    old.fingerprint == entry.step_plan_fingerprint
+                        && old.cached_at.elapsed() < STEP_PLAN_REUSE_MAX_AGE
+                })
+            }) {
+                return true;
+            }
+            self.step_plan_identities.remove(&row.name);
+            self.attempts.remove(&Some(row.name.clone()));
+            self.attempts.remove(&None);
+            self.snapshot.updated_at = stamp;
+            if let Some(entry) = current {
+                *row = entry.row.clone();
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 impl QuotaService {
     pub fn new(client: Option<AdminClient>) -> Self {
         Self {
             client,
-            cache: Mutex::new(QuotaSnapshot {
-                providers: vec![],
-                updated_at: now(),
-                online: false,
-                error: None,
+            step_plan_hasher: RandomState::new(),
+            cache: Mutex::new(QuotaCache {
+                snapshot: QuotaSnapshot {
+                    providers: vec![],
+                    updated_at: now(),
+                    online: false,
+                    error: None,
+                },
                 attempts: HashMap::new(),
+                step_plan_identities: HashMap::new(),
             }),
         }
     }
     pub async fn snapshot(&self, provider: Option<String>) -> Result<QuotaSnapshot, String> {
         let mut cache = self.cache.lock().await;
         let stamp = now();
-        if cache
-            .attempts
-            .get(&provider)
-            .is_some_and(|at| stamp.saturating_sub(*at) < 3_000)
-        {
-            return Ok(cache.clone());
+        // A throttled response may include Step Plan data for a different row than requested.
+        if cache.step_plan_identities.is_empty() && cache.throttled(&provider, stamp) {
+            return Ok(cache.snapshot.clone());
         }
-        cache.attempts.insert(provider.clone(), stamp);
         let config = match &self.client {
             Some(client) => match client.config().await {
                 Ok(config) => Some(config),
                 Err(error) if admin_auth_failed(&error) => {
-                    cache.providers.clear();
+                    cache.snapshot.providers.clear();
+                    cache.step_plan_identities.clear();
                     cache.attempts.clear();
-                    cache.online = false;
-                    cache.error = Some("本地 CCR 认证失败，请检查连接凭证".into());
-                    return Ok(cache.clone());
+                    cache.snapshot.online = false;
+                    cache.snapshot.error = Some("本地 CCR 认证失败，请检查连接凭证".into());
+                    return Ok(cache.snapshot.clone());
                 }
                 Err(_) => None,
             },
@@ -215,22 +272,28 @@ impl QuotaService {
         };
         let Some(config) = config else {
             cache.attempts.insert(provider.clone(), now());
-            cache.online = false;
-            cache.error = Some("无法连接本地 CCR，显示上次已知数据（可能过期）".into());
-            for row in &mut cache.providers {
+            cache.snapshot.online = false;
+            cache.snapshot.error = Some("无法连接本地 CCR，显示上次已知数据（可能过期）".into());
+            cache.step_plan_identities.clear();
+            for row in &mut cache.snapshot.providers {
                 if row.step_plan.is_some() {
                     *row = project_step_plan(row.clone(), &Value::Null);
                 }
             }
-            return Ok(cache.clone());
+            return Ok(cache.snapshot.clone());
         };
-        let rows = configured(&config);
+        let rows = configured(&config, &self.step_plan_hasher);
+        drop(config);
+        cache.invalidate_step_plans(&rows, stamp);
         if provider
             .as_ref()
             .is_some_and(|name| !rows.iter().any(|r| &r.row.name == name))
         {
             cache.attempts.remove(&provider);
             return Err("Provider is no longer configured".into());
+        }
+        if cache.throttled(&provider, stamp) {
+            return Ok(cache.snapshot.clone());
         }
         let client = self.client.as_ref().expect("config requires client");
         let chosen: Vec<_> = rows
@@ -263,35 +326,51 @@ impl QuotaService {
                 }
             }
         }
+        cache.invalidate_step_plans(&rows, stamp);
+        let mut step_plan_identities = HashMap::new();
         let providers = rows
             .into_iter()
             .map(|entry| {
-                let previous = cache.providers.iter().find(|r| r.name == entry.row.name);
-                match refreshed.iter().find(|r| r.name == entry.row.name) {
-                    Some(row) => preserve_stale(row.clone(), previous),
-                    None => {
-                        // A per-card aggregate read can also revoke another Step Plan account.
-                        if let Some(result) = aggregate
-                            .as_ref()
-                            .filter(|_| entry.adapter == Adapter::Aggregate)
-                        {
-                            let plan = result
-                                .as_ref()
-                                .ok()
-                                .and_then(|v| aggregate_row(v, &entry.row.name))
-                                .and_then(|q| q.get("stepPlan"));
-                            if let Some(plan) = plan {
-                                return project_step_plan(entry.row, plan);
-                            }
-                            if previous.is_some_and(|p| p.step_plan.is_some()) {
-                                return entry.row;
-                            }
-                        }
-                        let mut row = previous.cloned().unwrap_or(entry.row.clone());
-                        row.enabled = entry.row.enabled;
-                        row
+                let previous = cache
+                    .snapshot
+                    .providers
+                    .iter()
+                    .find(|r| r.name == entry.row.name);
+                let row = if let Some(row) = refreshed.iter().find(|r| r.name == entry.row.name) {
+                    preserve_stale(row.clone(), previous)
+                } else if let Some(result) = aggregate
+                    .as_ref()
+                    .filter(|_| entry.adapter == Adapter::Aggregate)
+                {
+                    // A per-card aggregate read can also revoke another Step Plan account.
+                    let plan = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| aggregate_row(v, &entry.row.name))
+                        .and_then(|q| q.get("stepPlan"));
+                    if let Some(plan) = plan.filter(|_| entry.row.enabled) {
+                        project_step_plan(entry.row, plan)
+                    } else if previous.is_some_and(|p| p.step_plan.is_some()) {
+                        entry.row
+                    } else {
+                        reuse_row(entry.row, previous)
                     }
+                } else {
+                    if let Some(identity) = cache.step_plan_identities.get(&entry.row.name) {
+                        step_plan_identities.insert(entry.row.name.clone(), *identity);
+                    }
+                    return reuse_row(entry.row, previous);
+                };
+                if row.step_plan.is_some() {
+                    step_plan_identities.insert(
+                        row.name.clone(),
+                        StepPlanIdentity {
+                            fingerprint: entry.step_plan_fingerprint,
+                            cached_at: Instant::now(),
+                        },
+                    );
                 }
+                row
             })
             .collect();
         let completed = now();
@@ -301,14 +380,23 @@ impl QuotaService {
                 cache.attempts.insert(Some(row.name.clone()), completed);
             }
         }
-        *cache = QuotaSnapshot {
+        cache.step_plan_identities = step_plan_identities;
+        cache.snapshot = QuotaSnapshot {
             providers,
             updated_at: stamp,
             online: true,
             error: None,
-            attempts: cache.attempts.clone(),
         };
-        Ok(cache.clone())
+        Ok(cache.snapshot.clone())
+    }
+}
+fn reuse_row(configured: ProviderQuota, previous: Option<&ProviderQuota>) -> ProviderQuota {
+    match previous {
+        Some(previous) => ProviderQuota {
+            enabled: configured.enabled,
+            ..previous.clone()
+        },
+        None => configured,
     }
 }
 fn preserve_stale(mut row: ProviderQuota, previous: Option<&ProviderQuota>) -> ProviderQuota {
@@ -359,9 +447,12 @@ async fn refresh(
             Some(Ok(value)) if value["quotas"].is_array() => {
                 if let Some(quota) = aggregate_row(value, &row.name) {
                     if let Some(raw) = quota.get("stepPlan") {
-                        return project_step_plan(row, raw);
+                        if row.enabled {
+                            return project_step_plan(row, raw);
+                        }
+                    } else {
+                        row.windows = aggregate_windows(quota, entry.local_limits);
                     }
-                    row.windows = aggregate_windows(quota, entry.local_limits);
                 }
                 row.status = if row.windows.is_empty() {
                     QuotaStatus::Unavailable
@@ -651,6 +742,11 @@ fn gemini_window(label: String, value: &Value) -> Option<QuotaWindow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configured_rows(config: &Value) -> Vec<ConfiguredProvider> {
+        configured(config, &RandomState::new())
+    }
+
     struct Mock {
         client: AdminClient,
         requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -872,6 +968,123 @@ mod tests {
         assert!(!rejected.online);
         mock.finish().await;
     }
+    #[tokio::test]
+    async fn managed_refresh_drops_step_plan_after_key_replacement() {
+        use crate::api::mock::{response, Mock as Sequence};
+
+        let config = |key| {
+            response(json!({"Providers":[
+                {"name":"step","api_key":key,"api_base_url":"https://api.stepfun.com/v1"},
+                {"name":"codex-subscription","codex_managed":true}
+            ]}))
+        };
+        let plan = response(json!({"quotas":[{"provider":"step","stepPlan":{
+            "state":"known","family":"token","observedAt":123,
+            "creditBuckets":[{"type":"subscription","total":"20","remaining":"15"}]
+        }}]}));
+        let codex = json!({"status":"connected","plan":"plus",
+            "primary":{"usedPercent":25,"windowSeconds":18000,"resetAt":4102444800000_i64}});
+        let managed = Some("codex-subscription".to_owned());
+
+        for throttled in [false, true] {
+            let mut replies = vec![
+                config("FIRST_KEY"),
+                plan.clone(),
+                config("FIRST_KEY"),
+                response(codex.clone()),
+                response(codex.clone()),
+                config("SECOND_KEY"),
+            ];
+            if !throttled {
+                replies.extend([response(codex.clone()), response(codex.clone())]);
+            }
+            let mock = Sequence::new(replies);
+            let service = QuotaService::new(Some(mock.client()));
+            service.snapshot(Some("step".into())).await.unwrap();
+            let unchanged = service.snapshot(managed.clone()).await.unwrap();
+            let old = serde_json::to_value(&unchanged.providers[0]).unwrap();
+            assert_eq!(old["stepPlan"]["creditBuckets"][0]["remaining"], "15");
+            assert_eq!(unchanged.providers[1].windows[0].remaining, Some(75.0));
+            if !throttled {
+                service.cache.lock().await.attempts.remove(&managed);
+            }
+
+            let changed = service.snapshot(managed.clone()).await.unwrap();
+            assert_eq!(changed.providers[0].name, "step");
+            assert_eq!(changed.providers[0].status, QuotaStatus::Unavailable);
+            assert!(changed.providers[0].step_plan.is_none());
+            assert!(changed.providers[0].updated_at.is_none());
+            assert_eq!(changed.providers[1].windows[0].remaining, Some(75.0));
+            let encoded = serde_json::to_string(&changed).unwrap();
+            for private in ["FIRST_KEY", "SECOND_KEY", "api.stepfun.com", "fingerprint"] {
+                assert!(!encoded.contains(private));
+            }
+            let requests = mock.finish().await;
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.starts_with("GET /api/config "))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.starts_with("GET /api/providers/quota "))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.starts_with("POST /api/codex/usage "))
+                    .count(),
+                if throttled { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn step_plan_identity_expires_and_rejects_endpoint_or_enabled_changes() {
+        let make_config = |endpoint, enabled| json!({"Providers":[{"name":"step","api_key":"KEY","api_base_url":endpoint,"enabled":enabled}]});
+        let hasher = RandomState::new();
+        let initial = configured(&make_config("first", true), &hasher).remove(0);
+        for (config, age) in [
+            (make_config("second", true), Duration::ZERO),
+            (make_config("first", false), Duration::ZERO),
+            (make_config("first", true), STEP_PLAN_REUSE_MAX_AGE),
+        ] {
+            let mut cache = QuotaCache {
+                snapshot: QuotaSnapshot {
+                    providers: vec![project_step_plan(
+                        initial.row.clone(),
+                        &json!({"state":"known","family":"token","observedAt":123}),
+                    )],
+                    updated_at: 123,
+                    online: true,
+                    error: None,
+                },
+                attempts: [(None, 123), (Some("step".into()), 123)].into(),
+                step_plan_identities: [(
+                    "step".into(),
+                    StepPlanIdentity {
+                        fingerprint: initial.step_plan_fingerprint,
+                        cached_at: Instant::now() - age,
+                    },
+                )]
+                .into(),
+            };
+            cache.invalidate_step_plans(&configured(&config, &hasher), 456);
+            assert!(cache.step_plan_identities.is_empty());
+            assert!(cache.attempts.is_empty());
+            assert!(cache.snapshot.providers[0].step_plan.is_none());
+            assert_eq!(
+                cache.snapshot.providers[0].enabled,
+                config["Providers"][0]["enabled"] == true
+            );
+        }
+    }
+
     #[test]
     fn all_configured_rows_in_order_without_models_or_enabled_filter() {
         let providers: Vec<_> = (0..25)
@@ -883,7 +1096,7 @@ mod tests {
                 json!({"name":"p1"}),
             ])
             .collect();
-        let rows = configured(&json!({"Providers": providers}));
+        let rows = configured_rows(&json!({"Providers": providers}));
         assert_eq!(rows.len(), 25);
         assert_eq!(rows[24].row.name, "p24");
         assert!(!rows[1].row.enabled);
@@ -934,7 +1147,7 @@ mod tests {
     }
     #[test]
     fn partial_error_preserves_previous_numbers_and_no_credentials_serialize() {
-        let mut old = configured(&json!({"Providers":[{"name":"one","api_key":"SECRET","api_base_url":"https://secret.invalid","quotaToken":"TOKEN"}]})).remove(0).row;
+        let mut old = configured_rows(&json!({"Providers":[{"name":"one","api_key":"SECRET","api_base_url":"https://secret.invalid","quotaToken":"TOKEN"}]})).remove(0).row;
         old.windows = vec![measured("配额".into(), Some(5.0), 10.0, None, None)];
         old.updated_at = Some(123);
         let mut failed = old.clone();
@@ -957,10 +1170,11 @@ mod tests {
     }
     #[test]
     fn guards_status_and_malformed_numbers_without_echoing_errors() {
-        let mut row =
-            configured(&json!({"Providers":[{"name":"codex-subscription","codex_managed":true}]}))
-                .remove(0)
-                .row;
+        let mut row = configured_rows(
+            &json!({"Providers":[{"name":"codex-subscription","codex_managed":true}]}),
+        )
+        .remove(0)
+        .row;
         apply_status(
             &mut row,
             &json!({"lastErrorCode":"codex_reauth_required","lastError":"SECRET"}),
