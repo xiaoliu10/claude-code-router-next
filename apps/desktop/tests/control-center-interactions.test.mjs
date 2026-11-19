@@ -88,6 +88,7 @@ export function harness(overrides = {}) {
   }
   doc.getElementById = id => [root, ...root.querySelectorAll('[id]')].find(n => n.getAttribute('id') === id) || null;
   const calls = []; const windowEvents = {};
+  const intervals = []; const cleared = [];
   const route = { providers: [{ name: 'alpha', models: ['one', 'two'] }], routes: [{ scope: 'global', field: 'default', target: 'alpha,one', fallback: [] }], familyRouting: false, fallbackEnabled: true, revision: '1' };
   const clients = { clients: [{ id: 'pi', name: 'Pi', enabled: true, managed: true, exists: true, activeModel: 'one', modelAlias: null }], success: true, message: null };
   const responses = {
@@ -110,9 +111,11 @@ export function harness(overrides = {}) {
     calls.push({ cmd, args });
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };
-  vm.runInNewContext(projectsJs + pluginsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout, setInterval, clearInterval });
+  vm.runInNewContext(projectsJs + pluginsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout,
+    setInterval: (fn, ms) => { intervals.push([fn, ms]); return setInterval(fn, ms); },
+    clearInterval: (t) => { cleared.push(t); clearInterval(t); } });
   doc.events.DOMContentLoaded();
-  return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus(), windowEvents };
+  return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus(), windowEvents, win, intervals, cleared };
 }
 
 test('interaction: tab keyboard, external stop disabled, offline quota never shows fake empty state', async () => {
@@ -321,6 +324,26 @@ test('interaction: opening usage loads the seven-day chart and matching records 
   const dateTable = h.id('usage-body').querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
   assert.match(dateTable.querySelector('tbody').textContent, /2026-09-01/);
   assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'all', page: 1, pageSize: 20 });
+});
+
+test('interaction: usage auto-refreshes on an interval while open and stops on tab switch', async () => {
+  const h = harness({ usage_snapshot: ({ period }) => ({ period, totalRequests: 1, byDay: [], byProvider: [] }), usage_records: ({ page }) => ({ period: '7d', page, pageSize: 20, total: 0, records: [] }) });
+  h.win.__CCR_USAGE_REFRESH_MS__ = 10;
+  await openUsage(h);
+  assert.ok(h.intervals.some(([, ms]) => ms === 10), 'auto-refresh interval is registered');
+  const count = () => h.calls.filter(c => c.cmd === 'usage_snapshot').length;
+  const first = count();
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.ok(count() > first, 'snapshot reloads while the usage tab stays open');
+  h.id('tab-quota').click(); await flush();
+  assert.ok(h.cleared.length >= 1, 'leaving the usage tab clears the timer');
+  const frozen = count();
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.equal(count(), frozen, 'no usage polling after leaving the tab');
+  h.id('tab-usage').click(); await flush();
+  assert.ok(h.intervals.length >= 2, 're-entering the usage tab resumes the interval');
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.ok(count() > frozen, 'polling resumes on re-entry');
 });
 
 test('interaction: records pager walks pages, resets on period switch, shows page/total info', async () => {
