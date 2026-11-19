@@ -1,6 +1,12 @@
-// Read-only management card: a self-contained ES chunk with no imports and no
-// network access. It only explains the local opt-in contract; the operator's
-// sidecar file and environment remain the single source of truth.
+// Read-only management card. It renders inside the host settings page, so the
+// host's global stylesheet (Tailwind utilities + the custom .glass-card rule)
+// is part of its runtime environment; class names mirror the gemini-oauth card
+// conventions (ui/badge, ui/card lists inlined). Import-free, network-free,
+// and all rendered strings go through textContent, never markup assignment.
+const BADGE_BASE = 'inline-flex items-center rounded-lg border px-2.5 py-0.5 text-[10px] font-bold transition-colors';
+const BADGE_OUTLINE = 'border-white/10 text-foreground bg-white/5';
+const BADGE_SECONDARY = 'border-white/5 bg-white/5 text-muted-foreground';
+
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -11,58 +17,41 @@ const el = (tag, className, text) => {
 export default {
   mount(target, props) {
     const zh = props.locale === 'zh';
-    const t = (en, cn) => (zh ? cn : en);
-    const root = el('div', 'ccr-agy-acp-card');
-    const style = root.style;
-    style.font = '13px/1.6 -apple-system, "Segoe UI", sans-serif';
-    style.color = 'inherit';
+    const t = (cn, en) => (zh ? cn : en);
+    const card = el('div', 'glass-card rounded-2xl overflow-hidden mb-4');
+    const layout = el('div', 'flex flex-col gap-4 p-5');
+    const body = el('div', 'min-w-0 flex-1 space-y-3');
 
-    const head = el('div', null, null);
-    head.style.display = 'flex';
-    head.style.alignItems = 'center';
-    head.style.gap = '8px';
-    const title = el('strong', null, t('Local Antigravity CLI (ACP) bridge', '本地 Antigravity CLI（ACP）桥'));
-    const badge = el('span', null, props.disabled ? t('Disabled', '未启用') : t('Enabled', '已启用'));
-    badge.style.padding = '1px 8px';
-    badge.style.borderRadius = '999px';
-    badge.style.fontSize = '12px';
-    badge.style.border = '1px solid currentColor';
-    if (!props.disabled) badge.style.opacity = '0.85'; else badge.style.opacity = '0.6';
-    head.append(title, badge);
-    root.append(head);
+    const header = el('div', 'flex flex-wrap items-center gap-2');
+    header.append(
+      el('p', 'text-lg font-bold tracking-tight text-foreground', t('本地 Antigravity CLI（ACP）桥', 'Local Antigravity CLI (ACP) bridge')),
+      el('span', BADGE_BASE + ' ' + BADGE_OUTLINE + ' border-amber-500/40 text-amber-600', t('实验原型', 'Experimental')),
+      el('span', BADGE_BASE + ' ' + BADGE_SECONDARY, 'API key'),
+    );
+    body.append(header);
 
-    if (props.plugin?.version) root.append(el('div', null, t('Version', '版本') + ': v' + props.plugin.version));
+    body.append(el('p', 'max-w-md truncate text-xs font-medium text-muted-foreground/60', props.plugin?.version ? 'v' + props.plugin.version : ''));
+    body.append(el('p', 'max-w-md text-xs text-muted-foreground',
+      t('通过官方 agy 二进制以 ACP stdio 提供纯文本对话，走 Gemini API key 配额。', 'Text-only chat through the official agy binary over ACP stdio, billed to the Gemini API key.')));
 
-    for (const line of props.disabled ? [
-      t('This prototype is off until the operator enables it. In the CCR config directory create gemini-agy-acp.json:',
-        '原型在运维者显式启用前保持关闭。请在 CCR 配置目录创建 gemini-agy-acp.json：'),
-    ] : [
-      t('Workers start only for requests routed to this provider; API-key quotas and charges apply.',
-        '仅路由到本供应商的请求会启动 worker；调用计入 API key 配额与费用。'),
-      t('Rotate the key by updating the environment and restarting the isolated CCR host.',
-        '更换密钥需更新环境变量并重启隔离的 CCR 实例。'),
-    ]) root.append(el('p', null, line));
+    const section = el('details', 'max-w-md text-xs text-muted-foreground');
+    section.append(el('summary', 'cursor-pointer select-none font-medium', t('配置说明', 'Setup instructions')));
+    section.append(el('p', 'mt-2 text-xs text-muted-foreground',
+      t('在 CCR 配置目录创建 gemini-agy-acp.json，将 binary 替换为本机 agy 的绝对路径。', 'Create gemini-agy-acp.json in the CCR config directory. Set binary to the absolute path of your agy executable.')));
+    const code = el('pre', 'max-w-md overflow-x-auto rounded-lg bg-white/5 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground',
+      JSON.stringify({ enabled: true, binary: '/absolute/path/to/agy', authMethod: 'gemini-api-key', maxWorkers: 1, timeoutMs: 60000 }, null, 2));
+    section.append(code);
+    section.append(el('p', 'text-[11px] text-muted-foreground', t('在 CCR 进程环境设置 GEMINI_API_KEY，然后重启隔离实例。', 'Set GEMINI_API_KEY in the CCR process environment, then restart the isolated instance.')));
+    section.append(el('p', 'max-w-md text-[11px] text-muted-foreground/60',
+      t('不支持个人订阅与浏览器 OAuth；请为主路由配置 enableFallback: false 的隔离实例。', 'Consumer OAuth and subscriptions are unsupported; run it as a primary route on an isolated instance with enableFallback: false.')));
 
-    const code = el('pre', null, JSON.stringify({
-      enabled: true, binary: '/absolute/path/to/agy', authMethod: 'gemini-api-key', maxWorkers: 1, timeoutMs: 60000,
-    }, null, 2));
-    code.style.background = 'rgba(127,127,127,.12)';
-    code.style.padding = '8px 10px';
-    code.style.borderRadius = '6px';
-    code.style.overflowX = 'auto';
-    code.style.whiteSpace = 'pre-wrap';
-    root.append(code);
+    body.append(section);
+    layout.append(body);
+    card.append(layout);
+    target.append(card);
 
-    root.append(el('p', null, t(
-      'Set GEMINI_API_KEY in the CCR process environment and route a primary model to gemini-agy-acp. Consumer OAuth and subscriptions are unsupported.',
-      '在 CCR 进程环境设置 GEMINI_API_KEY，并把主路由模型指向 gemini-agy-acp。不支持个人订阅与浏览器 OAuth。')));
-
-    target.append(root);
-    this._root = root;
   },
   unmount(el) {
-    this._root?.remove();
-    this._root = null;
     el.replaceChildren();
   },
 };

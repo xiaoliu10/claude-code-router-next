@@ -30,20 +30,29 @@ test('management card mounts from a DOM stub, localizes the badge and unmounts c
   const card = (await import('../src/card.mjs')).default;
   for (const locale of ['en', 'zh']) for (const disabled of [false, true]) {
     const events = [];
-    const make = () => ({ style: {}, className: '', textContent: '', children: [],
+    const make = tag => ({ tag, className: '', textContent: '', children: [],
       append(...kids) { this.children.push(...kids); },
       remove() { events.push('remove'); },
       replaceChildren() { this.children.length = 0; events.push('clear'); } });
     const previous = globalThis.document;
-    globalThis.document = { createElement: () => make() };
+    globalThis.document = { createElement: make };
     try {
       const host = make();
-      card.mount(host, { locale, disabled, plugin: { name: 'gemini-agy-acp', version: '0.0.2' } });
+      card.mount(host, { locale, disabled, plugin: { name: 'gemini-agy-acp', version: '0.0.3' } });
       assert.equal(host.children.length, 1);
-      const badge = host.children[0].children[0].children[1];
-      assert.match(badge.textContent, disabled ? /Disabled|未启用/ : /Enabled|已启用/);
+      const root = host.children[0];
+      // The card must opt into the host stylesheet like every other card.
+      assert.match(root.className, /glass-card/);
+      const header = root.children[0].children[0].children[0];
+      assert.match(header.children[0].className, /text-lg/);
+      assert.equal(header.children[1].textContent, locale === 'zh' ? '实验原型' : 'Experimental');
+      assert.equal(header.children[2].textContent, 'API key');
+      const details = root.children[0].children[0].children.at(-1);
+      assert.equal(details.tag, 'details');
+      assert.ok(!details.open);
+      assert.equal(details.children[0].textContent, locale === 'zh' ? '配置说明' : 'Setup instructions');
       card.unmount(host);
-      assert.deepEqual(events, ['remove', 'clear']);
+      assert.deepEqual(events, ['clear']);
       assert.equal(host.children.length, 0);
     } finally { globalThis.document = previous; }
   }
