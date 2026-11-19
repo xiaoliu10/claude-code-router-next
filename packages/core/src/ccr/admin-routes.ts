@@ -1035,9 +1035,9 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       }
 
       const stepPlans = await stepPlansPending;
-      for (const [provider, snapshot] of stepPlans) {
-        const row = quotaMap.get(provider);
-        if (row) row.stepPlan = snapshot;
+      for (const row of quotas) {
+        const snapshot = stepPlans.get(row.provider);
+        if (snapshot) row.stepPlan = snapshot;
       }
 
       return {

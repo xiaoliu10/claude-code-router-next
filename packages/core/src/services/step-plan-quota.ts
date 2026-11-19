@@ -142,17 +142,21 @@ interface Entry {
 
 type Provider = Pick<ConfigProvider, "name" | "enabled" | "api_key" | "api_base_url" | "proxy_enabled">;
 
+interface StepPlanQuotaRead {
+  get(providerName: string): StepPlanQuota | undefined;
+}
+
 /** Route-local account snapshots. These must never enter the model quota/health store. */
 export class StepPlanQuotaCache {
   private readonly entries = new Map<string, Entry>();
 
-  async poll(providers: Provider[], config: Parameters<typeof resolveProviderProxyUrl>[0]): Promise<Map<string, StepPlanQuota>> {
+  async poll(providers: Provider[], config: Parameters<typeof resolveProviderProxyUrl>[0]): Promise<StepPlanQuotaRead> {
     const eligible = providers.filter(p => p?.name && p.enabled !== false && INFERENCE_URLS.has(p.api_base_url));
     const names = new Set(eligible.map(p => p.name));
     for (const name of this.entries.keys()) {
       if (!names.has(name)) this.entries.delete(name);
     }
-    const snapshots = new Map<string, StepPlanQuota>();
+    const polledEntries = new Map<string, Entry>();
     await Promise.all(eligible.map(async provider => {
       const proxy = resolveProviderProxyUrl(config, provider);
       const identity = createHash("sha256").update(JSON.stringify([provider.api_base_url, provider.api_key, proxy])).digest("hex");
@@ -165,24 +169,28 @@ export class StepPlanQuotaCache {
         const current = entry;
         current.pending = this.refresh(current, provider.api_key, proxy).finally(() => { current.pending = undefined; });
       }
+      polledEntries.set(provider.name, entry);
       await entry.pending;
-      // A concurrent request may have removed this provider or changed its credentials.
-      if (this.entries.get(provider.name) !== entry) return;
-      const now = Date.now();
-      if (entry.snapshot.state === "stale" && now - entry.receivedAt > MAX_STALE_MS) entry.snapshot = unavailable();
-      const { snapshot } = entry;
-      // Cache entries can cross a billing boundary between refreshes. Suppress
-      // expired balances and reset windows until the upstream supplies new ones.
-      const creditBuckets = snapshot.creditBuckets.filter(bucket =>
-        (bucket.expiresAt === null || bucket.expiresAt > now) && (bucket.resetsAt === null || bucket.resetsAt > now));
-      const windows = snapshot.windows.filter(window => window.resetsAt === null || window.resetsAt > now);
-      const crossedBoundary = windows.length !== snapshot.windows.length || creditBuckets.length !== snapshot.creditBuckets.length;
-      const current: StepPlanQuota = crossedBoundary
-        ? { ...snapshot, state: snapshot.state === "stale" ? "stale" : "partial", allowed: null, windows, creditBuckets }
-        : snapshot;
-      return snapshots.set(provider.name, current);
     }));
-    return snapshots;
+    return { get: providerName => this.readCurrent(providerName, polledEntries.get(providerName)) };
+  }
+
+  private readCurrent(providerName: string, entry: Entry | undefined): StepPlanQuota | undefined {
+    // Another route can rotate credentials or remove and re-add the provider
+    // after this poll settles. Check the entry when attaching account figures.
+    if (!entry || this.entries.get(providerName) !== entry) return undefined;
+    const now = Date.now();
+    if (entry.snapshot.state === "stale" && now - entry.receivedAt > MAX_STALE_MS) entry.snapshot = unavailable();
+    const { snapshot } = entry;
+    // Cache entries can cross a billing boundary between refreshes. Suppress
+    // expired balances and reset windows until the upstream supplies new ones.
+    const creditBuckets = snapshot.creditBuckets.filter(bucket =>
+      (bucket.expiresAt === null || bucket.expiresAt > now) && (bucket.resetsAt === null || bucket.resetsAt > now));
+    const windows = snapshot.windows.filter(window => window.resetsAt === null || window.resetsAt > now);
+    const crossedBoundary = windows.length !== snapshot.windows.length || creditBuckets.length !== snapshot.creditBuckets.length;
+    return crossedBoundary
+      ? { ...snapshot, state: snapshot.state === "stale" ? "stale" : "partial", allowed: null, windows, creditBuckets }
+      : snapshot;
   }
 
   private async refresh(entry: Entry, key: string, proxy?: string): Promise<void> {

@@ -132,11 +132,51 @@ describe("Step Plan display quota", () => {
     }
   });
 
+  it("omits a completed Step Plan read if credentials rotate while the route waits for a plugin", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const app = Fastify();
+    const poll = vi.spyOn(StepPlanQuotaCache.prototype, "poll");
+    let startPlugin!: () => void;
+    let finishPlugin!: () => void;
+    const pluginStarted = new Promise<void>(resolve => { startPlugin = resolve; });
+    const pluginPending = new Promise<null>(resolve => { finishPlugin = () => resolve(null); });
+    const pluginRegistry = {
+      registerAllRoutes: () => {},
+      getManagedRuntimeFor: () => ({ fetchQuota: () => { startPlugin(); return pluginPending; } }),
+    };
+    const getProviders = vi.fn().mockReturnValueOnce([{ name: "held-plugin" }]).mockReturnValue([]);
+    Object.assign(app, { _server: { pluginRegistry, providerService: { getProviders } } });
+    vi.mocked(readConfigFile)
+      .mockResolvedValueOnce({ Providers: [provider] })
+      .mockResolvedValueOnce({ Providers: [{ ...provider, api_key: "replacement-fixture" }] });
+    upstream.mockResolvedValueOnce(Response.json(token)).mockResolvedValueOnce(Response.json(coding));
+    try {
+      await registerAdminRoutes({ app, pluginRegistry }, {});
+      const first = app.inject().get("/api/providers/quota").end();
+      await pluginStarted;
+      await poll.mock.results[0].value;
+
+      const rotated = await app.inject({ method: "GET", url: "/api/providers/quota" });
+      expect(rotated.statusCode).toBe(200);
+      expect(rotated.json().quotas.find((q: any) => q.provider === provider.name).stepPlan.family).toBe("coding");
+      finishPlugin();
+      const initial = await first;
+      expect(initial.statusCode).toBe(200);
+      const row = initial.json().quotas.find((q: any) => q.provider === provider.name);
+      expect(row).toBeDefined();
+      expect(row).not.toHaveProperty("stepPlan");
+    } finally {
+      finishPlugin();
+      poll.mockRestore();
+      await app.close();
+    }
+  });
+
   it("limits requests to enabled CN inference endpoints", async () => {
     for (const url of [base.replace("https:", "http:"), base.replace(".com", ".example"), base.replace(".com", ".com.example"),
       base.replace(".com", ".com:8443"), base.replace("//", "//user@"), base.replace("/step_plan", ""), `${base}_other`,
       `${base}/usage`, `${base}/arbitrary`, `${base}?query=1`, `${base}#fragment`]) {
-      expect((await cache.poll([{ ...provider, api_base_url: url }], direct)).size).toBe(0);
+      expect((await cache.poll([{ ...provider, api_base_url: url }], direct)).get(provider.name)).toBeUndefined();
     }
     await cache.poll([{ ...provider, enabled: false }], direct);
     expect(upstream).not.toHaveBeenCalled();
