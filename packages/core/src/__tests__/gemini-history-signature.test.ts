@@ -14,6 +14,22 @@ describe('AI Studio history signatures', () => {
   it.each(['ccr_1795069948562', 'ccr_think_signature', 'rs_abcd', 'a'.repeat(24), 'abc!?'])('drops foreign or malformed text signatures: %s', signature => {
     expect(replay(signature)).toEqual([{ text: 'previous reply' }]);
   });
+  it.each([
+    ['gemini-4-hydrogen', undefined],
+    ['gemini-3-pro', ''],
+    ['models/gemini-3-pro-preview', undefined],
+    ['models/gemini-4-hydrogen', 'rs_fixture'],
+    ['gemini-4-hydrogen', 'YWJjZA=='],
+  ])(
+    'places the recovered signature on the first call in each strict-model step (%s, %s)', (model, signature) => {
+      const calls = (ids: string[]): UnifiedMessage => ({ role: 'assistant', content: 'working',
+        ...(signature !== undefined && { thinking: { content: '', signature } }),
+        tool_calls: ids.map(id => ({ id, type: 'function', function: { name: 'bash', arguments: '{}' } })) });
+      const parts = buildRequestBody({ model: model!, messages: [calls(['one', 'two']), calls(['three'])] }).contents
+        .filter((c: any) => c.role === 'model').map((c: any) => c.parts.map((p: any) => p.thoughtSignature));
+      const expected = signature === 'YWJjZA==' ? signature : 'skip_thought_signature_validator';
+      expect(parts).toEqual([[undefined, expected, undefined], [undefined, expected]]);
+    });
   it('keeps legacy native-signature placement and repairs foreign parallel call history', () => {
     const sig = 'YWJjZA==';
     expect(replay(sig)[0].thoughtSignature).toBe(sig);

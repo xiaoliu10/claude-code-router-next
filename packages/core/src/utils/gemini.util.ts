@@ -281,6 +281,7 @@ export function buildRequestBody(
 
   const contents: any[] = [];
   const toolResponses = request.messages.filter((item) => item.role === "tool");
+  const strictToolSignatures = /(?:^|\/)gemini-[34](?:[.-]|$)/i.test(request.model);
 
 
   request.messages
@@ -296,9 +297,10 @@ export function buildRequestBody(
       }
       const parts: any[] = [];
       const signature = role === "model" ? replaySignature(message.thinking?.signature) : undefined;
+      const strictCalls = strictToolSignatures && !!message.tool_calls?.length;
       if (typeof message.content === "string") {
         const part: any = { text: message.content };
-        if (signature) {
+        if (signature && !strictCalls) {
           part.thoughtSignature = signature;
         }
         parts.push(part);
@@ -352,10 +354,11 @@ export function buildRequestBody(
                 args: JSON.parse(toolCall.function.arguments || "{}"),
               },
             };
-            if (signature) {
+            if (signature && (!strictCalls || index === 0)) {
               part.thoughtSignature = signature;
-            } else if (role === "model" && index === 0 && message.thinking?.signature) {
-              // Imported tool history carried a marker in place of native bytes.
+            } else if (role === "model" && index === 0 && (strictCalls || message.thinking?.signature)) {
+              // Gemini 3/4 require a signature on the first call of each step.
+              // Use Google’s documented placeholder for imported unsigned history.
               part.thoughtSignature = "skip_thought_signature_validator";
             }
             return part;
