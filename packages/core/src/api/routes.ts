@@ -890,6 +890,7 @@ async function handleFallback(
           // Format and return response
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
+          if (error?.code === "invalid_gemini_tool_choice") throw error;
           fallbackError = error;
           // A classified nonRetryable plugin failure never restarts its
           // account-pool attempt budget on a fallback retry.

@@ -113,6 +113,18 @@ describe("Gemini request tool ownership", () => {
       } });
       expect(invalid.statusCode).toBe(400);
       expect(captured).toHaveLength(2);
+      // The same deterministic validation error also terminates an existing fallback chain.
+      server.configService.set("Router", { enableFallback: true });
+      server.configService.set("fallback", { default: ["gemini-fixture,gemini-test", "chat-fixture,chat-test"] });
+      const fetchMock = vi.mocked(fetch);
+      fetchMock.mockClear();
+      fetchMock.mockImplementation(async () => Response.json({error:{message:"fixture failure"}}, {status:503}));
+      const fallback = await server.app.inject({ method: "POST", url: "/v1/responses", payload: {
+        model: "chat-fixture,chat-test", input: [{ role: "user", content: "hi" }], tools: [builtin], tool_choice: { type: "web_search" },
+      } });
+      expect(fallback.statusCode).toBe(400);
+      expect(fallback.body).toContain("invalid_gemini_tool_choice");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     } finally {
       await server.app.close();
       vi.unstubAllGlobals();
