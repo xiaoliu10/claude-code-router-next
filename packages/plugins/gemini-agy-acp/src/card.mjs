@@ -96,7 +96,9 @@ export default {
     };
 
     const message = el('p', 'max-w-md text-xs text-destructive', '');
+    const notice = el('p', 'max-w-md text-xs font-medium text-emerald-600', '');
     const setMessage = text => { message.textContent = text || ''; };
+    const setNotice = text => { notice.textContent = text || ''; };
     const errorText = error => {
       const code = error?.reason ?? error?.code;
       const hint = typeof code === 'string' ? CODE_HINTS[code] : null;
@@ -111,13 +113,22 @@ export default {
     const controls = [connect, sync, disconnect];
     const buttons = el('div', 'flex flex-wrap items-center gap-2');
     buttons.append(connect, sync, disconnect);
-    body.append(buttons, message);
+    body.append(buttons, notice, message);
 
     let busyDepth = 0;
+    const BUSY_LABELS = new Map([[connect, t('连接中…', 'Connecting…')], [sync, t('同步中…', 'Syncing…')], [disconnect, t('断开中…', 'Disconnecting…')]]);
     const setBusy = active => {
       busyDepth = Math.max(0, busyDepth + (active ? 1 : -1));
       const busy = busyDepth > 0;
-      for (const button of controls) button.disabled = busy || !call;
+      for (const button of controls) {
+        button.disabled = busy || !call;
+        if (busy) button.textContent = BUSY_LABELS.get(button);
+      }
+      if (!busy) {
+        connect.textContent = t('连接', 'Connect');
+        sync.textContent = t('同步模型', 'Sync models');
+        disconnect.textContent = t('断开', 'Disconnect');
+      }
       props.onBusy?.(busy);
     };
 
@@ -143,6 +154,7 @@ export default {
     const runAction = async (path, requestBody, onDone) => {
       if (!call || busyDepth > 0) return;
       setMessage('');
+      setNotice('');
       setBusy(true);
       try {
         const response = await call(path, {
@@ -150,8 +162,13 @@ export default {
           body: JSON.stringify(requestBody ?? {}),
           timeoutMs: 30000,
         });
-        onDone?.(response);
+        const doneNotice = onDone?.(response);
         await refresh();
+        // Explicit confirmation: these actions are idempotent, so without a
+        // success notice a repeated click looks like it did nothing.
+        const done = new Date();
+        const at = `${String(done.getHours()).padStart(2, '0')}:${String(done.getMinutes()).padStart(2, '0')}:${String(done.getSeconds()).padStart(2, '0')}`;
+        setNotice(`${doneNotice ?? t('已完成', 'Done')} · ${at}`);
       } catch (error) {
         setMessage(errorText(error));
       } finally {
@@ -162,9 +179,13 @@ export default {
     connect.onclick = () => runAction('/connect', {
       ...(binaryInput.value.trim() ? { binary: binaryInput.value.trim() } : {}),
       ...(keyInput.value ? { apiKey: keyInput.value } : {}),
-    }, () => { keyInput.value = ''; }); // never keep the typed key in the DOM
-    sync.onclick = () => runAction('/models/sync', {});
-    disconnect.onclick = () => runAction('/disconnect', {});
+    }, response => {
+      keyInput.value = ''; // never keep the typed key in the DOM
+      return t(`已连接（agy ${response?.version ?? ''}）`, `Connected (agy ${response?.version ?? ''})`);
+    });
+    sync.onclick = () => runAction('/models/sync', {}, response =>
+      t(`已同步 ${response?.models?.length ?? 0} 个模型`, `Synced ${response?.models?.length ?? 0} models`));
+    disconnect.onclick = () => runAction('/disconnect', {}, () => t('已断开', 'Disconnected'));
     setBusy(false);
 
     const section = el('details', 'max-w-md text-xs text-muted-foreground');
