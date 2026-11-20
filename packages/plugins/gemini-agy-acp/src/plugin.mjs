@@ -1,27 +1,18 @@
-import { readFile } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { access, stat } from 'node:fs/promises';
+import { constants, statSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
+import { AcpError } from './acp-errors.mjs';
+import { registerAdminRoutes } from './admin-routes.mjs';
 import { chatResponse, failure, textTurns, toPrompt } from './chat.mjs';
+import { apiKeyShapeOk, enabledSettings, readSidecar, sidecarCache, writeSidecar } from './settings.mjs';
 
 const NAME = 'gemini-agy-acp';
 const MARKER = `ccr-managed-${NAME}`;
+const SAFE_CODE = /^[a-z][a-z0-9_]{0,63}$/;
 
-async function readSettings(configDir) {
-  let settings;
-  try {
-    settings = JSON.parse(await readFile(join(configDir, `${NAME}.json`), 'utf8'));
-  } catch (error) {
-    if (error.code === 'ENOENT') return null;
-    throw failure('agy_config_invalid', 503);
-  }
-  if (settings?.enabled !== true) return null;
-  const { binary, authMethod, timeoutMs = 60000, maxWorkers = 1 } = settings;
-  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || authMethod !== 'gemini-api-key' ||
-      !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300000 ||
-      !Number.isSafeInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8) {
-    throw failure('agy_config_invalid', 503);
-  }
-  return { binary, authMethod, timeoutMs, maxWorkers };
-}
+// Importing transport.mjs must not start a subprocess; loading and installing
+// this prototype alone stays inert.
+const loadTransportModule = () => import('./transport.mjs');
 
 function assertProvider(provider) {
   if (provider?.name !== NAME || provider.apiKey !== MARKER || provider.enabled === false) {
@@ -29,28 +20,232 @@ function assertProvider(provider) {
   }
 }
 
-export async function activateWithTransport(ctx, createTransport) {
-  let transport;
-  let unavailable;
-  try {
-    const settings = await readSettings(ctx.host.configDir);
-    if (settings) transport = await createTransport(settings);
-  } catch {
-    unavailable = failure('agy_config_invalid', 503);
+function safeCode(error) {
+  return typeof error?.code === 'string' && SAFE_CODE.test(error.code) ? error.code : 'agy_route_error';
+}
+
+/** The card-facing model list: ids/names only, deduplicated and bounded. */
+function publicModels(value) {
+  if (!Array.isArray(value)) return undefined;
+  const models = [];
+  const seen = new Set();
+  for (const entry of value) {
+    if (!entry || typeof entry.id !== 'string' || !entry.id || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    models.push({ id: entry.id, name: typeof entry.name === 'string' && entry.name ? entry.name : entry.id });
+    if (models.length >= 256) break;
   }
-  function requireTransport() {
-    if (!transport) throw unavailable ?? failure('agy_disabled', 503);
+  return models.length ? models : undefined;
+}
+
+function configuredBinary(raw) {
+  return typeof raw?.binary === 'string' && isAbsolute(raw.binary) && !raw.binary.includes('\0') ? raw.binary : null;
+}
+
+async function assertExecutable(binary) {
+  try {
+    if (!(await stat(binary)).isFile()) throw new Error('not a file');
+    await access(binary, constants.X_OK);
+  } catch {
+    throw new AcpError('invalid_config');
+  }
+}
+
+export async function activateWithTransport(ctx, createTransport) {
+  const configDir = ctx.host.configDir;
+  const log = ctx.log;
+  const cache = sidecarCache(configDir);
+  let transport;
+  // Fingerprint of the settings the live pool was built from; a changed
+  // fingerprint (binary, apiKey, limits) is what actually swaps the pool, so
+  // a models-sync write never retires healthy workers.
+  let fingerprint;
+  let rebuilding;
+  let lastError;
+
+  const note = error => {
+    lastError = { code: safeCode(error), at: Date.now() };
+    return error;
+  };
+  const fingerprintOf = settings => JSON.stringify([settings.binary, settings.apiKey ?? null, settings.timeoutMs, settings.maxWorkers]);
+
+  async function applyTransport(force = false) {
+    const snapshot = await cache.read();
+    const settings = enabledSettings(snapshot.raw);
+    const next = settings ? fingerprintOf(settings) : null;
+    if (!force && next === fingerprint) return;
+    const previous = transport;
+    transport = settings ? await createTransport({ ...settings, ...(log ? { log } : {}) }) : undefined;
+    fingerprint = next;
+    await previous?.retireExisting();
+  }
+
+  /** Single-flight settings refresh; safe to await from every request. The
+   * force variant re-swaps even an unchanged fingerprint so a connect always
+   * retires the live pool (fresh environment capture included). */
+  function requireTransport(force = false) {
+    if (!rebuilding || force) rebuilding = applyTransport(force).finally(() => { rebuilding = null; });
+    return rebuilding;
+  }
+
+  async function connected() {
+    await requireTransport();
+    if (!transport) throw failure('agy_disabled', 503);
     return transport;
   }
+
+  async function status() {
+    let raw = null;
+    try {
+      ({ raw } = await readSidecar(configDir));
+    } catch (error) {
+      note(error);
+    }
+    const binary = configuredBinary(raw);
+    let binaryFound = false;
+    if (binary) {
+      try {
+        binaryFound = statSync(binary).isFile();
+      } catch { /* reported as not found */ }
+    }
+    const version = typeof raw?.version === 'string' && raw.version.length > 0 && raw.version.length <= 128
+      ? raw.version : null;
+    const models = publicModels(raw?.models);
+    const modelsSyncedAt = typeof raw?.modelsSyncedAt === 'number' && Number.isSafeInteger(raw.modelsSyncedAt)
+      ? raw.modelsSyncedAt : undefined;
+    return {
+      loaded: transport !== undefined,
+      enabled: raw?.enabled === true,
+      binary,
+      binaryFound,
+      version,
+      lastError: lastError ?? null,
+      apiKeyConfigured: apiKeyShapeOk(raw?.apiKey) || Boolean(process.env.GEMINI_API_KEY?.trim()),
+      ...(models ? { models } : {}),
+      ...(modelsSyncedAt !== undefined ? { modelsSyncedAt } : {}),
+    };
+  }
+
+  async function connect(body) {
+    const input = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    const { raw } = await readSidecar(configDir);
+    const merged = { ...(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) };
+    if (input.binary !== undefined) {
+      if (typeof input.binary !== 'string' || !isAbsolute(input.binary) || input.binary.includes('\0')) {
+        throw new AcpError('invalid_config');
+      }
+      merged.binary = input.binary;
+    }
+    if (!configuredBinary(merged)) throw new AcpError('invalid_config');
+    await assertExecutable(merged.binary);
+    // Bounded version probe BEFORE anything is persisted: a failed connect
+    // never enables a broken binary.
+    const { probeVersion } = await loadTransportModule();
+    const version = await probeVersion(merged.binary);
+    merged.version = version;
+    if (input.apiKey !== undefined) {
+      if (!apiKeyShapeOk(input.apiKey) || !input.apiKey.trim()) throw new AcpError('invalid_config');
+      merged.apiKey = input.apiKey;
+    }
+    // Full transport validation of the merged settings before the write.
+    enabledSettings(merged);
+    await writeSidecar(configDir, {
+      enabled: true,
+      binary: merged.binary,
+      authMethod: 'gemini-api-key',
+      version,
+      ...(input.apiKey !== undefined ? { apiKey: merged.apiKey } : {}),
+    });
+    cache.invalidate();
+    await requireTransport(true).catch(error => {
+      note(error);
+      log?.warn?.(`gemini-agy-acp connect could not refresh the worker pool (${safeCode(error)})`);
+    });
+    return status();
+  }
+
+  async function disconnect() {
+    await writeSidecar(configDir, { enabled: false });
+    cache.invalidate();
+    await requireTransport(true).catch(error => {
+      note(error);
+      log?.warn?.(`gemini-agy-acp disconnect could not refresh the worker pool (${safeCode(error)})`);
+    });
+    return status();
+  }
+
+  // Register the managed provider entry and the discovered models so the
+  // router accepts them, mirroring the codex plugin's sync semantics: Router
+  // untouched, best-effort rollback on a failed write. A missing entry is
+  // created with the managed marker and a placeholder URL (never dialed), so
+  // the card alone is enough to go from install to first message.
+  async function registerProviderModels(models) {
+    const { readConfig, writeConfig, reloadRuntime } = ctx.host;
+    if (typeof readConfig !== 'function' || typeof writeConfig !== 'function') return;
+    const config = await readConfig();
+    if (!Array.isArray(config?.Providers)) return;
+    let provider = config.Providers.find(entry => entry?.name === NAME);
+    const ids = models.map(model => model.id);
+    if (!provider) {
+      provider = { name: NAME, api_base_url: 'https://example.com/unused', api_key: MARKER, models: ids, transformer: { use: [NAME] } };
+      config.Providers.push(provider);
+    } else if (JSON.stringify(provider.models ?? []) === JSON.stringify(ids) &&
+        provider.api_key === MARKER && Array.isArray(provider.transformer?.use) && provider.transformer.use.includes(NAME)) {
+      return;
+    } else {
+      provider.models = ids;
+    }
+    const previous = JSON.stringify(config);
+    try {
+      await writeConfig(config);
+      await reloadRuntime?.(config);
+    } catch {
+      try { await writeConfig(JSON.parse(previous)); } catch { /* original failure is reported below */ }
+      throw failure('agy_config_write_failed', 500);
+    }
+  }
+
+  async function syncModels() {
+    const { raw } = await readSidecar(configDir);
+    const settings = enabledSettings(raw);
+    if (!settings) throw failure('agy_disabled', 503);
+    const apiKey = settings.apiKey ?? process.env.GEMINI_API_KEY;
+    if (!apiKey?.trim()) throw new AcpError('auth_required');
+    const { syncModelOptions } = await loadTransportModule();
+    const { models, version } = await syncModelOptions({ binary: settings.binary, apiKey, log });
+    const modelsSyncedAt = Date.now();
+    await writeSidecar(configDir, { models, modelsSyncedAt, version });
+    cache.invalidate();
+    await registerProviderModels(models);
+    return { models, modelsSyncedAt, version };
+  }
+
+  // Eager load at activation: a valid sidecar starts the pool now; a missing
+  // or malformed one stays a per-request failure until Connect fixes it — the
+  // mtime-gated cache retries on every request without a gateway restart.
+  try {
+    await requireTransport();
+  } catch (error) {
+    note(error);
+    log?.warn?.(`gemini-agy-acp starts disabled (${safeCode(error)})`);
+  }
+
+  const guarded = operation => async (...args) => {
+    try {
+      return await operation(...args);
+    } catch (error) {
+      throw note(error);
+    }
+  };
 
   class AgyTransformer {
     static TransformerName = NAME;
     name = NAME;
 
-    transformRequestIn(body, provider, context) {
+    async transformRequestIn(body, provider, context) {
       if (provider?.name === NAME && context?.req) context.req.enableFallback = false;
       assertProvider(provider);
-      requireTransport();
+      await connected();
       if (context?.req?.body) textTurns(context.req.body);
       return { body };
     }
@@ -59,6 +254,12 @@ export async function activateWithTransport(ctx, createTransport) {
   // Read-only management card; the UI renders a hard failure for enabled
   // plugins that ship none, so this prototype must always declare one.
   ctx.registerUiCard?.({ cardPath: 'card.js' });
+  ctx.registerAdminRoutes?.(app => registerAdminRoutes(app, { getService: () => ({
+    status: () => status(),
+    connect: guarded(connect),
+    disconnect: guarded(disconnect),
+    syncModels: guarded(syncModels),
+  }) }));
   ctx.registerManagedRuntime({
     name: NAME,
     // Claim this exact reserved name even on a malformed entry, so it fails
@@ -71,7 +272,7 @@ export async function activateWithTransport(ctx, createTransport) {
     async dispatchRequest({ requestBody, req, config, provider }) {
       if (req) req.enableFallback = false;
       assertProvider(provider);
-      const local = requireTransport();
+      const local = await connected();
       if (req?.body) textTurns(req.body);
       return chatResponse(local, toPrompt(requestBody, provider, req?.body), requestBody.stream === true, req, config);
     },
@@ -79,6 +280,5 @@ export async function activateWithTransport(ctx, createTransport) {
 }
 
 export function activate(ctx) {
-  // Loading and installing this prototype alone cannot start a subprocess.
-  return activateWithTransport(ctx, async options => (await import('./transport.mjs')).createTransport(options));
+  return activateWithTransport(ctx, async options => (await loadTransportModule()).createTransport(options));
 }

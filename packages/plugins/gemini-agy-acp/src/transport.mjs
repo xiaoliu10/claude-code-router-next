@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { configureSession } from './acp-config.mjs';
+import { configureSession, modelOptions, modelSelector } from './acp-config.mjs';
 import { AcpError } from './acp-errors.mjs';
 import { AcpStdio } from './acp-stdio.mjs';
 
@@ -11,6 +11,8 @@ const AUTH_METHOD = 'gemini-api-key';
 const MAX_PROMPT_BYTES = 1024 * 1024;
 const IDLE_MS = 30_000;
 const MAX_SESSIONS = 64;
+const PROBE_MS = 5000;
+const MODEL_SYNC_MS = 5000;
 const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'max_turn_requests', 'refusal', 'cancelled']);
 
 function clientVersion() {
@@ -23,15 +25,23 @@ function clientVersion() {
 }
 const clientInfo = { name: 'ccr-gemini-agy-acp', version: clientVersion() };
 
-function supportedVersion(output) {
+function cliVersion(output) {
   const versions = [...output.matchAll(/(?:^|[\s:(])v?(\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?)(?=$|[\s,)])/gi)];
-  if (versions.length !== 1) return false;
-  const [release, prerelease] = versions[0][1].split('+')[0].split('-');
+  return versions.length === 1 ? versions[0][1] : null;
+}
+
+function supportedVersion(version) {
+  if (!version) return false;
+  const [release, prerelease] = version.split('+')[0].split('-');
   const [major, minor, patch] = release.split('.').map(Number);
   return major > 1 || (major === 1 && (minor > 5 || (minor === 5 && (patch > 1 || (patch === 1 && !prerelease)))));
 }
 
-async function isolatedEnvironment(root) {
+// The CLI honors the standard proxy variables for its own upstream calls;
+// forward whichever are set in the CCR process (isolated otherwise).
+const PROXY_ENV_VARS = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
+
+export async function isolatedEnvironment(root) {
   const dirs = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'runtime', 'work']
     .map(name => [name, join(root, name)]));
   await Promise.all(Object.values(dirs).map(path => mkdir(path, { mode: 0o700 })));
@@ -41,6 +51,10 @@ async function isolatedEnvironment(root) {
     APPDATA: dirs.config, LOCALAPPDATA: dirs.data, TMPDIR: dirs.tmp, TEMP: dirs.tmp, TMP: dirs.tmp,
     PATH: '/usr/bin:/bin', LANG: 'C',
   };
+  for (const name of PROXY_ENV_VARS) {
+    const value = process.env[name];
+    if (value) env[name] = value;
+  }
   if (process.platform === 'win32') {
     env.SystemRoot = process.env.SystemRoot;
     env.PATH = join(env.SystemRoot, 'System32');
@@ -49,9 +63,10 @@ async function isolatedEnvironment(root) {
 }
 
 class Worker {
-  constructor(binary, onRetired) {
+  constructor(binary, onRetired, log) {
     this.binary = binary;
     this.onRetired = onRetired;
+    this.log = log;
     this.sessions = new Set();
   }
 
@@ -74,10 +89,13 @@ class Worker {
     return child;
   }
 
-  async start(apiKey) {
+  /** The bounded `--version` probe. Returns the advertised CLI version and
+   * leaves the isolated root in place for the ACP child that follows. */
+  async probe() {
     this.root = await mkdtemp(join(tmpdir(), 'ccr-agy-acp-'));
     const isolation = await isolatedEnvironment(this.root);
     this.cwd = isolation.cwd;
+    this.isolationEnv = isolation.env;
     const probe = this.spawnChild(['--version'], isolation.env);
     let output = '';
     let bytes = 0;
@@ -87,14 +105,22 @@ class Worker {
       else output += chunk.toString('ascii');
     });
     probe.stdin.end();
-    const probeTimeout = setTimeout(() => this.retire(new AcpError('timeout')), 5000);
+    const probeTimeout = setTimeout(() => this.retire(new AcpError('timeout')), PROBE_MS);
     let exitCode;
     try { exitCode = await this.childClosed; } finally { clearTimeout(probeTimeout); }
     this.child = null;
     this.check();
-    if (exitCode !== 0 || !supportedVersion(output)) throw new AcpError('unsupported_version');
+    const version = cliVersion(output);
+    if (exitCode !== 0 || !supportedVersion(version)) throw new AcpError('unsupported_version');
+    this.version = version;
+    return version;
+  }
 
-    const child = this.spawnChild(['acp', '--sandbox'], { ...isolation.env, GEMINI_API_KEY: apiKey });
+  async start(apiKey) {
+    await this.probe();
+    this.check();
+
+    const child = this.spawnChild(['acp', '--sandbox'], { ...this.isolationEnv, GEMINI_API_KEY: apiKey });
     child.once('exit', () => this.retire(new AcpError('worker_failed')));
     child.stdout.once('end', () => this.retire(new AcpError('worker_failed')));
     this.rpc = new AcpStdio(child, error => this.retire(error));
@@ -103,6 +129,9 @@ class Worker {
     if (!Array.isArray(init.authMethods) || !init.authMethods.some(method => method?.id === AUTH_METHOD &&
         (method.type == null || method.type === 'agent'))) throw new AcpError('auth_required');
     await this.rpc.request('authenticate', { methodId: AUTH_METHOD }, 'auth_required');
+    // One bounded spawn log per worker start: binary path and CLI version only,
+    // never key material or prompt content.
+    this.log?.info?.(`gemini-agy-acp worker started (agy ${this.version}, binary: ${this.binary})`);
   }
 
   async turn({ model, thinking, prompt, onText }, apiKey) {
@@ -197,13 +226,16 @@ class Worker {
   }
 }
 
-export function createTransport({ binary, authMethod, timeoutMs = 60_000, maxWorkers = 2 } = {}) {
+export function createTransport({ binary, authMethod, timeoutMs = 60_000, maxWorkers = 2, apiKey, log } = {}) {
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || authMethod !== AUTH_METHOD ||
       !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000 ||
-      !Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8) throw new AcpError('invalid_config');
-  // The host reads settings once per activation. Capture credentials at the
-  // same boundary so every worker in this pool has one billing identity.
-  const apiKey = process.env.GEMINI_API_KEY;
+      !Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8 ||
+      (apiKey != null && (typeof apiKey !== 'string' || !apiKey.trim()))) throw new AcpError('invalid_config');
+  // The plugin resolves the sidecar apiKey against the process environment at
+  // pool start; a standalone caller may omit it entirely and fall back to the
+  // environment here. One capture boundary gives every worker in this pool a
+  // single billing identity, immune to later environment edits.
+  const credential = typeof apiKey === 'string' && apiKey.trim() ? apiKey : process.env.GEMINI_API_KEY;
   const workers = new Set();
   let closed = false;
   return {
@@ -216,18 +248,64 @@ export function createTransport({ binary, authMethod, timeoutMs = 60_000, maxWor
           (thinking != null && (typeof thinking !== 'string' || !thinking || thinking.length > 128)) ||
           typeof onText !== 'function') throw new AcpError('invalid_request');
       if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) throw new AcpError('input_limit');
-      if (!apiKey?.trim()) throw new AcpError('auth_required');
+      if (!credential?.trim()) throw new AcpError('auth_required');
       let worker = [...workers].find(candidate => !candidate.task && !candidate.failure);
       if (!worker) {
         if (workers.size >= maxWorkers) throw new AcpError('busy');
-        worker = new Worker(binary, retired => workers.delete(retired));
+        worker = new Worker(binary, retired => workers.delete(retired), log);
         workers.add(worker);
       }
-      return worker.run({ model, thinking, prompt, signal, onText }, apiKey, timeoutMs);
+      return worker.run({ model, thinking, prompt, signal, onText }, credential, timeoutMs);
+    },
+    /** Pool reset without closing: every live or idle worker is retired so the
+     * next run() respawns with fresh settings. Connect and disconnect use this
+     * to drop stale billing identities immediately. */
+    async retireExisting() {
+      await Promise.all([...workers].map(worker => worker.retire(new AcpError('closed'))));
     },
     async close() {
       closed = true;
       await Promise.all([...workers].map(worker => worker.retire(new AcpError('closed'))));
     },
   };
+}
+
+/** Validate one binary in isolation: a bounded `--version` probe with the
+ * supported-version gate. Returns the advertised CLI version string. This is
+ * the connect route's only look at the binary — no ACP child is spawned. */
+export async function probeVersion(binary) {
+  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0')) throw new AcpError('invalid_config');
+  const worker = new Worker(binary, () => {});
+  const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), PROBE_MS);
+  try {
+    return await worker.probe();
+  } finally {
+    clearTimeout(deadline);
+    await worker.retire(worker.failure ?? new AcpError('closed')).catch(() => {});
+  }
+}
+
+/** One bounded temporary worker for catalog discovery: version probe, ACP
+ * handshake with the resolved key, session/new, then the advertised model
+ * selector options from the session config. Never touches the request pool. */
+export async function syncModelOptions({ binary, authMethod = AUTH_METHOD, apiKey, log } = {}) {
+  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || authMethod !== AUTH_METHOD ||
+      typeof apiKey !== 'string' || !apiKey.trim()) throw new AcpError('invalid_config');
+  const worker = new Worker(binary, () => {}, log);
+  const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), MODEL_SYNC_MS);
+  try {
+    await worker.start(apiKey);
+    worker.check();
+    const cwd = await mkdtemp(join(worker.root, 'session-'));
+    try {
+      const session = await worker.rpc.request('session/new', { cwd, mcpServers: [] });
+      const models = modelOptions(modelSelector(session.configOptions));
+      return { models, version: worker.version ?? null };
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  } finally {
+    clearTimeout(deadline);
+    await worker.retire(worker.failure ?? new AcpError('closed')).catch(() => {});
+  }
 }

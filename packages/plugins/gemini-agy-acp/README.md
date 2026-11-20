@@ -11,7 +11,7 @@ Experimental local provider for CCR 2.3.2433 (provider plugin API 1). A text cha
 Run the following in the isolated CCR instance described below. Installing the package leaves the transport disabled until the operator enables it.
 
 ```sh
-ccr plugin add @wengine-ai/ccr-provider-gemini-agy-acp@0.0.3
+ccr plugin add @wengine-ai/ccr-provider-gemini-agy-acp@0.1.0
 ```
 
 ## Build and install locally
@@ -51,7 +51,20 @@ Place this example in the disposable `$CCR_CONFIG_DIR/config.json`. Replace `mod
 
 Use ACP as a **primary route** in an isolated instance with effective `Router.enableFallback` set to `false` and no project or global fallback entries. ACP disables fallback on the primary request once its transformer or dispatcher receives it. Earlier host failures, including `plugin_missing`, occur before the plugin gets the request. CCR can also continue an outer fallback chain if it reached ACP as a fallback candidate. Neither path is controlled by the plugin. Background recovery probes are disabled for this prototype.
 
-To opt in, the local operator writes `$CCR_CONFIG_DIR/gemini-agy-acp.json` before starting the isolated host. This file is read at activation. Omission or `enabled: false` disables execution. `binary` must be an absolute path to a trusted executable (CLI 1.5.1+ with ACP). Worker limit is 1–8 (default 1) and timeout is 1–300000 ms (default 60000). Choose an unused test port and restrict access to these files and the process environment.
+## Enable from the settings card
+
+Open the CCR settings page, find the **Local Antigravity CLI (ACP) bridge** card and:
+
+1. Enter the absolute path of your local `agy` executable (CLI 1.5.1+ with ACP).
+2. Optionally enter a Gemini API key. Leave the field empty to keep an already stored key or to use the `GEMINI_API_KEY` process environment of the isolated CCR instance.
+3. Press **Connect**. The plugin validates that the path points to an executable, probes `agy --version` with a 5 second cap and requires CLI 1.5.1 or later, then writes `$CCR_CONFIG_DIR/gemini-agy-acp.json` and respawns its worker pool.
+4. Press **Sync models** to read the model catalog the CLI advertises over ACP (one temporary worker, bounded to 5 seconds). The catalog is stored in the sidecar, shown on the card and written to the provider's `models` list in `config.json` (Router entries are left untouched), so synced models are routable immediately. If the provider entry does not exist yet, Sync models creates it with the managed marker and a placeholder URL — no manual `config.json` editing is needed.
+
+The CLI makes its own upstream calls to Google. The worker environment is isolated but forwards the standard proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` in both cases) from the CCR process, so start CCR with those variables set when your network requires a proxy for Google endpoints. Key validity is not verified at Connect time (authentication is a local ACP handshake); an invalid key surfaces the CLI's own upstream error text on the first request — never another account's figures.
+
+**Disconnect** disables the provider and retires the workers without deleting the stored settings. The status line reports loaded/enabled state, whether the binary was found, the last probed CLI version and the synced model count. The card and its routes are local-only: they run under the same loopback + Origin allowlist as the other provider plugins and never return the API key — the status shape carries `apiKeyConfigured` only.
+
+Connect writes the sidecar `$CCR_CONFIG_DIR/gemini-agy-acp.json` (mode 0600). The file remains the source of truth, and editing it takes effect on the next request without a gateway restart:
 
 ```json
 {
@@ -63,7 +76,9 @@ To opt in, the local operator writes `$CCR_CONFIG_DIR/gemini-agy-acp.json` befor
 }
 ```
 
-Supply `GEMINI_API_KEY` through the isolated CCR process environment. Keep it out of request headers, JSON files, transcripts and source control. The only supported method is `gemini-api-key`. A missing key or unsupported auth method fails the request. The provider captures the API key and sidecar settings at activation. Restart the isolated CCR host with the updated environment to rotate the key for every worker.
+An `apiKey` written by Connect is stored inside this file with 0600 permissions and never appears in logs, config.json, transcripts or responses. Worker limit is 1–8 (default 1) and timeout is 1–300000 ms (default 60000). Choose an unused test port and restrict access to these files and the process environment.
+
+Supply `GEMINI_API_KEY` through the isolated CCR process environment (together with your proxy variables), or store the key once via Connect. An explicit sidecar `apiKey` takes precedence; without one the transport captures the environment key at pool start. Keep the key out of request headers, JSON files other than the 0600 sidecar, transcripts and source control. The only supported method is `gemini-api-key`. A missing key or unsupported auth method fails the request.
 
 ## Text chat
 
