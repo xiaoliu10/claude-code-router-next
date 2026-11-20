@@ -330,6 +330,36 @@ test('model sync registers discovered models on the provider entry and leaves Ro
   assert.equal(reloaded[0], writes[0]);
 });
 
+test('model sync creates a missing provider entry with the managed marker and skips no-op writes', async t => {
+  const writes = [];
+  const config = { Providers: [{ name: 'other', models: ['keep'] }], Router: { default: 'other,keep' } };
+  const p = await activate(t, { fixtureMode: 'ok', host: {
+    readConfig: async () => JSON.parse(JSON.stringify(config)),
+    writeConfig: async next => { writes.push(next); },
+  } });
+  await p.call('POST', CONNECT_URL, { body: { binary: p.fixture.binary } });
+  const { status, body: reported } = await p.call('POST', SYNC_URL, { body: {} });
+  assert.equal(status, 200);
+  assert.equal(writes.length, 1);
+  const created = writes[0].Providers.find(entry => entry.name === name);
+  assert.ok(created, 'provider entry created');
+  assert.equal(created.api_key, `ccr-managed-${name}`);
+  assert.deepEqual(created.models, reported.models.map(model => model.id));
+  assert.equal(created.api_base_url, 'https://example.com/unused');
+  assert.deepEqual(created.transformer, { use: [name] });
+  assert.deepEqual(writes[0].Providers.filter(entry => entry.name === 'other'), [{ name: 'other', models: ['keep'] }]);
+  assert.deepEqual(writes[0].Router, config.Router);
+  // A second sync over an already-correct entry performs no write at all.
+  const stable = { ...config, Providers: [created, ...config.Providers] };
+  const quiet = await activate(t, { fixtureMode: 'ok', host: {
+    readConfig: async () => JSON.parse(JSON.stringify(stable)),
+    writeConfig: async () => { throw Error('must not write'); },
+  } });
+  await quiet.call('POST', CONNECT_URL, { body: { binary: quiet.fixture.binary } });
+  const again = await quiet.call('POST', SYNC_URL, { body: {} });
+  assert.equal(again.status, 200);
+});
+
 test('model sync rolls back the provider entry when the config write fails', async t => {
   const config = { Providers: [{ name, models: ['stale-model'] }], Router: { default: `${name},stale-model` } };
   let writes = 0;
@@ -346,7 +376,7 @@ test('model sync rolls back the provider entry when the config write fails', asy
   assert.deepEqual(saved.models.map(model => model.id), ['m2', 'default'], 'sidecar keeps synced models for the next attempt');
 });
 
-test('admin routes answer a constant 503 envelope while no service is wired', async t => {
+test('admin routes answer a constant 503 envelope while no service is wired', async () => {
   const { app, call } = stubApp();
   registerAdminRoutes(app, { getService: () => undefined });
   for (const [method, url] of [['GET', STATUS_URL], ['POST', CONNECT_URL], ['POST', DISCONNECT_URL], ['POST', SYNC_URL]]) {

@@ -174,23 +174,32 @@ export async function activateWithTransport(ctx, createTransport) {
     return status();
   }
 
-  // Register the discovered models on the provider entry so the router
-  // accepts them, mirroring the codex plugin's sync semantics: models only,
-  // Router untouched, best-effort rollback on a failed write.
+  // Register the managed provider entry and the discovered models so the
+  // router accepts them, mirroring the codex plugin's sync semantics: Router
+  // untouched, best-effort rollback on a failed write. A missing entry is
+  // created with the managed marker and a placeholder URL (never dialed), so
+  // the card alone is enough to go from install to first message.
   async function registerProviderModels(models) {
     const { readConfig, writeConfig, reloadRuntime } = ctx.host;
     if (typeof readConfig !== 'function' || typeof writeConfig !== 'function') return;
     const config = await readConfig();
-    const provider = Array.isArray(config?.Providers) ? config.Providers.find(entry => entry?.name === NAME) : undefined;
-    if (!provider) return;
-    const previous = JSON.stringify(config);
+    if (!Array.isArray(config?.Providers)) return;
+    let provider = config.Providers.find(entry => entry?.name === NAME);
     const ids = models.map(model => model.id);
-    if (JSON.stringify(provider.models ?? []) === JSON.stringify(ids)) return;
-    provider.models = ids;
+    if (!provider) {
+      provider = { name: NAME, api_base_url: 'https://example.com/unused', api_key: MARKER, models: ids, transformer: { use: [NAME] } };
+      config.Providers.push(provider);
+    } else if (JSON.stringify(provider.models ?? []) === JSON.stringify(ids) &&
+        provider.api_key === MARKER && Array.isArray(provider.transformer?.use) && provider.transformer.use.includes(NAME)) {
+      return;
+    } else {
+      provider.models = ids;
+    }
+    const previous = JSON.stringify(config);
     try {
       await writeConfig(config);
       await reloadRuntime?.(config);
-    } catch (error) {
+    } catch {
       try { await writeConfig(JSON.parse(previous)); } catch { /* original failure is reported below */ }
       throw failure('agy_config_write_failed', 500);
     }
