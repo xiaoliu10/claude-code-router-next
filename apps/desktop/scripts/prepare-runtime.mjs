@@ -438,8 +438,11 @@ async function main() {
   }
 
   // 4) Desktop service entry: core runtime bundled once, deterministic.
-  const esbuild = path.join(repoRoot, "node_modules", ".bin", "esbuild");
-  run(esbuild, [
+  // Windows .bin shims are extensionless shell scripts CreateProcess cannot
+  // run; invoking the JS shim with node works on every platform.
+  const esbuild = path.join(repoRoot, "node_modules", "esbuild", "bin", "esbuild");
+  run(process.execPath, [esbuild, "--version"], { shell: process.platform === "win32" });
+  run(process.execPath, [esbuild,
     inputs.entrySource,
     "--bundle",
     "--platform=node",

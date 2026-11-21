@@ -56,6 +56,18 @@ if (!staged) {
 
 run("cargo", ["tauri", "build", "--bundles", "nsis", "--no-sign"], { cwd: srcTauriDir });
 
+// Deterministic presence gate: tauri-build stages the resources mapping into
+// target/release before the installer packs it. If the tree collapsed (a
+// known Tauri resources pitfall), the required files vanish here.
+const stagedResources = path.join(srcTauriDir, "target", "release", "runtime");
+const required = ["node.exe", "MANIFEST.json", path.join("service", "entry.cjs"), path.join("bin", "npm.cmd"), path.join("lib", "node_modules", "npm", "bin", "npm-cli.js")];
+for (const rel of required) {
+  if (!fs.existsSync(path.join(stagedResources, rel))) {
+    console.error(`build-standalone-windows: resources staging is missing ${rel} — the tauri.windows.conf.json mapping did not preserve the runtime tree`);
+    process.exit(1);
+  }
+}
+
 const bundleDir = path.join(srcTauriDir, "target", "release", "bundle", "nsis");
 const installers = fs
   .readdirSync(bundleDir)
@@ -65,23 +77,9 @@ if (installers.length === 0) {
   console.error("build-standalone-windows: no NSIS installer produced");
   process.exit(1);
 }
-// A self-contained installer must at least carry the staged runtime; a much
-// smaller file means the resources mapping silently dropped the tree.
-const runtimeBytes = fs.readdirSync(runtimeDir, { recursive: true }).reduce((total, entry) => {
-  const file = path.join(runtimeDir, entry);
-  try {
-    return total + fs.statSync(file).size;
-  } catch {
-    return total;
-  }
-}, 0);
+// The runtime tree rides through solid LZMA (node.exe alone compresses 2.5x+),
+// so installer size is only a weak signal; the staged-resources gate above is
+// the structural check.
 for (const installer of installers) {
-  if (installer.size < runtimeBytes * 0.6) {
-    console.error(
-      `build-standalone-windows: ${installer.name} is ${installer.size} bytes but the staged runtime is ${runtimeBytes} — ` +
-        "the resources mapping likely did not include the runtime tree",
-    );
-    process.exit(1);
-  }
   console.log(`build-standalone-windows: ${installer.file} (${Math.round(installer.size / 1048576)} MiB)`);
 }
