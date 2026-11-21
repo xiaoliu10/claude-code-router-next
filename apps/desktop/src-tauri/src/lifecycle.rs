@@ -161,9 +161,10 @@ impl RuntimeBundle {
             None
         }
     }
-    /// Fixed resource launch path: `<resources>/runtime/node` (portable node).
+    /// Fixed resource launch path: `<resources>/runtime/node` (portable node;
+    /// `node.exe` on Windows, where an extension is required to execute).
     pub fn node(&self) -> PathBuf {
-        self.root.join("node")
+        self.root.join(if cfg!(windows) { "node.exe" } else { "node" })
     }
     /// Fixed resource entry: `<resources>/runtime/service/entry.cjs` (the
     /// bundled desktop service entry reusing the core runtime directly).
