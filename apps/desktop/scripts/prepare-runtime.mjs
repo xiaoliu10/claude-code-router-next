@@ -438,24 +438,26 @@ async function main() {
   }
 
   // 4) Desktop service entry: core runtime bundled once, deterministic.
-  // esbuild's postinstall replaces bin/esbuild with the platform binary (a
-  // Mach-O/PE image, not a JS shim), so execute it directly; Windows needs
-  // the .exe suffix for CreateProcess.
-  const esbuildBin = path.join(repoRoot, "node_modules", "esbuild", "bin",
-    process.platform === "win32" ? "esbuild.exe" : "esbuild");
-  run(esbuildBin, [
-    inputs.entrySource,
-    "--bundle",
-    "--platform=node",
-    "--format=cjs",
-    "--minify",
-    "--tree-shaking=true",
-    "--external:better-sqlite3",
-    "--external:lru-cache",
-    `--alias:@wengine-ai/llms=${inputs.serverCjs}`,
-    `--alias:@wengine-ai/claude-code-router-shared=${inputs.sharedDist}`,
-    `--outfile=${path.join(serviceDir, "entry.cjs")}`,
+  // The esbuild JS API (not the bin shim): on Windows the postinstall binary
+  // is extension-less inside node_modules/esbuild/bin and CreateProcess cannot
+  // launch it, while the JS API resolves the platform binary itself.
+  const esbuildModule = path.join(repoRoot, "node_modules", "esbuild");
+  const esbuildResult = run(process.execPath, [
+    "-e",
+    `const esbuild = require(${JSON.stringify(esbuildModule)});\n` +
+      `esbuild.buildSync({\n` +
+      `  entryPoints: [${JSON.stringify(inputs.entrySource)}],\n` +
+      `  bundle: true,\n` +
+      `  platform: "node",\n` +
+      `  format: "cjs",\n` +
+      `  minify: true,\n` +
+      `  treeShaking: true,\n` +
+      `  external: ["better-sqlite3", "lru-cache"],\n` +
+      `  alias: { "@wengine-ai/llms": ${JSON.stringify(inputs.serverCjs)}, "@wengine-ai/claude-code-router-shared": ${JSON.stringify(inputs.sharedDist)} },\n` +
+      `  outfile: ${JSON.stringify(path.join(serviceDir, "entry.cjs"))},\n` +
+      `});\n`,
   ]);
+  if (esbuildResult.stdout) console.log(`prepare-runtime: esbuild ${esbuildResult.stdout.trim()}`);
   await fs.promises.copyFile(inputs.wasm, path.join(serviceDir, "tiktoken_bg.wasm"));
 
   // 5) External runtime deps (native better-sqlite3 + lru-cache) adjacent to
