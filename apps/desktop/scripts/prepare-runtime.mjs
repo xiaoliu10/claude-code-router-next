@@ -438,11 +438,12 @@ async function main() {
   }
 
   // 4) Desktop service entry: core runtime bundled once, deterministic.
-  // Windows .bin shims are extensionless shell scripts CreateProcess cannot
-  // run; invoking the JS shim with node works on every platform.
-  const esbuild = path.join(repoRoot, "node_modules", "esbuild", "bin", "esbuild");
-  run(process.execPath, [esbuild, "--version"], { shell: process.platform === "win32" });
-  run(process.execPath, [esbuild,
+  // esbuild's postinstall replaces bin/esbuild with the platform binary (a
+  // Mach-O/PE image, not a JS shim), so execute it directly; Windows needs
+  // the .exe suffix for CreateProcess.
+  const esbuildBin = path.join(repoRoot, "node_modules", "esbuild", "bin",
+    process.platform === "win32" ? "esbuild.exe" : "esbuild");
+  run(esbuildBin, [
     inputs.entrySource,
     "--bundle",
     "--platform=node",
