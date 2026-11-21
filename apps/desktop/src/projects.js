@@ -944,6 +944,10 @@
       if (text != null) n.textContent = text;
       return n;
     }
+    // Disabled-in-preview hint: projects using the global router render a
+    // read-only mirror, so every locked control explains why and how to edit.
+    var GLOBAL_PREVIEW_HINT = '使用全局路由：此处为全局配置预览；取消勾选「使用全局路由」后可编辑';
+    var hintWhen = function (locked, node) { if (locked) node.title = GLOBAL_PREVIEW_HINT; return node; };
     function button(text, fn, disabled, cls) {
       var n = el('button', cls || 'btn', text); n.type = 'button'; n.disabled = !!disabled;
       n.addEventListener('click', fn); return n;
@@ -1097,17 +1101,17 @@
         var labels = { enableFamilyRouting: '家族路由', enableFallback: '回退', enableExtendedContext: '扩展上下文' };
         (scope === 'root' ? PROJECT_FLAGS : FAMILY_FLAGS).forEach(function (k) {
           var row = el('div', 'project-setting');
-          row.appendChild(check(labels[k], obj[k], function (v) { controller.setFlag(id, scope, k, v); }, global));
+          row.appendChild(hintWhen(global, check(labels[k], obj[k], function (v) { controller.setFlag(id, scope, k, v); }, global)));
           row.appendChild(el('span', 'count', Object.prototype.hasOwnProperty.call(obj, k) ? '' : '未设置'));
           if (!global && Object.prototype.hasOwnProperty.call(obj, k)) row.appendChild(button('使用默认', function () { controller.setFlag(id, scope, k, null); }));
           flags.appendChild(row);
         });
         PROJECT_THRESHOLDS.forEach(function (k) {
-          var n = input(THRESHOLD_LABELS[k], obj[k], function (v) { controller.setThreshold(id, scope, k, v); }, global, id + '|' + scope + '|' + k, 'number');
+          var n = hintWhen(global, input(THRESHOLD_LABELS[k], obj[k], function (v) { controller.setThreshold(id, scope, k, v); }, global, id + '|' + scope + '|' + k, 'number'));
           n.min = '1'; n.step = '1'; n.placeholder = k === 'longContextThreshold' ? '默认 60000' : '默认 200000';
           refs.push({ node: n, scope: scope, field: k }); flags.appendChild(labeled(THRESHOLD_LABELS[k] + '（留空使用默认值）', n));
         });
-        if (scope !== 'root') flags.appendChild(button('移除家族配置', function () { controller.removeFamily(id, scope); }, global, 'btn btn-danger-quiet'));
+        if (scope !== 'root') flags.appendChild(hintWhen(global, button('移除家族配置', function () { controller.removeFamily(id, scope); }, global, 'btn btn-danger-quiet')));
         body.appendChild(flags);
         var grid = el('div', 'project-routes');
         var labelsByScenario = { default: '默认', background: '后台', think: '思考', longContext: '长上下文', extendedContext: '扩展上下文', webSearch: '网页搜索', image: '图像' };
@@ -1119,9 +1123,9 @@
           var list = el('ol', 'fallback-list'), entries = obj.fallback && obj.fallback[scenario] || [];
           entries.forEach(function (name, i) {
             var row = el('li', 'fallback-item'); row.appendChild(el('span', 'fallback-order', (i + 1) + '.')); row.appendChild(el('span', 'fallback-name', name));
-            var up = button('↑', function () { controller.moveFallback(id, scope, scenario, i, -1); }, global || i === 0); up.setAttribute('aria-label', label + ' 上移回退 ' + name);
-            var down = button('↓', function () { controller.moveFallback(id, scope, scenario, i, 1); }, global || i === entries.length - 1); down.setAttribute('aria-label', label + ' 下移回退 ' + name);
-            var remove = button('移除', function () { controller.removeFallback(id, scope, scenario, i); }, global); remove.setAttribute('aria-label', label + ' 移除回退 ' + name);
+            var up = hintWhen(global, button('↑', function () { controller.moveFallback(id, scope, scenario, i, -1); }, global || i === 0)); up.setAttribute('aria-label', label + ' 上移回退 ' + name);
+            var down = hintWhen(global, button('↓', function () { controller.moveFallback(id, scope, scenario, i, 1); }, global || i === entries.length - 1)); down.setAttribute('aria-label', label + ' 下移回退 ' + name);
+            var remove = hintWhen(global, button('移除', function () { controller.removeFallback(id, scope, scenario, i); }, global)); remove.setAttribute('aria-label', label + ' 移除回退 ' + name);
             row.appendChild(up); row.appendChild(down); row.appendChild(remove); list.appendChild(row);
           }); card.appendChild(list);
           if (!global) {
@@ -1138,7 +1142,7 @@
         }); body.appendChild(grid);
       }
       function routeInput(label, value, field) {
-        var n = input(label, value, function (v) { controller.setTarget(id, scope, field, v); }, global, id + '|' + scope + '|' + field);
+        var n = hintWhen(global, input(label, value, function (v) { controller.setTarget(id, scope, field, v); }, global, id + '|' + scope + '|' + field));
         n.setAttribute('list', 'project-route-choices'); n.placeholder = '提供方,模型（留空清除）';
         refs.push({ node: n, scope: scope, field: field }); return n;
       }
