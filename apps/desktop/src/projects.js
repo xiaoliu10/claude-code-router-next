@@ -1079,7 +1079,7 @@
         Object.keys(obj || {}).forEach(function (alias) {
           var card = el('div', 'route'); card.appendChild(el('div', 'route-name', alias));
           var n = routeInput(alias, obj[alias], alias); card.appendChild(n);
-          card.appendChild(button('移除别名', function () { controller.removeAlias(id, alias); }, global)); body.appendChild(card);
+          card.appendChild(hintWhen(global, button('移除别名', function () { controller.removeAlias(id, alias); }, global))); body.appendChild(card);
         });
         if (!global) {
           var aliasCard = el('div', 'card');
@@ -1095,7 +1095,7 @@
         }
       } else if (!obj) {
         var absent = el('div', 'card'); absent.appendChild(el('p', 'project-note', '该家族尚未配置，将使用项目路由。'));
-        absent.appendChild(button('添加家族配置', function () { controller.addFamily(id, scope); }, global)); body.appendChild(absent);
+        absent.appendChild(hintWhen(global, button('添加家族配置', function () { controller.addFamily(id, scope); }, global))); body.appendChild(absent);
       } else {
         var flags = el('div', 'card project-settings');
         var labels = { enableFamilyRouting: '家族路由', enableFallback: '回退', enableExtendedContext: '扩展上下文' };

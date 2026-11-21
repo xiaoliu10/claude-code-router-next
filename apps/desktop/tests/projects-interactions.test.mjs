@@ -100,6 +100,8 @@ test('projects interaction: global preview locks carry an editable hint, custom 
   assert.equal(locked.disabled, true);
   assert.match(locked.title, /使用全局路由/);
   assert.match(h.id('projects-body').querySelectorAll('.fallback-item')[0].querySelectorAll('button')[0].title, /使用全局路由/);
+  const lockedButtons = h.id('projects-body').querySelectorAll('button').filter(b => b.disabled && (b.textContent === '移除别名' || b.textContent === '添加家族配置'));
+  for (const b of lockedButtons) assert.match(b.title, /使用全局路由/, b.textContent);
   select(h, 'b'); await flush();
   const editable = byLabel(h, '默认 目标');
   assert.equal(editable.disabled, false);
