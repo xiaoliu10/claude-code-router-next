@@ -1,5 +1,6 @@
 import { access, stat } from 'node:fs/promises';
 import { constants, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { AcpError } from './acp-errors.mjs';
 import { registerAdminRoutes } from './admin-routes.mjs';
@@ -13,6 +14,14 @@ const SAFE_CODE = /^[a-z][a-z0-9_]{0,63}$/;
 // Importing transport.mjs must not start a subprocess; loading and installing
 // this prototype alone stays inert.
 const loadTransportModule = () => import('./transport.mjs');
+
+// Short non-reversible fingerprint of the configured credential so the card
+// can show WHICH key is connected without ever serializing the key itself.
+function credentialFingerprint(apiKey) {
+  const key = apiKeyShapeOk(apiKey) ? apiKey : process.env.GEMINI_API_KEY;
+  if (!apiKeyShapeOk(key)) return null;
+  return createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 10);
+}
 
 function assertProvider(provider) {
   if (provider?.name !== NAME || provider.apiKey !== MARKER || provider.enabled === false) {
@@ -121,6 +130,7 @@ export async function activateWithTransport(ctx, createTransport) {
       version,
       lastError: lastError ?? null,
       apiKeyConfigured: apiKeyShapeOk(raw?.apiKey) || Boolean(process.env.GEMINI_API_KEY?.trim()),
+      apiKeyFingerprint: credentialFingerprint(raw?.apiKey),
       ...(models ? { models } : {}),
       ...(modelsSyncedAt !== undefined ? { modelsSyncedAt } : {}),
     };

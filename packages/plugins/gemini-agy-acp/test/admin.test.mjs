@@ -1,5 +1,6 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -111,13 +112,16 @@ test('status shape when the plugin loaded before the sidecar existed', async t =
   const p = await activate(t);
   const { status, body: reported } = await p.call('GET', STATUS_URL);
   assert.equal(status, 200);
+  const fingerprint = createHash('sha256').update(variables.GEMINI_API_KEY, 'utf8').digest('hex').slice(0, 10);
   assert.deepEqual(reported, { loaded: false, enabled: false, binary: null, binaryFound: false,
-    version: null, lastError: null, apiKeyConfigured: true });
+    version: null, lastError: null, apiKeyConfigured: true, apiKeyFingerprint: fingerprint });
+  assert.ok(!('apiKey' in reported));
   assert.ok(!('models' in reported) && !('modelsSyncedAt' in reported));
   delete process.env.GEMINI_API_KEY;
   try {
     const withoutEnv = await p.call('GET', STATUS_URL);
     assert.equal(withoutEnv.body.apiKeyConfigured, false);
+    assert.equal(withoutEnv.body.apiKeyFingerprint, null);
   } finally {
     process.env.GEMINI_API_KEY = variables.GEMINI_API_KEY;
   }

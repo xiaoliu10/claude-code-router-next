@@ -64,6 +64,13 @@ export default {
 
     const statusLine = el('p', 'max-w-md text-xs font-medium text-muted-foreground', '');
     body.append(statusLine);
+    // Synced model list (collapsed by default) and credential fingerprint.
+    const modelsBox = el('details', 'max-w-md text-xs text-muted-foreground');
+    modelsBox.append(el('summary', null, t('模型列表', 'Model list')));
+    const modelsList = el('ul', 'list-disc pl-5');
+    modelsBox.append(modelsList);
+    modelsBox.hidden = true;
+    body.append(modelsBox);
 
     const binaryInput = el('input', INPUT_CLASS);
     binaryInput.type = 'text';
@@ -90,7 +97,8 @@ export default {
       } else if (typeof status.modelsSyncedAt === 'number') {
         parts.push(t('0 个模型', '0 models'));
       }
-      if (status.apiKeyConfigured !== true) parts.push(t('缺少 API key', 'no API key'));
+      if (status.apiKeyFingerprint) parts.push(t(`凭据 ${status.apiKeyFingerprint}…`, `credential ${status.apiKeyFingerprint}…`));
+      else if (status.apiKeyConfigured !== true) parts.push(t('缺少 API key', 'no API key'));
       if (status.lastError?.code) parts.push(t(`上次错误 ${status.lastError.code}`, `last error ${status.lastError.code}`));
       return parts.join(' · ');
     };
@@ -134,6 +142,17 @@ export default {
 
     const renderStatus = status => {
       statusLine.textContent = statusText(status);
+      // ACP key auth exposes no account email; the fingerprint lets the
+      // operator match WHICH key is connected without revealing it.
+      statusLine.title = status?.apiKeyFingerprint
+        ? t('凭据指纹 = Gemini API key 的 SHA-256 前 10 位', 'credential fingerprint = first 10 hex of the Gemini API key SHA-256')
+        : '';
+      const modelEntries = Array.isArray(status?.models) ? status.models : [];
+      modelsList.replaceChildren(...modelEntries.map(model => {
+        const li = el('li', null, (typeof model?.name === 'string' && model.name ? model.name + ' ' : '') + (model?.id ?? ''));
+        return li;
+      }));
+      modelsBox.hidden = modelEntries.length === 0;
       // Prefill only the binary path (an operator setting, not a secret);
       // the key input is never populated from stored state.
       if (!binaryInput.value && typeof status?.binary === 'string') binaryInput.value = status.binary;

@@ -30,7 +30,8 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
   const card = (await import('../src/card.mjs')).default;
   for (const locale of ['en', 'zh']) for (const disabled of [false, true]) {
     const status = { loaded: true, enabled: true, binary: '/fixture/agy', binaryFound: true, version: '1.5.1',
-      lastError: null, apiKeyConfigured: true, models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }],
+      lastError: null, apiKeyConfigured: true, apiKeyFingerprint: '0248f56577',
+      models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }],
       modelsSyncedAt: 1700000000000 };
     const calls = [];
     const callApi = async (path, init) => {
@@ -44,7 +45,7 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       setAttribute() {},
       append(...kids) { this.children.push(...kids); },
       remove() { events.push('remove'); },
-      replaceChildren() { this.children.length = 0; events.push('clear'); } });
+      replaceChildren(...kids) { this.children.length = 0; this.children.push(...kids); events.push('clear'); } });
     const previous = globalThis.document;
     globalThis.document = { createElement: make };
     try {
@@ -84,6 +85,11 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       assert.ok(line);
       assert.match(line.textContent, locale === 'zh' ? /已连接/ : /Connected/);
       assert.match(line.textContent, /2/);
+      // Credential fingerprint (never the key) plus the expandable model list.
+      assert.match(line.textContent, locale === 'zh' ? /凭据 0248f56577…/ : /credential 0248f56577…/);
+      const modelsUl = all.find(node => node.tag === 'ul');
+      assert.ok(modelsUl);
+      assert.deepEqual(modelsUl.children.map(li => li.textContent), ['Gemini Model m2', 'Default default']);
       assert.deepEqual(calls[0], ['/status', { timeoutMs: 15000 }]);
       // Connect sends the binary path, no key when the field is empty, and clears it after typing.
       inputNodes[0].value = '/fixture/agy';
@@ -93,7 +99,9 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       assert.equal(inputNodes[1].value, '');
       assert.ok(calls.some(([path]) => path === '/status'));
       card.unmount(host);
-      assert.deepEqual(events, ['clear']);
+      // Mount renders status twice (each re-clears the model list) and unmount
+      // clears the host: three clear events, no removals.
+      assert.deepEqual(events, ['clear', 'clear', 'clear']);
       assert.equal(host.children.length, 0);
     } finally { globalThis.document = previous; }
   }
