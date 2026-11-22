@@ -6,9 +6,11 @@ import {
   nodeDistFilename,
   nodeDistPlatform,
   npmCmdWrapper,
+  readPeHeader,
   satisfiesRange,
 } from "../scripts/prepare-runtime.mjs";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const scriptsDir = path.dirname(new URL(import.meta.url).pathname);
@@ -61,6 +63,16 @@ test("pe gate accepts the DOS image header and rejects text", () => {
   assert.equal(isPeBuffer(Buffer.from("#!/bin/sh\n")), false);
   assert.equal(isPeBuffer(Buffer.alloc(1)), false);
   assert.equal(isPeBuffer(undefined), false);
+});
+
+test("readPeHeader reads the DOS header without loading the whole binary", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pe-header-"));
+  const binary = path.join(dir, "node.exe");
+  fs.writeFileSync(binary, Buffer.concat([Buffer.from([0x4d, 0x5a]), Buffer.alloc(64)]));
+  assert.deepEqual(readPeHeader(binary), Buffer.from([0x4d, 0x5a]));
+  fs.writeFileSync(binary, Buffer.from("#"));
+  assert.equal(readPeHeader(binary).length, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("semver subset covers caret tilde bare-major and exact ranges", () => {

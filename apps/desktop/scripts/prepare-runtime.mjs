@@ -80,6 +80,18 @@ export function isPeBuffer(buffer) {
   return buffer?.length >= 2 && buffer[0] === 0x4d && buffer[1] === 0x5a;
 }
 
+/** Read just the 2-byte DOS header without loading a ~100 MB binary. */
+export function readPeHeader(file) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const header = Buffer.alloc(2);
+    const read = fs.readSync(fd, header, 0, 2, 0);
+    return header.subarray(0, read);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /** Bundled npm wrapper for Windows (CRLF batch, fixed relative paths). */
 export function npmCmdWrapper(kind) {
   const cli = kind === "npx" ? "npx-cli.js" : "npm-cli.js";
@@ -432,8 +444,7 @@ async function main() {
     // Full import-table analysis is out of scope; the require roundtrip below
     // is the authoritative check that the binary actually runs.
     for (const binary of [nodeReal]) {
-      const head = fs.readFileSync(binary).subarray(0, 2);
-      if (!isPeBuffer(head)) fail(`Staged ${path.basename(binary)} is not a PE image`);
+      if (!isPeBuffer(readPeHeader(binary))) fail(`Staged ${path.basename(binary)} is not a PE image`);
     }
   }
 
@@ -458,6 +469,11 @@ async function main() {
       `});\n`,
   ]);
   if (esbuildResult.stdout) console.log(`prepare-runtime: esbuild ${esbuildResult.stdout.trim()}`);
+  // esbuild reports warnings on stderr even when the build succeeds; don't
+  // swallow them on the success path.
+  if (esbuildResult.stderr?.trim()) {
+    console.log(`prepare-runtime: esbuild warnings:\n${esbuildResult.stderr.trim()}`);
+  }
   await fs.promises.copyFile(inputs.wasm, path.join(serviceDir, "tiktoken_bg.wasm"));
 
   // 5) External runtime deps (native better-sqlite3 + lru-cache) adjacent to

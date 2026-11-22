@@ -54,12 +54,18 @@ if (!staged) {
   process.exit(1);
 }
 
+// tauri-build's copy_resources never cleans previously copied files, so a
+// stale staging tree from an earlier build would survive a broken mapping.
+// Clear it first; the presence gate below only passes on what the current
+// mapping actually produced.
+const stagedResources = path.join(srcTauriDir, "target", "release", "runtime");
+fs.rmSync(stagedResources, { recursive: true, force: true });
+
 run("cargo", ["tauri", "build", "--bundles", "nsis", "--no-sign"], { cwd: srcTauriDir });
 
 // Deterministic presence gate: tauri-build stages the resources mapping into
 // target/release before the installer packs it. If the tree collapsed (a
 // known Tauri resources pitfall), the required files vanish here.
-const stagedResources = path.join(srcTauriDir, "target", "release", "runtime");
 const required = ["node.exe", "MANIFEST.json", path.join("service", "entry.cjs"), path.join("bin", "npm.cmd"), path.join("lib", "node_modules", "npm", "bin", "npm-cli.js")];
 for (const rel of required) {
   if (!fs.existsSync(path.join(stagedResources, rel))) {
