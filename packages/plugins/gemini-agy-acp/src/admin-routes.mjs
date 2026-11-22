@@ -6,6 +6,7 @@
  * match our authority; an originless loopback request (local CLI) is allowed.
  *
  *  GET  /status          → redacted status shape for the management card
+ *  POST /install         {} — kick off the official agy auto-install
  *  POST /connect         {binary?, apiKey?}
  *  POST /disconnect      {}
  *  POST /models/sync     {}
@@ -93,6 +94,19 @@ export function registerAdminRoutes(app, { getService }) {
       return await resolved.status();
     } catch (error) {
       return agyRouteError(error, reply, 'status');
+    }
+  });
+
+  app.post('/api/gemini-agy-acp/install', async (req, reply) => {
+    try {
+      assertLocalAgyRequest(req);
+      const resolved = service(reply);
+      if (!resolved) return { ok: false, success: false, error: 'agy_route_failed' };
+      // Kicks off the single-flight background install and answers with the
+      // current status immediately; the card polls /status for completion.
+      return { ok: true, success: true, ...(await resolved.install()) };
+    } catch (error) {
+      return agyRouteError(error, reply, 'install');
     }
   });
 

@@ -51,6 +51,16 @@ Place this example in the disposable `$CCR_CONFIG_DIR/config.json`. Replace `mod
 
 Use ACP as a **primary route** in an isolated instance with effective `Router.enableFallback` set to `false` and no project or global fallback entries. ACP disables fallback on the primary request once its transformer or dispatcher receives it. Earlier host failures, including `plugin_missing`, occur before the plugin gets the request. CCR can also continue an outer fallback chain if it reached ACP as a fallback candidate. Neither path is controlled by the plugin. Background recovery probes are disabled for this prototype.
 
+## Automatic agy install
+
+When the settings card first opens and no `agy` is detected (no sidecar binary and nothing at the official default location), it starts the official install automatically for the current OS and CPU architecture — macOS/Linux/Windows on x64 or arm64, including the Linux musl builds. The flow mirrors the vendor bootstrappers step for step: the release manifest is queried from the pinned Antigravity updater, the payload downloads over HTTPS only (curl inherits the gateway's `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` environment), the SHA-512 checksum is verified before anything is placed, and payload URLs are restricted to the vendor's own hosts. The binary lands at `~/.local/bin/agy` on unix and `%LOCALAPPDATA%\agy\bin\agy.exe` on Windows; no remote script is ever piped into a shell.
+
+The install runs in the background (single-flight) while the card polls status; a failure shows a stable error code with an explicit **Install agy** retry button and is never retried automatically. Installing never writes the sidecar and never enables the provider — **Connect** remains the only action that persists settings and starts workers. `POST /api/gemini-agy-acp/install` triggers the same flow manually (local-only guard).
+
+首次打开设置卡片时，若未检测到 `agy`（sidecar 未配置 binary，官方默认位置也没有），会按当前系统与 CPU 架构自动安装官方发布版——支持 macOS/Linux/Windows 的 x64 与 arm64（含 Linux musl 构建）。流程与官方引导脚本逐步一致：从固定的 Antigravity 更新器查询发布清单，仅经 HTTPS 下载（curl 继承网关的 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` 环境变量），放置任何文件前先校验 SHA-512，下载地址限定厂商自有域名。unix 安装到 `~/.local/bin/agy`，Windows 安装到 `%LOCALAPPDATA%\agy\bin\agy.exe`；绝不把远程脚本管道进 shell。
+
+安装在后台单飞执行，卡片轮询状态；失败时显示稳定错误码与显式「安装 agy」重试按钮，不会自动重试。安装不写 sidecar、不启用供应商——**连接**仍是唯一持久化配置并启动 worker 的操作。`POST /api/gemini-agy-acp/install` 可手动触发同一流程（仅限本机守卫）。
+
 ## Enable from the settings card
 
 Open the CCR settings page, find the **Local Antigravity CLI (ACP) bridge** card and:

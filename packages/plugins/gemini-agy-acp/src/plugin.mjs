@@ -6,6 +6,7 @@ import { AcpError } from './acp-errors.mjs';
 import { registerAdminRoutes } from './admin-routes.mjs';
 import { accountEmailShapeOk } from './account.mjs';
 import { chatResponse, failure, textTurns, toPrompt } from './chat.mjs';
+import { createInstaller } from './install.mjs';
 import { AUTH_METHODS, apiKeyShapeOk, enabledSettings, hiddenModelsOf, readSidecar, sidecarCache, writeSidecar } from './settings.mjs';
 
 const NAME = 'gemini-agy-acp';
@@ -61,7 +62,8 @@ async function assertExecutable(binary) {
   }
 }
 
-export async function activateWithTransport(ctx, createTransport) {
+export async function activateWithTransport(ctx, createTransport, options = {}) {
+  const installer = options.installer ?? createInstaller();
   const configDir = ctx.host.configDir;
   const log = ctx.log;
   const cache = sidecarCache(configDir);
@@ -72,6 +74,12 @@ export async function activateWithTransport(ctx, createTransport) {
   let fingerprint;
   let rebuilding;
   let lastError;
+  // Background install state: single-flight promise while the official agy
+  // download runs, the last failure token, and the path placed by a successful
+  // install (reported as detectedBinary until Connect persists it).
+  let installing = null;
+  let installError = null;
+  let installedBinary = null;
 
   const note = error => {
     lastError = { code: safeCode(error), at: Date.now() };
@@ -104,6 +112,26 @@ export async function activateWithTransport(ctx, createTransport) {
     return transport;
   }
 
+  // Single-flight background install of the official agy binary for this
+  // platform/architecture. The route kicks it off and answers immediately;
+  // the card polls /status until the download finishes. Success never touches
+  // the sidecar — Connect remains the only action that persists settings and
+  // enables the provider.
+  function startInstall() {
+    if (installing) return installing;
+    installError = null;
+    installing = installer.install()
+      .then(result => { installedBinary = result.binary; })
+      .catch(error => { installError = { code: safeCode(error), at: Date.now() }; })
+      .finally(() => { installing = null; });
+    return installing;
+  }
+
+  async function install() {
+    void startInstall();
+    return status();
+  }
+
   async function status() {
     let raw = null;
     try {
@@ -117,6 +145,14 @@ export async function activateWithTransport(ctx, createTransport) {
       try {
         binaryFound = statSync(binary).isFile();
       } catch { /* reported as not found */ }
+    }
+    // With no sidecar binary, surface an agy found at the official default
+    // location (or placed by the background install) so the card can prefill
+    // it without any config write.
+    let detectedBinary = null;
+    if (!binary) {
+      const candidate = installedBinary ?? installer.targetBinary;
+      try { if (statSync(candidate).isFile()) detectedBinary = candidate; } catch { /* not installed */ }
     }
     const version = typeof raw?.version === 'string' && raw.version.length > 0 && raw.version.length <= 128
       ? raw.version : null;
@@ -133,6 +169,9 @@ export async function activateWithTransport(ctx, createTransport) {
       enabled: raw?.enabled === true,
       binary,
       binaryFound,
+      detectedBinary,
+      installing: installing !== null,
+      installError: installError ?? null,
       version,
       lastError: lastError ?? null,
       authMethod,
@@ -340,6 +379,7 @@ export async function activateWithTransport(ctx, createTransport) {
   ctx.registerUiCard?.({ cardPath: 'card.js' });
   ctx.registerAdminRoutes?.(app => registerAdminRoutes(app, { getService: () => ({
     status: () => status(),
+    install: guarded(install),
     connect: guarded(connect),
     disconnect: guarded(disconnect),
     syncModels: guarded(syncModels),

@@ -19,6 +19,7 @@ const CONNECT_URL = `/api/${name}/connect`;
 const DISCONNECT_URL = `/api/${name}/disconnect`;
 const SYNC_URL = `/api/${name}/models/sync`;
 const VISIBILITY_URL = `/api/${name}/models/visibility`;
+const INSTALL_URL = `/api/${name}/install`;
 
 const variables = { GEMINI_API_KEY: 'fixture-value' };
 const previous = new Map();
@@ -67,7 +68,7 @@ function stubApp(port = 43781) {
   return { app, call };
 }
 
-async function activate(t, { local, fixtureMode, fixtureAuth, host } = {}) {
+async function activate(t, { local, fixtureMode, fixtureAuth, host, installer } = {}) {
   const configDir = await mkdtemp(join(tmpdir(), 'agy-admin-'));
   t.after(() => rm(configDir, { recursive: true, force: true }));
   if (local !== undefined) await writeFile(sidecarPath(configDir), JSON.stringify(local));
@@ -91,7 +92,12 @@ async function activate(t, { local, fixtureMode, fixtureAuth, host } = {}) {
     };
     transports.push(transport);
     return transport;
-  });
+  }, { installer: installer ?? {
+    // Default stub: no test may reach the network; the target path is absent
+    // so detectedBinary stays null unless a test installs a real fixture.
+    install: async () => { throw new Error('unexpected install in test'); },
+    targetBinary: join(configDir, 'absent-agy'),
+  } });
   assert.equal(registrars.length, 1);
   const { app, call } = stubApp();
   registrars[0](app);
@@ -116,6 +122,7 @@ test('status shape when the plugin loaded before the sidecar existed', async t =
   assert.equal(status, 200);
   const fingerprint = createHash('sha256').update(variables.GEMINI_API_KEY, 'utf8').digest('hex').slice(0, 10);
   assert.deepEqual(reported, { loaded: false, enabled: false, binary: null, binaryFound: false,
+    detectedBinary: null, installing: false, installError: null,
     version: null, lastError: null, authMethod: null, apiKeyConfigured: true, apiKeyFingerprint: fingerprint,
     hiddenModels: [] });
   assert.ok(!('apiKey' in reported));
@@ -138,6 +145,7 @@ test('route guard rejects non-loopback sockets, foreign origins and unknown host
     ['POST', DISCONNECT_URL, { headers: { host: 'localhost:9999' } }],
     ['POST', SYNC_URL, { headers: { host: '127.0.0.1:43781', origin: 'ftp://127.0.0.1:43781' } }],
     ['POST', VISIBILITY_URL, { headers: { host: 'localhost:9999' } }],
+    ['POST', INSTALL_URL, { ip: '10.1.2.3', headers: { host: '127.0.0.1:43781' } }],
   ]) {
     const { status, body: reported } = await p.call(method, url, request);
     assert.equal(status, 403, `${method} ${url}`);
@@ -595,4 +603,75 @@ test('admin routes answer a constant 503 envelope while no service is wired', as
     assert.equal(status, 503);
     assert.deepEqual(reported, { ok: false, success: false, error: 'agy_route_failed' });
   }
+});
+
+test('install kicks off the single-flight background installer and never touches the sidecar', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'agy-installed-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const placed = join(dir, 'agy');
+  let resolveInstall;
+  let starts = 0;
+  const installer = {
+    targetBinary: placed,
+    install: () => { starts += 1; return new Promise(resolve => { resolveInstall = resolve; }); },
+  };
+  const p = await activate(t, { installer });
+  const first = await p.call('POST', INSTALL_URL, { body: {} });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.installing, true);
+  assert.equal(starts, 1);
+  // Single-flight: a second kick while running starts no second download.
+  const second = await p.call('POST', INSTALL_URL, { body: {} });
+  assert.equal(second.body.installing, true);
+  assert.equal(starts, 1);
+  const mid = await p.call('GET', STATUS_URL);
+  assert.equal(mid.body.installing, true);
+  assert.equal(mid.body.detectedBinary, null); // nothing placed yet
+  // The installer finishes: the binary appears at the official target path.
+  await writeFile(placed, 'fixture agy');
+  resolveInstall({ version: '1.5.14', binary: placed });
+  await delay(20);
+  const done = await p.call('GET', STATUS_URL);
+  assert.equal(done.body.installing, false);
+  assert.equal(done.body.installError, null);
+  assert.equal(done.body.detectedBinary, placed);
+  // Connect remains the only action that persists settings / enables.
+  assert.equal(done.body.binary, null);
+  assert.equal(done.body.enabled, false);
+  await assert.rejects(readFile(sidecarPath(p.configDir)), { code: 'ENOENT' });
+});
+
+test('a failed install surfaces a stable code, never the raw message, and retries only explicitly', async t => {
+  let calls = 0;
+  const installer = {
+    targetBinary: join(tmpdir(), 'agy-absent-target'),
+    install: async () => {
+      calls += 1;
+      throw Object.assign(new Error('secret upstream detail'), { code: 'agy_install_download_failed' });
+    },
+  };
+  const p = await activate(t, { installer });
+  const kicked = await p.call('POST', INSTALL_URL, { body: {} });
+  assert.equal(kicked.status, 200);
+  await delay(20);
+  const done = await p.call('GET', STATUS_URL);
+  assert.equal(done.body.installing, false);
+  assert.equal(done.body.installError.code, 'agy_install_download_failed');
+  assert.doesNotMatch(JSON.stringify(done.body), /secret upstream detail/);
+  // Status reads never retry: only an explicit POST starts another attempt.
+  await p.call('GET', STATUS_URL);
+  assert.equal(calls, 1);
+  await p.call('POST', INSTALL_URL, { body: {} });
+  await delay(20);
+  assert.equal(calls, 2);
+  // An unknown error collapses to the constant safe token.
+  const plain = await activate(t, { installer: {
+    targetBinary: join(tmpdir(), 'agy-absent-target-2'),
+    install: async () => { throw new Error('raw internals'); },
+  } });
+  await plain.call('POST', INSTALL_URL, { body: {} });
+  await delay(20);
+  const collapsed = await plain.call('GET', STATUS_URL);
+  assert.equal(collapsed.body.installError.code, 'agy_route_error');
+  assert.doesNotMatch(JSON.stringify(collapsed.body), /raw internals/);
 });

@@ -23,7 +23,7 @@ test('build fails without destroying the previous dist when the card source is m
   assert.equal(await readFile(join(source, 'dist', 'card.js'), 'utf8'), packaged);
 });
 
-test('management card mounts from a DOM stub, localizes the surface and unmounts cleanly', async t => {
+test('management card mounts from a DOM stub, localizes the surface and unmounts cleanly', async () => {
   const source = await readFile(new URL('../src/card.mjs', import.meta.url), 'utf8');
   // The card must stay free of imports and browser/network escape hatches.
   assert.doesNotMatch(source, /(^|[^\w.])import\s|fetch\(|XMLHttpRequest|innerHTML|eval\(|new Function/);
@@ -80,10 +80,13 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       walk(root);
       const buttonNodes = all.filter(node => node.tag === 'button');
       const inputNodes = all.filter(node => node.tag === 'input');
-      // The three fixed actions, the two auth-mode toggle buttons, a per-row
-      // toggle for each of the two models and one restore-all for the seeded
-      // hidden model.
-      assert.equal(buttonNodes.length, 8);
+      // The three fixed actions, the (hidden) install button, the two
+      // auth-mode toggle buttons, a per-row toggle for each of the two models
+      // and one restore-all for the seeded hidden model.
+      assert.equal(buttonNodes.length, 9);
+      const installButton = buttonNodes.find(node => /安装 agy|Install agy/.test(node.textContent));
+      assert.ok(installButton);
+      assert.equal(installButton.hidden, true); // a binary is configured → no install offer
       const mainLabels = zh ? ['连接', '同步模型', '断开'] : ['Connect', 'Sync models', 'Disconnect'];
       const actionButtons = mainLabels.map(label => buttonNodes.find(node => node.textContent === label));
       assert.deepEqual(actionButtons.map(node => node.textContent), mainLabels);
@@ -166,7 +169,7 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
   }
 });
 
-test('management card oauth-personal mode hides the key input, reports the account and maps login failures to the terminal hint', async t => {
+test('management card oauth-personal mode hides the key input, reports the account and maps login failures to the terminal hint', async () => {
   const card = (await import('../src/card.mjs')).default;
   for (const locale of ['zh', 'en']) {
     const zh = locale === 'zh';
@@ -272,7 +275,7 @@ test('built plugin.js activates in a standalone Node process under a temporary H
   await mkdir(source);
   await mkdir(join(source, 'src'));
   for (const file of ['package.json', 'plugin.json', 'scripts', 'src/account.mjs', 'src/chat.mjs', 'src/card.mjs', 'src/plugin.mjs',
-    'src/settings.mjs', 'src/admin-routes.mjs', 'src/acp-errors.mjs']) {
+    'src/settings.mjs', 'src/admin-routes.mjs', 'src/acp-errors.mjs', 'src/install.mjs']) {
     await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
   }
   await writeFile(join(source, 'src', 'transport.mjs'), `
@@ -304,4 +307,93 @@ test('built plugin.js activates in a standalone Node process under a temporary H
     console.log((await response.json()).choices[0].message.content);
   `], { cwd: destination, env, encoding: 'utf8' });
   assert.equal(output.trim(), 'fixture reply');
+});
+
+test('card auto-installs agy when none is detected, polls while installing and offers explicit retry after failure', async () => {
+  const card = (await import('../src/card.mjs')).default;
+  const make = tag => ({ tag, className: '', textContent: '', children: [], value: '', type: '', disabled: false,
+    hidden: false, onclick: null, setAttribute() {},
+    append(...kids) { this.children.push(...kids); },
+    remove() {},
+    replaceChildren(...kids) { this.children.length = 0; this.children.push(...kids); } });
+  const walk = root => { const all = []; const visit = node => { all.push(node); for (const kid of node.children) visit(kid); }; visit(root); return all; };
+  const baseStatus = { loaded: false, enabled: false, binary: null, binaryFound: false, detectedBinary: null,
+    installing: false, installError: null, version: null, lastError: null, authMethod: null,
+    apiKeyConfigured: false, apiKeyFingerprint: null, hiddenModels: [] };
+  const previousDocument = globalThis.document;
+  const previousSetInterval = globalThis.setInterval;
+  globalThis.document = { createElement: make };
+  try {
+    // A: nothing detected → the first view kicks /install exactly once; the
+    // completed refresh prefills the detected binary and re-hides the button.
+    const statusA = { ...baseStatus };
+    const callsA = [];
+    const callApiA = async (path, init) => {
+      callsA.push([path, init]);
+      if (path === '/install') {
+        statusA.detectedBinary = '/installed/agy';
+        return { ok: true, success: true, ...statusA };
+      }
+      return { ...statusA };
+    };
+    const hostA = make();
+    await card.mount(hostA, { callApi: callApiA, locale: 'zh', plugin: { name: 'gemini-agy-acp', version: '0.1.0' }, onBusy() {} });
+    assert.deepEqual(callsA[0], ['/status', { timeoutMs: 15000 }]);
+    assert.deepEqual(callsA[1], ['/install', { method: 'POST', body: JSON.stringify({}), timeoutMs: 30000 }]);
+    assert.equal(callsA.filter(([path]) => path === '/install').length, 1);
+    const allA = walk(hostA);
+    assert.equal(allA.find(node => node.tag === 'input').value, '/installed/agy');
+    assert.equal(allA.find(node => node.tag === 'button' && node.textContent === '安装 agy').hidden, true);
+    assert.ok(allA.some(node => typeof node.textContent === 'string' && node.textContent.includes('已开始自动安装 agy')));
+    card.unmount(hostA);
+
+    // B: a running install locks every action, shows 安装中… and polls /status;
+    // the poll tick that observes completion surfaces the success notice and
+    // unmount clears the timer.
+    const statusB = { ...baseStatus, installing: true };
+    const callsB = [];
+    const callApiB = async path => { callsB.push(path); return { ...statusB }; };
+    let pollTick = null;
+    globalThis.setInterval = fn => { pollTick = fn; return previousSetInterval(fn, 60000); };
+    const hostB = make();
+    await card.mount(hostB, { callApi: callApiB, locale: 'zh', plugin: { name: 'gemini-agy-acp', version: '0.1.0' }, onBusy() {} });
+    assert.deepEqual(callsB, ['/status']); // no auto kick while already installing
+    const allB = walk(hostB);
+    const installingButton = allB.find(node => node.tag === 'button' && node.textContent === '安装中…');
+    assert.ok(installingButton);
+    assert.equal(installingButton.disabled, true);
+    assert.equal(allB.find(node => node.tag === 'button' && node.textContent === '连接').disabled, true);
+    assert.ok(allB.some(node => typeof node.textContent === 'string' && node.textContent.includes('正在自动安装 agy')));
+    assert.ok(hostB.__agyPollTimer);
+    assert.equal(typeof pollTick, 'function');
+    // The background install finishes between polls.
+    statusB.installing = false;
+    statusB.detectedBinary = '/installed/agy';
+    await pollTick();
+    const afterB = walk(hostB);
+    assert.ok(afterB.some(node => typeof node.textContent === 'string' && node.textContent.includes('agy 已安装，可直接连接')));
+    assert.equal(afterB.find(node => node.tag === 'input').value, '/installed/agy');
+    assert.equal(hostB.__agyPollTimer, null);
+    card.unmount(hostB);
+    assert.equal(hostB.__agyPollTimer, null);
+    globalThis.setInterval = previousSetInterval;
+
+    // C: a previous failure is never auto-retried; the Install button is the
+    // explicit retry and the stable code maps to its recovery hint.
+    const statusC = { ...baseStatus, installError: { code: 'agy_install_download_failed', at: 1 } };
+    const callsC = [];
+    const callApiC = async path => { callsC.push(path); return { ...statusC }; };
+    const hostC = make();
+    await card.mount(hostC, { callApi: callApiC, locale: 'zh', plugin: { name: 'gemini-agy-acp', version: '0.1.0' }, onBusy() {} });
+    assert.deepEqual(callsC, ['/status']);
+    const allC = walk(hostC);
+    const retryButton = allC.find(node => node.tag === 'button' && node.textContent === '安装 agy');
+    assert.equal(retryButton.hidden, false);
+    assert.equal(retryButton.disabled, false);
+    assert.ok(allC.some(node => typeof node.textContent === 'string' && node.textContent.includes('下载 agy 失败')));
+    card.unmount(hostC);
+  } finally {
+    globalThis.document = previousDocument;
+    globalThis.setInterval = previousSetInterval;
+  }
 });

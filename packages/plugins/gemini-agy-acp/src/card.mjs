@@ -37,6 +37,14 @@ const CODE_HINTS = {
   agy_config_write_failed: ['写入配置文件失败。', 'Writing the configuration file failed.'],
   agy_unauthorized: ['仅限本机访问。', 'Local access only.'],
   agy_route_failed: ['管理请求失败，请重试。', 'The management request failed, please retry.'],
+  agy_install_unsupported_platform: ['当前系统/架构没有官方 agy 构建。', 'No official agy build exists for this OS/architecture.'],
+  agy_install_manifest_failed: ['无法访问 agy 发布服务器，请检查网络或代理。', 'Cannot reach the agy release server — check the network or proxy.'],
+  agy_install_manifest_invalid: ['agy 发布清单无效。', 'The agy release manifest is invalid.'],
+  agy_install_download_failed: ['下载 agy 失败，请检查网络或代理后重试。', 'Downloading agy failed — check the network or proxy and retry.'],
+  agy_install_too_large: ['agy 下载体积超出限制。', 'The agy download exceeded the size limit.'],
+  agy_install_checksum_mismatch: ['agy 校验失败，已中止安装。', 'The agy checksum failed; installation was aborted.'],
+  agy_install_extract_failed: ['解压 agy 失败。', 'Extracting agy failed.'],
+  agy_install_write_failed: ['写入 agy 失败，请检查目录权限。', 'Writing agy failed — check directory permissions.'],
 };
 
 export default {
@@ -117,6 +125,9 @@ export default {
     oauthModeButton.onclick = () => { authMode = 'oauth-personal'; renderAuthMode(); };
 
     const statusText = status => {
+      if (status?.installing) {
+        return t('正在自动安装 agy（官方发布，SHA-512 校验）…', 'Installing agy automatically (official release, SHA-512 verified)…');
+      }
       if (!status || status.enabled !== true) {
         return t('未启用 — 填写 binary 后按连接', 'Not enabled — fill in the binary path and press Connect');
       }
@@ -162,24 +173,33 @@ export default {
     const connect = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE, t('连接', 'Connect'));
     const sync = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE, t('同步模型', 'Sync models'));
     const disconnect = el('button', BUTTON_BASE + ' ' + BUTTON_DESTRUCTIVE, t('断开', 'Disconnect'));
-    for (const button of [connect, sync, disconnect]) button.type = 'button';
-    const controls = [connect, sync, disconnect];
+    // Manual install / retry: shown only while no agy is detected anywhere or
+    // the last auto-install failed. The first card view auto-starts it.
+    const install = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE, t('安装 agy', 'Install agy'));
+    install.hidden = true;
+    for (const button of [connect, sync, disconnect, install]) button.type = 'button';
+    const controls = [connect, sync, disconnect, install];
     const buttons = el('div', 'flex flex-wrap items-center gap-2');
-    buttons.append(connect, sync, disconnect);
+    buttons.append(connect, sync, disconnect, install);
     body.append(buttons, notice, message);
 
     let busyDepth = 0;
-    const BUSY_LABELS = new Map([[connect, t('连接中…', 'Connecting…')], [sync, t('同步中…', 'Syncing…')], [disconnect, t('断开中…', 'Disconnecting…')]]);
+    let latestStatus = null;
+    let installingNow = false;
+    let wasInstalling = false;
+    let pollTimer = null;
+    const BUSY_LABELS = new Map([[connect, t('连接中…', 'Connecting…')], [sync, t('同步中…', 'Syncing…')], [disconnect, t('断开中…', 'Disconnecting…')], [install, t('安装中…', 'Installing…')]]);
     // Per-model visibility controls live inside the freshly rendered list;
     // setBusy keeps them disabled together with the three fixed actions and
     // the auth-mode toggle.
     let rowButtons = [];
     let currentHiddenIds = [];
-    const setBusy = active => {
-      busyDepth = Math.max(0, busyDepth + (active ? 1 : -1));
+    const applyDisabled = () => {
       const busy = busyDepth > 0;
       for (const button of [...controls, ...rowButtons, restoreAll, keyModeButton, oauthModeButton]) {
-        button.disabled = busy || !call;
+        // A running background install locks the actions too: connecting a
+        // half-downloaded binary must not be possible from the card.
+        button.disabled = busy || !call || installingNow;
         const busyLabel = BUSY_LABELS.get(button);
         if (busy && busyLabel) button.textContent = busyLabel;
       }
@@ -187,11 +207,36 @@ export default {
         connect.textContent = t('连接', 'Connect');
         sync.textContent = t('同步模型', 'Sync models');
         disconnect.textContent = t('断开', 'Disconnect');
+        install.textContent = installingNow ? t('安装中…', 'Installing…') : t('安装 agy', 'Install agy');
       }
-      props.onBusy?.(busy);
+    };
+    const setBusy = active => {
+      busyDepth = Math.max(0, busyDepth + (active ? 1 : -1));
+      applyDisabled();
+      props.onBusy?.(busyDepth > 0);
     };
 
     const renderStatus = status => {
+      latestStatus = status;
+      installingNow = Boolean(status?.installing);
+      // Poll while the background download runs; surface the outcome once it
+      // finishes (success prefills the detected binary, failure shows the hint).
+      if (installingNow && !pollTimer && !target.__agyDisposed) {
+        pollTimer = setInterval(() => { void refresh(); }, 3000);
+        target.__agyPollTimer = pollTimer;
+      } else if (!installingNow && pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        target.__agyPollTimer = null;
+      }
+      if (wasInstalling && !installingNow) {
+        if (status?.detectedBinary) setNotice(t('agy 已安装，可直接连接', 'agy installed — press Connect'));
+        else if (status?.installError) setMessage(errorText({ code: status.installError.code }));
+      }
+      wasInstalling = installingNow;
+      install.hidden = Boolean(status?.binary || status?.detectedBinary) && !status?.installError;
+      if (status?.installError && !installingNow) setMessage(errorText({ code: status.installError.code }));
+      applyDisabled();
       statusLine.textContent = statusText(status);
       // ACP key auth exposes no account email; the fingerprint lets the
       // operator match WHICH key is connected without revealing it.
@@ -229,12 +274,16 @@ export default {
       accountLine.textContent = status?.accountEmail ? t('账号：', 'Account: ') + status.accountEmail
         : status?.authMethod === 'oauth-personal' ? t('账号邮箱未提供', 'account email not provided') : '';
       renderAuthMode();
-      // Prefill only the binary path (an operator setting, not a secret);
-      // the key input is never populated from stored state.
-      if (!binaryInput.value && typeof status?.binary === 'string') binaryInput.value = status.binary;
+      // Prefill only the binary path (an operator setting, not a secret) —
+      // the sidecar's configured path, or an agy detected at the official
+      // default location; the key input is never populated from stored state.
+      const prefill = typeof status?.binary === 'string' ? status.binary
+        : typeof status?.detectedBinary === 'string' ? status.detectedBinary : null;
+      if (!binaryInput.value && prefill) binaryInput.value = prefill;
     };
 
     const refresh = async () => {
+      if (target.__agyDisposed) return;
       if (!call) {
         renderStatus(null);
         return;
@@ -284,6 +333,7 @@ export default {
     sync.onclick = () => runAction('/models/sync', {}, response =>
       t(`已同步 ${response?.models?.length ?? 0} 个模型`, `Synced ${response?.models?.length ?? 0} models`));
     disconnect.onclick = () => runAction('/disconnect', {}, () => t('已断开', 'Disconnected'));
+    install.onclick = () => runAction('/install', {}, () => t('已开始安装 agy', 'agy install started'));
     setBusy(false);
 
     const section = el('details', 'max-w-md text-xs text-muted-foreground');
@@ -301,8 +351,20 @@ export default {
     target.append(card);
 
     await refresh();
+    // First view with no agy anywhere: start the official install right away.
+    // A previous failure is never retried automatically — the Install button
+    // is the explicit retry, so a broken network cannot loop downloads.
+    const first = latestStatus;
+    if (call && first && !first.binary && !first.detectedBinary && !first.installing && !first.installError) {
+      await runAction('/install', {}, () => t('已开始自动安装 agy', 'Automatic agy install started'));
+    }
   },
   unmount(el) {
+    el.__agyDisposed = true;
+    if (el.__agyPollTimer) {
+      clearInterval(el.__agyPollTimer);
+      el.__agyPollTimer = null;
+    }
     el.replaceChildren();
   },
 };
