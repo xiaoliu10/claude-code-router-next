@@ -73,6 +73,7 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
   // the pool, so a models-sync write never retires healthy workers.
   let fingerprint;
   let rebuilding;
+  let adminMutation = Promise.resolve();
   let lastError;
   // Background install state: single-flight promise while the official agy
   // download runs, the last failure token, and the path placed by a successful
@@ -187,7 +188,7 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
       ...(accountEmail ? { accountEmail } : {}),
       ...(models ? { models } : {}),
       ...(modelsSyncedAt !== undefined ? { modelsSyncedAt } : {}),
-      hiddenModels: hiddenModelsOf(raw),
+      hiddenModels: hiddenModelsOf(raw).filter(id => models?.some(model => model.id === id)),
     };
   }
 
@@ -286,8 +287,9 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
   async function registerProviderModels(models) {
     const { readConfig, writeConfig, reloadRuntime } = ctx.host;
     if (typeof readConfig !== 'function' || typeof writeConfig !== 'function') return;
-    const config = await readConfig();
-    if (!Array.isArray(config?.Providers)) return;
+    const previous = await readConfig();
+    if (!Array.isArray(previous?.Providers)) return;
+    const config = structuredClone(previous);
     let provider = config.Providers.find(entry => entry?.name === NAME);
     const ids = models.map(model => model.id);
     if (!provider) {
@@ -299,13 +301,32 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     } else {
       provider.models = ids;
     }
-    const previous = JSON.stringify(config);
+    const rollback = async () => {
+      try {
+        await writeConfig(previous);
+        await reloadRuntime?.(previous);
+      } catch {
+        log?.warn?.('gemini-agy-acp could not restore the previous provider catalog');
+      }
+    };
     try {
       await writeConfig(config);
       await reloadRuntime?.(config);
+      return rollback;
     } catch {
-      try { await writeConfig(JSON.parse(previous)); } catch { /* original failure is reported below */ }
+      await rollback();
       throw failure('agy_config_write_failed', 500);
+    }
+  }
+
+  async function updateCatalog(visibleModels, sidecarPatch) {
+    const rollback = await registerProviderModels(visibleModels);
+    try {
+      await writeSidecar(configDir, sidecarPatch);
+      cache.invalidate();
+    } catch (error) {
+      await rollback?.();
+      throw error;
     }
   }
 
@@ -327,9 +348,8 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     // upstream are dropped from it silently (always persisted so a pruned
     // empty set actually replaces the stale list).
     const hiddenModels = hiddenModelsOf(raw).filter(id => models.some(model => model.id === id));
-    await writeSidecar(configDir, { models, modelsSyncedAt, version, hiddenModels });
-    cache.invalidate();
-    await registerProviderModels(models.filter(model => !hiddenModels.includes(model.id)));
+    await updateCatalog(models.filter(model => !hiddenModels.includes(model.id)),
+      { models, modelsSyncedAt, version, hiddenModels });
     return { models, modelsSyncedAt, version };
   }
 
@@ -358,9 +378,7 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     for (const id of requested(body.restore)) hidden.delete(id);
     for (const id of requested(body.hide)) hidden.add(id);
     const hiddenModels = [...hidden];
-    await writeSidecar(configDir, { hiddenModels });
-    cache.invalidate();
-    await registerProviderModels(synced.filter(model => !hidden.has(model.id)));
+    await updateCatalog(synced.filter(model => !hidden.has(model.id)), { hiddenModels });
     return status();
   }
 
@@ -382,6 +400,14 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     }
   };
 
+  // Serialize admin updates that read and write both the sidecar and catalog.
+  // A failed mutation must not prevent the next admin operation from running.
+  const serialized = operation => (...args) => {
+    const next = adminMutation.then(() => operation(...args));
+    adminMutation = next.catch(() => {});
+    return next;
+  };
+
   class AgyTransformer {
     static TransformerName = NAME;
     name = NAME;
@@ -401,10 +427,10 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
   ctx.registerAdminRoutes?.(app => registerAdminRoutes(app, { getService: () => ({
     status: () => status(),
     install: guarded(install),
-    connect: guarded(connect),
-    disconnect: guarded(disconnect),
-    syncModels: guarded(syncModels),
-    hideModels: guarded(hideModels),
+    connect: guarded(serialized(connect)),
+    disconnect: guarded(serialized(disconnect)),
+    syncModels: guarded(serialized(syncModels)),
+    hideModels: guarded(serialized(hideModels)),
   }) }));
   ctx.registerManagedRuntime({
     name: NAME,
