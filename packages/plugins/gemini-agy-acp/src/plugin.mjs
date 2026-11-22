@@ -5,7 +5,7 @@ import { isAbsolute } from 'node:path';
 import { AcpError } from './acp-errors.mjs';
 import { registerAdminRoutes } from './admin-routes.mjs';
 import { chatResponse, failure, textTurns, toPrompt } from './chat.mjs';
-import { apiKeyShapeOk, enabledSettings, readSidecar, sidecarCache, writeSidecar } from './settings.mjs';
+import { apiKeyShapeOk, enabledSettings, hiddenModelsOf, readSidecar, sidecarCache, writeSidecar } from './settings.mjs';
 
 const NAME = 'gemini-agy-acp';
 const MARKER = `ccr-managed-${NAME}`;
@@ -135,6 +135,7 @@ export async function activateWithTransport(ctx, createTransport) {
       apiKeyFingerprint: credentialFingerprint(raw?.apiKey),
       ...(models ? { models } : {}),
       ...(modelsSyncedAt !== undefined ? { modelsSyncedAt } : {}),
+      hiddenModels: hiddenModelsOf(raw),
     };
   }
 
@@ -226,10 +227,45 @@ export async function activateWithTransport(ctx, createTransport) {
     const { syncModelOptions } = await loadTransportModule();
     const { models, version } = await syncModelOptions({ binary: settings.binary, apiKey, log });
     const modelsSyncedAt = Date.now();
-    await writeSidecar(configDir, { models, modelsSyncedAt, version });
+    // The operator's hide set survives re-syncs; ids that disappeared
+    // upstream are dropped from it silently (always persisted so a pruned
+    // empty set actually replaces the stale list).
+    const hiddenModels = hiddenModelsOf(raw).filter(id => models.some(model => model.id === id));
+    await writeSidecar(configDir, { models, modelsSyncedAt, version, hiddenModels });
     cache.invalidate();
-    await registerProviderModels(models);
+    await registerProviderModels(models.filter(model => !hiddenModels.includes(model.id)));
     return { models, modelsSyncedAt, version };
+  }
+
+  // Hide/restore synced models: every id is validated against the synced
+  // catalog (unknown → unsupported_option), the merged set persists in the
+  // sidecar (hide wins for ids in both lists) and the provider entry is
+  // re-registered with the visible models only. Hiding never retires
+  // workers — the pool fingerprint does not include models.
+  async function hideModels(input) {
+    const body = input && typeof input === 'object' && !Array.isArray(input) ? input : null;
+    if (!body) throw new AcpError('unsupported_option');
+    const { raw } = await readSidecar(configDir);
+    const synced = publicModels(raw?.models);
+    if (!synced) throw new AcpError('unsupported_option');
+    const known = new Set(synced.map(model => model.id));
+    const requested = value => {
+      if (value === undefined) return [];
+      if (!Array.isArray(value)) throw new AcpError('unsupported_option');
+      return value;
+    };
+    for (const id of [...requested(body.hide), ...requested(body.restore)]) {
+      if (!known.has(id)) throw new AcpError('unsupported_option');
+    }
+    // hide wins for ids present in both lists: restores apply first.
+    const hidden = new Set(hiddenModelsOf(raw).filter(id => known.has(id)));
+    for (const id of requested(body.restore)) hidden.delete(id);
+    for (const id of requested(body.hide)) hidden.add(id);
+    const hiddenModels = [...hidden];
+    await writeSidecar(configDir, { hiddenModels });
+    cache.invalidate();
+    await registerProviderModels(synced.filter(model => !hidden.has(model.id)));
+    return status();
   }
 
   // Eager load at activation: a valid sidecar starts the pool now; a missing
@@ -271,6 +307,7 @@ export async function activateWithTransport(ctx, createTransport) {
     connect: guarded(connect),
     disconnect: guarded(disconnect),
     syncModels: guarded(syncModels),
+    hideModels: guarded(hideModels),
   }) }));
   ctx.registerManagedRuntime({
     name: NAME,

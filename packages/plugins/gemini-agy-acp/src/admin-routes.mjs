@@ -9,6 +9,7 @@
  *  POST /connect         {binary?, apiKey?}
  *  POST /disconnect      {}
  *  POST /models/sync     {}
+ *  POST /models/visibility {hide?: [ids], restore?: [ids]}
  *
  * Two secrecy rules travel with every route:
  *  - the sidecar apiKey is never serialized, logged or echoed — responses
@@ -128,6 +129,19 @@ export function registerAdminRoutes(app, { getService }) {
       return { ok: true, success: true, ...result };
     } catch (error) {
       return agyRouteError(error, reply, 'models/sync');
+    }
+  });
+
+  app.post('/api/gemini-agy-acp/models/visibility', async (req, reply) => {
+    try {
+      assertLocalAgyRequest(req);
+      const resolved = service(reply);
+      if (!resolved) return { ok: false, success: false, error: 'agy_route_failed' };
+      // {ok,success,...status}: same envelope as the other mutations, so the
+      // card refreshes its model list straight from the response.
+      return { ok: true, success: true, ...(await resolved.hideModels(req.body)) };
+    } catch (error) {
+      return agyRouteError(error, reply, 'models/visibility');
     }
   });
 }

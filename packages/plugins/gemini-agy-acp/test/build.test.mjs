@@ -29,13 +29,27 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
   assert.doesNotMatch(source, /(^|[^\w.])import\s|fetch\(|XMLHttpRequest|innerHTML|eval\(|new Function/);
   const card = (await import('../src/card.mjs')).default;
   for (const locale of ['en', 'zh']) for (const disabled of [false, true]) {
+    const zh = locale === 'zh';
     const status = { loaded: true, enabled: true, binary: '/fixture/agy', binaryFound: true, version: '1.5.1',
       lastError: null, apiKeyConfigured: true, apiKeyFingerprint: '0248f56577',
       models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }],
-      modelsSyncedAt: 1700000000000 };
+      hiddenModels: ['default'], modelsSyncedAt: 1700000000000 };
     const calls = [];
+    const busyEvents = [];
+    // The first visibility call parks until released so the busy state of
+    // every control can be observed mid-flight.
+    let parked = null;
+    let releaseVisibility;
     const callApi = async (path, init) => {
       calls.push([path, init]);
+      if (path === '/models/visibility' && parked) { await parked; parked = null; }
+      if (path === '/models/visibility') {
+        const requested = JSON.parse(init.body);
+        const hidden = new Set(status.hiddenModels ?? []);
+        for (const id of requested.hide ?? []) hidden.add(id);
+        for (const id of requested.restore ?? []) hidden.delete(id);
+        status.hiddenModels = [...hidden];
+      }
       if (path === '/status') return status;
       return { ok: true, success: true, ...status };
     };
@@ -50,7 +64,7 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
     globalThis.document = { createElement: make };
     try {
       const host = make();
-      await card.mount(host, { callApi, locale, disabled, plugin: { name: 'gemini-agy-acp', version: '0.1.0' }, onBusy() {} });
+      await card.mount(host, { callApi, locale, disabled, plugin: { name: 'gemini-agy-acp', version: '0.1.0' }, onBusy: busy => busyEvents.push(busy) });
       assert.equal(host.children.length, 1);
       const root = host.children[0];
       // The card must opt into the host stylesheet like every other card.
@@ -61,16 +75,17 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       assert.equal(header.children[1].textContent, locale === 'zh' ? '实验原型' : 'Experimental');
       assert.equal(header.children[2].textContent, 'API key');
       // Status line, action buttons and inputs — the Connect-first flow.
-      const buttons = surface.children.filter(child => child.tag === 'button').length ? surface
-        : surface.children.find(child => child.children.some(node => node.tag === 'button'));
       const all = [];
       const walk = node => { all.push(node); for (const kid of node.children) walk(kid); };
       walk(root);
       const buttonNodes = all.filter(node => node.tag === 'button');
       const inputNodes = all.filter(node => node.tag === 'input');
-      assert.equal(buttonNodes.length, 3);
-      assert.deepEqual(buttonNodes.map(node => node.textContent),
-        locale === 'zh' ? ['连接', '同步模型', '断开'] : ['Connect', 'Sync models', 'Disconnect']);
+      // The three fixed actions plus a per-row toggle for each of the two
+      // models and one restore-all for the seeded hidden model.
+      assert.equal(buttonNodes.length, 6);
+      const mainLabels = zh ? ['连接', '同步模型', '断开'] : ['Connect', 'Sync models', 'Disconnect'];
+      const actionButtons = mainLabels.map(label => buttonNodes.find(node => node.textContent === label));
+      assert.deepEqual(actionButtons.map(node => node.textContent), mainLabels);
       assert.equal(inputNodes.length, 2);
       assert.equal(inputNodes[1].type, 'password');
       assert.equal(inputNodes[0].value, '/fixture/agy'); // binary prefilled from status
@@ -83,25 +98,61 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       // The status line reflects the fetched status shape.
       const line = all.find(node => typeof node.textContent === 'string' && node.textContent.includes('1.5.1'));
       assert.ok(line);
-      assert.match(line.textContent, locale === 'zh' ? /已连接/ : /Connected/);
-      assert.match(line.textContent, /2/);
-      // Credential fingerprint (never the key) plus the expandable model list.
-      assert.match(line.textContent, locale === 'zh' ? /凭据 0248f56577…/ : /credential 0248f56577…/);
+      assert.match(line.textContent, zh ? /已连接/ : /Connected/);
+      // The model count stays the TOTAL catalog size, with the hidden ones
+      // reported separately, and the credential line names the AI Studio key.
+      assert.match(line.textContent, zh ? /2 个模型（已隐藏 1）/ : /2 models \(1 hidden\)/);
+      assert.match(line.textContent, zh ? /AI Studio key 凭据 0248f56577…/ : /AI Studio key credential 0248f56577…/);
+      // The expandable model list: per-row visibility toggles, hidden rows
+      // dimmed with a suffix, restore-all under the list.
       const modelsUl = all.find(node => node.tag === 'ul');
       assert.ok(modelsUl);
-      assert.deepEqual(modelsUl.children.map(li => li.textContent), ['Gemini Model m2', 'Default default']);
+      assert.equal(modelsUl.children[0].textContent, 'Gemini Model · m2');
+      assert.equal(modelsUl.children[0].className, '');
+      assert.equal(modelsUl.children[1].textContent, zh ? 'Default · default 已隐藏' : 'Default · default hidden');
+      assert.equal(modelsUl.children[1].className, 'text-muted-foreground/50');
+      const rowToggles = () => modelsUl.children.map(li => li.children.find(node => node.tag === 'button'));
+      assert.deepEqual(rowToggles().map(node => node.textContent), [zh ? '隐藏' : 'Hide', zh ? '恢复' : 'Restore']);
+      const restoreAllButton = all.find(node => node.tag === 'button' && node.textContent === (zh ? '恢复全部' : 'Restore all'));
+      assert.ok(restoreAllButton);
+      assert.equal(restoreAllButton.disabled, false);
       assert.deepEqual(calls[0], ['/status', { timeoutMs: 15000 }]);
       // Connect sends the binary path, no key when the field is empty, and clears it after typing.
       inputNodes[0].value = '/fixture/agy';
       inputNodes[1].value = 'typed-secret';
-      await buttonNodes[0].onclick();
+      await actionButtons[0].onclick();
       assert.deepEqual(calls[1], ['/connect', { method: 'POST', body: JSON.stringify({ binary: '/fixture/agy', apiKey: 'typed-secret' }), timeoutMs: 30000 }]);
       assert.equal(inputNodes[1].value, '');
       assert.ok(calls.some(([path]) => path === '/status'));
+      // Hiding parks the visibility POST: every control is disabled while
+      // busy, then the refreshed status dims the row and flips the toggle.
+      parked = new Promise(resolve => { releaseVisibility = resolve; });
+      const pendingHide = rowToggles()[0].onclick();
+      for (const node of [...actionButtons, ...rowToggles(), restoreAllButton]) {
+        assert.equal(node.disabled, true, node.textContent);
+      }
+      assert.deepEqual(busyEvents.slice(-1), [true]);
+      releaseVisibility();
+      await pendingHide;
+      assert.deepEqual(calls.at(-2), ['/models/visibility', { method: 'POST', body: JSON.stringify({ hide: ['m2'] }), timeoutMs: 30000 }]);
+      assert.equal(calls.at(-1)[0], '/status');
+      assert.deepEqual(rowToggles().map(node => node.textContent), [zh ? '恢复' : 'Restore', zh ? '恢复' : 'Restore']);
+      assert.equal(modelsUl.children.filter(li => li.className === 'text-muted-foreground/50').length, 2);
+      assert.match(line.textContent, zh ? /（已隐藏 2）/ : /\(2 hidden\)/);
+      assert.deepEqual(busyEvents.slice(-1), [false]);
+      // Restore-all empties the hide set: rows undim, the suffix disappears
+      // and the restore-all button hides itself.
+      await restoreAllButton.onclick();
+      assert.deepEqual(calls.at(-2), ['/models/visibility', { method: 'POST', body: JSON.stringify({ restore: ['default', 'm2'] }), timeoutMs: 30000 }]);
+      assert.ok(modelsUl.children.every(li => li.className === ''));
+      assert.deepEqual(rowToggles().map(node => node.textContent), [zh ? '隐藏' : 'Hide', zh ? '隐藏' : 'Hide']);
+      assert.equal(restoreAllButton.hidden, true);
+      assert.doesNotMatch(line.textContent, zh ? /已隐藏/ : /hidden/);
+      assert.deepEqual(busyEvents.slice(-1), [false]);
       card.unmount(host);
-      // Mount renders status twice (each re-clears the model list) and unmount
-      // clears the host: three clear events, no removals.
-      assert.deepEqual(events, ['clear', 'clear', 'clear']);
+      // Each mutation re-clears the model list and unmount clears the host:
+      // five clear events, no removals.
+      assert.deepEqual(events, ['clear', 'clear', 'clear', 'clear', 'clear']);
       assert.equal(host.children.length, 0);
     } finally { globalThis.document = previous; }
   }

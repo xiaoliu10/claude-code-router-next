@@ -5,9 +5,35 @@ import { failure } from './chat.mjs';
 
 const NAME = 'gemini-agy-acp';
 const MAX_API_KEY_BYTES = 4096;
+const MAX_HIDDEN_MODEL_CHARS = 128;
+const MAX_HIDDEN_MODELS = 256;
 
 export function settingsPath(configDir) {
   return join(configDir, `${NAME}.json`);
+}
+
+/** A hidden-model id is a bounded, non-control string (never a secret
+ * carrier; C0 controls and DEL cannot appear in advertised model ids). */
+function hiddenModelShapeOk(id) {
+  return typeof id === 'string' && id.length > 0 && id.length <= MAX_HIDDEN_MODEL_CHARS &&
+    !/[\0-\x1f\x7f]/.test(id);
+}
+
+/** The sidecar's hidden-model blacklist, normalized: invalid entries are
+ * dropped, duplicates collapse, order is preserved and the list is capped so
+ * a hand-edited sidecar can never grow config.json unboundedly. Absent or
+ * malformed containers normalize to []. */
+export function hiddenModelsOf(raw) {
+  const entries = Array.isArray(raw?.hiddenModels) ? raw.hiddenModels : [];
+  const hidden = [];
+  const seen = new Set();
+  for (const id of entries) {
+    if (!hiddenModelShapeOk(id) || seen.has(id)) continue;
+    seen.add(id);
+    hidden.push(id);
+    if (hidden.length >= MAX_HIDDEN_MODELS) break;
+  }
+  return hidden;
 }
 
 /** A sidecar apiKey is configured only as a bounded, non-empty string. */

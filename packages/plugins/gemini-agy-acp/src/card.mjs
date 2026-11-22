@@ -69,6 +69,11 @@ export default {
     modelsBox.append(el('summary', null, t('模型列表', 'Model list')));
     const modelsList = el('ul', 'list-disc pl-5');
     modelsBox.append(modelsList);
+    const restoreAll = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE + ' mt-1 px-2 py-0.5 text-[10px]',
+      t('恢复全部', 'Restore all'));
+    restoreAll.type = 'button';
+    restoreAll.hidden = true;
+    modelsBox.append(restoreAll);
     modelsBox.hidden = true;
     body.append(modelsBox);
 
@@ -93,12 +98,18 @@ export default {
       if (status.binaryFound === false) parts.push(t('binary 未找到', 'binary not found'));
       else if (status.version) parts.push(`agy ${status.version}`);
       if (Array.isArray(status.models) && status.models.length) {
-        parts.push(t(`${status.models.length} 个模型`, `${status.models.length} models`));
+        // The count stays the TOTAL catalog size; hidden ones are extra info.
+        const hiddenCount = Array.isArray(status.hiddenModels) ? status.hiddenModels.length : 0;
+        parts.push(t(`${status.models.length} 个模型`, `${status.models.length} models`) +
+          (hiddenCount > 0 ? t(`（已隐藏 ${hiddenCount}）`, ` (${hiddenCount} hidden)`) : ''));
       } else if (typeof status.modelsSyncedAt === 'number') {
         parts.push(t('0 个模型', '0 models'));
       }
-      if (status.apiKeyFingerprint) parts.push(t(`凭据 ${status.apiKeyFingerprint}…`, `credential ${status.apiKeyFingerprint}…`));
-      else if (status.apiKeyConfigured !== true) parts.push(t('缺少 API key', 'no API key'));
+      // authMethod is always gemini-api-key today, so the credential line
+      // names the channel explicitly.
+      if (status.apiKeyFingerprint) {
+        parts.push(t(`AI Studio key 凭据 ${status.apiKeyFingerprint}…`, `AI Studio key credential ${status.apiKeyFingerprint}…`));
+      } else if (status.apiKeyConfigured !== true) parts.push(t('缺少 API key', 'no API key'));
       if (status.lastError?.code) parts.push(t(`上次错误 ${status.lastError.code}`, `last error ${status.lastError.code}`));
       return parts.join(' · ');
     };
@@ -125,12 +136,17 @@ export default {
 
     let busyDepth = 0;
     const BUSY_LABELS = new Map([[connect, t('连接中…', 'Connecting…')], [sync, t('同步中…', 'Syncing…')], [disconnect, t('断开中…', 'Disconnecting…')]]);
+    // Per-model visibility controls live inside the freshly rendered list;
+    // setBusy keeps them disabled together with the three fixed actions.
+    let rowButtons = [];
+    let currentHiddenIds = [];
     const setBusy = active => {
       busyDepth = Math.max(0, busyDepth + (active ? 1 : -1));
       const busy = busyDepth > 0;
-      for (const button of controls) {
+      for (const button of [...controls, ...rowButtons, restoreAll]) {
         button.disabled = busy || !call;
-        if (busy) button.textContent = BUSY_LABELS.get(button);
+        const busyLabel = BUSY_LABELS.get(button);
+        if (busy && busyLabel) button.textContent = busyLabel;
       }
       if (!busy) {
         connect.textContent = t('连接', 'Connect');
@@ -148,10 +164,29 @@ export default {
         ? t('凭据指纹 = Gemini API key 的 SHA-256 前 10 位', 'credential fingerprint = first 10 hex of the Gemini API key SHA-256')
         : '';
       const modelEntries = Array.isArray(status?.models) ? status.models : [];
+      currentHiddenIds = Array.isArray(status?.hiddenModels) ? status.hiddenModels.filter(id =>
+        typeof id === 'string' && modelEntries.some(model => model?.id === id)) : [];
+      const hiddenSet = new Set(currentHiddenIds);
+      rowButtons = [];
+      const busy = busyDepth > 0;
       modelsList.replaceChildren(...modelEntries.map(model => {
-        const li = el('li', null, (typeof model?.name === 'string' && model.name ? model.name + ' ' : '') + (model?.id ?? ''));
+        const id = model?.id ?? '';
+        const isHidden = hiddenSet.has(id);
+        const li = el('li', isHidden ? 'text-muted-foreground/50' : null,
+          (typeof model?.name === 'string' && model.name ? model.name + ' · ' : '') + id +
+          (isHidden ? t(' 已隐藏', ' hidden') : ''));
+        const toggle = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE + ' ml-2 px-2 py-0.5 text-[10px]',
+          isHidden ? t('恢复', 'Restore') : t('隐藏', 'Hide'));
+        toggle.type = 'button';
+        toggle.disabled = busy || !call;
+        toggle.onclick = () => runAction('/models/visibility', isHidden ? { restore: [id] } : { hide: [id] });
+        rowButtons.push(toggle);
+        li.append(toggle);
         return li;
       }));
+      restoreAll.hidden = modelEntries.length === 0 || currentHiddenIds.length === 0;
+      restoreAll.disabled = busy || !call;
+      restoreAll.onclick = () => runAction('/models/visibility', { restore: [...currentHiddenIds] });
       modelsBox.hidden = modelEntries.length === 0;
       // Prefill only the binary path (an operator setting, not a secret);
       // the key input is never populated from stored state.

@@ -18,6 +18,7 @@ const STATUS_URL = `/api/${name}/status`;
 const CONNECT_URL = `/api/${name}/connect`;
 const DISCONNECT_URL = `/api/${name}/disconnect`;
 const SYNC_URL = `/api/${name}/models/sync`;
+const VISIBILITY_URL = `/api/${name}/models/visibility`;
 
 const variables = { GEMINI_API_KEY: 'fixture-value' };
 const previous = new Map();
@@ -114,7 +115,7 @@ test('status shape when the plugin loaded before the sidecar existed', async t =
   assert.equal(status, 200);
   const fingerprint = createHash('sha256').update(variables.GEMINI_API_KEY, 'utf8').digest('hex').slice(0, 10);
   assert.deepEqual(reported, { loaded: false, enabled: false, binary: null, binaryFound: false,
-    version: null, lastError: null, apiKeyConfigured: true, apiKeyFingerprint: fingerprint });
+    version: null, lastError: null, apiKeyConfigured: true, apiKeyFingerprint: fingerprint, hiddenModels: [] });
   assert.ok(!('apiKey' in reported));
   assert.ok(!('models' in reported) && !('modelsSyncedAt' in reported));
   delete process.env.GEMINI_API_KEY;
@@ -134,6 +135,7 @@ test('route guard rejects non-loopback sockets, foreign origins and unknown host
     ['POST', CONNECT_URL, { headers: { host: '127.0.0.1:43781', origin: 'http://evil.example:43781' } }],
     ['POST', DISCONNECT_URL, { headers: { host: 'localhost:9999' } }],
     ['POST', SYNC_URL, { headers: { host: '127.0.0.1:43781', origin: 'ftp://127.0.0.1:43781' } }],
+    ['POST', VISIBILITY_URL, { headers: { host: 'localhost:9999' } }],
   ]) {
     const { status, body: reported } = await p.call(method, url, request);
     assert.equal(status, 403, `${method} ${url}`);
@@ -383,10 +385,115 @@ test('model sync rolls back the provider entry when the config write fails', asy
   assert.deepEqual(saved.models.map(model => model.id), ['m2', 'default'], 'sidecar keeps synced models for the next attempt');
 });
 
+const providerModels = (writes) => writes.at(-1)?.Providers.find(entry => entry.name === name)?.models;
+
+test('model visibility validates ids, persists the hide set and re-registers only visible models', async t => {
+  const writes = [];
+  const reloaded = [];
+  let stored = { Providers: [{ name: 'other', models: ['keep'] }], Router: { default: 'other,keep' } };
+  const p = await activate(t, { fixtureMode: 'ok', host: {
+    readConfig: async () => JSON.parse(JSON.stringify(stored)),
+    writeConfig: async next => { writes.push(next); stored = next; },
+    reloadRuntime: async next => { reloaded.push(next); },
+  } });
+  await p.call('POST', CONNECT_URL, { body: { binary: p.fixture.binary } });
+  // Without a synced catalog every request fails closed before persisting.
+  for (const input of [{}, { hide: ['m2'] }, { restore: ['m2'] }]) {
+    const early = await p.call('POST', VISIBILITY_URL, { body: input });
+    assert.equal(early.status, 400, JSON.stringify(input));
+    assert.equal(early.body.error, 'acp_unsupported_option');
+  }
+  assert.equal((await p.sidecar()).hiddenModels, undefined);
+  const { body: synced } = await p.call('POST', SYNC_URL, { body: {} });
+  assert.deepEqual(synced.models.map(model => model.id), ['m2', 'default']);
+  assert.equal(writes.length, 1);
+  assert.deepEqual(providerModels(writes), ['m2', 'default']);
+
+  // Unknown ids, malformed shapes and non-object bodies are all rejected.
+  for (const input of [{ hide: ['gone'] }, { restore: ['gone'] }, { hide: 'm2' }, { restore: 'm2' },
+    { hide: [42] }, { hide: ['m2'], restore: ['gone'] }, 'nope', null, ['m2']]) {
+    const rejection = await p.call('POST', VISIBILITY_URL, { body: input });
+    assert.equal(rejection.status, 400, JSON.stringify(input));
+    assert.deepEqual(rejection.body, { ok: false, success: false, error: 'acp_unsupported_option' });
+  }
+  // The rejections above persisted nothing: the sidecar still holds only the
+  // empty hide set written by the sync itself.
+  assert.deepEqual((await p.sidecar()).hiddenModels, []);
+
+  // Hiding persists and the provider entry stops advertising hidden models.
+  const hidden = await p.call('POST', VISIBILITY_URL, { body: { hide: ['m2'] } });
+  assert.equal(hidden.status, 200);
+  assert.equal(hidden.body.ok, true);
+  assert.deepEqual(hidden.body.hiddenModels, ['m2']);
+  assert.deepEqual(hidden.body.models.map(model => model.id), ['m2', 'default']);
+  assert.deepEqual((await p.sidecar()).hiddenModels, ['m2']);
+  assert.deepEqual(providerModels(writes), ['default']);
+  assert.equal(reloaded.length, 2);
+
+  // hide wins for ids present in both lists.
+  const conflict = await p.call('POST', VISIBILITY_URL, { body: { hide: ['default'], restore: ['default'] } });
+  assert.deepEqual(conflict.body.hiddenModels, ['m2', 'default']);
+  assert.deepEqual(providerModels(writes), []);
+
+  // Restoring one model re-registers it and keeps the other hidden.
+  const restore = await p.call('POST', VISIBILITY_URL, { body: { restore: ['default'] } });
+  assert.deepEqual(restore.body.hiddenModels, ['m2']);
+  assert.deepEqual(providerModels(writes), ['default']);
+
+  // Re-sync keeps the hide set and registers visible models only (already
+  // registered → the write is skipped entirely).
+  const writesAfterRestore = writes.length;
+  const reloadsAfterRestore = reloaded.length;
+  const again = await p.call('POST', SYNC_URL, { body: {} });
+  assert.equal(again.status, 200);
+  assert.deepEqual((await p.sidecar()).hiddenModels, ['m2']);
+  assert.equal(writes.length, writesAfterRestore);
+  assert.equal(reloaded.length, reloadsAfterRestore);
+  const { body: statusBody } = await p.call('GET', STATUS_URL);
+  assert.deepEqual(statusBody.models.map(model => model.id), ['m2', 'default']);
+  assert.deepEqual(statusBody.hiddenModels, ['m2']);
+
+  // A model that disappears upstream is dropped from the hide set silently.
+  await p.writeSidecar({ ...(await p.sidecar()), models: [{ id: 'gone', name: 'Gone' }, { id: 'default', name: 'Default' }],
+    hiddenModels: ['m2', 'gone'] }, 5000);
+  const pruned = await p.call('POST', SYNC_URL, { body: {} });
+  assert.equal(pruned.status, 200);
+  assert.deepEqual((await p.sidecar()).hiddenModels, ['m2']);
+  assert.deepEqual(providerModels(writes), ['default']);
+});
+
+test('model visibility keeps the persisted hide set when provider registration fails', async t => {
+  let writes = 0;
+  const p = await activate(t, { fixtureMode: 'ok', host: {
+    readConfig: async () => ({ Providers: [{ name, models: ['m2', 'default'] }] }),
+    writeConfig: async () => { writes += 1; throw Error('disk full'); },
+  } });
+  await p.writeSidecar({ enabled: true, binary: p.fixture.binary, authMethod: 'gemini-api-key',
+    models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }], modelsSyncedAt: 1, version: '1.5.1' }, 1000);
+  const failure = await p.call('POST', VISIBILITY_URL, { body: { hide: ['m2'] } });
+  assert.equal(failure.status, 500);
+  assert.equal(failure.body.error, 'agy_config_write_failed');
+  assert.ok(writes >= 2, 'rollback write attempted after the failed write');
+  // The hide set itself persists, so a retried visibility or the next sync
+  // keeps the operator's intent.
+  assert.deepEqual((await p.sidecar()).hiddenModels, ['m2']);
+  const retried = await activate(t, { fixtureMode: 'ok', host: {
+    readConfig: async () => ({ Providers: [{ name, models: ['m2', 'default'] }] }),
+    writeConfig: async () => {},
+  } });
+  await retried.writeSidecar({ enabled: true, binary: retried.fixture.binary, authMethod: 'gemini-api-key',
+    models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }], modelsSyncedAt: 1, version: '1.5.1',
+    hiddenModels: ['m2'] }, 1000);
+  const recovered = await retried.call('POST', SYNC_URL, { body: {} });
+  assert.equal(recovered.status, 200);
+  assert.deepEqual((await retried.sidecar()).hiddenModels, ['m2'], 'sync keeps the persisted hide set across re-registration');
+});
+
 test('admin routes answer a constant 503 envelope while no service is wired', async () => {
   const { app, call } = stubApp();
   registerAdminRoutes(app, { getService: () => undefined });
-  for (const [method, url] of [['GET', STATUS_URL], ['POST', CONNECT_URL], ['POST', DISCONNECT_URL], ['POST', SYNC_URL]]) {
+  for (const [method, url] of [['GET', STATUS_URL], ['POST', CONNECT_URL], ['POST', DISCONNECT_URL], ['POST', SYNC_URL],
+    ['POST', VISIBILITY_URL]]) {
     const { status, body: reported } = await call(method, url, { body: {} });
     assert.equal(status, 503);
     assert.deepEqual(reported, { ok: false, success: false, error: 'agy_route_failed' });
