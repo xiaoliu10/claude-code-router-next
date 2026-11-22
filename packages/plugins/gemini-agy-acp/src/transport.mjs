@@ -7,6 +7,7 @@ import { configureSession, modelOptions, modelSelector } from './acp-config.mjs'
 import { AcpError } from './acp-errors.mjs';
 import { AcpStdio } from './acp-stdio.mjs';
 import { accountEmailShapeOk, extractAccountEmail } from './account.mjs';
+import { promptUsage } from './acp-usage.mjs';
 
 const AUTH_METHOD = 'gemini-api-key';
 const OAUTH_METHOD = 'oauth-personal';
@@ -214,9 +215,11 @@ class Worker {
       await configureSession(this.rpc, session, model, thinking);
       this.rpc.sessionId = sessionId;
       this.rpc.onText = onText;
-      const { stopReason } = await this.rpc.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] });
+      const result = await this.rpc.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] });
+      const { stopReason } = result;
       if (!STOP_REASONS.has(stopReason)) throw new AcpError('protocol_error');
-      return { stopReason };
+      const usage = promptUsage(result);
+      return usage ? { stopReason, usage } : { stopReason };
     } finally {
       this.rpc.sessionId = null;
       this.rpc.onText = null;

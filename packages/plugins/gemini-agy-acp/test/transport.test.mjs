@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { after, before, test } from 'node:test';
 import { createTransport, isolatedEnvironment, probeVersion, syncModelOptions, verifyOauthHandshake } from '../src/transport.mjs';
+import { chatResponse } from '../src/chat.mjs';
 
 test('oauth-personal runs the whitelisted real environment, authenticates the CLI login and never creates an isolated root', async t => {
   const { transport, events } = await setup(t, 'ok', { authMethod: 'oauth-personal' });
@@ -146,6 +147,67 @@ test('reuses an authenticated worker, creates fresh sessions, and forwards only 
   const dirs = log.filter(record => record.cwd).map(record => record.cwd);
   assert.equal(new Set(dirs).size, 2);
   assert.ok(dirs.every(cwd => !existsSync(cwd)));
+});
+
+test('prompt usage reaches chat completions and only the terminal stream chunk', async t => {
+  const { transport } = await setup(t, 'prompt-usage');
+  const quota = { quota: { token_count: { input_tokens: 81, output_tokens: 11 }, remaining: 'private' } };
+  const detailed = { usage_source: 'gemini-agy-acp', prompt_tokens: 39, completion_tokens: 9, total_tokens: 48,
+    prompt_tokens_details: { cached_tokens: 21, cache_write_tokens: 2 },
+    completion_tokens_details: { reasoning_tokens: 7 } };
+  const detailCounts = { cachedReadTokens: 21, cachedWriteTokens: 2, thoughtTokens: 7, totalTokens: 48 };
+  for (const [name, fields, expected] of [
+    ['current net input', { usage: { ...detailCounts, inputTokens: 16, outputTokens: 9 }, _meta: quota }, detailed],
+    ['legacy gross input and exclusive output', { usage: { ...detailCounts, inputTokens: 39, outputTokens: 2 } }, detailed],
+    ['gross input and inclusive output', { usage: { ...detailCounts, inputTokens: 39, outputTokens: 9 } }, detailed],
+    ['input includes reads only', { usage: { ...detailCounts, inputTokens: 37, outputTokens: 2 } }, detailed],
+    ['missing total uses current layout', { usage: { inputTokens: 16, outputTokens: 9,
+      cachedReadTokens: 21, cachedWriteTokens: 2, thoughtTokens: 7 } }, detailed],
+    ['legacy quota', { _meta: quota },
+      { usage_source: 'gemini-agy-acp', prompt_tokens: 81, completion_tokens: 11, total_tokens: 92 }],
+    ['quota fallback uses the whole pair when standard output is invalid',
+      { usage: { inputTokens: 0, outputTokens: -1, cachedReadTokens: 1.5 }, _meta: quota },
+      { usage_source: 'gemini-agy-acp', prompt_tokens: 81, completion_tokens: 11, total_tokens: 92 }],
+    ['quota input is already gross, even with partial standard cache details',
+      { usage: { inputTokens: -1, outputTokens: 9, cachedReadTokens: 21, cachedWriteTokens: 2 },
+        _meta: { quota: { token_count: { input_tokens: 39, output_tokens: 9 } } } },
+      { usage_source: 'gemini-agy-acp', prompt_tokens: 39, completion_tokens: 9, total_tokens: 48 }],
+    ['standard and quota fields cannot make a mixed pair',
+      { usage: { inputTokens: 16 }, _meta: { quota: { token_count: { output_tokens: 9 } } } }, undefined],
+    ['distinct splits matching the same total',
+      { usage: { ...detailCounts, inputTokens: 37, outputTokens: 9, thoughtTokens: 2 }, _meta: quota }, undefined],
+    ['distinct splits even when the current layout matches',
+      { usage: { ...detailCounts, inputTokens: 37, outputTokens: 25, thoughtTokens: 21, totalTokens: 85 } }, undefined],
+    ['no split matches the reported total',
+      { usage: { ...detailCounts, inputTokens: 16, outputTokens: 9, totalTokens: 49 }, _meta: quota }, undefined],
+    ['invalid reported total', { usage: { inputTokens: 16, outputTokens: 9, totalTokens: -1 } }, undefined],
+    ['explicit zeros and equivalent layouts', { usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
+      { usage_source: 'gemini-agy-acp', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }],
+    ['absent', {}, undefined],
+    ['malformed', { usage: { inputTokens: '3', outputTokens: 2.5 }, _meta: { quota: { token_count: {
+      input_tokens: -1, output_tokens: Number.MAX_SAFE_INTEGER + 1,
+    } } } }, undefined],
+    ['missing output', { usage: { inputTokens: 7, thoughtTokens: 3 } }, undefined],
+    ['unsafe sum', { usage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 } }, undefined],
+  ]) await t.test(name, async () => {
+    const prompt = { ...input, prompt: JSON.stringify(fields) };
+    const json = await (await chatResponse(transport, prompt, false)).text();
+    assert.doesNotMatch(json, /_meta|private/);
+    const completion = JSON.parse(json);
+    assert.deepEqual(completion.usage, expected);
+    assert.equal(completion.choices[0].message.content, 'fixture response');
+    const sse = await (await chatResponse(transport, prompt, true)).text();
+    assert.doesNotMatch(sse, /_meta|private/);
+    const frames = sse.trimEnd().split('\n\n').map(frame => frame.slice('data: '.length));
+    assert.equal(frames.pop(), '[DONE]');
+    const [role, text, finish] = frames.map(JSON.parse);
+    assert.equal(frames.length, 3);
+    assert.equal(role.usage, undefined);
+    assert.equal(text.usage, undefined);
+    assert.equal(text.choices[0].delta.content, 'fixture response');
+    assert.equal(finish.choices[0].finish_reason, 'stop');
+    assert.deepEqual(finish.usage, expected);
+  });
 });
 
 test('denies permission, read/write and terminal callbacks with protocol responses', async t => {

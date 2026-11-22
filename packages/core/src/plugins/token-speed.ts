@@ -200,6 +200,7 @@ export const tokenSpeedPlugin: CCRPlugin = {
 
     // Add onSend hook to intercept both streaming and non-streaming responses
     fastify.addHook('onSend', async (request, _reply, payload) => {
+      if (!shouldTrackTokenSpeed(request.url)) return;
       const startTime = (request as any).requestStartTime;
       if (!startTime) return;
       const requestId = (request as any).id || Date.now().toString();

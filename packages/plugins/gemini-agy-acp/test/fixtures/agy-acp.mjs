@@ -136,7 +136,23 @@ if (argv[0] === '--version') {
       assert.equal(params.prompt.length, 1);
       assert.equal(params.prompt[0].type, 'text');
       promptId = id;
+      if (mode === 'prompt-usage') {
+        chunk('fixture response');
+        reply({ stopReason: 'end_turn', ...JSON.parse(params.prompt[0].text) });
+        return;
+      }
       switch (params.prompt[0].text) {
+        case 'echo this text':
+          chunk(params.prompt[0].text);
+          reply({ stopReason: 'end_turn', usage: {
+            inputTokens: 16, outputTokens: 9, cachedReadTokens: 21,
+            cachedWriteTokens: 2, thoughtTokens: 7, totalTokens: 48,
+          } });
+          break;
+        case 'partial-error':
+          chunk('partial fixture response');
+          send({ id, error: { code: -32000, message: 'fixture-secret-diagnostic' } });
+          break;
         case 'exit': process.exit(17); break;
         case 'hang': chunk('ready'); break;
         case 'bad-json': process.stdout.write('not-json\n'); break;
