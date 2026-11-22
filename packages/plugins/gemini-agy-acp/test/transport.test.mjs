@@ -21,7 +21,7 @@ test('oauth-personal runs the whitelisted real environment, authenticates the CL
   const session = log.find(record => record.event === 'session/new');
   assert.equal(dirname(session.cwd), tmpdir()); // per-turn session cwds under the OS temp dir
   await transport.close();
-  assert.equal(existsSync(spawn.cwd), true); // oauth leaves no root for retire to remove
+  assert.equal(existsSync(spawn.cwd), false);
   assert.throws(() => process.kill(spawn.pid, 0), { code: 'ESRCH' });
   assert.equal(existsSync(session.cwd), false);
 });
@@ -50,9 +50,18 @@ test('oauth handshake verification returns only this handshake\'s account email'
   const silent = await setup(t, 'silent-login', { authMethod: 'oauth-personal' });
   assert.deepEqual(await verifyOauthHandshake({ binary: silent.binary }),
     { version: '1.5.1', accountEmail: null });
+  const versionOnly = await setup(t, 'version-email', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await verifyOauthHandshake({ binary: versionOnly.binary }),
+    { version: '1.5.1', accountEmail: null });
+  for (const record of await versionOnly.events()) {
+    if (record.cwd) assert.equal(existsSync(record.cwd), false);
+  }
   // A rejected authenticate maps to auth_required without leaking diagnostics.
   const failing = await setup(t, 'auth-failure', { authMethod: 'oauth-personal' });
   await rejects(verifyOauthHandshake({ binary: failing.binary }), 'auth_required', 401);
+  for (const record of await failing.events()) {
+    if (record.cwd) assert.equal(existsSync(record.cwd), false);
+  }
   for (const invalid of ['agy', '/x/\0y', 42]) {
     await assert.rejects(verifyOauthHandshake({ binary: invalid }), { code: 'acp_invalid_config' });
   }

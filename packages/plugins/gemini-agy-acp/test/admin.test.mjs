@@ -68,7 +68,7 @@ function stubApp(port = 43781) {
   return { app, call };
 }
 
-async function activate(t, { local, fixtureMode, fixtureAuth, host, installer } = {}) {
+async function activate(t, { local, fixtureMode, fixtureAuth, host, installer, preparePool } = {}) {
   const configDir = await mkdtemp(join(tmpdir(), 'agy-admin-'));
   t.after(() => rm(configDir, { recursive: true, force: true }));
   if (local !== undefined) await writeFile(sidecarPath(configDir), JSON.stringify(local));
@@ -84,6 +84,7 @@ async function activate(t, { local, fixtureMode, fixtureAuth, host, installer } 
     registerAdminRoutes(fn) { registrars.push(fn); },
   };
   await activateWithTransport(ctx, async options => {
+    await preparePool?.(options);
     const transport = {
       options,
       run: async () => ({ stopReason: 'end_turn' }),
@@ -290,6 +291,20 @@ test('oauth-personal connect maps a failed handshake to auth_required and persis
   assert.equal(p.transports.length, 0);
   const { body: statusBody } = await p.call('GET', STATUS_URL);
   assert.equal(statusBody.lastError.code, 'acp_auth_required');
+});
+
+test('OAuth connect preserves saved credentials if validation or pool preparation fails', async t => {
+  for (const maxWorkers of [0, 1]) {
+    const p = await activate(t, { fixtureMode: 'ok', fixtureAuth: 'oauth-personal',
+      preparePool: () => { throw new Error('fixture pool error'); } });
+    const saved = { enabled: true, binary: p.fixture.binary, authMethod: 'gemini-api-key',
+      apiKey: 'fixture-value', maxWorkers };
+    await p.writeSidecar(saved);
+    const response = await p.call('POST', CONNECT_URL,
+      { body: { authMethod: 'oauth-personal' } });
+    assert.ok(response.status >= 400);
+    assert.deepEqual(await p.sidecar(), saved);
+  }
 });
 
 test('oauth-personal connect evicts a stored gemini apiKey; gemini connect clears the stale account', async t => {

@@ -350,7 +350,10 @@ test('card auto-installs agy when none is detected, polls while installing and o
     // B: a running install locks every action, shows 安装中… and polls /status;
     // the poll tick that observes completion surfaces the success notice and
     // unmount clears the timer.
-    const statusB = { ...baseStatus, installing: true };
+    // Models seeded while installing: the freshly rebuilt row toggles and
+    // restore-all must be locked by the install too (P2-1 regression).
+    const statusB = { ...baseStatus, installing: true,
+      models: [{ id: 'm1', name: 'M1' }, { id: 'm2', name: 'M2' }], hiddenModels: ['m2'] };
     const callsB = [];
     const callApiB = async path => { callsB.push(path); return { ...statusB }; };
     let pollTick = null;
@@ -364,6 +367,11 @@ test('card auto-installs agy when none is detected, polls while installing and o
     assert.equal(installingButton.disabled, true);
     assert.equal(allB.find(node => node.tag === 'button' && node.textContent === '连接').disabled, true);
     assert.ok(allB.some(node => typeof node.textContent === 'string' && node.textContent.includes('正在自动安装 agy')));
+    const rowTogglesB = allB.filter(node => node.tag === 'button' && (node.textContent === '隐藏' || node.textContent === '恢复'));
+    assert.equal(rowTogglesB.length, 2);
+    for (const toggle of rowTogglesB) assert.equal(toggle.disabled, true);
+    const restoreAllB = allB.find(node => node.tag === 'button' && node.textContent === '恢复全部');
+    assert.equal(restoreAllB.disabled, true);
     assert.ok(hostB.__agyPollTimer);
     assert.equal(typeof pollTick, 'function');
     // The background install finishes between polls.
@@ -392,6 +400,18 @@ test('card auto-installs agy when none is detected, polls while installing and o
     assert.equal(retryButton.disabled, false);
     assert.ok(allC.some(node => typeof node.textContent === 'string' && node.textContent.includes('下载 agy 失败')));
     card.unmount(hostC);
+
+    // D: a stale install failure is superseded once a binary is detected
+    // (manual install after a failed auto-install): no hint, no retry button.
+    const statusD = { ...baseStatus, detectedBinary: '/manual/agy', installError: { code: 'agy_install_download_failed', at: 1 } };
+    const callApiD = async () => ({ ...statusD });
+    const hostD = make();
+    await card.mount(hostD, { callApi: callApiD, locale: 'zh', plugin: { name: 'gemini-agy-acp', version: '0.1.0' }, onBusy() {} });
+    const allD = walk(hostD);
+    assert.equal(allD.find(node => node.tag === 'button' && node.textContent === '安装 agy').hidden, true);
+    assert.equal(allD.find(node => node.tag === 'input').value, '/manual/agy');
+    assert.ok(!allD.some(node => typeof node.textContent === 'string' && node.textContent.includes('下载 agy 失败')));
+    card.unmount(hostD);
   } finally {
     globalThis.document = previousDocument;
     globalThis.setInterval = previousSetInterval;

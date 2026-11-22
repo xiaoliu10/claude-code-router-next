@@ -42,7 +42,8 @@ if (isolated) {
 if (argv[0] === '--version') {
   assert.deepEqual(argv, ['--version']);
   assert.equal(process.env.GEMINI_API_KEY, undefined);
-  record('version', isolated ? { root } : {});
+  record('version', isolated ? { root } : { cwd: process.cwd() });
+  if (mode === 'version-email') process.stderr.write('applyAuthResult: email=probe@example.com, status=OK\n');
   if (mode === 'hang-version') setInterval(() => {}, 60_000);
   else if (mode === 'long-version') process.stdout.write('0'.repeat(4097));
   else console.log(`agy version ${mode === 'old' ? '1.5.0' : mode === 'prerelease' ? '1.5.1-rc1' : '1.5.1'}`);
@@ -92,7 +93,7 @@ if (argv[0] === '--version') {
           ...(isolated && mode === 'terminal-auth' && { type: 'terminal' }),
           ...(isolated && mode === 'env-auth' && { type: 'env_var' }) }])],
         // Explicit ACP account metadata, only in the oauth modes that opt in.
-        ...(authMethod === 'oauth-personal' && mode !== 'silent-login' && mode !== 'stderr-login' &&
+        ...(authMethod === 'oauth-personal' && !['silent-login', 'stderr-login', 'version-email'].includes(mode) &&
           { accountInfo: { email: 'metadata-account@example.com' } }) });
     } else if (method === 'authenticate') {
       assert.deepEqual(params, { methodId: authMethod });
@@ -103,7 +104,7 @@ if (argv[0] === '--version') {
         authenticated = true;
         // The verifying child's own login diagnostic, written to stderr so
         // the transport's bounded capture can scan it for the account email.
-        if (authMethod === 'oauth-personal' && mode !== 'silent-login') {
+        if (authMethod === 'oauth-personal' && !['silent-login', 'version-email'].includes(mode)) {
           process.stderr.write('applyAuthResult: email=stderr-account@example.com, status=OK\n');
         }
         reply({});

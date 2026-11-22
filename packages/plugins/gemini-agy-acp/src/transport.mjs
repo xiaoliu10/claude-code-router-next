@@ -103,14 +103,14 @@ class Worker {
     if (this.failure) throw this.failure;
   }
 
-  spawnChild(args, env) {
+  spawnChild(args, env, captureStderr = false) {
     this.check();
     const child = spawn(this.binary, args, {
       cwd: this.cwd, env, shell: false, windowsHide: true, detached: process.platform !== 'win32',
       // Subprocess diagnostics may contain credentials or prompts; they are
       // captured only for the bounded oauth login verification below and are
       // never logged or returned raw.
-      stdio: ['pipe', 'pipe', this.captureStderr ? 'pipe' : 'ignore'],
+      stdio: ['pipe', 'pipe', captureStderr ? 'pipe' : 'ignore'],
     });
     this.child = child;
     this.childClosed = new Promise(resolve => child.once('close', resolve));
@@ -119,7 +119,7 @@ class Worker {
     child.stdin.on('error', fail);
     child.stdout.on('error', fail);
     child.stderr?.on('error', fail);
-    if (this.captureStderr) {
+    if (captureStderr) {
       // Bounded rolling tail (last 64 KiB) of THIS child's diagnostics.
       child.stderr.on('data', chunk => {
         this.stderrChunks.push(chunk);
@@ -141,19 +141,22 @@ class Worker {
   }
 
   /** The bounded `--version` probe. Returns the advertised CLI version and
-   * leaves the workspace in place for the ACP child that follows. oauth
-   * workers skip the isolated root entirely: they run on a fresh temp cwd
-   * with the whitelisted real environment so the CLI can use its own login. */
+   * leaves the workspace in place for the ACP child that follows. OAuth
+   * workers use a private temporary cwd and the whitelisted real environment
+   * so the CLI can use its native login. */
   async probe() {
-    if (this.authMethod === OAUTH_METHOD) {
-      this.cwd = await mkdtemp(join(tmpdir(), 'ccr-agy-acp-'));
-      this.spawnEnv = oauthEnvironment();
-    } else {
+    this.rootReady = (async () => {
       this.root = await mkdtemp(join(tmpdir(), 'ccr-agy-acp-'));
-      const isolation = await isolatedEnvironment(this.root);
-      this.cwd = isolation.cwd;
-      this.spawnEnv = isolation.env;
-    }
+      if (this.authMethod === OAUTH_METHOD) {
+        this.cwd = this.root;
+        this.spawnEnv = oauthEnvironment();
+      } else {
+        const isolation = await isolatedEnvironment(this.root);
+        this.cwd = isolation.cwd;
+        this.spawnEnv = isolation.env;
+      }
+    })();
+    await this.rootReady;
     const probe = this.spawnChild(['--version'], this.spawnEnv);
     let output = '';
     let bytes = 0;
@@ -179,7 +182,8 @@ class Worker {
     this.check();
 
     const child = this.spawnChild(['acp', '--sandbox'],
-      this.authMethod === OAUTH_METHOD ? this.spawnEnv : { ...this.spawnEnv, GEMINI_API_KEY: apiKey });
+      this.authMethod === OAUTH_METHOD ? this.spawnEnv : { ...this.spawnEnv, GEMINI_API_KEY: apiKey },
+      this.captureStderr);
     child.once('exit', () => this.retire(new AcpError('worker_failed')));
     child.stdout.once('end', () => this.retire(new AcpError('worker_failed')));
     this.rpc = new AcpStdio(child, error => this.retire(error));
@@ -199,9 +203,7 @@ class Worker {
   async turn({ model, thinking, prompt, onText }, apiKey) {
     if (!this.rpc) await this.start(apiKey);
     this.check();
-    // OAuth workers have no isolated root; their per-turn session cwds live
-    // directly under the OS temp dir and are removed after every turn.
-    const cwd = await mkdtemp(join(this.root ?? tmpdir(), 'session-'));
+    const cwd = await mkdtemp(join(this.authMethod === OAUTH_METHOD ? tmpdir() : this.root, 'session-'));
     try {
       const session = await this.rpc.request('session/new', { cwd, mcpServers: [] });
       const { sessionId } = session;
@@ -276,10 +278,8 @@ class Worker {
     this.cleanup = (async () => {
       try {
         await this.task?.catch(() => {});
+        await this.rootReady?.catch(() => {});
         await this.childClosed;
-        // Only an isolated root is removed. OAuth workers never create one
-        // (their spawn cwd is the CLI's own working directory in the real
-        // user context), so retirement leaves nothing to delete.
         if (this.root) await rm(this.root, { recursive: true, force: true, maxRetries: 3 });
       } catch {
         throw new AcpError('worker_failed');
@@ -407,7 +407,7 @@ export async function syncModelOptions({ binary, authMethod = AUTH_METHOD, apiKe
   try {
     await worker.start(oauth ? undefined : apiKey);
     worker.check();
-    const cwd = await mkdtemp(join(worker.root ?? tmpdir(), 'session-'));
+    const cwd = await mkdtemp(join(oauth ? tmpdir() : worker.root, 'session-'));
     try {
       const session = await worker.rpc.request('session/new', { cwd, mcpServers: [] });
       const models = modelOptions(modelSelector(session.configOptions));

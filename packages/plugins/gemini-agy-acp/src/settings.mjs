@@ -117,9 +117,10 @@ export function sidecarCache(configDir) {
 /** Merge fields into the sidecar atomically and keep it 0600. The apiKey is
  * intentionally persisted here (never in config.json, logs or responses);
  * the mode is enforced with chmod so an existing looser file is tightened. */
-export async function writeSidecar(configDir, merge) {
+export async function writeSidecar(configDir, merge, prepare) {
   const { raw } = await readSidecar(configDir);
   const next = { ...(objectOrNothing(raw) ?? {}), ...merge };
+  await prepare?.(next);
   const path = settingsPath(configDir);
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {

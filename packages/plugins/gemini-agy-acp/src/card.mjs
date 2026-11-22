@@ -229,14 +229,16 @@ export default {
         pollTimer = null;
         target.__agyPollTimer = null;
       }
+      // A detected binary supersedes any stale install failure: the operator
+      // may have installed agy manually after a failed auto-install.
+      const binaryPresent = Boolean(status?.binary || status?.detectedBinary);
       if (wasInstalling && !installingNow) {
         if (status?.detectedBinary) setNotice(t('agy 已安装，可直接连接', 'agy installed — press Connect'));
-        else if (status?.installError) setMessage(errorText({ code: status.installError.code }));
+        else if (status?.installError && !binaryPresent) setMessage(errorText({ code: status.installError.code }));
       }
       wasInstalling = installingNow;
-      install.hidden = Boolean(status?.binary || status?.detectedBinary) && !status?.installError;
-      if (status?.installError && !installingNow) setMessage(errorText({ code: status.installError.code }));
-      applyDisabled();
+      install.hidden = binaryPresent;
+      if (status?.installError && !installingNow && !binaryPresent) setMessage(errorText({ code: status.installError.code }));
       statusLine.textContent = statusText(status);
       // ACP key auth exposes no account email; the fingerprint lets the
       // operator match WHICH key is connected without revealing it.
@@ -258,14 +260,14 @@ export default {
         const toggle = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE + ' ml-2 px-2 py-0.5 text-[10px]',
           isHidden ? t('恢复', 'Restore') : t('隐藏', 'Hide'));
         toggle.type = 'button';
-        toggle.disabled = busy || !call;
+        toggle.disabled = busy || !call || installingNow;
         toggle.onclick = () => runAction('/models/visibility', isHidden ? { restore: [id] } : { hide: [id] });
         rowButtons.push(toggle);
         li.append(toggle);
         return li;
       }));
       restoreAll.hidden = modelEntries.length === 0 || currentHiddenIds.length === 0;
-      restoreAll.disabled = busy || !call;
+      restoreAll.disabled = busy || !call || installingNow;
       restoreAll.onclick = () => runAction('/models/visibility', { restore: [...currentHiddenIds] });
       modelsBox.hidden = modelEntries.length === 0;
       // The persisted auth method wins after every status refresh (it is what
@@ -280,6 +282,9 @@ export default {
       const prefill = typeof status?.binary === 'string' ? status.binary
         : typeof status?.detectedBinary === 'string' ? status.detectedBinary : null;
       if (!binaryInput.value && prefill) binaryInput.value = prefill;
+      // Re-apply the lock AFTER the row buttons are rebuilt so a running
+      // install disables the freshly created visibility toggles too.
+      applyDisabled();
     };
 
     const refresh = async () => {

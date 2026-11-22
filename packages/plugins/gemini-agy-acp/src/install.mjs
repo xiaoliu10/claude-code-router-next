@@ -5,10 +5,10 @@
 // HTTPS_PROXY/HTTP_PROXY/NO_PROXY environment natively), verify the SHA-512
 // checksum, extract the unix tarball member and place the binary at the
 // official default location. No remote script is ever piped into a shell.
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { createReadStream, existsSync } from 'node:fs';
-import { chmod, copyFile, mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, rename, rm, stat } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { failure } from './chat.mjs';
@@ -147,11 +147,20 @@ export function createInstaller(options = {}) {
         } catch { throw failure('agy_install_extract_failed', 502); }
         binarySource = join(staging, 'antigravity');
       }
+      // Atomic placement: copy to a temp name IN the target directory, chmod
+      // there, then rename. A crash mid-copy can never leave a truncated file
+      // at the official path (which status would report as detectedBinary),
+      // and on unix the rename safely replaces a running executable.
+      const temporary = join(dirname(targetBinary), `.agy-${randomUUID()}.tmp`);
       try {
         await mkdir(dirname(targetBinary), { recursive: true });
-        await copyFile(binarySource, targetBinary);
-        if (platform !== 'win32') await chmod(targetBinary, 0o755);
-      } catch { throw failure('agy_install_write_failed', 500); }
+        await copyFile(binarySource, temporary);
+        if (platform !== 'win32') await chmod(temporary, 0o755);
+        await rename(temporary, targetBinary);
+      } catch {
+        await rm(temporary, { force: true }).catch(() => {});
+        throw failure('agy_install_write_failed', 500);
+      }
       // Best-effort vendor handoff, exactly like the bootstrappers' `|| true`
       // steps: clear macOS quarantine and let agy configure the shell PATH.
       if (platform === 'darwin') {

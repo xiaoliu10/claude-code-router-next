@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInstaller, defaultBinaryPath, platformKey, validateManifest } from '../src/install.mjs';
@@ -97,6 +97,8 @@ test('unix install downloads, verifies, extracts and places the binary at the of
   assert.equal(result.binary, join(home, '.local', 'bin', 'agy'));
   assert.deepEqual(await readFile(result.binary), PAYLOAD);
   if (process.platform !== 'win32') assert.equal((await stat(result.binary)).mode & 0o777, 0o755);
+  // Atomic placement: the temp copy is renamed away, never left behind.
+  assert.deepEqual(await readdir(join(home, '.local', 'bin')), ['agy']);
   // Manifest queried for THIS platform; payload fetched over https-only curl;
   // tar extracted the antigravity member; the vendor handoff ran best-effort.
   assert.ok(calls[0].args.at(-1).endsWith('/manifests/darwin_arm64.json'));

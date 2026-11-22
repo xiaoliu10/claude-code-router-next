@@ -98,12 +98,17 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     await previous?.retireExisting();
   }
 
-  /** Single-flight settings refresh; safe to await from every request. The
-   * force variant re-swaps even an unchanged fingerprint so a connect always
-   * retires the live pool (fresh environment capture included). */
+  function queueTransportUpdate(update) {
+    const next = Promise.resolve(rebuilding).catch(() => {}).then(update).finally(() => {
+      if (rebuilding === next) rebuilding = null;
+    });
+    rebuilding = next;
+    return next;
+  }
+
+  /** Single-flight settings refresh; safe to await from every request. */
   function requireTransport(force = false) {
-    if (!rebuilding || force) rebuilding = applyTransport(force).finally(() => { rebuilding = null; });
-    return rebuilding;
+    return !rebuilding || force ? queueTransportUpdate(() => applyTransport(force)) : rebuilding;
   }
 
   async function connected() {
@@ -236,13 +241,29 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
       : { enabled: true, binary: merged.binary, authMethod, version,
           ...(input.apiKey !== undefined ? { apiKey: merged.apiKey } : {}),
           ...(typeof raw?.accountEmail === 'string' ? { accountEmail: undefined } : {}) };
-    // Full transport validation of the persisted settings before the write.
-    enabledSettings(payload);
-    await writeSidecar(configDir, payload);
-    cache.invalidate();
-    await requireTransport(true).catch(error => {
-      note(error);
-      log?.warn?.(`gemini-agy-acp connect could not refresh the worker pool (${safeCode(error)})`);
+    await queueTransportUpdate(async () => {
+      let replacement;
+      let settings;
+      try {
+        // Validate the complete merged settings and prepare the new pool before
+        // replacing the saved credentials or the live pool.
+        await writeSidecar(configDir, payload, async next => {
+          settings = enabledSettings(next);
+          replacement = await createTransport({ ...settings, ...(log ? { log } : {}) });
+          if (!replacement) throw failure('agy_config_invalid', 503);
+        });
+      } catch (error) {
+        await replacement?.close()?.catch(() => {});
+        throw error;
+      }
+      cache.invalidate();
+      const previous = transport;
+      transport = replacement;
+      fingerprint = fingerprintOf(settings);
+      lastError = undefined;
+      await previous?.retireExisting().catch(error => {
+        log?.warn?.(`gemini-agy-acp could not retire the previous worker pool (${safeCode(error)})`);
+      });
     });
     return status();
   }
