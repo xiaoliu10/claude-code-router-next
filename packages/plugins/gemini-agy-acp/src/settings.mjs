@@ -4,6 +4,9 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { failure } from './chat.mjs';
 
 const NAME = 'gemini-agy-acp';
+/** The two transport-level auth methods; oauth-personal carries no apiKey at
+ * all — its credential is the CLI's own Google login. */
+export const AUTH_METHODS = ['gemini-api-key', 'oauth-personal'];
 const MAX_API_KEY_BYTES = 4096;
 const MAX_HIDDEN_MODEL_CHARS = 128;
 const MAX_HIDDEN_MODELS = 256;
@@ -47,17 +50,19 @@ function objectOrNothing(raw) {
 }
 
 /** Validate the enabled transport settings, resolving the optional sidecar
- * apiKey. Absent or null apiKey keeps the transport's GEMINI_API_KEY process
- * environment fallback (the pre-card behavior). Any malformed enabled field
- * fails closed. The resolved apiKey never travels anywhere except into the
- * transport factory arguments. */
+ * apiKey. gemini-api-key mode keeps the optional key with the transport's
+ * GEMINI_API_KEY process environment fallback (the pre-card behavior);
+ * oauth-personal mode must NOT carry an apiKey at all (presence fails closed
+ * — its credential is the CLI's own Google login). Any malformed enabled
+ * field fails closed. The resolved apiKey never travels anywhere except into
+ * the transport factory arguments. */
 export function enabledSettings(raw) {
   if (raw?.enabled !== true) return null;
   const { binary, authMethod, timeoutMs = 60000, maxWorkers = 1, apiKey } = raw;
-  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || authMethod !== 'gemini-api-key' ||
+  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.includes(authMethod) ||
       !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300000 ||
       !Number.isSafeInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8 ||
-      (apiKey != null && !apiKeyShapeOk(apiKey))) {
+      (apiKey != null && (authMethod !== 'gemini-api-key' || !apiKeyShapeOk(apiKey)))) {
     throw failure('agy_config_invalid', 503);
   }
   return { binary, authMethod, timeoutMs, maxWorkers, ...(apiKeyShapeOk(apiKey) ? { apiKey } : {}) };

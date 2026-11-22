@@ -4,8 +4,9 @@ import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { AcpError } from './acp-errors.mjs';
 import { registerAdminRoutes } from './admin-routes.mjs';
+import { accountEmailShapeOk } from './account.mjs';
 import { chatResponse, failure, textTurns, toPrompt } from './chat.mjs';
-import { apiKeyShapeOk, enabledSettings, hiddenModelsOf, readSidecar, sidecarCache, writeSidecar } from './settings.mjs';
+import { AUTH_METHODS, apiKeyShapeOk, enabledSettings, hiddenModelsOf, readSidecar, sidecarCache, writeSidecar } from './settings.mjs';
 
 const NAME = 'gemini-agy-acp';
 const MARKER = `ccr-managed-${NAME}`;
@@ -66,8 +67,8 @@ export async function activateWithTransport(ctx, createTransport) {
   const cache = sidecarCache(configDir);
   let transport;
   // Fingerprint of the settings the live pool was built from; a changed
-  // fingerprint (binary, apiKey, limits) is what actually swaps the pool, so
-  // a models-sync write never retires healthy workers.
+  // fingerprint (binary, auth method, apiKey, limits) is what actually swaps
+  // the pool, so a models-sync write never retires healthy workers.
   let fingerprint;
   let rebuilding;
   let lastError;
@@ -76,7 +77,7 @@ export async function activateWithTransport(ctx, createTransport) {
     lastError = { code: safeCode(error), at: Date.now() };
     return error;
   };
-  const fingerprintOf = settings => JSON.stringify([settings.binary, settings.apiKey ?? null, settings.timeoutMs, settings.maxWorkers]);
+  const fingerprintOf = settings => JSON.stringify([settings.binary, settings.authMethod, settings.apiKey ?? null, settings.timeoutMs, settings.maxWorkers]);
 
   async function applyTransport(force = false) {
     const snapshot = await cache.read();
@@ -122,6 +123,11 @@ export async function activateWithTransport(ctx, createTransport) {
     const models = publicModels(raw?.models);
     const modelsSyncedAt = typeof raw?.modelsSyncedAt === 'number' && Number.isSafeInteger(raw.modelsSyncedAt)
       ? raw.modelsSyncedAt : undefined;
+    const authMethod = AUTH_METHODS.includes(raw?.authMethod) ? raw.authMethod : null;
+    const oauth = authMethod === 'oauth-personal';
+    // The account email is only ever the one persisted from connect's verified
+    // handshake of the selected binary — never discovered from stale logs.
+    const accountEmail = oauth && accountEmailShapeOk(raw?.accountEmail) ? raw.accountEmail : null;
     return {
       loaded: transport !== undefined,
       enabled: raw?.enabled === true,
@@ -129,10 +135,12 @@ export async function activateWithTransport(ctx, createTransport) {
       binaryFound,
       version,
       lastError: lastError ?? null,
-      // Both credential fields share one validation so a malformed env key
-      // reports "no API key" instead of a fingerprint-less configured state.
-      apiKeyConfigured: apiKeyShapeOk(raw?.apiKey) || apiKeyShapeOk(process.env.GEMINI_API_KEY),
-      apiKeyFingerprint: credentialFingerprint(raw?.apiKey),
+      authMethod,
+      // oauth-personal pools carry no API key credential at all: the CLI uses
+      // its own OS-keyring Google login, so the key fields stay empty.
+      apiKeyConfigured: !oauth && (apiKeyShapeOk(raw?.apiKey) || apiKeyShapeOk(process.env.GEMINI_API_KEY)),
+      apiKeyFingerprint: oauth ? null : credentialFingerprint(raw?.apiKey),
+      ...(accountEmail ? { accountEmail } : {}),
       ...(models ? { models } : {}),
       ...(modelsSyncedAt !== undefined ? { modelsSyncedAt } : {}),
       hiddenModels: hiddenModelsOf(raw),
@@ -143,6 +151,13 @@ export async function activateWithTransport(ctx, createTransport) {
     const input = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
     const { raw } = await readSidecar(configDir);
     const merged = { ...(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) };
+    const authMethod = input.authMethod === undefined ? AUTH_METHODS[0]
+      : AUTH_METHODS.includes(input.authMethod) ? input.authMethod : null;
+    if (!authMethod) throw new AcpError('invalid_config');
+    const oauth = authMethod === 'oauth-personal';
+    // oauth-personal must not carry an apiKey: its credential is the CLI's
+    // own Google login, and a stored key would poison the pool settings.
+    if (oauth && input.apiKey !== undefined) throw new AcpError('invalid_config');
     if (input.binary !== undefined) {
       if (typeof input.binary !== 'string' || !isAbsolute(input.binary) || input.binary.includes('\0')) {
         throw new AcpError('invalid_config');
@@ -152,23 +167,39 @@ export async function activateWithTransport(ctx, createTransport) {
     if (!configuredBinary(merged)) throw new AcpError('invalid_config');
     await assertExecutable(merged.binary);
     // Bounded version probe BEFORE anything is persisted: a failed connect
-    // never enables a broken binary.
+    // never enables a broken binary. The probe runs in the same auth mode as
+    // the pool that follows.
     const { probeVersion } = await loadTransportModule();
-    const version = await probeVersion(merged.binary);
-    merged.version = version;
-    if (input.apiKey !== undefined) {
+    const version = await probeVersion(merged.binary, authMethod);
+    let accountEmail = null;
+    if (oauth) {
+      // A `--version` probe cannot prove the OS-keyring Google login works:
+      // verify with one real bounded ACP handshake (authenticate + session/new)
+      // on a temporary worker of the selected binary. Any handshake failure
+      // maps to auth_required so the card surfaces the terminal-login hint.
+      const { verifyOauthHandshake } = await loadTransportModule();
+      try {
+        ({ accountEmail } = await verifyOauthHandshake({ binary: merged.binary, log }));
+      } catch (error) {
+        log?.warn?.(`gemini-agy-acp oauth handshake failed (${safeCode(error)})`);
+        throw new AcpError('auth_required');
+      }
+    } else if (input.apiKey !== undefined) {
       if (!apiKeyShapeOk(input.apiKey) || !input.apiKey.trim()) throw new AcpError('invalid_config');
       merged.apiKey = input.apiKey;
     }
-    // Full transport validation of the merged settings before the write.
-    enabledSettings(merged);
-    await writeSidecar(configDir, {
-      enabled: true,
-      binary: merged.binary,
-      authMethod: 'gemini-api-key',
-      version,
-      ...(input.apiKey !== undefined ? { apiKey: merged.apiKey } : {}),
-    });
+    // Write payload (not the merged view): switching to oauth evicts any
+    // stored apiKey, and switching back to gemini-api-key evicts the stale
+    // account email. `undefined` merge values delete the persisted keys.
+    const payload = oauth
+      ? { enabled: true, binary: merged.binary, authMethod, version,
+          apiKey: undefined, ...(accountEmail ? { accountEmail } : { accountEmail: undefined }) }
+      : { enabled: true, binary: merged.binary, authMethod, version,
+          ...(input.apiKey !== undefined ? { apiKey: merged.apiKey } : {}),
+          ...(typeof raw?.accountEmail === 'string' ? { accountEmail: undefined } : {}) };
+    // Full transport validation of the persisted settings before the write.
+    enabledSettings(payload);
+    await writeSidecar(configDir, payload);
     cache.invalidate();
     await requireTransport(true).catch(error => {
       note(error);
@@ -222,10 +253,15 @@ export async function activateWithTransport(ctx, createTransport) {
     const { raw } = await readSidecar(configDir);
     const settings = enabledSettings(raw);
     if (!settings) throw failure('agy_disabled', 503);
-    const apiKey = settings.apiKey ?? process.env.GEMINI_API_KEY;
-    if (!apiKey?.trim()) throw new AcpError('auth_required');
     const { syncModelOptions } = await loadTransportModule();
-    const { models, version } = await syncModelOptions({ binary: settings.binary, apiKey, log });
+    const oauth = settings.authMethod === 'oauth-personal';
+    // oauth-personal pools have no credential: the sync worker authenticates
+    // the CLI's own login, exactly like the request pool.
+    const apiKey = oauth ? undefined : settings.apiKey ?? process.env.GEMINI_API_KEY;
+    if (!oauth && !apiKey?.trim()) throw new AcpError('auth_required');
+    const { models, version } = await syncModelOptions(oauth
+      ? { binary: settings.binary, authMethod: 'oauth-personal', log }
+      : { binary: settings.binary, apiKey, log });
     const modelsSyncedAt = Date.now();
     // The operator's hide set survives re-syncs; ids that disappeared
     // upstream are dropped from it silently (always persisted so a pruned

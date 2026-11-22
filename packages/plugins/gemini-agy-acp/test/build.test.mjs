@@ -80,16 +80,22 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       walk(root);
       const buttonNodes = all.filter(node => node.tag === 'button');
       const inputNodes = all.filter(node => node.tag === 'input');
-      // The three fixed actions plus a per-row toggle for each of the two
-      // models and one restore-all for the seeded hidden model.
-      assert.equal(buttonNodes.length, 6);
+      // The three fixed actions, the two auth-mode toggle buttons, a per-row
+      // toggle for each of the two models and one restore-all for the seeded
+      // hidden model.
+      assert.equal(buttonNodes.length, 8);
       const mainLabels = zh ? ['连接', '同步模型', '断开'] : ['Connect', 'Sync models', 'Disconnect'];
       const actionButtons = mainLabels.map(label => buttonNodes.find(node => node.textContent === label));
       assert.deepEqual(actionButtons.map(node => node.textContent), mainLabels);
+      // The 登录方式 toggle: API key mode is the default/persisted mode here.
+      const authLabels = zh ? ['API key', 'Google 账号'] : ['API key', 'Google account'];
+      const authButtons = buttonNodes.filter(node => authLabels.includes(node.textContent));
+      assert.equal(authButtons.length, 2);
       assert.equal(inputNodes.length, 2);
       assert.equal(inputNodes[1].type, 'password');
       assert.equal(inputNodes[0].value, '/fixture/agy'); // binary prefilled from status
       assert.equal(inputNodes[1].value, '');             // the apiKey is never rendered back
+      assert.equal(inputNodes[1].hidden, false);         // API key mode keeps the key input visible
       const details = all.filter(node => node.tag === 'details').at(-1);
       assert.ok(details);
       assert.ok(!details.open);
@@ -117,18 +123,20 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       assert.ok(restoreAllButton);
       assert.equal(restoreAllButton.disabled, false);
       assert.deepEqual(calls[0], ['/status', { timeoutMs: 15000 }]);
-      // Connect sends the binary path, no key when the field is empty, and clears it after typing.
+      // Connect sends the binary path, the chosen auth method, no key when
+      // the field is empty, and clears the typed key after connecting.
       inputNodes[0].value = '/fixture/agy';
       inputNodes[1].value = 'typed-secret';
       await actionButtons[0].onclick();
-      assert.deepEqual(calls[1], ['/connect', { method: 'POST', body: JSON.stringify({ binary: '/fixture/agy', apiKey: 'typed-secret' }), timeoutMs: 30000 }]);
+      assert.deepEqual(calls[1], ['/connect', { method: 'POST',
+        body: JSON.stringify({ binary: '/fixture/agy', authMethod: 'gemini-api-key', apiKey: 'typed-secret' }), timeoutMs: 30000 }]);
       assert.equal(inputNodes[1].value, '');
       assert.ok(calls.some(([path]) => path === '/status'));
       // Hiding parks the visibility POST: every control is disabled while
       // busy, then the refreshed status dims the row and flips the toggle.
       parked = new Promise(resolve => { releaseVisibility = resolve; });
       const pendingHide = rowToggles()[0].onclick();
-      for (const node of [...actionButtons, ...rowToggles(), restoreAllButton]) {
+      for (const node of [...actionButtons, ...authButtons, ...rowToggles(), restoreAllButton]) {
         assert.equal(node.disabled, true, node.textContent);
       }
       assert.deepEqual(busyEvents.slice(-1), [true]);
@@ -157,6 +165,99 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
     } finally { globalThis.document = previous; }
   }
 });
+
+test('management card oauth-personal mode hides the key input, reports the account and maps login failures to the terminal hint', async t => {
+  const card = (await import('../src/card.mjs')).default;
+  for (const locale of ['zh', 'en']) {
+    const zh = locale === 'zh';
+    const status = { loaded: true, enabled: true, binary: '/fixture/agy', binaryFound: true, version: '1.5.1',
+      authMethod: 'oauth-personal', accountEmail: 'agy.user@example.com', lastError: null,
+      apiKeyConfigured: false, apiKeyFingerprint: null,
+      models: [{ id: 'm2', name: 'Gemini Model' }], hiddenModels: [] };
+    const calls = [];
+    let failNextConnect = false;
+    const callApi = async (path, init) => {
+      calls.push([path, init]);
+      if (path === '/connect') {
+        if (failNextConnect) {
+          failNextConnect = false;
+          throw Object.assign(new Error('acp_auth_required'), { code: 'acp_auth_required' });
+        }
+        const requested = JSON.parse(init.body);
+        status.authMethod = requested.authMethod;
+        if ('email' in requested) status.accountEmail = requested.email;
+        return { ok: true, success: true, ...status };
+      }
+      if (path === '/status') return status;
+      return { ok: true, success: true, ...status };
+    };
+    const make = tag => ({ tag, className: '', textContent: '', children: [], value: '', type: '', disabled: false,
+      onclick: null,
+      setAttribute() {},
+      append(...kids) { this.children.push(...kids); },
+      remove() {},
+      replaceChildren(...kids) { this.children.length = 0; this.children.push(...kids); } });
+    const previous = globalThis.document;
+    globalThis.document = { createElement: make };
+    try {
+      const host = make();
+      await card.mount(host, { callApi, locale, plugin: { name: 'gemini-agy-acp', version: '0.1.0' } });
+      const all = [];
+      const walk = node => { all.push(node); for (const kid of node.children) walk(kid); };
+      walk(host);
+      const buttonNodes = all.filter(node => node.tag === 'button');
+      const inputNodes = all.filter(node => node.tag === 'input');
+      const oauthLabel = zh ? 'Google 账号' : 'Google account';
+      const keyModeButton = buttonNodes.find(node => node.textContent === 'API key');
+      const oauthModeButton = buttonNodes.find(node => node.textContent === oauthLabel);
+      const connectButton = buttonNodes.find(node => node.textContent === (zh ? '连接' : 'Connect'));
+      assert.ok(keyModeButton && oauthModeButton && connectButton);
+      const accountLine = all.find(node => typeof node.textContent === 'string' && node.textContent.startsWith(zh ? '账号：' : 'Account: '));
+      const line = all.find(node => typeof node.textContent === 'string' && node.textContent.includes('1.5.1'));
+      // Google-account mode: the key input is hidden and the handshake-verified
+      // account email is shown prominently and in the status line.
+      assert.equal(inputNodes[1].hidden, true);
+      assert.deepEqual(accountLine.textContent, zh ? '账号：agy.user@example.com' : 'Account: agy.user@example.com');
+      assert.match(line.textContent, zh ? /账号 agy\.user@example\.com/ : /account agy\.user@example\.com/);
+      assert.doesNotMatch(line.textContent, zh ? /AI Studio key 凭据/ : /AI Studio key credential/);
+      // Toggling back to API key mode reveals the key input and flips the
+      // active segment styling.
+      keyModeButton.onclick();
+      assert.equal(inputNodes[1].hidden, false);
+      assert.match(keyModeButton.className, /border-primary/);
+      assert.match(oauthModeButton.className, /opacity-60/);
+      oauthModeButton.onclick();
+      assert.equal(inputNodes[1].hidden, true);
+      assert.match(oauthModeButton.className, /border-primary/);
+      // OAuth connect never sends credential material, even with a typed key.
+      inputNodes[0].value = '/fixture/agy';
+      inputNodes[1].value = 'typed-secret';
+      await connectButton.onclick();
+      assert.deepEqual(calls.at(-2), ['/connect', { method: 'POST',
+        body: JSON.stringify({ binary: '/fixture/agy', authMethod: 'oauth-personal' }), timeoutMs: 30000 }]);
+      assert.equal(inputNodes[1].value, '');
+      // A failed oauth connect surfaces the terminal sign-in hint, not the
+      // API-key hint.
+      failNextConnect = true;
+      await connectButton.onclick();
+      const message = all.find(node => typeof node.textContent === 'string' &&
+        node.textContent === (zh ? '请先在终端运行一次 agy 完成浏览器登录' : 'Run agy once in a terminal to complete the browser sign-in first'));
+      assert.ok(message, 'terminal sign-in hint shown');
+      // Without a handshake-provided email the card shows the explicit
+      // not-provided placeholder.
+      status.accountEmail = undefined;
+      const host2 = make();
+      await card.mount(host2, { callApi, locale, plugin: { name: 'gemini-agy-acp', version: '0.1.0' } });
+      const all2 = [];
+      const walk2 = node => { all2.push(node); for (const kid of node.children) walk2(kid); };
+      walk2(host2);
+      const line2 = all2.find(node => typeof node.textContent === 'string' && node.textContent.includes('1.5.1'));
+      assert.match(line2.textContent, zh ? /账号邮箱未提供/ : /account email not provided/);
+      card.unmount(host2);
+      card.unmount(host);
+    } finally { globalThis.document = previous; }
+  }
+});
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -170,7 +271,7 @@ test('built plugin.js activates in a standalone Node process under a temporary H
   const destination = join(configDir, 'plugins', 'gemini-agy-acp');
   await mkdir(source);
   await mkdir(join(source, 'src'));
-  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/chat.mjs', 'src/card.mjs', 'src/plugin.mjs',
+  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/account.mjs', 'src/chat.mjs', 'src/card.mjs', 'src/plugin.mjs',
     'src/settings.mjs', 'src/admin-routes.mjs', 'src/acp-errors.mjs']) {
     await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
   }

@@ -3,10 +3,71 @@ import { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { after, before, test } from 'node:test';
-import { createTransport, isolatedEnvironment, probeVersion, syncModelOptions } from '../src/transport.mjs';
+import { createTransport, isolatedEnvironment, probeVersion, syncModelOptions, verifyOauthHandshake } from '../src/transport.mjs';
+
+test('oauth-personal runs the whitelisted real environment, authenticates the CLI login and never creates an isolated root', async t => {
+  const { transport, events } = await setup(t, 'ok', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+  const log = await events();
+  assert.deepEqual(log.map(record => record.event), ['version', 'spawn', 'initialize', 'authenticate',
+    'session/new', 'session/set_config_option', 'session/set_config_option', 'session/prompt']);
+  const spawn = log.find(record => record.event === 'spawn');
+  assert.equal(spawn.root, undefined); // no isolated root was ever created
+  assert.match(spawn.cwd, /ccr-agy-acp-/); // fresh cwd directly under the OS temp dir
+  assert.equal(spawn.home, process.env.HOME); // the CLI sees the real user's home (keyring login)
+  const session = log.find(record => record.event === 'session/new');
+  assert.equal(dirname(session.cwd), tmpdir()); // per-turn session cwds under the OS temp dir
+  await transport.close();
+  assert.equal(existsSync(spawn.cwd), true); // oauth leaves no root for retire to remove
+  assert.throws(() => process.kill(spawn.pid, 0), { code: 'ESRCH' });
+  assert.equal(existsSync(session.cwd), false);
+});
+
+test('oauth transport rejects an apiKey; gemini transport still requires a captured credential', async t => {
+  assert.throws(() => createTransport({ binary: join('x', 'y'), authMethod: 'oauth-personal', apiKey: 'fixture-value' }),
+    { code: 'acp_invalid_config' });
+  delete process.env.GEMINI_API_KEY;
+  try {
+    const missing = await setup(t);
+    await rejects(missing.transport.run(input), 'auth_required', 401);
+    assert.deepEqual(await missing.events(), []);
+  } finally { process.env.GEMINI_API_KEY = variables.GEMINI_API_KEY; }
+});
+
+test('oauth handshake verification returns only this handshake\'s account email', async t => {
+  const metadata = await setup(t, 'ok', { authMethod: 'oauth-personal' });
+  // Explicit ACP metadata wins over the child's own stderr login line.
+  assert.deepEqual(await verifyOauthHandshake({ binary: metadata.binary }),
+    { version: '1.5.1', accountEmail: 'metadata-account@example.com' });
+  assert.deepEqual((await metadata.events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+  const stderr = await setup(t, 'stderr-login', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await verifyOauthHandshake({ binary: stderr.binary }),
+    { version: '1.5.1', accountEmail: 'stderr-account@example.com' });
+  const silent = await setup(t, 'silent-login', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await verifyOauthHandshake({ binary: silent.binary }),
+    { version: '1.5.1', accountEmail: null });
+  // A rejected authenticate maps to auth_required without leaking diagnostics.
+  const failing = await setup(t, 'auth-failure', { authMethod: 'oauth-personal' });
+  await rejects(verifyOauthHandshake({ binary: failing.binary }), 'auth_required', 401);
+  for (const invalid of ['agy', '/x/\0y', 42]) {
+    await assert.rejects(verifyOauthHandshake({ binary: invalid }), { code: 'acp_invalid_config' });
+  }
+});
+
+test('model sync supports oauth-personal without any credential', async t => {
+  const { binary, events } = await setup(t, 'ok', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await syncModelOptions({ binary, authMethod: 'oauth-personal' }),
+    { models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }], version: '1.5.1' });
+  assert.deepEqual((await events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+  await rejects(syncModelOptions({ binary, authMethod: 'oauth-personal', apiKey: 'fixture-value' }), 'invalid_config', 400);
+  assert.deepEqual((await events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+});
 
 const input = { model: 'Gemini Model', thinking: 'xhigh', prompt: '你好', onText() {} };
 const variables = { GEMINI_API_KEY: 'fixture-value', AGY_TEST_PARENT_ONLY: 'not-for-child',
@@ -30,6 +91,7 @@ async function setup(t, mode = 'ok', config = {}) {
   const source = await readFile(new URL('./fixtures/agy-acp.mjs', import.meta.url), 'utf8');
   await writeFile(binary, `#!${process.execPath}\n${source}`, { mode: 0o700 });
   await writeFile(join(dir, 'mode'), mode);
+  await writeFile(join(dir, 'authMethod'), config.authMethod === 'oauth-personal' ? 'oauth-personal' : 'gemini-api-key');
   await writeFile(join(dir, 'events'), '');
   const transport = createTransport({ binary, authMethod: 'gemini-api-key', ...config });
   const events = async () => (await readFile(join(dir, 'events'), 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);

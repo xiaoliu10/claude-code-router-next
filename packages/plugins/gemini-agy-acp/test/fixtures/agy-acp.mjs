@@ -1,35 +1,55 @@
 import assert from 'node:assert/strict';
 import { appendFileSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const fixtureDir = dirname(fileURLToPath(import.meta.url));
 const mode = readFileSync(join(fixtureDir, 'mode'), 'utf8');
+// The authMethod file selects the transport mode under test: gemini-api-key
+// workers run in the isolated environment, oauth-personal workers run with
+// the whitelisted real environment and authenticate the fixture's own login.
+let authMethod = 'gemini-api-key';
+try { authMethod = readFileSync(join(fixtureDir, 'authMethod'), 'utf8').trim(); } catch { /* default */ }
+const isolated = authMethod === 'gemini-api-key';
 const record = (event, data = {}) => appendFileSync(join(fixtureDir, 'events'), JSON.stringify({ event, pid: process.pid, ...data }) + '\n');
 const send = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
 const argv = process.argv.slice(2);
 const root = dirname(process.env.HOME);
-for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
-  'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR', 'TEMP', 'TMP']) {
-  assert.equal(dirname(process.env[key]), root);
-  assert.equal(statSync(process.env[key]).mode & 0o077, 0);
+if (isolated) {
+  for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+    'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR', 'TEMP', 'TMP']) {
+    assert.equal(dirname(process.env[key]), root);
+    assert.equal(statSync(process.env[key]).mode & 0o077, 0);
+  }
+  assert.equal(dirname(process.cwd()), realpathSync(root));
+  assert.equal(process.env.AGY_TEST_PARENT_ONLY, undefined);
+  assert.equal(process.env.GOOGLE_APPLICATION_CREDENTIALS, undefined);
+} else {
+  // oauth-personal: whitelisted real-user environment (real HOME for the
+  // keyring login, asserted by the test against the parent's own HOME), no
+  // blanket parent passthrough, no credential variables, and a fresh cwd
+  // directly under the OS temp dir.
+  assert.equal(process.env.GEMINI_API_KEY, undefined);
+  assert.equal(process.env.AGY_TEST_PARENT_ONLY, undefined);
+  assert.equal(process.env.GOOGLE_APPLICATION_CREDENTIALS, undefined);
+  assert.notEqual(process.env.PATH, undefined);
+  assert.notEqual(process.env.HOME, undefined);
+  assert.equal(realpathSync(dirname(process.cwd())), realpathSync(tmpdir()));
 }
-assert.equal(dirname(process.cwd()), realpathSync(root));
-assert.equal(process.env.AGY_TEST_PARENT_ONLY, undefined);
-assert.equal(process.env.GOOGLE_APPLICATION_CREDENTIALS, undefined);
 
 if (argv[0] === '--version') {
   assert.deepEqual(argv, ['--version']);
   assert.equal(process.env.GEMINI_API_KEY, undefined);
-  record('version', { root });
+  record('version', isolated ? { root } : {});
   if (mode === 'hang-version') setInterval(() => {}, 60_000);
   else if (mode === 'long-version') process.stdout.write('0'.repeat(4097));
   else console.log(`agy version ${mode === 'old' ? '1.5.0' : mode === 'prerelease' ? '1.5.1-rc1' : '1.5.1'}`);
 } else {
   assert.deepEqual(argv, ['acp', '--sandbox']);
-  assert.equal(process.env.GEMINI_API_KEY, 'fixture-value');
-  record('spawn', { root });
+  assert.equal(process.env.GEMINI_API_KEY, isolated ? 'fixture-value' : undefined);
+  record('spawn', isolated ? { root } : { cwd: process.cwd(), home: process.env.HOME });
   let authenticated = false;
   let sessionNumber = 0;
   let sessionId;
@@ -68,18 +88,29 @@ if (argv[0] === '--version') {
       assert.match(params.clientInfo.version, /^\d+\.\d+\.\d+/);
       assert.deepEqual(params.clientCapabilities, {});
       if (mode !== 'hang-init') reply({ protocolVersion: mode === 'v2' ? 2 : 1, agentCapabilities: {},
-        authMethods: [{ id: 'consumer' }, ...(mode === 'no-key-method' ? [] : [{ id: 'gemini-api-key',
-          ...(mode === 'terminal-auth' && { type: 'terminal' }),
-          ...(mode === 'env-auth' && { type: 'env_var' }) }])] });
+        authMethods: [{ id: 'consumer' }, ...(mode === 'no-key-method' ? [] : [{ id: authMethod,
+          ...(isolated && mode === 'terminal-auth' && { type: 'terminal' }),
+          ...(isolated && mode === 'env-auth' && { type: 'env_var' }) }])],
+        // Explicit ACP account metadata, only in the oauth modes that opt in.
+        ...(authMethod === 'oauth-personal' && mode !== 'silent-login' && mode !== 'stderr-login' &&
+          { accountInfo: { email: 'metadata-account@example.com' } }) });
     } else if (method === 'authenticate') {
-      assert.deepEqual(params, { methodId: 'gemini-api-key' });
+      assert.deepEqual(params, { methodId: authMethod });
       if (mode === 'auth-failure') {
         process.stderr.write('fixture-secret-diagnostic\n');
         send({ id, error: { code: -32000, message: 'fixture-secret-diagnostic' } });
-      } else { authenticated = true; reply({}); }
+      } else {
+        authenticated = true;
+        // The verifying child's own login diagnostic, written to stderr so
+        // the transport's bounded capture can scan it for the account email.
+        if (authMethod === 'oauth-personal' && mode !== 'silent-login') {
+          process.stderr.write('applyAuthResult: email=stderr-account@example.com, status=OK\n');
+        }
+        reply({});
+      }
     } else if (method === 'session/new') {
       assert.equal(authenticated, true);
-      assert.equal(dirname(params.cwd), root);
+      assert.equal(dirname(params.cwd), isolated ? root : tmpdir());
       assert.deepEqual(readdirSync(params.cwd), []);
       assert.deepEqual(params.mcpServers, []);
       sessionNumber++;

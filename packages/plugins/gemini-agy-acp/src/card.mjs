@@ -59,8 +59,8 @@ export default {
 
     body.append(el('p', 'max-w-md truncate text-xs font-medium text-muted-foreground/60', props.plugin?.version ? 'v' + props.plugin.version : ''));
     body.append(el('p', 'max-w-md text-xs text-muted-foreground',
-      t('通过官方 agy 二进制以 ACP stdio 提供纯文本对话，走 Gemini API key 配额。',
-        'Text-only chat through the official agy binary over ACP stdio, billed to the Gemini API key.')));
+      t('通过官方 agy 二进制以 ACP stdio 提供纯文本对话，走 Gemini API key 配额或已登录的 Google 账号。',
+        'Text-only chat through the official agy binary over ACP stdio, billed to the Gemini API key or the signed-in Google account.')));
 
     const statusLine = el('p', 'max-w-md text-xs font-medium text-muted-foreground', '');
     body.append(statusLine);
@@ -86,9 +86,35 @@ export default {
       'Gemini API key (optional; leave empty to keep the stored key or environment variable)');
     keyInput.setAttribute('autocomplete', 'new-password');
     keyInput.value = ''; // the stored apiKey is never rendered back into the form
+    // 登录方式 segmented toggle: the choice persists per connect call as the
+    // sidecar's authMethod (reported back by /status). Google-account mode
+    // hides the key input entirely — its credential is the CLI's own browser
+    // login, verified by connect through one real ACP handshake. The account
+    // email is shown only when that handshake explicitly provided one;
+    // otherwise the explicit 账号邮箱未提供 placeholder is shown.
+    let authMode = 'gemini-api-key';
+    const OAUTH_LOGIN_HINT = ['请先在终端运行一次 agy 完成浏览器登录', 'Run agy once in a terminal to complete the browser sign-in first'];
+    const authToggle = el('div', 'flex max-w-md items-center gap-2');
+    const keyModeButton = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE, t('API key', 'API key'));
+    const oauthModeButton = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE, t('Google 账号', 'Google account'));
+    keyModeButton.type = oauthModeButton.type = 'button';
+    authToggle.append(keyModeButton, oauthModeButton);
+    const accountLine = el('p', 'max-w-md truncate text-xs font-semibold text-foreground', '');
     const form = el('div', 'max-w-md space-y-2');
     form.append(binaryInput, keyInput);
-    body.append(form);
+    body.append(authToggle, accountLine, form);
+
+    const renderAuthMode = () => {
+      const oauth = authMode === 'oauth-personal';
+      keyInput.hidden = oauth;
+      accountLine.hidden = !oauth || !accountLine.textContent;
+      keyModeButton.className = BUTTON_BASE + ' ' + BUTTON_OUTLINE + (oauth ? ' opacity-60' : ' border-primary/60 bg-input/80');
+      oauthModeButton.className = BUTTON_BASE + ' ' + BUTTON_OUTLINE + (oauth ? ' border-primary/60 bg-input/80' : ' opacity-60');
+      keyModeButton.setAttribute('aria-pressed', String(!oauth));
+      oauthModeButton.setAttribute('aria-pressed', String(oauth));
+    };
+    keyModeButton.onclick = () => { authMode = 'gemini-api-key'; renderAuthMode(); };
+    oauthModeButton.onclick = () => { authMode = 'oauth-personal'; renderAuthMode(); };
 
     const statusText = status => {
       if (!status || status.enabled !== true) {
@@ -105,9 +131,14 @@ export default {
       } else if (typeof status.modelsSyncedAt === 'number') {
         parts.push(t('0 个模型', '0 models'));
       }
-      // authMethod is always gemini-api-key today, so the credential line
-      // names the channel explicitly.
-      if (status.apiKeyFingerprint) {
+      // Credential line: oauth pools report the handshake-verified account
+      // (or the explicit not-provided placeholder); API-key pools keep the
+      // fingerprint line.
+      if (status?.authMethod === 'oauth-personal') {
+        parts.push(status.accountEmail
+          ? t(`账号 ${status.accountEmail}`, `account ${status.accountEmail}`)
+          : t('账号邮箱未提供', 'account email not provided'));
+      } else if (status.apiKeyFingerprint) {
         parts.push(t(`AI Studio key 凭据 ${status.apiKeyFingerprint}…`, `AI Studio key credential ${status.apiKeyFingerprint}…`));
       } else if (status.apiKeyConfigured !== true) parts.push(t('缺少 API key', 'no API key'));
       if (status.lastError?.code) parts.push(t(`上次错误 ${status.lastError.code}`, `last error ${status.lastError.code}`));
@@ -120,6 +151,9 @@ export default {
     const setNotice = text => { notice.textContent = text || ''; };
     const errorText = error => {
       const code = error?.reason ?? error?.code;
+      // OAuth login failures surface the terminal sign-in hint instead of the
+      // API-key hint; every other code keeps its static mapping.
+      if (code === 'acp_auth_required' && authMode === 'oauth-personal') return t(OAUTH_LOGIN_HINT[0], OAUTH_LOGIN_HINT[1]);
       const hint = typeof code === 'string' ? CODE_HINTS[code] : null;
       if (hint) return t(hint[0], hint[1]);
       return typeof code === 'string' ? `${t('操作失败', 'The action failed')} (${code})` : t('操作失败', 'The action failed');
@@ -137,13 +171,14 @@ export default {
     let busyDepth = 0;
     const BUSY_LABELS = new Map([[connect, t('连接中…', 'Connecting…')], [sync, t('同步中…', 'Syncing…')], [disconnect, t('断开中…', 'Disconnecting…')]]);
     // Per-model visibility controls live inside the freshly rendered list;
-    // setBusy keeps them disabled together with the three fixed actions.
+    // setBusy keeps them disabled together with the three fixed actions and
+    // the auth-mode toggle.
     let rowButtons = [];
     let currentHiddenIds = [];
     const setBusy = active => {
       busyDepth = Math.max(0, busyDepth + (active ? 1 : -1));
       const busy = busyDepth > 0;
-      for (const button of [...controls, ...rowButtons, restoreAll]) {
+      for (const button of [...controls, ...rowButtons, restoreAll, keyModeButton, oauthModeButton]) {
         button.disabled = busy || !call;
         const busyLabel = BUSY_LABELS.get(button);
         if (busy && busyLabel) button.textContent = busyLabel;
@@ -188,6 +223,12 @@ export default {
       restoreAll.disabled = busy || !call;
       restoreAll.onclick = () => runAction('/models/visibility', { restore: [...currentHiddenIds] });
       modelsBox.hidden = modelEntries.length === 0;
+      // The persisted auth method wins after every status refresh (it is what
+      // the last connect call stored), then the account line re-renders.
+      if (status?.authMethod === 'oauth-personal' || status?.authMethod === 'gemini-api-key') authMode = status.authMethod;
+      accountLine.textContent = status?.accountEmail ? t('账号：', 'Account: ') + status.accountEmail
+        : status?.authMethod === 'oauth-personal' ? t('账号邮箱未提供', 'account email not provided') : '';
+      renderAuthMode();
       // Prefill only the binary path (an operator setting, not a secret);
       // the key input is never populated from stored state.
       if (!binaryInput.value && typeof status?.binary === 'string') binaryInput.value = status.binary;
@@ -232,7 +273,10 @@ export default {
 
     connect.onclick = () => runAction('/connect', {
       ...(binaryInput.value.trim() ? { binary: binaryInput.value.trim() } : {}),
-      ...(keyInput.value ? { apiKey: keyInput.value } : {}),
+      authMethod: authMode,
+      // The API key only ever travels in gemini-api-key mode; oauth-personal
+      // mode never sends credential material.
+      ...(authMode === 'gemini-api-key' && keyInput.value ? { apiKey: keyInput.value } : {}),
     }, response => {
       keyInput.value = ''; // never keep the typed key in the DOM
       return t(`已连接（agy ${response?.version ?? ''}）`, `Connected (agy ${response?.version ?? ''})`);
@@ -248,7 +292,8 @@ export default {
       t('在上方填入 agy 的绝对路径（可选 API key）并按连接，写入 CCR 配置目录的 gemini-agy-acp.json（API key 以 0600 权限保存）；断开仅停用，不删除配置。',
         'Enter the absolute agy path above (optionally an API key) and press Connect. This writes gemini-agy-acp.json in the CCR config directory (the API key is stored with 0600 permissions); Disconnect only disables, it does not delete settings.')));
     section.append(el('p', 'max-w-md text-[11px] text-muted-foreground/60',
-      t('不支持个人订阅与浏览器 OAuth；请为主路由配置 enableFallback: false 的隔离实例。', 'Consumer OAuth and subscriptions are unsupported; run it as a primary route on an isolated instance with enableFallback: false.')));
+      t('Google 账号模式需先在终端运行一次 agy 完成浏览器登录；连接时通过一次真实 ACP 握手验证登录状态，账号邮箱仅在本次握手明确提供时显示。请为主路由配置 enableFallback: false 的隔离实例。',
+        'Google account mode requires running agy once in a terminal to complete the browser sign-in first; Connect verifies the login with one real ACP handshake. The account email is shown only when that handshake explicitly provides it. Run it as a primary route on an isolated instance with enableFallback: false.')));
 
     body.append(section);
     layout.append(body);

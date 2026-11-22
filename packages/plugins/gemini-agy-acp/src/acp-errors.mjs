@@ -2,7 +2,7 @@ const errors = {
   invalid_config: [400, 'Invalid ACP transport configuration'],
   invalid_request: [400, 'Invalid ACP request'],
   input_limit: [413, 'ACP prompt exceeds the input limit'],
-  auth_required: [401, 'ACP API key authentication is required'],
+  auth_required: [401, 'ACP authentication is required'],
   unsupported_version: [502, 'Antigravity CLI 1.5.1 or later is required'],
   unsupported_option: [400, 'Requested ACP session option is unavailable'],
   busy: [503, 'ACP worker pool is full'],

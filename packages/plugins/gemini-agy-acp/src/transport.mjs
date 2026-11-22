@@ -6,13 +6,18 @@ import { isAbsolute, join } from 'node:path';
 import { configureSession, modelOptions, modelSelector } from './acp-config.mjs';
 import { AcpError } from './acp-errors.mjs';
 import { AcpStdio } from './acp-stdio.mjs';
+import { accountEmailShapeOk, extractAccountEmail } from './account.mjs';
 
 const AUTH_METHOD = 'gemini-api-key';
+const OAUTH_METHOD = 'oauth-personal';
+const AUTH_METHODS = new Set([AUTH_METHOD, OAUTH_METHOD]);
 const MAX_PROMPT_BYTES = 1024 * 1024;
 const IDLE_MS = 30_000;
 const MAX_SESSIONS = 64;
 const PROBE_MS = 5000;
 const MODEL_SYNC_MS = 5000;
+const OAUTH_VERIFY_MS = 10_000;
+const MAX_STDERR_TAIL_BYTES = 64 * 1024;
 const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'max_turn_requests', 'refusal', 'cancelled']);
 
 function clientVersion() {
@@ -41,6 +46,26 @@ function supportedVersion(version) {
 // forward whichever are set in the CCR process (isolated otherwise).
 const PROXY_ENV_VARS = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
 
+// An isolated runtime is NOT guaranteed to share the CLI's Google login, so
+// oauth-personal workers run in the real user context with a whitelist of
+// only what the child needs to run, reach its network endpoints and use the
+// OS keyring/browser login: runtime paths, real HOME, temp dirs, platform
+// config locations, GUI/DBus sessions and the standard proxy variables.
+// Never a blanket process.env copy — credential variables such as
+// GEMINI_API_KEY and GOOGLE_APPLICATION_CREDENTIALS are absent by design.
+const OAUTH_ENV_VARS = ['PATH', 'HOME', 'USERPROFILE', 'LANG', 'TMPDIR', 'TEMP', 'TMP',
+  'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'SystemRoot', 'COMSPEC', 'PATHEXT',
+  'DBUS_SESSION_BUS_ADDRESS', 'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', ...PROXY_ENV_VARS];
+
+function oauthEnvironment() {
+  const env = {};
+  for (const name of OAUTH_ENV_VARS) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  return env;
+}
+
 export async function isolatedEnvironment(root) {
   const dirs = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'runtime', 'work']
     .map(name => [name, join(root, name)]));
@@ -63,10 +88,14 @@ export async function isolatedEnvironment(root) {
 }
 
 class Worker {
-  constructor(binary, onRetired, log) {
+  constructor(binary, authMethod, onRetired, log, { captureStderr = false } = {}) {
     this.binary = binary;
+    this.authMethod = authMethod;
     this.onRetired = onRetired;
     this.log = log;
+    this.captureStderr = captureStderr;
+    this.stderrChunks = [];
+    this.stderrBytes = 0;
     this.sessions = new Set();
   }
 
@@ -78,7 +107,10 @@ class Worker {
     this.check();
     const child = spawn(this.binary, args, {
       cwd: this.cwd, env, shell: false, windowsHide: true, detached: process.platform !== 'win32',
-      stdio: ['pipe', 'pipe', 'ignore'], // subprocess diagnostics may contain credentials or prompts
+      // Subprocess diagnostics may contain credentials or prompts; they are
+      // captured only for the bounded oauth login verification below and are
+      // never logged or returned raw.
+      stdio: ['pipe', 'pipe', this.captureStderr ? 'pipe' : 'ignore'],
     });
     this.child = child;
     this.childClosed = new Promise(resolve => child.once('close', resolve));
@@ -86,17 +118,43 @@ class Worker {
     child.on('error', fail);
     child.stdin.on('error', fail);
     child.stdout.on('error', fail);
+    child.stderr?.on('error', fail);
+    if (this.captureStderr) {
+      // Bounded rolling tail (last 64 KiB) of THIS child's diagnostics.
+      child.stderr.on('data', chunk => {
+        this.stderrChunks.push(chunk);
+        this.stderrBytes += chunk.length;
+        while (this.stderrBytes > MAX_STDERR_TAIL_BYTES && this.stderrChunks.length) {
+          const drop = Math.min(this.stderrBytes - MAX_STDERR_TAIL_BYTES, this.stderrChunks[0].length);
+          this.stderrChunks[0] = this.stderrChunks[0].subarray(drop);
+          if (this.stderrChunks[0].length === 0) this.stderrChunks.shift();
+          this.stderrBytes -= drop;
+        }
+      });
+    }
     return child;
   }
 
+  /** The captured diagnostics tail, scanned only for the account email. */
+  stderrText() {
+    return Buffer.concat(this.stderrChunks, this.stderrBytes).toString('utf8');
+  }
+
   /** The bounded `--version` probe. Returns the advertised CLI version and
-   * leaves the isolated root in place for the ACP child that follows. */
+   * leaves the workspace in place for the ACP child that follows. oauth
+   * workers skip the isolated root entirely: they run on a fresh temp cwd
+   * with the whitelisted real environment so the CLI can use its own login. */
   async probe() {
-    this.root = await mkdtemp(join(tmpdir(), 'ccr-agy-acp-'));
-    const isolation = await isolatedEnvironment(this.root);
-    this.cwd = isolation.cwd;
-    this.isolationEnv = isolation.env;
-    const probe = this.spawnChild(['--version'], isolation.env);
+    if (this.authMethod === OAUTH_METHOD) {
+      this.cwd = await mkdtemp(join(tmpdir(), 'ccr-agy-acp-'));
+      this.spawnEnv = oauthEnvironment();
+    } else {
+      this.root = await mkdtemp(join(tmpdir(), 'ccr-agy-acp-'));
+      const isolation = await isolatedEnvironment(this.root);
+      this.cwd = isolation.cwd;
+      this.spawnEnv = isolation.env;
+    }
+    const probe = this.spawnChild(['--version'], this.spawnEnv);
     let output = '';
     let bytes = 0;
     probe.stdout.on('data', chunk => {
@@ -120,15 +178,19 @@ class Worker {
     await this.probe();
     this.check();
 
-    const child = this.spawnChild(['acp', '--sandbox'], { ...this.isolationEnv, GEMINI_API_KEY: apiKey });
+    const child = this.spawnChild(['acp', '--sandbox'],
+      this.authMethod === OAUTH_METHOD ? this.spawnEnv : { ...this.spawnEnv, GEMINI_API_KEY: apiKey });
     child.once('exit', () => this.retire(new AcpError('worker_failed')));
     child.stdout.once('end', () => this.retire(new AcpError('worker_failed')));
     this.rpc = new AcpStdio(child, error => this.retire(error));
     const init = await this.rpc.request('initialize', { protocolVersion: 1, clientInfo, clientCapabilities: {} });
     if (init.protocolVersion !== 1) throw new AcpError('protocol_error');
-    if (!Array.isArray(init.authMethods) || !init.authMethods.some(method => method?.id === AUTH_METHOD &&
+    if (!Array.isArray(init.authMethods) || !init.authMethods.some(method => method?.id === this.authMethod &&
         (method.type == null || method.type === 'agent'))) throw new AcpError('auth_required');
-    await this.rpc.request('authenticate', { methodId: AUTH_METHOD }, 'auth_required');
+    await this.rpc.request('authenticate', { methodId: this.authMethod }, 'auth_required');
+    // Explicit ACP account metadata of THIS handshake, when the CLI reports
+    // it; verified against the bounded email shape before it is kept.
+    this.initAccountEmail = accountEmailShapeOk(init.accountInfo?.email) ? init.accountInfo.email : null;
     // One bounded spawn log per worker start: binary path and CLI version only,
     // never key material or prompt content.
     this.log?.info?.(`gemini-agy-acp worker started (agy ${this.version}, binary: ${this.binary})`);
@@ -137,7 +199,9 @@ class Worker {
   async turn({ model, thinking, prompt, onText }, apiKey) {
     if (!this.rpc) await this.start(apiKey);
     this.check();
-    const cwd = await mkdtemp(join(this.root, 'session-'));
+    // OAuth workers have no isolated root; their per-turn session cwds live
+    // directly under the OS temp dir and are removed after every turn.
+    const cwd = await mkdtemp(join(this.root ?? tmpdir(), 'session-'));
     try {
       const session = await this.rpc.request('session/new', { cwd, mcpServers: [] });
       const { sessionId } = session;
@@ -213,6 +277,9 @@ class Worker {
       try {
         await this.task?.catch(() => {});
         await this.childClosed;
+        // Only an isolated root is removed. OAuth workers never create one
+        // (their spawn cwd is the CLI's own working directory in the real
+        // user context), so retirement leaves nothing to delete.
         if (this.root) await rm(this.root, { recursive: true, force: true, maxRetries: 3 });
       } catch {
         throw new AcpError('worker_failed');
@@ -226,16 +293,19 @@ class Worker {
   }
 }
 
-export function createTransport({ binary, authMethod, timeoutMs = 60_000, maxWorkers = 2, apiKey, log } = {}) {
-  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || authMethod !== AUTH_METHOD ||
+export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 60_000, maxWorkers = 2, apiKey, log } = {}) {
+  const oauth = authMethod === OAUTH_METHOD;
+  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod) ||
       !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000 ||
       !Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8 ||
-      (apiKey != null && (typeof apiKey !== 'string' || !apiKey.trim()))) throw new AcpError('invalid_config');
+      (apiKey != null && (oauth || typeof apiKey !== 'string' || !apiKey.trim()))) throw new AcpError('invalid_config');
   // The plugin resolves the sidecar apiKey against the process environment at
   // pool start; a standalone caller may omit it entirely and fall back to the
   // environment here. One capture boundary gives every worker in this pool a
-  // single billing identity, immune to later environment edits.
-  const credential = typeof apiKey === 'string' && apiKey.trim() ? apiKey : process.env.GEMINI_API_KEY;
+  // single billing identity, immune to later environment edits. oauth-personal
+  // pools carry no credential at all: the CLI uses its own OS-keyring login.
+  const credential = oauth ? undefined
+    : typeof apiKey === 'string' && apiKey.trim() ? apiKey : process.env.GEMINI_API_KEY;
   const workers = new Set();
   let closed = false;
   return {
@@ -248,11 +318,11 @@ export function createTransport({ binary, authMethod, timeoutMs = 60_000, maxWor
           (thinking != null && (typeof thinking !== 'string' || !thinking || thinking.length > 128)) ||
           typeof onText !== 'function') throw new AcpError('invalid_request');
       if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) throw new AcpError('input_limit');
-      if (!credential?.trim()) throw new AcpError('auth_required');
+      if (!oauth && !credential?.trim()) throw new AcpError('auth_required');
       let worker = [...workers].find(candidate => !candidate.task && !candidate.failure);
       if (!worker) {
         if (workers.size >= maxWorkers) throw new AcpError('busy');
-        worker = new Worker(binary, retired => workers.delete(retired), log);
+        worker = new Worker(binary, authMethod, retired => workers.delete(retired), log);
         workers.add(worker);
       }
       return worker.run({ model, thinking, prompt, signal, onText }, credential, timeoutMs);
@@ -272,10 +342,14 @@ export function createTransport({ binary, authMethod, timeoutMs = 60_000, maxWor
 
 /** Validate one binary in isolation: a bounded `--version` probe with the
  * supported-version gate. Returns the advertised CLI version string. This is
- * the connect route's only look at the binary — no ACP child is spawned. */
-export async function probeVersion(binary) {
-  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0')) throw new AcpError('invalid_config');
-  const worker = new Worker(binary, () => {});
+ * the connect route's only look at the binary — no ACP child is spawned. The
+ * probe runs in the same auth mode as the pool that follows (oauth probes
+ * use the whitelisted real environment; gemini probes the isolated one). */
+export async function probeVersion(binary, authMethod = AUTH_METHOD) {
+  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod)) {
+    throw new AcpError('invalid_config');
+  }
+  const worker = new Worker(binary, authMethod, () => {});
   const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), PROBE_MS);
   try {
     return await worker.probe();
@@ -285,18 +359,55 @@ export async function probeVersion(binary) {
   }
 }
 
+/** One bounded temporary oauth-personal worker that proves the selected
+ * binary's real login: version probe, ACP handshake authenticating the CLI's
+ * own OS-keyring Google account, then one session/new. A `--version` probe
+ * cannot prove the keyring login works. Returns { version, accountEmail }
+ * where the email — when the CLI provides one at all — comes exclusively from
+ * THIS handshake's explicit ACP account metadata or this child's own bounded
+ * diagnostics tail; never from stale logs, other processes or token stores,
+ * and only the validated email ever leaves this function. */
+export async function verifyOauthHandshake({ binary, log } = {}) {
+  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0')) throw new AcpError('invalid_config');
+  const worker = new Worker(binary, OAUTH_METHOD, () => {}, log, { captureStderr: true });
+  const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), OAUTH_VERIFY_MS);
+  try {
+    await worker.start();
+    worker.check();
+    const cwd = await mkdtemp(join(tmpdir(), 'session-'));
+    try {
+      const session = await worker.rpc.request('session/new', { cwd, mcpServers: [] });
+      if (typeof session?.sessionId !== 'string' || !session.sessionId || session.sessionId.length > 4096) {
+        throw new AcpError('protocol_error');
+      }
+      return {
+        version: worker.version ?? null,
+        // Explicit ACP metadata wins over the child's own login diagnostics.
+        accountEmail: worker.initAccountEmail ?? extractAccountEmail(worker.stderrText()),
+      };
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  } finally {
+    clearTimeout(deadline);
+    await worker.retire(worker.failure ?? new AcpError('closed')).catch(() => {});
+  }
+}
+
 /** One bounded temporary worker for catalog discovery: version probe, ACP
  * handshake with the resolved key, session/new, then the advertised model
- * selector options from the session config. Never touches the request pool. */
+ * selector options from the session config. Never touches the request pool.
+ * oauth-personal syncs authenticate the CLI's own login without any key. */
 export async function syncModelOptions({ binary, authMethod = AUTH_METHOD, apiKey, log } = {}) {
-  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || authMethod !== AUTH_METHOD ||
-      typeof apiKey !== 'string' || !apiKey.trim()) throw new AcpError('invalid_config');
-  const worker = new Worker(binary, () => {}, log);
+  const oauth = authMethod === OAUTH_METHOD;
+  if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod) ||
+      (oauth ? apiKey != null : typeof apiKey !== 'string' || !apiKey.trim())) throw new AcpError('invalid_config');
+  const worker = new Worker(binary, authMethod, () => {}, log);
   const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), MODEL_SYNC_MS);
   try {
-    await worker.start(apiKey);
+    await worker.start(oauth ? undefined : apiKey);
     worker.check();
-    const cwd = await mkdtemp(join(worker.root, 'session-'));
+    const cwd = await mkdtemp(join(worker.root ?? tmpdir(), 'session-'));
     try {
       const session = await worker.rpc.request('session/new', { cwd, mcpServers: [] });
       const models = modelOptions(modelSelector(session.configOptions));

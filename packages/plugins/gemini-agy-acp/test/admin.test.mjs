@@ -35,13 +35,14 @@ after(() => {
 });
 
 /** A mock executable built from the protocol fixture (no real agy, no network). */
-async function fixtureBinary(t, mode = 'ok') {
+async function fixtureBinary(t, mode = 'ok', authMethod = 'gemini-api-key') {
   const dir = await mkdtemp(join(tmpdir(), 'agy-admin-fixture-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const binary = join(dir, 'fixture.mjs');
   const source = await readFile(new URL('./fixtures/agy-acp.mjs', import.meta.url), 'utf8');
   await writeFile(binary, `#!${process.execPath}\n${source}`, { mode: 0o700 });
   await writeFile(join(dir, 'mode'), mode);
+  await writeFile(join(dir, 'authMethod'), authMethod);
   await writeFile(join(dir, 'events'), '');
   return { binary, dir, events: async () => (await readFile(join(dir, 'events'), 'utf8'))
     .trim().split('\n').filter(Boolean).map(JSON.parse) };
@@ -66,7 +67,7 @@ function stubApp(port = 43781) {
   return { app, call };
 }
 
-async function activate(t, { local, fixtureMode, host } = {}) {
+async function activate(t, { local, fixtureMode, fixtureAuth, host } = {}) {
   const configDir = await mkdtemp(join(tmpdir(), 'agy-admin-'));
   t.after(() => rm(configDir, { recursive: true, force: true }));
   if (local !== undefined) await writeFile(sidecarPath(configDir), JSON.stringify(local));
@@ -99,7 +100,7 @@ async function activate(t, { local, fixtureMode, host } = {}) {
     configDir,
     dispatch: () => runtime.dispatchRequest({ requestBody: body, req: { body }, config: {}, provider }),
     transports,
-    fixture: fixtureMode === undefined ? undefined : await fixtureBinary(t, fixtureMode),
+    fixture: fixtureMode === undefined ? undefined : await fixtureBinary(t, fixtureMode, fixtureAuth),
     sidecar: () => readFile(sidecarPath(configDir), 'utf8').then(JSON.parse),
     writeSidecar: async (settings, mtimeOffsetMs = 0) => {
       await writeFile(sidecarPath(configDir), JSON.stringify(settings));
@@ -115,7 +116,8 @@ test('status shape when the plugin loaded before the sidecar existed', async t =
   assert.equal(status, 200);
   const fingerprint = createHash('sha256').update(variables.GEMINI_API_KEY, 'utf8').digest('hex').slice(0, 10);
   assert.deepEqual(reported, { loaded: false, enabled: false, binary: null, binaryFound: false,
-    version: null, lastError: null, apiKeyConfigured: true, apiKeyFingerprint: fingerprint, hiddenModels: [] });
+    version: null, lastError: null, authMethod: null, apiKeyConfigured: true, apiKeyFingerprint: fingerprint,
+    hiddenModels: [] });
   assert.ok(!('apiKey' in reported));
   assert.ok(!('models' in reported) && !('modelsSyncedAt' in reported));
   delete process.env.GEMINI_API_KEY;
@@ -221,6 +223,101 @@ test('connect with a missing, relative or unsupported binary maps to a stable er
   const { body: statusBody } = await p.call('GET', STATUS_URL);
   assert.equal(statusBody.lastError.code, 'acp_unsupported_version');
   assert.equal(typeof statusBody.lastError.at, 'number');
+});
+
+test('oauth-personal connect verifies the real handshake, persists no key and syncs without one', async t => {
+  const p = await activate(t, { fixtureMode: 'ok', fixtureAuth: 'oauth-personal' });
+  const { binary } = p.fixture;
+  // An apiKey alongside oauth-personal is rejected before anything is probed.
+  const keyed = await p.call('POST', CONNECT_URL, { body: { binary, authMethod: 'oauth-personal', apiKey: 'sk-fixture-secret' } });
+  assert.equal(keyed.status, 400);
+  assert.equal(keyed.body.error, 'acp_invalid_config');
+  assert.equal(p.transports.length, 0);
+  const { status, body: reported } = await p.call('POST', CONNECT_URL, { body: { binary, authMethod: 'oauth-personal' } });
+  assert.equal(status, 200);
+  assert.equal(reported.ok, true);
+  assert.equal(reported.enabled, true);
+  assert.equal(reported.loaded, true);
+  assert.equal(reported.authMethod, 'oauth-personal');
+  assert.equal(reported.accountEmail, 'metadata-account@example.com');
+  assert.equal(reported.apiKeyFingerprint, null);
+  assert.equal(reported.apiKeyConfigured, false);
+  assert.doesNotMatch(JSON.stringify(reported), /fixture-value|fixture-secret/);
+  // The stored apiKey of a previous gemini connect is evicted; no key ever
+  // persists in oauth mode.
+  const saved = await p.sidecar();
+  assert.deepEqual(saved, { enabled: true, binary, authMethod: 'oauth-personal', version: '1.5.1',
+    accountEmail: 'metadata-account@example.com' });
+  assert.ok(!('apiKey' in saved));
+  assert.equal((await stat(sidecarPath(p.configDir))).mode & 0o777, 0o600);
+  assert.deepEqual(p.transports[0].options,
+    { binary, authMethod: 'oauth-personal', maxWorkers: 1, timeoutMs: 60000, log: p.transports[0].options.log });
+  assert.equal('apiKey' in p.transports[0].options, false);
+  assert.doesNotReject(p.dispatch());
+  // Model sync runs without any credential: the worker authenticates the
+  // CLI's own login.
+  const sync = await p.call('POST', SYNC_URL, { body: {} });
+  assert.equal(sync.status, 200);
+  assert.deepEqual(sync.body.models, [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }]);
+  // Connect: isolated --version probe, then the REAL oauth handshake worker
+  // (probe, spawn, initialize, authenticate, session/new). Sync repeats the
+  // same bounded temporary worker sequence.
+  const events = await p.fixture.events();
+  assert.deepEqual(events.map(record => record.event),
+    ['version', 'version', 'spawn', 'initialize', 'authenticate', 'session/new',
+     'version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+  assert.ok(events.every(record => record.root === undefined), 'no isolated root in oauth mode');
+});
+
+test('oauth-personal connect maps a failed handshake to auth_required and persists nothing', async t => {
+  const p = await activate(t, { fixtureMode: 'auth-failure', fixtureAuth: 'oauth-personal' });
+  const { status, body: reported } = await p.call('POST', CONNECT_URL,
+    { body: { binary: p.fixture.binary, authMethod: 'oauth-personal' } });
+  // Never 401 (the UI would treat it as a CCR logout) and never the fixture's
+  // stderr diagnostic.
+  assert.equal(status, 422);
+  assert.equal(reported.error, 'acp_auth_required');
+  assert.doesNotMatch(JSON.stringify(reported), /fixture-secret-diagnostic/);
+  await assert.rejects(p.sidecar(), { code: 'ENOENT' });
+  assert.equal(p.transports.length, 0);
+  const { body: statusBody } = await p.call('GET', STATUS_URL);
+  assert.equal(statusBody.lastError.code, 'acp_auth_required');
+});
+
+test('oauth-personal connect evicts a stored gemini apiKey; gemini connect clears the stale account', async t => {
+  const oauth = await activate(t, { fixtureMode: 'ok', fixtureAuth: 'oauth-personal' });
+  await oauth.writeSidecar({ enabled: true, binary: oauth.fixture.binary, authMethod: 'gemini-api-key',
+    apiKey: 'sk-stored-secret' }, 1000);
+  const switched = await oauth.call('POST', CONNECT_URL,
+    { body: { binary: oauth.fixture.binary, authMethod: 'oauth-personal' } });
+  assert.equal(switched.status, 200);
+  const saved = await oauth.sidecar();
+  assert.equal(saved.authMethod, 'oauth-personal');
+  assert.ok(!('apiKey' in saved), 'stored gemini apiKey evicted on oauth connect');
+  const oauthStatus = switched.body;
+  assert.equal(oauthStatus.authMethod, 'oauth-personal');
+  assert.equal(oauthStatus.apiKeyFingerprint, null);
+  assert.equal(oauthStatus.apiKeyConfigured, false);
+
+  const gemini = await activate(t, { fixtureMode: 'ok' });
+  await gemini.writeSidecar({ enabled: false, binary: gemini.fixture.binary, authMethod: 'oauth-personal',
+    version: '1.5.1', accountEmail: 'stale@example.com' }, 1000);
+  const back = await gemini.call('POST', CONNECT_URL,
+    { body: { binary: gemini.fixture.binary, apiKey: 'sk-next-secret' } });
+  assert.equal(back.status, 200);
+  const geminiSaved = await gemini.sidecar();
+  assert.equal(geminiSaved.authMethod, 'gemini-api-key');
+  assert.equal(geminiSaved.apiKey, 'sk-next-secret');
+  assert.ok(!('accountEmail' in geminiSaved), 'stale oauth account email cleared on gemini connect');
+  assert.equal(back.body.authMethod, 'gemini-api-key');
+  assert.equal('accountEmail' in back.body, false);
+  assert.equal(back.body.apiKeyFingerprint,
+    createHash('sha256').update('sk-next-secret', 'utf8').digest('hex').slice(0, 10));
+  // An unknown authMethod value is rejected like every other malformed input.
+  const invalid = await gemini.call('POST', CONNECT_URL,
+    { body: { binary: gemini.fixture.binary, authMethod: 'consumer-login' } });
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.error, 'acp_invalid_config');
 });
 
 test('disconnect persists enabled:false, retires the pool and keeps other settings', async t => {
