@@ -129,7 +129,9 @@ export async function activateWithTransport(ctx, createTransport) {
       binaryFound,
       version,
       lastError: lastError ?? null,
-      apiKeyConfigured: apiKeyShapeOk(raw?.apiKey) || Boolean(process.env.GEMINI_API_KEY?.trim()),
+      // Both credential fields share one validation so a malformed env key
+      // reports "no API key" instead of a fingerprint-less configured state.
+      apiKeyConfigured: apiKeyShapeOk(raw?.apiKey) || apiKeyShapeOk(process.env.GEMINI_API_KEY),
       apiKeyFingerprint: credentialFingerprint(raw?.apiKey),
       ...(models ? { models } : {}),
       ...(modelsSyncedAt !== undefined ? { modelsSyncedAt } : {}),

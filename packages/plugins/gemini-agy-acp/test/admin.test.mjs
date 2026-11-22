@@ -187,6 +187,9 @@ test('connect with an apiKey reaches the transport and is never serialized into 
   assert.doesNotMatch(JSON.stringify(reported), /sk-fixture-secret-1/);
   const { body: statusBody } = await p.call('GET', STATUS_URL);
   assert.equal(statusBody.apiKeyConfigured, true);
+  // The fingerprint is derived from the stored sidecar key, never the env.
+  assert.equal(statusBody.apiKeyFingerprint,
+    createHash('sha256').update('sk-fixture-secret-1', 'utf8').digest('hex').slice(0, 10));
   assert.doesNotMatch(JSON.stringify(statusBody), /sk-fixture-secret-1/);
   // A later failing connect keeps both the new and the stored key out of the envelope.
   const failed = await p.call('POST', CONNECT_URL,
