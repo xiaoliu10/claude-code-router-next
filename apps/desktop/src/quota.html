@@ -6,6 +6,7 @@
   <title>CCR 控制中心</title>
   <link rel="stylesheet" href="quota.css">
   <!-- CSP is enforced by tauri.conf.json (script-src 'self'): external scripts only, no inline script/handlers. -->
+  <script src="general-settings.js" defer></script>
   <script src="projects.js" defer></script>
   <script src="quota.js" defer></script>
 </head>
@@ -43,6 +44,7 @@
       <button id="tab-usage" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-usage" tabindex="-1">用量</button>
       <button id="tab-clients" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-clients" tabindex="-1">客户端</button>
       <button id="tab-projects" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-projects" tabindex="-1">项目</button>
+      <button id="tab-settings" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" tabindex="-1">设置</button>
     </nav>
 
     <section id="panel-quota" class="panel" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
@@ -125,6 +127,134 @@
       <div id="projects-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <div class="projects-picker"><label for="projects-select">当前项目</label><select id="projects-select" class="route-input" aria-label="选择项目"></select></div>
       <div id="projects-body" class="list"></div>
+    </section>
+
+    <section id="panel-settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" tabindex="-1" hidden>
+      <div class="panel-head">
+        <h1>设置</h1>
+        <span id="settings-revision" class="count"></span>
+        <span class="spacer"></span>
+        <button id="settings-save" class="btn btn-primary" type="button" disabled hidden>保存设置</button>
+        <button id="settings-refresh" class="btn" type="button" title="重新读取最新配置并保留草稿">刷新</button>
+      </div>
+      <p class="hint">点击「保存设置」后才会写入配置。需要重启时，请先结束正在进行的请求。外部网关由其管理者重启。修改地址、端口或密钥后，请重新打开桌面并检查客户端连接。</p>
+      <div id="settings-msg" class="banner" role="status" aria-live="polite" hidden></div>
+
+      <div id="settings-body" class="settings-body list" role="form" aria-label="通用设置" hidden>
+        <div class="settings-group" role="group" aria-label="通用行为">
+          <p class="settings-group-title">通用行为</p>
+          <div class="settings-rows">
+            <label class="flag settings-flag"><input id="set-log" data-setting="LOG" class="switch" type="checkbox" role="switch"><span>请求日志（LOG）</span></label>
+            <label class="flag settings-flag"><input id="set-statusline" data-setting="statusLineEnabled" class="switch" type="checkbox" role="switch"><span>状态栏（StatusLine）</span></label>
+            <label class="flag settings-flag"><input id="set-token-speed" data-setting="tokenSpeedEnabled" class="switch" type="checkbox" role="switch"><span>令牌速度统计（token-speed）</span></label>
+            <label class="flag settings-flag"><input id="set-attribution" data-setting="disableAttributionHeader" class="switch" type="checkbox" role="switch"><span>去除客户端 attribution 头</span></label>
+            <div class="settings-field">
+              <label for="set-log-level">日志级别（LOG_LEVEL）</label>
+              <select id="set-log-level" data-setting="LOG_LEVEL" class="route-input">
+                <option value="fatal">fatal</option>
+                <option value="error">error</option>
+                <option value="warn">warn</option>
+                <option value="info">info</option>
+                <option value="debug">debug</option>
+                <option value="trace">trace</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="路由与并发">
+          <p class="settings-group-title">路由与并发</p>
+          <div class="settings-rows">
+            <label class="flag settings-flag"><input id="set-concurrency" data-setting="enableConcurrencyPriority" class="switch" type="checkbox" role="switch"><span>并发优先路由</span></label>
+            <div class="settings-field">
+              <label for="set-concurrency-threshold">并发阈值</label>
+              <input id="set-concurrency-threshold" data-setting="concurrencyThreshold" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+              <p class="settings-note">主模型并发达到阈值后，新会话溢出到回退模型。</p>
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="定时唤醒">
+          <p class="settings-group-title">定时唤醒</p>
+          <div class="settings-rows">
+            <label class="flag settings-flag"><input id="set-wakeup" data-setting="WAKEUP_ENABLED" class="switch" type="checkbox" role="switch"><span>定时唤醒探测</span></label>
+            <div class="settings-field">
+              <label for="set-wakeup-time">唤醒时间</label>
+              <input id="set-wakeup-time" data-setting="WAKEUP_TIME" class="route-input" type="time">
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="网关连接">
+          <p class="settings-group-title">网关连接</p>
+          <div class="settings-grid">
+            <div class="settings-field">
+              <label for="set-host">监听地址（HOST）</label>
+              <input id="set-host" data-setting="HOST" class="route-input" type="text" autocomplete="off">
+              <p class="settings-note">留空使用网关默认监听地址。</p>
+            </div>
+            <div class="settings-field">
+              <label for="set-port">端口（PORT）</label>
+              <input id="set-port" data-setting="PORT" class="route-input" type="number" min="1" max="65535" step="1" inputmode="numeric">
+            </div>
+            <div class="settings-field">
+              <label for="set-timeout">请求超时（API_TIMEOUT_MS，毫秒）</label>
+              <input id="set-timeout" data-setting="API_TIMEOUT_MS" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+            </div>
+            <div class="settings-field">
+              <label for="set-context-window">上下文窗口（ContextWindow）</label>
+              <input id="set-context-window" data-setting="ContextWindow" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+            </div>
+            <div class="settings-field">
+              <label for="set-claude-path">Claude 可执行文件路径（CLAUDE_PATH）</label>
+              <input id="set-claude-path" data-setting="CLAUDE_PATH" class="route-input" type="text" autocomplete="off">
+            </div>
+            <div class="settings-field">
+              <label for="set-custom-router">自定义路由文件（CUSTOM_ROUTER_PATH）</label>
+              <input id="set-custom-router" data-setting="CUSTOM_ROUTER_PATH" class="route-input" type="text" autocomplete="off" placeholder="绝对路径，.js/.cjs/.mjs">
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="连通性探测">
+          <p class="settings-group-title">连通性探测</p>
+          <div class="settings-grid">
+            <div class="settings-field">
+              <label for="set-probe-timeout">探测超时（PROBE_TIMEOUT_MS，毫秒）</label>
+              <input id="set-probe-timeout" data-setting="PROBE_TIMEOUT_MS" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+            </div>
+            <div class="settings-field">
+              <label for="set-probe-slow">慢网络阈值（PROBE_SLOW_THRESHOLD_MS，毫秒）</label>
+              <input id="set-probe-slow" data-setting="PROBE_SLOW_THRESHOLD_MS" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="代理">
+          <p class="settings-group-title">代理</p>
+          <div class="settings-rows">
+            <label class="flag settings-flag"><input id="set-proxy-global" data-setting="PROXY_GLOBAL_ENABLED" class="switch" type="checkbox" role="switch"><span>代理作用于全部提供方</span></label>
+            <div class="settings-field">
+              <label for="set-proxy-url-action">代理地址（PROXY_URL）</label>
+              <select id="set-proxy-url-action" class="route-input" aria-describedby="settings-proxy-status">
+                <option value="keep">保持不变</option><option value="replace">替换</option><option value="clear">清除</option>
+              </select>
+              <label for="set-proxy-url" id="set-proxy-url-label" hidden>新代理地址</label>
+              <input id="set-proxy-url" class="route-input" type="password" autocomplete="new-password" spellcheck="false" hidden>
+              <p id="settings-proxy-status" class="settings-note" role="status"></p>
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="访问密钥">
+          <p class="settings-group-title">访问密钥</p>
+          <div class="settings-rows">
+            <div class="settings-field">
+              <label for="set-apikey-action">密钥（APIKEY）</label>
+              <select id="set-apikey-action" class="route-input" aria-describedby="settings-key-status">
+                <option value="keep">保持不变</option><option value="replace">替换</option><option value="clear">清除</option>
+              </select>
+              <label for="set-apikey" id="set-apikey-label" hidden>新密钥</label>
+              <input id="set-apikey" class="route-input" type="password" autocomplete="new-password" spellcheck="false" hidden>
+              <p id="settings-key-status" class="settings-note" role="status"></p>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <footer class="footer">
