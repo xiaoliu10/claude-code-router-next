@@ -194,7 +194,6 @@ export function UsageStats() {
   const [filterScenario, setFilterScenario] = useState("");
   const [filterClient, setFilterClient] = useState("");
   const [filterStatus, setFilterStatus] = useState<"success" | "error" | "">("");
-  const [activeView, setActiveView] = useState<"records" | "model">("records");
 
   const pageSize = 20;
 
@@ -313,6 +312,23 @@ export function UsageStats() {
   const maxDailyTokens = Math.max(1, ...dailyData.map(([, d]) =>
     computeEffectiveInputTokens(d.inputTokens, d.cacheReadInputTokens, d.cacheCreationInputTokens) + d.outputTokens
   ));
+
+  const modelData = Object.entries(summary?.byModel ?? {})
+    .map(([model, data]) => {
+      const effectiveInput = computeEffectiveInputTokens(
+        data.inputTokens, data.cacheReadInputTokens, data.cacheCreationInputTokens
+      );
+      return {
+        model,
+        count: data.count,
+        effectiveInput,
+        totalTokens: effectiveInput + data.outputTokens,
+        outputTokens: data.outputTokens,
+      };
+    })
+    .sort((a, b) => b.totalTokens - a.totalTokens)
+    .slice(0, 10);
+  const maxModelTokens = Math.max(1, ...modelData.map(p => p.totalTokens));
 
   return (
     <TooltipProvider>
@@ -541,35 +557,50 @@ export function UsageStats() {
             </div>
           )}
 
-          {/* View Tabs */}
-          <div className="mb-3 flex items-center gap-1 border-b border-gray-200">
-            <button
-              type="button"
-              className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-colors ${
-                activeView === "records"
-                  ? "border-blue-500 text-blue-600"
-                  : "border-transparent text-gray-500 hover:text-gray-700"
-              }`}
-              onClick={() => setActiveView("records")}
-            >
-              {t("usage.records_tab")}
-            </button>
-            <button
-              type="button"
-              className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-colors ${
-                activeView === "model"
-                  ? "border-blue-500 text-blue-600"
-                  : "border-transparent text-gray-500 hover:text-gray-700"
-              }`}
-              onClick={() => setActiveView("model")}
-            >
-              {t("usage.model_chart")}
-            </button>
-          </div>
+          {summary && (
+            <section className="mb-4">
+              <h2 className="mb-2 text-sm font-semibold text-gray-700">{t("usage.model_chart")}</h2>
+              {modelData.length > 0 ? (
+                <div className="space-y-2">
+                  {modelData.map(({ model, count, totalTokens, effectiveInput, outputTokens }) => {
+                    const width = Math.max(8, (totalTokens / maxModelTokens) * 100);
+                    const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
+                    return (
+                      <Tooltip key={model}>
+                        <TooltipTrigger asChild>
+                          <div className="flex items-center gap-3 cursor-pointer group">
+                            <div className="w-[180px] text-sm text-gray-700 truncate font-medium group-hover:text-gray-900" title={model}>
+                              {displayModel}
+                            </div>
+                            <div className="flex-1 h-7 bg-gray-100 rounded overflow-hidden flex">
+                              <div
+                                className="h-full bg-blue-400 group-hover:bg-blue-500 transition-colors rounded"
+                                style={{ width: `${width}%` }}
+                              />
+                            </div>
+                            <div className="w-[70px] text-sm text-gray-500 text-right">
+                              {formatTokens(totalTokens)}
+                            </div>
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="text-xs">
+                          <div className="font-medium mb-1">{model}</div>
+                          <div>{t("usage.requests")}: {count}</div>
+                          <div>{t("usage.input_tokens")}: {formatTokens(effectiveInput)}</div>
+                          <div>{t("usage.output_tokens")}: {formatTokens(outputTokens)}</div>
+                          <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(totalTokens)}</div>
+                        </TooltipContent>
+                      </Tooltip>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="text-sm text-gray-500">{t("usage.no_model_data")}</p>
+              )}
+            </section>
+          )}
 
-          {activeView === "records" ? (
-          <>
-          {/* Table */}
+          <h2 className="mb-2 text-sm font-semibold text-gray-700">{t("usage.records_tab")}</h2>
           <div className="overflow-auto border rounded text-xs">
             <table className="w-full">
               <thead>
@@ -670,71 +701,6 @@ export function UsageStats() {
                 </Button>
               </div>
             </div>
-          )}
-          </>
-          ) : (
-          <>
-          {/* Model Chart */}
-          {summary?.byModel && Object.keys(summary.byModel).length > 0 ? (
-            <div>
-              {(() => {
-                const modelData = Object.entries(summary.byModel)
-                  .map(([model, data]) => {
-                    const effectiveInput = computeEffectiveInputTokens(
-                      data.inputTokens, data.cacheReadInputTokens, data.cacheCreationInputTokens
-                    );
-                    return {
-                      model,
-                      count: data.count,
-                      effectiveInput,
-                      totalTokens: effectiveInput + data.outputTokens,
-                      outputTokens: data.outputTokens,
-                    };
-                  })
-                  .sort((a, b) => b.totalTokens - a.totalTokens)
-                  .slice(0, 10);
-                const maxModelTokens = Math.max(1, ...modelData.map(p => p.totalTokens));
-                return (
-                  <div className="space-y-2">
-                    {modelData.map(({ model, count, totalTokens, effectiveInput, outputTokens }) => {
-                      const width = Math.max(8, (totalTokens / maxModelTokens) * 100);
-                      const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
-                      return (
-                        <Tooltip key={model}>
-                          <TooltipTrigger asChild>
-                            <div className="flex items-center gap-3 cursor-pointer group">
-                              <div className="w-[180px] text-sm text-gray-700 truncate font-medium group-hover:text-gray-900" title={model}>
-                                {displayModel}
-                              </div>
-                              <div className="flex-1 h-7 bg-gray-100 rounded overflow-hidden flex">
-                                <div
-                                  className="h-full bg-blue-400 group-hover:bg-blue-500 transition-colors rounded"
-                                  style={{ width: `${width}%` }}
-                                />
-                              </div>
-                              <div className="w-[70px] text-sm text-gray-500 text-right">
-                                {formatTokens(totalTokens)}
-                              </div>
-                            </div>
-                          </TooltipTrigger>
-                          <TooltipContent side="top" className="text-xs">
-                            <div className="font-medium mb-1">{model}</div>
-                            <div>{t("usage.requests")}: {count}</div>
-                            <div>{t("usage.input_tokens")}: {formatTokens(effectiveInput)}</div>
-                            <div>{t("usage.output_tokens")}: {formatTokens(outputTokens)}</div>
-                            <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(totalTokens)}</div>
-                          </TooltipContent>
-                        </Tooltip>
-                      );
-                    })}
-                  </div>
-                );
-              })()}
-            </div>
-          ) : (
-            <div className="text-center py-8 text-gray-400 text-sm">{t("usage.no_data")}</div>
-          )}
-          </>
           )}
         </CardContent>
     </Card>
