@@ -8,6 +8,7 @@ import { CCR_SELF_PROVIDER_NAME } from "@wengine-ai/claude-code-router-shared";
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
+import type { ChatCompletionCapture } from "../ccr/chat-completion-capture";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
 import { type PluginRegistry, isPluginClassifiedError, pluginErrorFrom } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, pluginTerminalFailure, rememberPluginFailure } from "./plugin-request-state";
@@ -172,6 +173,7 @@ declare module "fastify" {
 
   interface FastifyRequest {
     provider?: string;
+    chatCompletionCapture?: ChatCompletionCapture;
   }
 }
 
@@ -209,6 +211,7 @@ async function handleTransformerEndpoint(
   // OpenAI clients can address a family by alias on either wire protocol.
   // Keep explicit targets and bare catalog names on the direct lookup path.
   const isChat = transformer.endPoint === "/v1/chat/completions";
+  if (isChat) (req as any).originalModel ??= body?.model;
   if (
     (isChat || transformer.endPoint === "/v1/responses") &&
     !req.provider &&
@@ -410,7 +413,7 @@ async function handleTransformerEndpoint(
 
     try {
       const model = body.model || (req as any).originalModel;
-      if (providerName && model) {
+      if (!req.chatCompletionCapture && providerName && model) {
         getHealthStore().recordSuccess(providerName, model);
       }
     } catch {}
@@ -651,7 +654,7 @@ async function handleFallback(
       errorMessage: error?.message || String(error),
       sessionId: (req as any).sessionId || (req as any).usageSessionId || req.id,
       stream: (req.body as any).stream,
-      inputTokens: (req as any).tokenCount || 0,
+      inputTokens: req.chatCompletionCapture ? 0 : (req as any).tokenCount || 0,
       req,
     });
   }
@@ -867,7 +870,7 @@ async function handleFallback(
           req.log.info(`Fallback model ${fbProviderName},${fbModel} succeeded`);
 
           // Record success for the fallback model
-          healthStore.recordSuccess(fbProviderName, fbModel);
+          if (!req.chatCompletionCapture) healthStore.recordSuccess(fbProviderName, fbModel);
 
           // Promote the fallback model globally for this primary + scenario
           // This ensures all clients skip the failing primary until TTL expires.
@@ -936,7 +939,7 @@ async function handleFallback(
         errorMessage: fallbackError?.message || String(fallbackError),
         sessionId: (req as any).sessionId || (req as any).usageSessionId || req.id,
         stream: (req.body as any).stream,
-        inputTokens: (req as any).tokenCount || 0,
+        inputTokens: req.chatCompletionCapture ? 0 : (req as any).tokenCount || 0,
         req,
       });
 

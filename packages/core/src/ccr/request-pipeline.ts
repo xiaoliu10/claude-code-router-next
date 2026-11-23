@@ -36,6 +36,7 @@ import {
   normalizeUsagePayload,
   mergeUsageCapture,
 } from "./usage-merge";
+import { captureChatStream, type ChatCompletionCapture } from "./chat-completion-capture";
 import type { IAgent } from "./agents/type";
 import agentsManager from "./agents";
 import { apiKeyAuth } from "./auth";
@@ -238,7 +239,10 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       return;
     }
     req.pathname = url.pathname;
-    if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/responses")) && !req.requestStartTime) {
+    if (req.method === "POST" && url.pathname.endsWith("/v1/chat/completions")) {
+      req.chatCompletionCapture = {};
+    }
+    if ((req.chatCompletionCapture || url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/responses")) && !req.requestStartTime) {
       req.requestStartTime = performance.now();
     }
   });
@@ -278,6 +282,17 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
   // Hook 3: onSend — agent tool rewrite + SSE usage capture + upstream model capture
   serverInstance.addHook("onSend", (req: any, reply: any, payload: any, done: any) => {
     (req.ccrHookOrder ||= []).push("onSend");
+    const chat: ChatCompletionCapture | undefined = req.chatCompletionCapture;
+    if (chat && reply.statusCode < 400 && req.provider) {
+      ensureClientContext(req, config);
+      if (payload instanceof ReadableStream) {
+        return done(null, payload.pipeThrough(captureChatStream(chat, req.requestStartTime)));
+      }
+      const meta = extractNonStreamMeta(payload);
+      chat.usage = meta?.usage;
+      if (isRealUpstreamModel(meta?.model)) chat.model = meta.model;
+      return done(null, payload);
+    }
     const isMessages = req.pathname?.endsWith("/v1/messages");
     const isResponses = req.pathname?.endsWith("/v1/responses");
     if (isMessages || isResponses) {
@@ -620,7 +635,10 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     // Release the concurrency-priority in-flight lease (no-op when the request
     // did not go through concurrency-priority routing).
     releaseRequestLease(req);
-    if (!req.pathname?.endsWith("/v1/messages") && !req.pathname?.endsWith("/v1/responses")) return;
+    const chat: ChatCompletionCapture | undefined = req.chatCompletionCapture;
+    // handleFallback already books failed HTTP attempts against each provider.
+    if (chat && (reply.statusCode >= 400 || !req.provider)) return;
+    if (!chat && !req.pathname?.endsWith("/v1/messages") && !req.pathname?.endsWith("/v1/responses")) return;
     try {
       // Bounded drain: the usage/TTFT readers tee the response and normally end
       // with the client, but an upstream that stops mid-stream would otherwise
@@ -662,8 +680,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // record this failure with the predecessor's input/cache tokens. Ignore the
       // slot on hard failure and fall back to the router's own token estimate.
       const hardFailed = reply.statusCode >= 400;
-      const usage = hardFailed ? undefined : sessionUsageCache.get(getUsageCacheKey(req));
-      const speedStats = readTokenSpeedStats(speedStatsKey);
+      const usage = chat ? chat.usage : hardFailed ? undefined : sessionUsageCache.get(getUsageCacheKey(req));
+      const speedStats = chat ? { ttft: chat.ttft ?? null, tokensPerSecond: null } : readTokenSpeedStats(speedStatsKey);
       const healthStore = getHealthStore();
 
       // Extract error message if request failed
@@ -682,9 +700,10 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // (thrown before the stream is forwarded) and a genuine error-only stream
       // are still judged as failures here.
       const contentDelivered = req.contentDelivered === true;
-      const isFailedRequest = hardFailed || (hasSseError && !hasOutputTokens && !contentDelivered);
+      const chatError = chat?.error || (chat?.stream && !chat.finished ? "Chat stream ended without a finish_reason" : undefined);
+      const isFailedRequest = Boolean(chatError) || hardFailed || (hasSseError && !hasOutputTokens && !contentDelivered);
       if (isFailedRequest) {
-        errorMessage = req.errorMessage || reply.errorMessage || (req.error?.message || req.error?.toString?.() || undefined);
+        errorMessage = chatError || req.errorMessage || reply.errorMessage || (req.error?.message || req.error?.toString?.() || undefined);
         if (hasSseError) {
           errorMessage = errorMessage || JSON.stringify(sseError);
           errorResponseBody = JSON.stringify(sseError);
@@ -717,8 +736,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // usage.input_tokens is missing OR zero, so a zeroed usage frame can't wipe
       // out the input token count for the whole request.
       const reportedInputTokens = usage?.input_tokens || 0;
-      const rawInputTokens = reportedInputTokens || req.tokenCount || 0;
-      if (!usage?.usage_estimated && !cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
+      const rawInputTokens = reportedInputTokens || (chat ? 0 : req.tokenCount) || 0;
+      if (!chat && !usage?.usage_estimated && !cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
         cacheReadInputTokens = req.tokenCount - usage.input_tokens;
         if (cacheReadInputTokens) {
           console.log('[Usage] Inferred cache tokens:', {
@@ -755,7 +774,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         // carried a model, the routed model is the truthful best answer and
         // matches what the client was told. `unknown` in the UI looked like a
         // routing bug rather than a missing upstream echo.
-        upstreamModel: req.upstreamModel || getRequestModel(req) || undefined,
+        upstreamModel: chat?.model || req.upstreamModel || getRequestModel(req) || undefined,
         ...(usage?.usage_estimated === true ? { usageEstimated: true } : {}),
         modelFamily: req.modelFamily || "",
         scenarioType: req.scenarioType || "default",
@@ -778,7 +797,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         errorMessage,
         responseBody: errorResponseBody,
       });
-      if (req.clientContext?.usageScope !== "session") {
+      if (!chat && req.clientContext?.usageScope !== "session") {
         sessionUsageCache.delete(getUsageCacheKey(req));
       }
     } catch (e) {

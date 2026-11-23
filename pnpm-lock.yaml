@@ -169,6 +169,9 @@ importers:
       dotenv:
         specifier: ^16.5.0
         version: 16.6.1
+      eventsource-parser:
+        specifier: ^3.0.6
+        version: 3.0.6
       fastify:
         specifier: ^5.4.0
         version: 5.6.1

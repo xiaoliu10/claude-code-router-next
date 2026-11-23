@@ -57,6 +57,7 @@
     "adm-zip": "^0.5.16",
     "better-sqlite3": "^12.10.0",
     "dotenv": "^16.5.0",
+    "eventsource-parser": "^3.0.6",
     "fastify": "^5.4.0",
     "fastify-plugin": "^5.1.0",
     "google-auth-library": "^10.1.0",
