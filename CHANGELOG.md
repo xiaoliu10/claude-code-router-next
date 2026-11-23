@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2434] - 2026-11-23
+
+### Fixed
+
+Chat Completions now follow model-family fallback rules, preserve the Chat response format on Anthropic backups, and record the final outcome against the serving provider. Family routes skip text-only Agy ACP for tool requests and use the configured backups when the family primary is empty.
+
+### 修复
+
+Chat Completions 按模型族配置切换备用通道。Anthropic 备用通道返回标准 Chat 格式，调用记录按实际服务方记入最终结果。带工具的模型族请求会跳过纯文本 Agy ACP。模型族主通道为空时也能使用已配置的备用通道。
+
 ## [2.3.2433] - 2026-11-18
 
 ### Added
