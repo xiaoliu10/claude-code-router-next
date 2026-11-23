@@ -4,11 +4,13 @@ import {
   FastifyRequest,
   FastifyReply,
 } from "fastify";
+import { CCR_SELF_PROVIDER_NAME } from "@wengine-ai/claude-code-router-shared";
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
+import type { ChatCompletionCapture } from "../ccr/chat-completion-capture";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
-import { type PluginRegistry, pluginErrorFrom } from "../provider-plugins/registry";
+import { type PluginRegistry, isPluginClassifiedError, pluginErrorFrom } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, pluginTerminalFailure, rememberPluginFailure } from "./plugin-request-state";
 import { pluginResponseError, describeTransportFailure } from "./plugin-response-error";
 import {
@@ -24,7 +26,7 @@ import { ProviderService } from "@/services/provider";
 import { TransformerService } from "@/services/transformer";
 import { Transformer } from "@/types/transformer";
 import { getHealthStore } from "@/services/provider-health";
-import { captureRateLimitHeaders } from "@/services/rate-limit";
+import { captureRateLimitHeaders, isRateLimitMessage } from "@/services/rate-limit";
 import { getFallbackPromotionStore } from "@/utils/fallback-promotion";
 import { rebindSessionModel } from "@/utils/concurrency-router";
 import { OpenAIResponsesTransformer } from "../transformer/openai.responses.transformer";
@@ -171,6 +173,7 @@ declare module "fastify" {
 
   interface FastifyRequest {
     provider?: string;
+    chatCompletionCapture?: ChatCompletionCapture;
   }
 }
 
@@ -186,6 +189,7 @@ async function handleTransformerEndpoint(
   transformer: any
 ) {
   const body = req.body as any;
+  if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
   ((req as any).ccrHookOrder ||= []).push("handler");
   // Initialize on the original request before any fallback spreads it.
   ensurePluginRequestState(req);
@@ -205,12 +209,12 @@ async function handleTransformerEndpoint(
     normalizeResponsesBody(body);
   }
 
-  // Codex sends a bare CCR family alias (e.g. "ccr-opus") to /v1/responses. Run the
-  // same family router used for /v1/messages so Codex is routed by the CCR model
-  // family (default/think/longContext/webSearch) instead of falling back to
-  // Router.default. The router rewrites body.model to "provider,model".
+  // OpenAI clients can address a family by alias on either wire protocol.
+  // Keep explicit targets and bare catalog names on the direct lookup path.
+  const isChat = transformer.endPoint === "/v1/chat/completions";
+  if (isChat) (req as any).originalModel ??= body?.model;
   if (
-    transformer.endPoint === "/v1/responses" &&
+    (isChat || transformer.endPoint === "/v1/responses") &&
     !req.provider &&
     typeof body?.model === "string" &&
     CCR_FAMILY_ALIAS.test(body.model)
@@ -221,8 +225,19 @@ async function handleTransformerEndpoint(
     });
   }
 
-  // For /v1/responses (Codex) the modelProviderMiddleware does not run because
-  // it only handles /v1/messages. Parse provider from body.model here.
+  // A still-unresolved Chat alias must not enter catalog lookup: the CLI's
+  // preset self provider advertises these names and points back to CCR.
+  if (isChat && !req.provider && typeof body?.model === "string" && CCR_FAMILY_ALIAS.test(body.model)) {
+    throw createApiError("No upstream route configured for this model family", 404, "provider_not_found");
+  }
+
+  // Direct Chat requests skip router(), which normally copies Router.fallback
+  // onto the request. Preserve a family's project-specific fallback settings.
+  if (isChat && !(req as any).strictProjectRouting) {
+    (req as any).fallbackConfig ??= fastify.configService.get("Router")?.fallback;
+  }
+
+  // OpenAI endpoints resolve the provider here, after optional family routing.
   let providerName = req.provider as string | undefined;
   if (!providerName && body?.model) {
     const parts = body.model.split(",");
@@ -266,7 +281,10 @@ async function handleTransformerEndpoint(
     (req as any).originalModel = body?.model;
   }
 
-  // Validate provider exists
+  // A configured family/default can also point back to the managed preset.
+  if (isChat && provider && isLoopbackPreset(provider)) {
+    throw createApiError("The managed CCR preset cannot be a Chat upstream", 400, "invalid_route");
+  }
   if (!provider) {
     throw createApiError(
       `Provider '${providerName}' not found`,
@@ -390,13 +408,13 @@ async function handleTransformerEndpoint(
       transformerContext
     );
 
-    finalResponse = await validateStreamingResponse(body, finalResponse, provider.name || providerName);
+    finalResponse = await validateStreamingResponse(body, finalResponse, provider.name || providerName, req.chatCompletionCapture);
 
     const result = formatResponse(finalResponse, reply, body, fastify);
 
     try {
       const model = body.model || (req as any).originalModel;
-      if (providerName && model) {
+      if (!req.chatCompletionCapture && providerName && model) {
         getHealthStore().recordSuccess(providerName, model);
       }
     } catch {}
@@ -405,7 +423,7 @@ async function handleTransformerEndpoint(
   } catch (error: any) {
     // ProjectRoutingError must propagate directly — it is a configuration
     // error, not a transient upstream failure. No retry, no fallback.
-    if (error instanceof ProjectRoutingError) {
+    if (error instanceof ProjectRoutingError || (isChat && isTerminalChatError(error))) {
       throw error;
     }
     // Double-check: retry the same model once before falling back.
@@ -417,6 +435,12 @@ async function handleTransformerEndpoint(
     // replaced the per-provider inline checks); generic transient errors
     // (5xx/empty stream/network) keep one retry.
     const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error, provider, body.model);
+    // A terminal reauthentication challenge may follow a failed send whose
+    // delivery is unknown. Do not replay that generation via another channel.
+    if (isChat && terminalPluginFailure && error.statusCode === 401) {
+      (req as any).__fallbackExhausted = true;
+      throw error;
+    }
     if (!terminalPluginFailure && !(req as any).__retryAttempted) {
       (req as any).__retryAttempted = true;
       try {
@@ -424,7 +448,7 @@ async function handleTransformerEndpoint(
       } catch (retryError: any) {
         // If the recursive call already tried fallback and it failed,
         // re-throw immediately — don't try fallback a second time.
-        if ((req as any).__fallbackExhausted) {
+        if ((req as any).__fallbackExhausted || (isChat && isTerminalChatError(retryError))) {
           throw retryError;
         }
         error = retryError;
@@ -450,7 +474,8 @@ async function handleTransformerEndpoint(
 async function validateStreamingResponse(
   body: any,
   finalResponse: any,
-  providerName?: string
+  providerName?: string,
+  chat?: ChatCompletionCapture
 ): Promise<any> {
   if (!finalResponse?.body) {
     return finalResponse;
@@ -500,6 +525,10 @@ async function validateStreamingResponse(
 
   if (accText.includes("event: error")) {
     reader.releaseLock();
+    if (chat) {
+      chat.streamError = true;
+      chat.rateLimited = isRateLimitMessage(200, accText);
+    }
     const errMsg = accText.length < 500 ? accText : accText.slice(0, 500);
     throw createApiError(
       `Provider ${providerName} returned error in SSE stream: ${errMsg}`,
@@ -621,6 +650,7 @@ async function handleFallback(
     }
     attemptedFallbacks.add(`${originalProvider},${originalModel}`);
 
+    if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
     // Record failed primary model attempt in usage stats
     fastify.recordUsage?.({
       provider: originalProvider,
@@ -631,7 +661,7 @@ async function handleFallback(
       errorMessage: error?.message || String(error),
       sessionId: (req as any).sessionId || (req as any).usageSessionId || req.id,
       stream: (req.body as any).stream,
-      inputTokens: (req as any).tokenCount || 0,
+      inputTokens: req.chatCompletionCapture ? 0 : (req as any).tokenCount || 0,
       req,
     });
   }
@@ -753,7 +783,7 @@ async function handleFallback(
         fallbackRoute.provider,
         fallbackRoute.model
       );
-      if (!configuredFallback) {
+      if (!configuredFallback || (transformer.endPoint === "/v1/chat/completions" && isLoopbackPreset(configuredFallback.provider))) {
         req.log.warn(`Fallback model ${fallbackModel} is not configured or provider is disabled, skipping`);
         continue;
       }
@@ -775,6 +805,7 @@ async function handleFallback(
       if (fallbackRuntime && pluginTerminalFailure(req, fallbackRuntime, { name: fbProviderName }, fbModel)) continue;
       let fallbackError: any;
       for (let attempt = 1; attempt <= 2; attempt++) {
+        if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
         try {
           req.log.info(`Trying fallback model: ${fbProviderName},${fbModel}${attempt > 1 ? " (retry)" : ""}`);
 
@@ -842,12 +873,12 @@ async function handleFallback(
             bypass,
             fbContext
           );
-          finalResponse = await validateStreamingResponse(newBody, finalResponse, fbProviderName);
+          finalResponse = await validateStreamingResponse(newBody, finalResponse, fbProviderName, req.chatCompletionCapture);
 
           req.log.info(`Fallback model ${fbProviderName},${fbModel} succeeded`);
 
           // Record success for the fallback model
-          healthStore.recordSuccess(fbProviderName, fbModel);
+          if (!req.chatCompletionCapture) healthStore.recordSuccess(fbProviderName, fbModel);
 
           // Promote the fallback model globally for this primary + scenario
           // This ensures all clients skip the failing primary until TTL expires.
@@ -889,6 +920,9 @@ async function handleFallback(
           // Format and return response
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
+          if (transformer.endPoint === "/v1/chat/completions" && isTerminalChatError(error)) {
+            throw error;
+          }
           fallbackError = error;
           // A classified nonRetryable plugin failure never restarts its
           // account-pool attempt budget on a fallback retry.
@@ -903,6 +937,7 @@ async function handleFallback(
       healthStore.recordFailure(fbProviderName, fbModel, fallbackError?.message);
       req.log.warn(`Fallback model ${fbProviderName},${fbModel} failed after retry: ${fallbackError?.message}`);
 
+      if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
       // Record failed fallback attempt in usage stats
       fastify.recordUsage?.({
         provider: fbProviderName,
@@ -913,7 +948,7 @@ async function handleFallback(
         errorMessage: fallbackError?.message || String(fallbackError),
         sessionId: (req as any).sessionId || (req as any).usageSessionId || req.id,
         stream: (req.body as any).stream,
-        inputTokens: (req as any).tokenCount || 0,
+        inputTokens: req.chatCompletionCapture ? 0 : (req as any).tokenCount || 0,
         req,
       });
 
@@ -944,6 +979,7 @@ async function processRequestTransformers(
       !context.pluginRegistry.getManagedRuntimeFor(provider)) {
     throw createApiError("Provider plugin missing or disabled; install and enable its provider plugin.", 503, "plugin_missing");
   }
+  context.clientEndpoint = transformer.endPoint;
   const managedRequest = { model: body.model, provider, requestState: {} };
   const runtime = context.pluginRegistry.getManagedRuntimeFor(provider);
   if (runtime) {
@@ -1040,11 +1076,18 @@ async function processRequestTransformers(
       ) {
         continue;
       }
-      requestBody = await modelTransformer.transformRequestIn(
+      const transformIn = await modelTransformer.transformRequestIn(
         requestBody,
         provider,
         context
       );
+      // A model-level native Anthropic transformer returns a body/header envelope.
+      if (context.anthropicChat && transformIn.body) {
+        requestBody = transformIn.body;
+        config = { ...config, ...transformIn.config };
+      } else {
+        requestBody = transformIn;
+      }
     }
   }
 
@@ -1304,6 +1347,8 @@ async function sendProviderAttempt(
   );
   try {
     response = await dispatchUpstream();
+    const chat: ChatCompletionCapture | undefined = context.req.chatCompletionCapture;
+    if (chat) chat.unbookedAttempt = { provider: context.req.provider, model: context.req.body.model };
   } catch (sendError: any) {
     if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), describeTransportFailure(sendError), managedRequest);
     throw sendError;
@@ -1348,8 +1393,10 @@ async function sendProviderAttempt(
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
     );
+    const errorDetail = context.req.chatCompletionCapture && (isEventStreamResponse(response) || looksLikeSSE(errorText))
+      ? "Upstream SSE error" : errorText;
     const error = createApiError(
-      `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
+      `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorDetail}`,
       response.status,
       "provider_response_error"
     );
@@ -1867,20 +1914,36 @@ export const registerApiRoutes = async (
  * Check if an error message or response body indicates a rate-limit error.
  * Matches common patterns across providers (OpenAI, GLM/Zhipu, Anthropic, etc.).
  */
-function isRateLimitError(text: string): boolean {
+function isRateLimitError(text: string, allowAmbiguous = true): boolean {
   const lower = text.toLowerCase();
   return (
     lower.includes('rate limit') ||
     lower.includes('rate_limit') ||
     lower.includes('rate_limit_error') ||
     lower.includes('too many requests') ||
-    lower.includes('too many') ||
+    (allowAmbiguous && lower.includes('too many')) ||
     lower.includes('quota exhausted') ||
     lower.includes('qps_limit') ||
     lower.includes('token_limit') ||
     lower.includes('限流') ||
     lower.includes('频率限制')
   );
+}
+
+// For Chat, surface a rejected request without sending it to more providers.
+// Preserve the provider's rate-limit classification even when it uses a 4xx
+// other than 429. A request timeout can also recover on the next attempt.
+function isTerminalChatError(error: any): boolean {
+  // Managed plugins classify failures within their own account budget. Keep
+  // their cross-provider recovery behavior (including exhausted accounts).
+  if (isPluginClassifiedError(error)) return false;
+  const status = error?.statusCode;
+  const rateLimited = error?.isRateLimit && (typeof error.rawBody !== "string" || isRateLimitError(error.rawBody, false));
+  return status >= 400 && status < 500 && status !== 408 && status !== 429 && !rateLimited;
+}
+
+function isLoopbackPreset(provider: LLMProvider): boolean {
+  return provider.name === CCR_SELF_PROVIDER_NAME && provider.pluginManaged === true;
 }
 
 // Helper function

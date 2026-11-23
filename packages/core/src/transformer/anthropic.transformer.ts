@@ -18,6 +18,7 @@ import {
   peekBodyForSSE,
   readBodyForSSE,
 } from "./response-body";
+import { convertAnthropicChatResponse } from "./anthropic-chat-response";
 import { formatBase64 } from "@/utils/image";
 import { convertToAnthropic } from "@/utils/converter";
 import { modelSupportsImages } from "@/utils/router";
@@ -369,7 +370,15 @@ export class AnthropicTransformer implements Transformer {
     if (context && context.req) {
       context.req.isTargetAnthropic = true;
     }
-    const body = convertToAnthropic(request);
+    const isChat = context?.clientEndpoint === "/v1/chat/completions";
+    if (isChat) {
+      // Per-attempt state: a fallback may use a different wire protocol.
+      context.anthropicChat = {
+        cacheMode: provider.cacheMode,
+        includeUsage: context.req?.body?.stream_options?.include_usage === true,
+      };
+    }
+    const body = convertToAnthropic(request, isChat);
 
     const headers: Record<string, string | undefined> = {};
     if (this.useBearer) {
@@ -388,6 +397,12 @@ export class AnthropicTransformer implements Transformer {
         headers,
       },
     };
+  }
+
+  async transformResponseOut(response: Response, context: TransformerContext): Promise<Response> {
+    if (!context?.anthropicChat) return response;
+    const { cacheMode, includeUsage } = context.anthropicChat;
+    return convertAnthropicChatResponse(response, cacheMode, includeUsage);
   }
 
   private isAnthropicMessagesEndpoint(baseUrl: string): boolean {

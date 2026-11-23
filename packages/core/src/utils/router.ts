@@ -7,6 +7,7 @@ import {
   CLAUDE_PROJECTS_DIR,
   HOME_DIR,
   getClaudeProjectId,
+  isCcrSelfProvider,
   isZcodeProjectTakeoverActive,
 } from "@wengine-ai/claude-code-router-shared";
 import { ConfigService } from "../services/config";
@@ -945,6 +946,9 @@ const getUseModel = async (
   if (!isStrictProject && normalizedModelPart) {
     for (const provider of providers) {
       if (provider?.enabled === false || !Array.isArray(provider?.models)) continue;
+      // The CLI advertises these aliases on its own loopback provider. That
+      // entry is a client-facing address, not an upstream owner for Chat.
+      if (req.pathname?.endsWith('/v1/chat/completions') && isCcrSelfProvider(provider)) continue;
       const found = provider.models.find(
         (m: any) => typeof m === 'string' && m.toLowerCase() === normalizedModelPart
       );
