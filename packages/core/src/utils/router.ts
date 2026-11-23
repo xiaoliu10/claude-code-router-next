@@ -846,8 +846,10 @@ function resolveFamilyModel(
     req.log.warn(`Family: think model unavailable (fail pool), skipping`);
   }
 
-  if (familyConfig.default) {
-    const model = resolveConfiguredModel(familyConfig.default, providers, false, 'default', enableFallback, allowPromotion, isStrictProject);
+  if (familyConfig.default || (enableFallback && familyConfig.fallback?.default?.length)) {
+    const model = familyConfig.default
+      ? resolveConfiguredModel(familyConfig.default, providers, false, 'default', enableFallback, allowPromotion, isStrictProject)
+      : null;
     if (model) {
       return { model, scenarioType: 'default', isFallback: false };
     }
@@ -860,7 +862,7 @@ function resolveFamilyModel(
       return { model: fallbackResult, scenarioType: 'default', isFallback: true };
     }
 
-    if (isStrictProject) {
+    if (isStrictProject && familyConfig.default) {
       const lastResort = throwStrictProjectError(req, familyConfig.default, providers, 'default');
       if (lastResort) return { model: lastResort, scenarioType: 'default', isFallback: false };
     }
