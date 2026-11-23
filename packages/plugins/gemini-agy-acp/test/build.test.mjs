@@ -55,13 +55,13 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
     };
     const events = [];
     const make = tag => ({ tag, className: '', textContent: '', children: [], value: '', type: '', disabled: false,
-      onclick: null,
-      setAttribute() {},
+      onclick: null, attrs: {},
+      setAttribute(name, value) { this.attrs[name] = value; },
       append(...kids) { this.children.push(...kids); },
       remove() { events.push('remove'); },
       replaceChildren(...kids) { this.children.length = 0; this.children.push(...kids); events.push('clear'); } });
     const previous = globalThis.document;
-    globalThis.document = { createElement: make };
+    globalThis.document = { createElement: make, createElementNS: (_ns, tag) => make(tag) };
     try {
       const host = make();
       await card.mount(host, { callApi, locale, disabled, plugin: { name: 'gemini-agy-acp', version: '0.1.0' }, onBusy: busy => busyEvents.push(busy) });
@@ -121,7 +121,12 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       assert.equal(modelsUl.children[1].textContent, zh ? 'Default · default 已隐藏' : 'Default · default hidden');
       assert.equal(modelsUl.children[1].className, 'text-muted-foreground/50');
       const rowToggles = () => modelsUl.children.map(li => li.children.find(node => node.tag === 'button'));
-      assert.deepEqual(rowToggles().map(node => node.textContent), [zh ? '隐藏' : 'Hide', zh ? '恢复' : 'Restore']);
+      assert.deepEqual(rowToggles().map(node => node.textContent), ['', zh ? '恢复' : 'Restore']);
+      const hide = rowToggles()[0];
+      assert.equal(hide.children[0].tag, 'svg');
+      assert.equal(hide.children[0].attrs['aria-hidden'], 'true');
+      assert.equal(hide.attrs['aria-label'], zh ? '隐藏模型 m2' : 'Hide model m2');
+      assert.equal(hide.title, hide.attrs['aria-label']);
       const restoreAllButton = all.find(node => node.tag === 'button' && node.textContent === (zh ? '恢复全部' : 'Restore all'));
       assert.ok(restoreAllButton);
       assert.equal(restoreAllButton.disabled, false);
@@ -156,7 +161,8 @@ test('management card mounts from a DOM stub, localizes the surface and unmounts
       await restoreAllButton.onclick();
       assert.deepEqual(calls.at(-2), ['/models/visibility', { method: 'POST', body: JSON.stringify({ restore: ['default', 'm2'] }), timeoutMs: 30000 }]);
       assert.ok(modelsUl.children.every(li => li.className === ''));
-      assert.deepEqual(rowToggles().map(node => node.textContent), [zh ? '隐藏' : 'Hide', zh ? '隐藏' : 'Hide']);
+      assert.deepEqual(rowToggles().map(node => node.textContent), ['', '']);
+      assert.ok(rowToggles().every(button => button.children[0].tag === 'svg'));
       assert.equal(restoreAllButton.hidden, true);
       assert.doesNotMatch(line.textContent, zh ? /已隐藏/ : /hidden/);
       assert.deepEqual(busyEvents.slice(-1), [false]);
@@ -201,7 +207,7 @@ test('management card oauth-personal mode hides the key input, reports the accou
       remove() {},
       replaceChildren(...kids) { this.children.length = 0; this.children.push(...kids); } });
     const previous = globalThis.document;
-    globalThis.document = { createElement: make };
+    globalThis.document = { createElement: make, createElementNS: (_ns, tag) => make(tag) };
     try {
       const host = make();
       await card.mount(host, { callApi, locale, plugin: { name: 'gemini-agy-acp', version: '0.1.0' } });
@@ -322,7 +328,7 @@ test('card auto-installs agy when none is detected, polls while installing and o
     apiKeyConfigured: false, apiKeyFingerprint: null, hiddenModels: [] };
   const previousDocument = globalThis.document;
   const previousSetInterval = globalThis.setInterval;
-  globalThis.document = { createElement: make };
+  globalThis.document = { createElement: make, createElementNS: (_ns, tag) => make(tag) };
   try {
     // A: nothing detected → the first view kicks /install exactly once; the
     // completed refresh prefills the detected binary and re-hides the button.
@@ -367,7 +373,7 @@ test('card auto-installs agy when none is detected, polls while installing and o
     assert.equal(installingButton.disabled, true);
     assert.equal(allB.find(node => node.tag === 'button' && node.textContent === '连接').disabled, true);
     assert.ok(allB.some(node => typeof node.textContent === 'string' && node.textContent.includes('正在自动安装 agy')));
-    const rowTogglesB = allB.filter(node => node.tag === 'button' && (node.textContent === '隐藏' || node.textContent === '恢复'));
+    const rowTogglesB = allB.find(node => node.tag === 'ul').children.map(row => row.children.find(node => node.tag === 'button'));
     assert.equal(rowTogglesB.length, 2);
     for (const toggle of rowTogglesB) assert.equal(toggle.disabled, true);
     const restoreAllB = allB.find(node => node.tag === 'button' && node.textContent === '恢复全部');

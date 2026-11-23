@@ -257,8 +257,27 @@ export default {
         const li = el('li', isHidden ? 'text-muted-foreground/50' : null,
           (typeof model?.name === 'string' && model.name ? model.name + ' · ' : '') + id +
           (isHidden ? t(' 已隐藏', ' hidden') : ''));
-        const toggle = el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE + ' ml-2 px-2 py-0.5 text-[10px]',
-          isHidden ? t('恢复', 'Restore') : t('隐藏', 'Hide'));
+        const toggle = isHidden
+          ? el('button', BUTTON_BASE + ' ' + BUTTON_OUTLINE + ' ml-2 px-2 py-0.5 text-[10px]', t('恢复', 'Restore'))
+          : el('button', 'ml-1 inline-flex items-center align-middle rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-white/10 hover:text-foreground focus-visible:ring-2 disabled:pointer-events-none disabled:opacity-40');
+        if (!isHidden) {
+          const ns = 'http://www.w3.org/2000/svg';
+          const icon = document.createElementNS(ns, 'svg');
+          icon.setAttribute('viewBox', '0 0 24 24');
+          icon.setAttribute('width', '12');
+          icon.setAttribute('height', '12');
+          icon.setAttribute('fill', 'none');
+          icon.setAttribute('stroke', 'currentColor');
+          icon.setAttribute('stroke-width', '2');
+          icon.setAttribute('stroke-linecap', 'round');
+          icon.setAttribute('aria-hidden', 'true');
+          const path = document.createElementNS(ns, 'path');
+          path.setAttribute('d', 'M18 6 6 18 M6 6l12 12');
+          icon.append(path);
+          toggle.append(icon);
+          toggle.title = t('隐藏模型 ' + id, 'Hide model ' + id);
+          toggle.setAttribute('aria-label', toggle.title);
+        }
         toggle.type = 'button';
         toggle.disabled = busy || !call || installingNow;
         toggle.onclick = () => runAction('/models/visibility', isHidden ? { restore: [id] } : { hide: [id] });
