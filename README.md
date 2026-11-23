@@ -93,6 +93,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2435** | 修复流式 Chat 请求启用用量统计时被 Codex 拒绝的问题。CCR 转为 Responses 请求时会移除 Chat 专用的 include_usage 字段。 |
 | **v2.3.2434** | Chat Completions 按模型族配置切换备用通道。Anthropic 备用通道返回标准 Chat 格式，调用记录按实际服务方记入最终结果。带工具的模型族请求会跳过纯文本 Agy ACP。 |
 | **v2.3.2433** | <ul><li>**桌面控制中心套件**：菜单栏全供应商额度面板（K/M/B + 焦点看门狗防卡死）、独立本地控制中心与内置网关运行时、项目配置页（按项目路由/别名/客户端接管）。</li><li>**桌面用量分析**：缓存感知有效输入总 tokens（不重复计数）、模型/提供方/日期缓存列、纯 CSS 图表、分页调用记录（成功率/TTFT/速度）。</li><li>**火山 Coding Plan 配额**（AK/SK 本地凭证面板 + SigV4 适配）；**Kimi 5h 窗口恢复**（上游缺 remaining 时不再消失）。</li><li>**Codex 套餐升级配额恢复 + UI HTML 协商缓存 + 卡片确认居中模态 + 冷却中同步模型可点**；插件：codex 1.0.14 / kiro 0.1.3 / workbuddy 1.0.3 / gemini-oauth 1.0.14。</li></ul> |
 | **v2.3.2432** | <ul><li>**Gemini 独立配额池（Argon / Hydrogen / Claude，插件 1.0.13）**：供应商卡片按模型家族分池展示配额，不再只看汇总——Argon 池耗尽一眼可见（此前周汇总 71% 却 429 的迷惑场景消除）。</li><li>**PID 文件失效时 restart 兜底杀真实监听进程**：修「页面更新一直失败」——PID 文件残留尸体 PID 时什么都杀不掉、respawn 撞 EADDRINUSE 旧版本永远在线；现在带 CCR 身份校验的端口兜底 + 等待端口释放 + PID 文件 bind 成功后才写入。</li></ul> |
@@ -102,7 +103,6 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 | **v2.3.2428** | <ul><li>**配额适配器 gzip 修复**：经代理的配额请求固定 `Accept-Encoding: identity`，避免 undici 未解压 gzip 导致解析失败、卡片不显示用量（智谱等供应商恢复配额展示）。</li></ul> |
 | **v2.3.2427** | <ul><li>**配额窗口过期修复**：重置时间已过的窗口不再被当作当前用量展示，卡片回退到本地 token 统计，不再卡死在旧百分比上。</li></ul> |
 | **v2.3.2426** | <ul><li>**Gemini (Antigravity) 模型隐藏/恢复**：卡片列出可见模型 chips（带隐藏按钮）与隐藏列表（恢复/全部恢复）；隐藏时自动清理 Router 引用并回退默认路由，失败完整回滚。</li></ul> |
-| **v2.3.2425** | <ul><li>**供应商拖动排序**：卡片可拖动重排，顺序立即写入配置；拖拽按稳定行 ID 定位，搜索过滤下依然正确，无 name 的供应商也能拖。</li><li>**grok 与 cursor 卡片对齐家族样式**：统一按钮词汇、尺寸、图标与 destructive 变体，七张供应商卡片外观一致。</li></ul> |
 
 > 仅保留最近 10 个版本，更早版本的发布摘要见 [CHANGELOG-archive.md](./CHANGELOG-archive.md)，完整详细变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
