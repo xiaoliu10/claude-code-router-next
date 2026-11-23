@@ -183,6 +183,15 @@ export class OpenAIResponsesTransformer implements Transformer {
   async transformRequestIn(
     request: UnifiedChatRequest
   ): Promise<UnifiedChatRequest> {
+    // Responses reports usage on completion. Keep Chat's usage-trailer option
+    // on the caller request for downstream formatting and fallback attempts.
+    request = { ...request };
+    const options = request.stream_options;
+    if (options && Object.hasOwn(options, "include_usage")) {
+      const { include_usage: _, ...remaining } = options;
+      if (Object.keys(remaining).length) request.stream_options = remaining as typeof options;
+      else delete request.stream_options;
+    }
     delete request.temperature;
     delete request.max_tokens;
 

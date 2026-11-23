@@ -10,6 +10,22 @@ import { OpenAIResponsesTransformer } from "../transformer/openai.responses.tran
  * input[127].thinking" (chatgpt.com backend-api/codex).
  */
 describe("OpenAIResponsesTransformer — request input sanitation", () => {
+  it.each([true, false])("removes the Chat usage option (%s) from the Responses payload only", async includeUsage => {
+    const transformer = new OpenAIResponsesTransformer();
+    const request = { stream: true, stream_options: { include_usage: includeUsage }, messages: [] };
+    const result = await transformer.transformRequestIn(request as any);
+    expect(result).not.toHaveProperty("stream_options");
+    expect(request.stream_options.include_usage).toBe(includeUsage);
+    expect(result.stream).toBe(true);
+  });
+
+  it("preserves Responses stream options alongside the Chat usage option", async () => {
+    const result = await new OpenAIResponsesTransformer().transformRequestIn({
+      messages: [], stream_options: { include_usage: true, include_obfuscation: false },
+    } as any);
+    expect(result.stream_options).toEqual({ include_obfuscation: false });
+  });
+
   it("strips the top-level thinking field from assistant input items", async () => {
     const t = new OpenAIResponsesTransformer();
     const request: any = {

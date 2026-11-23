@@ -94,6 +94,7 @@ export interface UnifiedChatRequest {
   max_tokens?: number;
   temperature?: number;
   stream?: boolean;
+  stream_options?: { include_usage?: boolean; [option: string]: unknown };
   tools?: UnifiedTool[];
   tool_choice?:
     | "auto"
