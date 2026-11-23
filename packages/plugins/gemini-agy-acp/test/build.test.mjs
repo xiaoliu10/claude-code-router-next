@@ -8,7 +8,8 @@ test('build fails without destroying the previous dist when the card source is m
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = join(root, 'source');
   await mkdir(join(source, 'src'), { recursive: true });
-  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/transport.mjs', 'src/card.mjs', 'src/chat.mjs', 'src/plugin.mjs']) {
+  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/transport.mjs', 'src/card.mjs', 'src/chat.mjs', 'src/plugin.mjs',
+    'src/agy-tools.mjs', 'src/agy-tool-bridge.mjs']) {
     await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
   }
   execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: source });
@@ -61,7 +62,8 @@ test('built plugin.js activates in a standalone Node process under a temporary H
   const destination = join(configDir, 'plugins', 'gemini-agy-acp');
   await mkdir(source);
   await mkdir(join(source, 'src'));
-  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/chat.mjs', 'src/card.mjs', 'src/plugin.mjs']) {
+  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/chat.mjs', 'src/card.mjs', 'src/plugin.mjs',
+    'src/agy-tools.mjs', 'src/agy-tool-bridge.mjs']) {
     await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
   }
   await writeFile(join(source, 'src', 'transport.mjs'), `

@@ -37,6 +37,20 @@ if (argv[0] === '--version') {
   let thinking;
   let promptId;
   let denied = new Set();
+  const mcpBySession = new Map();
+  const toolSettledBySession = new Map();
+  const mcp = async (method, params) => {
+    const target = mcpBySession.get(sessionId);
+    // A text-only session was given no bridge: a real agent would simply not
+    // have this tool available, so report that instead of crashing.
+    if (!target) throw new Error('no MCP bridge for this session');
+    const response = await fetch(target.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${target.token}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: Math.random(), method, params }),
+    });
+    return (await response.json()).result;
+  };
   function configOptions() {
     const options = [{ id: mode === 'wrong-category' ? 'model' : 'agentModel', category: mode === 'wrong-category' ? 'mode' : 'model', type: 'select', currentValue: model, options: [
       { group: 'all', name: 'All', options: [{ value: 'm2', name: 'Gemini Model' }, { value: 'default', name: 'Default' }] },
@@ -50,7 +64,7 @@ if (argv[0] === '--version') {
   const chunk = (text, sid = sessionId) => send({ method: 'session/update', params: { sessionId: sid,
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } });
   const input = createInterface({ input: process.stdin });
-  input.on('line', line => {
+  input.on('line', async line => {
     const { id, method, params, result, error } = JSON.parse(line);
     assert.equal(JSON.parse(line).jsonrpc, '2.0');
     if (!method) {
@@ -81,9 +95,22 @@ if (argv[0] === '--version') {
       assert.equal(authenticated, true);
       assert.equal(dirname(params.cwd), root);
       assert.deepEqual(readdirSync(params.cwd), []);
-      assert.deepEqual(params.mcpServers, []);
       sessionNumber++;
       sessionId = mode === 'duplicate-session' ? 'one' : `sess-${sessionNumber}`;
+      if (mode === 'mcp-tool') {
+        // Adopt the caller's MCP server exactly as a real agent does, so the
+        // fixture can call the tool over HTTP like the production agent would.
+        // The bridge is per session: two interleaved conversations must each
+        // talk to the bridge their own session was given. A text-only session
+        // advertises nothing, which a real agent also serves without tools.
+        const [server] = params.mcpServers;
+        if (server) {
+          assert.equal(server.type, 'http');
+          mcpBySession.set(sessionId, { url: server.url, token: server.headers[0].value.replace('Bearer ', '') });
+        }
+      } else {
+        assert.deepEqual(params.mcpServers, []);
+      }
       model = 'default';
       thinking = 'Med';
       reply({ sessionId, configOptions: configOptions() });
@@ -117,6 +144,39 @@ if (argv[0] === '--version') {
             ['write', 'fs/write_text_file'], ['terminal', 'terminal/create']]) send({ id: key, method: callback, params: { sessionId } });
           break;
         default:
+          if (mode === 'mcp-tool' && !mcpBySession.has(sessionId)) {
+            // Text-only session: answer plainly, exactly as the ok mode does.
+            chunk('from previous turn', `sess-${sessionNumber - 1}`);
+            reply({ stopReason: 'max_tokens' });
+            return;
+          }
+          if (mode === 'mcp-tool' && !toolSettledBySession.has(sessionId)) {
+            // Discover the caller's tools over MCP, then raise a call. The call
+            // stays parked until the caller answers, so this prompt never
+            // finishes until the follow-up request resolves it.
+            const listed = await mcp('tools/list', {});
+            record('mcp-list', { tools: listed.tools.map(entry => entry.name) });
+            // A real agent starts the MCP call before it can report anything
+            // about it: the call is what tells the caller a tool is in use.
+            const call = mcp('tools/call', { name: listed.tools[0].name, arguments: { key: 'answer' } })
+              // A bridge that goes away mid-call is a normal outcome: the turn
+              // is abandoned, not a crash.
+              .catch(() => ({ content: [{ type: 'text', text: 'bridge closed' }], isError: true }));
+            send({ method: 'session/update', params: { sessionId, update: { sessionUpdate: 'tool_call',
+              toolCallId: 'agent-side-id', title: 'lookup', rawInput: { key: 'answer' } } } });
+            const settled = await call;
+            record('mcp-call', { text: settled.content?.[0]?.text, isError: settled.isError === true });
+            toolSettledBySession.set(sessionId, settled.content?.[0]?.text ?? '');
+            chunk(toolSettledBySession.get(sessionId) ?? '');
+            reply({ stopReason: 'end_turn' });
+            return;
+          }
+          if (mode === 'mcp-tool') {
+            // The follow-up turn carries the caller's result: relay it and end.
+            chunk(`resumed with ${toolSettledBySession.get(sessionId) ?? ''}`);
+            reply({ stopReason: 'end_turn' });
+            return;
+          }
           chunk('from previous turn', `sess-${sessionNumber - 1}`);
           for (const [sessionUpdate, content] of [ ['user_message_chunk', { type: 'text', text: 'user' }],
             ['agent_thought_chunk', { type: 'text', text: 'thought' }], ['agent_message_chunk', { type: 'image' }],
