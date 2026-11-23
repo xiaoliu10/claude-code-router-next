@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Tool calling for the Agy ACP provider** (`@wengine-ai/ccr-provider-gemini-agy-acp` 0.0.3): a request that declares tools used to be rejected with `400 agy_unsupported_request`; it is now served. The plugin publishes the caller's tools to the agent through an MCP server bound to `127.0.0.1` (ephemeral port, random bearer token, timing-safe comparison), the agent raises a call, and the caller receives it as `tool_calls`. The ACP session and the MCP call stay warm, so a follow-up request that carries the caller's results resumes the same turn instead of starting a new conversation. The agent never executes anything — every tool result is one the caller returned, and a missing answer is an `isError` result rather than a hang. Bridge descriptor, token and tool schemas travel only to the agent subprocess through `session/new`, never into a response, usage record or log. A tool set the agent cannot serve is an explicit `400` naming the reasons. The bridge keeps parked calls per caller (a resume only resumes the bridge whose parked calls are exactly the ones it answers) and the default worker count rises to 2, because a parked call holds its worker warm.
+
 ## [2.3.2435] - 2026-11-23
 
 ### Fixed
