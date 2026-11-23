@@ -313,6 +313,20 @@ impl ControlService {
         usage_snapshot_from(&summary, period)
     }
 
+    async fn usage_trend_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
+        let (start, end) = usage_trend_window(period, OffsetDateTime::now_utc())?;
+        let path = format!(
+            "/api/usage/summary?startDate={}&endDate={}",
+            encode_query(&start),
+            encode_query(&end)
+        );
+        let summary = self.client()?.get_json(&path).await?;
+        let mut snapshot = usage_snapshot_from(&summary, period)?;
+        // Anchor chart labels to the instant queried, even across local midnight.
+        snapshot.updated_at = end;
+        Ok(snapshot)
+    }
+
     pub(crate) async fn usage_records(
         &self,
         period: &str,
@@ -456,9 +470,14 @@ pub async fn usage_snapshot(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
     period: String,
+    trend: Option<bool>,
 ) -> Result<UsageSnapshot, String> {
     crate::popup::guard(&window)?;
-    service.usage_snapshot(&period).await
+    if trend.unwrap_or(false) {
+        service.usage_trend_snapshot(&period).await
+    } else {
+        service.usage_snapshot(&period).await
+    }
 }
 
 #[tauri::command]
@@ -859,6 +878,17 @@ fn rfc3339(moment: OffsetDateTime) -> String {
     moment
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+// A fall-back transition can make N local calendar dates span more than N
+// 24-hour days. Fetch one day of headroom; the chart selects exact local keys.
+fn usage_trend_window(period: &str, now: OffsetDateTime) -> Result<(String, String), String> {
+    let days = match period {
+        "7d" => 7,
+        "30d" => 30,
+        _ => return Err(ERR_PERIOD.into()),
+    };
+    Ok((rfc3339(now - time::Duration::days(days + 1)), rfc3339(now)))
 }
 
 /// (startDate, endDate) for the panel periods: today starts at local midnight
@@ -1858,6 +1888,23 @@ mod tests {
             .unwrap_err();
         assert!(!error.contains("LEAK_SECRET"));
         assert_eq!(mock.finish().await.len(), 1);
+    }
+
+    #[test]
+    fn trend_window_covers_the_full_first_date_across_fall_back() {
+        // 23:30 PST on Nov 2; the oldest midnights were still PDT (UTC-7).
+        let now = OffsetDateTime::parse("2026-11-03T07:30:00Z", &Rfc3339).unwrap();
+        for (period, days, midnight) in [
+            ("7d", 7, "2026-10-27T07:00:00Z"),
+            ("30d", 30, "2026-10-04T07:00:00Z"),
+        ] {
+            let first = OffsetDateTime::parse(midnight, &Rfc3339).unwrap();
+            assert!(now - time::Duration::days(days) > first);
+            let (start, end) = usage_trend_window(period, now).unwrap();
+            assert!(OffsetDateTime::parse(&start, &Rfc3339).unwrap() <= first);
+            assert_eq!(OffsetDateTime::parse(&end, &Rfc3339).unwrap(), now);
+        }
+        assert_eq!(usage_trend_window("today", now).unwrap_err(), ERR_PERIOD);
     }
 
     #[test]

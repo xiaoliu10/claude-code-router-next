@@ -783,15 +783,32 @@
     };
   }
 
+  // Core's SQLite buckets use date(timestamp, 'localtime'). Step through local
+  // calendar dates so UTC offsets and daylight-saving transitions match them.
+  function usageDayKey(end, daysAgo) {
+    var date = new Date(end.getFullYear(), end.getMonth(), end.getDate() - daysAgo, 12);
+    return date.getFullYear() + '-' + pad2(date.getMonth() + 1) + '-' + pad2(date.getDate());
+  }
+
+  function usageTrendRows(rows, dayCount, end) {
+    var byDate = new Map(rows.map(function (row) { return [row.name, row]; }));
+    var days = [];
+    for (var i = dayCount - 1; i >= 0; i--) {
+      var name = usageDayKey(end, i);
+      days.push(byDate.get(name) || { name: name, inputTokens: 0, outputTokens: 0 });
+    }
+    return days;
+  }
+
   function createUsageController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createUsageController: 需要 invoke 函数');
     var snapshot = null, loading = false, error = null, period = DEFAULT_USAGE_PERIOD;
-    var epoch = 0;
+    var epoch = 0, trend = null;
     var listeners = new Set();
 
     function state() {
-      return { snapshot: snapshot, loading: loading, error: error, period: period };
+      return { snapshot: snapshot, loading: loading, error: error, period: period, trend: trend };
     }
     function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
     function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
@@ -801,8 +818,10 @@
       period = p;
       loading = true;
       error = null;
-      emit();
       var my = ++epoch;
+      var dayCount = p === 'today' || p === '7d' ? 7 : p === '30d' ? 30 : 0;
+      trend = dayCount ? { dayCount: dayCount, rows: null, error: null } : null;
+      emit();
       invoke('usage_snapshot', { period: p }).then(function (r) {
         if (my !== epoch) return;
         snapshot = normalizeUsageSnapshot(r);
@@ -814,6 +833,19 @@
         error = errorMessage(err);
         emit();
       });
+      if (trend) {
+        invoke('usage_snapshot', { period: dayCount + 'd', trend: true }).then(function (r) {
+          if (my !== epoch) return;
+          var end = new Date(r.updatedAt);
+          if (!Number.isFinite(end.getTime())) throw new Error('趋势时间无效');
+          trend.rows = usageTrendRows(r.byDay.map(usageRow), dayCount, end);
+          emit();
+        }).catch(function (err) {
+          if (my !== epoch) return;
+          trend.error = errorMessage(err);
+          emit();
+        });
+      }
     }
 
     return {
@@ -1214,6 +1246,7 @@
       fallbackEnabled: true,
       revision: 'rev-1',
     };
+    var previewDay = new Date();
     var usage = {
       today: {
         period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
@@ -1224,7 +1257,7 @@
           { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
         ],
         byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
-        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byDay: [{ name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
         updatedAt: Date.now() - 3000,
       },
       '7d': {
@@ -1237,13 +1270,13 @@
           { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
-          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
-          { name: '2026-11-14', requests: 132, inputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
-          { name: '2026-11-13', requests: 147, inputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
-          { name: '2026-11-12', requests: 101, inputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
-          { name: '2026-11-11', requests: 99, inputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
+          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: usageDayKey(previewDay, 2), requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
+          { name: usageDayKey(previewDay, 3), requests: 132, inputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
+          { name: usageDayKey(previewDay, 4), requests: 147, inputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
+          { name: usageDayKey(previewDay, 5), requests: 101, inputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
+          { name: usageDayKey(previewDay, 6), requests: 99, inputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
         ],
         updatedAt: Date.now() - 3000,
       },
@@ -1257,8 +1290,8 @@
           { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
         ],
         updatedAt: Date.now() - 3000,
       },
@@ -1410,7 +1443,9 @@
       }
       if (cmd === 'usage_snapshot') {
         var period = USAGE_PERIODS.indexOf(a.period) !== -1 ? a.period : 'today';
-        return delay(copy(usage[period]));
+        var result = copy(usage[period]);
+        if (a.trend) result.updatedAt = previewDay.getTime();
+        return delay(result);
       }
       if (cmd === 'usage_records') {
         // Mirrors the native contract: invalid period is a fixed error, page
@@ -2184,6 +2219,7 @@
       if (!s.snapshot) {
         // No snapshot yet: never fabricate an empty state.
         body.appendChild(noteEl(s.loading ? '正在读取用量…' : (s.error ? '用量读取失败：' + s.error : '尚未读取用量数据')));
+        if (s.trend) body.appendChild(buildUsageTrend(s.trend));
         renderRecords(recordsCtrl ? recordsCtrl.state() : null);
         return;
       }
@@ -2209,7 +2245,11 @@
       totals.appendChild(grid);
       body.appendChild(totals);
       totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
-      body.appendChild(buildDayChart(u.byDay));
+      if (s.trend) {
+        body.appendChild(buildUsageTrend(s.trend));
+      } else {
+        body.appendChild(buildDayChart(u.byDay));
+      }
       body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
         var rowTotal = rowTotalTokens(m);
@@ -2225,6 +2265,17 @@
       body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
       body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
       renderRecords(recordsCtrl ? recordsCtrl.state() : null);
+    }
+
+    function buildUsageTrend(trend) {
+      var title = '每日用量 · 近 ' + trend.dayCount + ' 天（有效输入 + 输出）';
+      var card = trend.rows ? buildDayChart(trend.rows) : el('div', 'usage-card');
+      if (trend.rows) card.querySelector('.usage-title').textContent = title;
+      else {
+        card.appendChild(el('div', 'usage-title', title));
+        card.appendChild(noteEl(trend.error ? '趋势读取失败：' + trend.error : '正在读取趋势…'));
+      }
+      return card;
     }
 
     // Charts are plain divs; per-bar sizes go through CSSOM writes because the
