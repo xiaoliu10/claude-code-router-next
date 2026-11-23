@@ -513,7 +513,8 @@ export function convertFromAnthropic(
 }
 
 export function convertToAnthropic(
-  request: UnifiedChatRequest
+  request: UnifiedChatRequest,
+  fromChatCompletions = false
 ): AnthropicChatRequest {
   const otherMessages: UnifiedMessage[] = [];
   const systemBlocks: any[] = [];
@@ -575,7 +576,7 @@ export function convertToAnthropic(
     if (msg.role === "tool") {
       let content: any = msg.content;
       try {
-        if (typeof msg.content === "string") {
+        if (!fromChatCompletions && typeof msg.content === "string") {
           content = JSON.parse(msg.content);
         }
       } catch {}
@@ -812,9 +813,13 @@ export function convertToAnthropic(
 
   if (request.tools && request.tools.length > 0) {
     result.tools = convertToolsToAnthropic(request.tools);
+    if (fromChatCompletions) {
+      // OpenAI permits a function without parameters. Anthropic requires an object schema.
+      for (const tool of result.tools) tool.input_schema ??= { type: "object", properties: {} };
+    }
     if (request.tool_choice) {
-      if (request.tool_choice === "auto") {
-        result.tool_choice = { type: "auto" };
+      if (request.tool_choice === "auto" || (fromChatCompletions && request.tool_choice === "none")) {
+        result.tool_choice = { type: request.tool_choice };
       } else if (request.tool_choice === "any" || request.tool_choice === "required") {
         result.tool_choice = { type: "any" };
       } else if (typeof request.tool_choice === "string") {

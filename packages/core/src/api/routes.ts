@@ -967,6 +967,7 @@ async function processRequestTransformers(
       !context.pluginRegistry.getManagedRuntimeFor(provider)) {
     throw createApiError("Provider plugin missing or disabled; install and enable its provider plugin.", 503, "plugin_missing");
   }
+  context.clientEndpoint = transformer.endPoint;
   const managedRequest = { model: body.model, provider, requestState: {} };
   const runtime = context.pluginRegistry.getManagedRuntimeFor(provider);
   if (runtime) {
@@ -1063,11 +1064,18 @@ async function processRequestTransformers(
       ) {
         continue;
       }
-      requestBody = await modelTransformer.transformRequestIn(
+      const transformIn = await modelTransformer.transformRequestIn(
         requestBody,
         provider,
         context
       );
+      // A model-level native Anthropic transformer returns a body/header envelope.
+      if (context.anthropicChat && transformIn.body) {
+        requestBody = transformIn.body;
+        config = { ...config, ...transformIn.config };
+      } else {
+        requestBody = transformIn;
+      }
     }
   }
 
