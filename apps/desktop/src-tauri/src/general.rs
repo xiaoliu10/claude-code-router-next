@@ -19,6 +19,7 @@ const LOG_LEVELS: [&str; 6] = ["fatal", "error", "warn", "info", "debug", "trace
 pub struct GeneralSettingsSnapshot {
     revision: String,
     values: Map<String, Value>,
+    port_from_env: bool,
     api_key_configured: bool,
     proxy_configured: bool,
 }
@@ -171,8 +172,26 @@ fn effective(config: &Value, key: &str, default: &Value) -> Value {
     }
 }
 
+// Recognize $NAME and ${NAME} in the raw PORT without resolving or exposing the name.
+fn port_from_env(config: &Value) -> bool {
+    config["PORT"].as_str().is_some_and(|port| {
+        port.match_indices('$').any(|(index, _)| {
+            let tail = &port[index + 1..];
+            tail.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                || tail
+                    .strip_prefix('{')
+                    .and_then(|s| s.split_once('}'))
+                    .is_some_and(|(name, _)| !name.is_empty())
+        })
+    })
+}
+
 fn snapshot_from(config: &Value) -> GeneralSettingsSnapshot {
     let mut values = defaults().as_object().unwrap().clone();
+    let port_from_env = port_from_env(config);
+    if port_from_env {
+        values.remove("PORT");
+    }
     for (key, value) in &mut values {
         *value = effective(config, key, value);
     }
@@ -180,6 +199,7 @@ fn snapshot_from(config: &Value) -> GeneralSettingsSnapshot {
     GeneralSettingsSnapshot {
         revision: revision_of(config),
         values,
+        port_from_env,
         api_key_configured: configured("APIKEY"),
         proxy_configured: PROXY_KEYS.into_iter().any(configured),
     }
@@ -314,7 +334,7 @@ mod tests {
     fn web_defaults_and_legacy_projection_expose_only_public_scalars() {
         let raw = json!({
             "APIKEY": "private-admin", "HTTPS_PROXY": "http://user:private-proxy@proxy.invalid",
-            "PORT": "$PORT", "Router": {"concurrencyThreshold": "9"}, "API_TIMEOUT_MS": "7000",
+            "PORT": "$PRIVATE_PORT_NAME", "Router": {"concurrencyThreshold": "9"}, "API_TIMEOUT_MS": "7000",
             "WAKEUP_ENABLED": "1", "PROXY_GLOBAL_ENABLED": "False", "StatusLine": ["private-status"],
             "Plugins": [{"name":"token-speed", "enabled":true, "options":{"token":"private-plugin"}}],
             "Providers": [{"api_key":"private-provider"}]
@@ -323,18 +343,28 @@ mod tests {
         assert_eq!(
             snapshot,
             json!({
-                "revision": revision_of(&raw), "apiKeyConfigured":true, "proxyConfigured":true,
+                "revision": revision_of(&raw), "portFromEnv":true, "apiKeyConfigured":true, "proxyConfigured":true,
                 "values": {
                     "LOG":false, "LOG_LEVEL":"error", "statusLineEnabled":false, "tokenSpeedEnabled":true,
                     "disableAttributionHeader":true, "enableConcurrencyPriority":false, "concurrencyThreshold":9,
-                    "WAKEUP_ENABLED":true, "WAKEUP_TIME":"06:00", "CLAUDE_PATH":"", "HOST":"", "PORT":3456,
+                    "WAKEUP_ENABLED":true, "WAKEUP_TIME":"06:00", "CLAUDE_PATH":"", "HOST":"",
                     "API_TIMEOUT_MS":7000, "PROBE_TIMEOUT_MS":15000, "PROBE_SLOW_THRESHOLD_MS":3000,
                     "ContextWindow":200000, "PROXY_GLOBAL_ENABLED":false, "CUSTOM_ROUTER_PATH":""
                 }
             })
         );
         assert!(!snapshot.to_string().contains("private-"));
+        for port in ["${PRIVATE_PORT_NAME}", "$private_port", "34$PORT_SUFFIX"] {
+            let projection = snapshot_from(&json!({"PORT":port}));
+            assert!(projection.port_from_env);
+            assert!(!projection.values.contains_key("PORT"));
+        }
+        let numeric = snapshot_from(&json!({"PORT":"4000"}));
+        assert!(!numeric.port_from_env);
+        assert_eq!(numeric.values["PORT"], 4000);
         let empty = snapshot_from(&json!({}));
+        assert!(!empty.port_from_env);
+        assert_eq!(empty.values["PORT"], 3456);
         assert_eq!(empty.values["API_TIMEOUT_MS"], 600000);
         assert_eq!(empty.values["concurrencyThreshold"], 3);
         assert_eq!(empty.values["PROXY_GLOBAL_ENABLED"], true);
@@ -348,17 +378,18 @@ mod tests {
             "StatusLine":{"enabled":true,"custom":{"modules":["other"]}},
             "plugins":[{"name":"other"},{"name":"token-speed","options":{"keep":true}}],
             "Plugins":["legacy-shadowed"], "Router":{"default":"provider,model","families":{}},
-            "APIKEY":"$OLD", "PROXY_URL":"$PROXY", "PORT":"4000", "Providers":[{"api_key":"$TOKEN"}]
+            "APIKEY":"$OLD", "PROXY_URL":"$PROXY", "PORT":"${PRIVATE_PORT_NAME}", "Providers":[{"api_key":"$TOKEN"}]
         });
         let edits = json!({"statusLineEnabled":false,"tokenSpeedEnabled":true,"enableConcurrencyPriority":true,
-            "concurrencyThreshold":4,"APIKEY":"new-test-key","PORT":43210});
+            "concurrencyThreshold":4,"APIKEY":"new-test-key","PORT":3456});
+        assert!(snapshot_from(&original).port_from_env);
         let mut expected = original.clone();
         expected["StatusLine"]["enabled"] = json!(false);
         expected["plugins"][1]["enabled"] = json!(true);
         expected["Router"]["enableConcurrencyPriority"] = json!(true);
         expected["Router"]["concurrencyThreshold"] = json!(4);
         expected["APIKEY"] = json!("new-test-key");
-        expected["PORT"] = json!(43210);
+        expected["PORT"] = json!(3456);
         let mut readback = expected.clone();
         readback["Providers"][0]["normalized"] = json!(true);
         let mock = Mock::new(vec![
@@ -370,6 +401,8 @@ mod tests {
             .save(&revision_of(&original), &edits)
             .await
             .unwrap();
+        assert!(!result.port_from_env);
+        assert_eq!(result.values["PORT"], 3456);
         assert_eq!(result.revision, revision_of(&readback));
         assert!(result.api_key_configured && result.proxy_configured);
         assert!(!serde_json::to_string(&result)
@@ -409,6 +442,8 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(result.port_from_env);
+        assert!(!result.values.contains_key("PORT"));
         assert!(!result.api_key_configured && result.proxy_configured);
         let requests = mock.finish().await;
         let body = requests[1].split_once("\r\n\r\n").unwrap().1;

@@ -27,7 +27,7 @@ const saves = h => h.calls.filter(c => c.cmd === 'general_settings_save');
 const reads = h => h.calls.filter(c => c.cmd === 'general_settings_snapshot');
 
 function setup(overrides = {}) {
-  const fixture = { revision: 'r1', values: { ...defaults }, apiKeyConfigured: true, proxyConfigured: true };
+  const fixture = { revision: 'r1', values: { ...defaults }, portFromEnv: false, apiKeyConfigured: true, proxyConfigured: true };
   const h = harness({
     general_settings_snapshot: () => plain(fixture),
     general_settings_save: ({ revision, changes }) => {
@@ -35,7 +35,10 @@ function setup(overrides = {}) {
       for (const [key, value] of Object.entries(changes)) {
         if (key === 'APIKEY') fixture.apiKeyConfigured = value !== '';
         else if (key === 'PROXY_URL') fixture.proxyConfigured = value !== '';
-        else fixture.values[key] = value;
+        else {
+          fixture.values[key] = value;
+          if (key === 'PORT') fixture.portFromEnv = false;
+        }
       }
       fixture.revision += '+';
       return plain(fixture);
@@ -118,6 +121,38 @@ test('settings: invalid edits focus the field, stale saves retain the draft unti
   assert.equal(h.id('set-port').value, '4000');
   h.id('settings-save').click(); await flush();
   assert.deepEqual(plain(saves(h)[1].args), { revision: 'r2', changes: { PORT: 4000 } });
+});
+
+test('settings: environment port is preserved on unrelated saves and can be replaced with 3456 after a conflict', async () => {
+  const { h, fixture } = setup();
+  delete fixture.values.PORT;
+  fixture.portFromEnv = true;
+  await open(h);
+  const port = h.id('set-port'), status = h.id('settings-port-status'), save = h.id('settings-save');
+  assert.equal(port.value, '');
+  assert.equal(status.hidden, false);
+  assert.match(status.textContent, /环境变量/);
+  assert.equal(save.disabled, true);
+  write(h, 'set-port', '3456');
+  write(h, 'set-port', '');
+  assert.equal(save.disabled, true);
+  write(h, 'set-log', true); save.click(); await flush();
+  assert.deepEqual(plain(saves(h)[0].args.changes), { LOG: true });
+  assert.equal(port.value, '');
+  assert.equal(status.hidden, false);
+
+  write(h, 'set-port', '3456');
+  fixture.revision = 'r2';
+  save.click(); await flush();
+  assert.match(h.id('settings-msg').textContent, /配置已在其他位置修改/);
+  assert.equal(save.disabled, true);
+  h.id('settings-refresh').click(); await flush();
+  assert.equal(port.value, '3456');
+  save.click(); await flush();
+  assert.deepEqual(plain(saves(h)[2].args), { revision: 'r2', changes: { PORT: 3456 } });
+  assert.equal(port.value, '3456');
+  assert.equal(status.hidden, true);
+  assert.equal(save.disabled, true);
 });
 
 test('settings: failed load has a retry and unconfirmed saves require an explicit reload', async () => {
