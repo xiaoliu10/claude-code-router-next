@@ -434,7 +434,7 @@ async function handleTransformerEndpoint(
       } catch (retryError: any) {
         // If the recursive call already tried fallback and it failed,
         // re-throw immediately — don't try fallback a second time.
-        if ((req as any).__fallbackExhausted) {
+        if ((req as any).__fallbackExhausted || (isChat && isTerminalChatError(retryError))) {
           throw retryError;
         }
         error = retryError;
