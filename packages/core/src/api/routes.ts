@@ -1971,6 +1971,11 @@ function chatUsesTools(body: any): boolean {
   const tools = body.tools;
   if (tools !== undefined && !(Array.isArray(tools) && tools.every(namedTool))) return false;
 
+  const functions = body.functions;
+  if (functions !== undefined && !(Array.isArray(functions) && functions.every(fn => named(fn?.name)))) return false;
+  const legacyChoice = body.function_call;
+  if (legacyChoice != null && !["auto", "none"].includes(legacyChoice) && !named(legacyChoice.name)) return false;
+
   const choice = body.tool_choice;
   if (choice != null) {
     if (["auto", "none", "required"].includes(choice) || namedTool(choice)) return true;
@@ -1978,7 +1983,7 @@ function chatUsesTools(body: any): boolean {
     return choice.type === "allowed_tools" && ["auto", "required"].includes(allowed?.mode) &&
       Array.isArray(allowed.tools) && allowed.tools.length > 0 && allowed.tools.every(namedTool);
   }
-  if (tools?.length) return true;
+  if (tools?.length || functions?.length || legacyChoice != null) return true;
 
   return Array.isArray(body.messages) && body.messages.some((message: any) => {
     if (message?.role === "tool") return named(message.tool_call_id) && message.content != null;
