@@ -433,7 +433,10 @@ async function handleTransformerEndpoint(
     const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error, provider, body.model);
     // A terminal reauthentication challenge may follow a failed send whose
     // delivery is unknown. Do not replay that generation via another channel.
-    if (isChat && terminalPluginFailure && error.statusCode === 401) throw error;
+    if (isChat && terminalPluginFailure && error.statusCode === 401) {
+      (req as any).__fallbackExhausted = true;
+      throw error;
+    }
     if (!terminalPluginFailure && !(req as any).__retryAttempted) {
       (req as any).__retryAttempted = true;
       try {

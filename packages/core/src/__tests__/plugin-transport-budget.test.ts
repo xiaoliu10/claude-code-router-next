@@ -104,6 +104,21 @@ describe("plugin response confidentiality and request-wide account budget", () =
     expect(gates.find(ctx => ctx.model === "other")?.requestState).not.toBe(context.requestState);
   });
 
+  it("returns a terminal managed 401 reached during the primary retry", async () => {
+    const rt = runtime(), server = await host(rt, true);
+    server.configService.set("fallback", { default: ["ordinary,m"] });
+    const statuses = [503, 401, 401];
+    const attempts: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: URL | string) => {
+      const provider = new URL(url).hostname.split(".")[0];
+      attempts.push(provider);
+      return provider === "sub" ? json({ error: "fixture failure" }, statuses.shift()) : json({ choices: [] });
+    }));
+    expect((await send(server, "sub,m")).statusCode).toBe(401);
+    expect(attempts).toEqual(["sub", "sub", "sub"]);
+    expect(rt.authRefresh!.forceRefresh).toHaveBeenCalledTimes(1);
+  });
+
   it("an ordinary primary falling back to repeated plugin 401 uses exactly 2 sends and 1 refresh", async () => {
     const rt = runtime(), server = await host(rt, true); let ordinaryCalls = 0, subCalls = 0;
     vi.spyOn(getHealthStore(), "isAvailable").mockReturnValue(true);
