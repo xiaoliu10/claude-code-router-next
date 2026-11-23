@@ -205,12 +205,11 @@ async function handleTransformerEndpoint(
     normalizeResponsesBody(body);
   }
 
-  // Codex sends a bare CCR family alias (e.g. "ccr-opus") to /v1/responses. Run the
-  // same family router used for /v1/messages so Codex is routed by the CCR model
-  // family (default/think/longContext/webSearch) instead of falling back to
-  // Router.default. The router rewrites body.model to "provider,model".
+  // OpenAI clients can address a family by alias on either wire protocol.
+  // Keep explicit targets and bare catalog names on the direct lookup path.
+  const isChat = transformer.endPoint === "/v1/chat/completions";
   if (
-    transformer.endPoint === "/v1/responses" &&
+    (isChat || transformer.endPoint === "/v1/responses") &&
     !req.provider &&
     typeof body?.model === "string" &&
     CCR_FAMILY_ALIAS.test(body.model)
@@ -221,8 +220,13 @@ async function handleTransformerEndpoint(
     });
   }
 
-  // For /v1/responses (Codex) the modelProviderMiddleware does not run because
-  // it only handles /v1/messages. Parse provider from body.model here.
+  // Direct Chat requests skip router(), which normally copies Router.fallback
+  // onto the request. Preserve a family's project-specific fallback settings.
+  if (isChat && !(req as any).strictProjectRouting) {
+    (req as any).fallbackConfig ??= fastify.configService.get("Router")?.fallback;
+  }
+
+  // OpenAI endpoints resolve the provider here, after optional family routing.
   let providerName = req.provider as string | undefined;
   if (!providerName && body?.model) {
     const parts = body.model.split(",");
@@ -405,7 +409,7 @@ async function handleTransformerEndpoint(
   } catch (error: any) {
     // ProjectRoutingError must propagate directly — it is a configuration
     // error, not a transient upstream failure. No retry, no fallback.
-    if (error instanceof ProjectRoutingError) {
+    if (error instanceof ProjectRoutingError || (isChat && isTerminalChatError(error))) {
       throw error;
     }
     // Double-check: retry the same model once before falling back.
@@ -889,6 +893,9 @@ async function handleFallback(
           // Format and return response
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
+          if (transformer.endPoint === "/v1/chat/completions" && isTerminalChatError(error)) {
+            throw error;
+          }
           fallbackError = error;
           // A classified nonRetryable plugin failure never restarts its
           // account-pool attempt budget on a fallback retry.
@@ -1881,6 +1888,14 @@ function isRateLimitError(text: string): boolean {
     lower.includes('限流') ||
     lower.includes('频率限制')
   );
+}
+
+// For Chat, surface a rejected request without sending it to more providers.
+// Preserve the provider's rate-limit classification even when it uses a 4xx
+// other than 429. A request timeout can also recover on the next attempt.
+function isTerminalChatError(error: any): boolean {
+  const status = error?.statusCode;
+  return status >= 400 && status < 500 && status !== 408 && status !== 429 && !error.isRateLimit;
 }
 
 // Helper function
