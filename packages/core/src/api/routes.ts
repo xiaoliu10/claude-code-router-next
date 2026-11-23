@@ -4,6 +4,7 @@ import {
   FastifyRequest,
   FastifyReply,
 } from "fastify";
+import { CCR_SELF_PROVIDER_NAME } from "@wengine-ai/claude-code-router-shared";
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
@@ -276,7 +277,10 @@ async function handleTransformerEndpoint(
     (req as any).originalModel = body?.model;
   }
 
-  // Validate provider exists
+  // A configured family/default can also point back to the managed preset.
+  if (isChat && provider && isLoopbackPreset(provider)) {
+    throw createApiError("The managed CCR preset cannot be a Chat upstream", 400, "invalid_route");
+  }
   if (!provider) {
     throw createApiError(
       `Provider '${providerName}' not found`,
@@ -427,6 +431,9 @@ async function handleTransformerEndpoint(
     // replaced the per-provider inline checks); generic transient errors
     // (5xx/empty stream/network) keep one retry.
     const terminalPluginFailure = rememberPluginFailure(req, fastify.pluginRegistry.getManagedRuntimeFor(provider), error, provider, body.model);
+    // A terminal reauthentication challenge may follow a failed send whose
+    // delivery is unknown. Do not replay that generation via another channel.
+    if (isChat && terminalPluginFailure && error.statusCode === 401) throw error;
     if (!terminalPluginFailure && !(req as any).__retryAttempted) {
       (req as any).__retryAttempted = true;
       try {
@@ -763,7 +770,7 @@ async function handleFallback(
         fallbackRoute.provider,
         fallbackRoute.model
       );
-      if (!configuredFallback) {
+      if (!configuredFallback || (transformer.endPoint === "/v1/chat/completions" && isLoopbackPreset(configuredFallback.provider))) {
         req.log.warn(`Fallback model ${fallbackModel} is not configured or provider is disabled, skipping`);
         continue;
       }
@@ -1880,14 +1887,14 @@ export const registerApiRoutes = async (
  * Check if an error message or response body indicates a rate-limit error.
  * Matches common patterns across providers (OpenAI, GLM/Zhipu, Anthropic, etc.).
  */
-function isRateLimitError(text: string): boolean {
+function isRateLimitError(text: string, allowAmbiguous = true): boolean {
   const lower = text.toLowerCase();
   return (
     lower.includes('rate limit') ||
     lower.includes('rate_limit') ||
     lower.includes('rate_limit_error') ||
     lower.includes('too many requests') ||
-    lower.includes('too many') ||
+    (allowAmbiguous && lower.includes('too many')) ||
     lower.includes('quota exhausted') ||
     lower.includes('qps_limit') ||
     lower.includes('token_limit') ||
@@ -1904,7 +1911,12 @@ function isTerminalChatError(error: any): boolean {
   // their cross-provider recovery behavior (including exhausted accounts).
   if (isPluginClassifiedError(error)) return false;
   const status = error?.statusCode;
-  return status >= 400 && status < 500 && status !== 408 && status !== 429 && !error.isRateLimit;
+  const rateLimited = error?.isRateLimit && (typeof error.rawBody !== "string" || isRateLimitError(error.rawBody, false));
+  return status >= 400 && status < 500 && status !== 408 && status !== 429 && !rateLimited;
+}
+
+function isLoopbackPreset(provider: LLMProvider): boolean {
+  return provider.name === CCR_SELF_PROVIDER_NAME && provider.pluginManaged === true;
 }
 
 // Helper function

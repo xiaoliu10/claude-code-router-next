@@ -139,13 +139,29 @@ describe("/v1/chat/completions family routing and fallback", () => {
     const attempts = mockUpstreams();
     const server = await buildServer({
       includeSelfProvider: true,
-      routerOverrides: { default: "", families: { ...router.families, opus: { default: "primary,missing-model" } } },
+      routerOverrides: { default: "", families: { ...router.families, opus: { ...router.families.opus, default: "primary,missing-model" } } },
     });
     const response = await sendChat(server, "ccr-opus");
 
     expect(attempts).toEqual([]);
     expect(response.statusCode).toBe(404);
     expect(response.json()).toMatchObject({ error: { code: "provider_not_found" } });
+  });
+
+  it("rejects a configured family target pointing to the managed preset", async () => {
+    const attempts = mockUpstreams();
+    const server = await buildServer({ includeSelfProvider: true, routerOverrides: {
+      families: { ...router.families, opus: { ...router.families.opus, default: "ccr,ccr-opus" } },
+    } });
+    expect((await sendChat(server, "ccr-opus")).statusCode).toBe(400);
+    expect(attempts).toEqual([]);
+  });
+
+  it("skips the managed preset when it appears in a fallback chain", async () => {
+    const attempts = mockUpstreams({ "opus-model": unavailable });
+    const server = await buildServer({ includeSelfProvider: true, fallback: { default: ["ccr,ccr-opus", "global,global-second"] } });
+    expect((await sendChat(server, "ccr-opus")).statusCode).toBe(200);
+    expect(attempts).toEqual(["primary.example.com/opus-model", "primary.example.com/opus-model", "global.example.com/global-second"]);
   });
 
   it("retries the primary but skips configured family and global fallbacks when disabled", async () => {
@@ -215,7 +231,7 @@ describe("/v1/chat/completions family routing and fallback", () => {
     });
   });
 
-  it.each([callerError, channelDisabled])("returns primary HTTP $status without retry or fallback", async (failure) => {
+  it.each([callerError, channelDisabled, upstreamError(400, "invalid_request_error", "Too many tools: maximum is 128")])("returns primary HTTP $status without retry or fallback", async (failure) => {
     const attempts = mockUpstreams({ "direct-model": failure });
     const response = await sendChat(await buildServer({ fallback: globalFallback }), "primary,direct-model");
 
