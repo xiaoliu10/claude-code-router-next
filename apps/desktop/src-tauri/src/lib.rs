@@ -1,6 +1,7 @@
 mod api;
 mod control;
 mod credentials;
+mod general;
 mod lifecycle;
 mod popup;
 mod projects;
@@ -24,6 +25,8 @@ pub fn run() {
             popup::quota_hide,
             popup::quota_open_ui,
             popup::quota_quit,
+            general::general_settings_snapshot,
+            general::general_settings_save,
             control::routing_snapshot,
             control::routing_save,
             control::routing_save_groups,
@@ -61,6 +64,7 @@ pub fn run() {
                 Ok((settings, client)) => {
                     app.manage(quota::QuotaService::new(Some(client.clone())));
                     app.manage(control::ControlService::new(Some(client.clone())));
+                    app.manage(general::GeneralService::new(Some(client.clone())));
                     app.manage(projects::ProjectsService::new(Some(client.clone())));
                     app.manage(credentials::CredentialsService::new(Some(client.clone())));
                     let resources = app.path().resource_dir().ok();
@@ -77,6 +81,7 @@ pub fn run() {
                 Err(e) => {
                     app.manage(quota::QuotaService::new(None));
                     app.manage(control::ControlService::new(None));
+                    app.manage(general::GeneralService::new(None));
                     app.manage(projects::ProjectsService::new(None));
                     app.manage(credentials::CredentialsService::new(None));
                     eprintln!("Invalid CCR connection settings: {e}");
