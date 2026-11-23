@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2435] - 2026-11-23
+
+### Fixed
+
+Fix Codex rejection of streaming Chat requests that ask for token usage. CCR now removes the Chat-only include_usage field when converting the request to Responses.
+
+### 修复
+
+修复流式 Chat 请求启用用量统计时被 Codex 拒绝的问题。CCR 转为 Responses 请求时会移除 Chat 专用的 include_usage 字段。
+
 ## [2.3.2434] - 2026-11-23
 
 ### Fixed
