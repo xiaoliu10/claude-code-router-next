@@ -98,6 +98,9 @@ class Worker {
     this.stderrChunks = [];
     this.stderrBytes = 0;
     this.sessions = new Set();
+    // The warm ACP session kept alive while the caller executes a parked tool
+    // call, so a follow-up request can resume the same turn.
+    this.binding = null;
   }
 
   check() {
@@ -201,30 +204,132 @@ class Worker {
     this.log?.info?.(`gemini-agy-acp worker started (agy ${this.version}, binary: ${this.binary})`);
   }
 
-  async turn({ model, thinking, prompt, onText }, apiKey) {
+  /**
+   * The live tool bridge of the warm binding, if a call is still parked. A
+   * resume turn reuses it so the agent keeps seeing the same tools and the
+   * parked call resolves inside its original MCP request.
+   */
+  toolBridge() {
+    return this.binding?.bridge;
+  }
+
+  /**
+   * One ACP turn.
+   *
+   * When the caller declared tools, `bridge` is the live MCP bridge the plugin
+   * already started; its descriptor goes into `session/new` so the agent can
+   * discover the tools, and the session stays warm in `this.binding` while a
+   * call is parked, so a follow-up request can resume the same ACP turn.
+   */
+  async turn({ model, thinking, prompt, onText, onToolCall, bridge, resume }, apiKey) {
     if (!this.rpc) await this.start(apiKey);
     this.check();
     const cwd = await mkdtemp(join(this.authMethod === OAUTH_METHOD ? tmpdir() : this.root, 'session-'));
+    const hasTools = !!bridge && !bridge.empty;
+    const mcpServers = hasTools ? [bridge.descriptor()] : [];
+    let sessionId;
     try {
-      const session = await this.rpc.request('session/new', { cwd, mcpServers: [] });
-      const { sessionId } = session;
-      if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 4096 || this.sessions.has(sessionId)) {
-        throw new AcpError('protocol_error');
+      if (resume && this.binding?.sessionId && this.binding.bridge === bridge) {
+        // The parked turn left its prompt in flight; drop it so this turn can
+        // issue a fresh one on the same session.
+        sessionId = this.binding.sessionId;
+        this.rpc.abandon();
+      } else {
+        if (this.binding) await this.closeBinding();
+        const session = await this.rpc.request('session/new', { cwd, mcpServers });
+        sessionId = session.sessionId;
+        if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 4096 || this.sessions.has(sessionId)) {
+          throw new AcpError('protocol_error');
+        }
+        this.sessions.add(sessionId);
+        await configureSession(this.rpc, session, model, thinking);
+        this.binding = { sessionId, bridge };
       }
-      this.sessions.add(sessionId);
-      await configureSession(this.rpc, session, model, thinking);
       this.rpc.sessionId = sessionId;
       this.rpc.onText = onText;
-      const result = await this.rpc.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] });
-      const { stopReason } = result;
+      // A raised tool call parks the turn: the agent is blocked inside its own
+      // MCP request and will not answer the prompt until the caller does. Stop
+      // waiting on the prompt and report the parked call instead. A resume turn
+      // has already been answered, so the agent will finish on its own and no
+      // parking race is needed.
+      let parkedNow;
+      const parked = new Promise(resolve => { parkedNow = resolve; });
+      this.rpc.parked = resume ? null : parkedNow;
+      // The bridge mints the caller-visible call when the agent starts it, so
+      // that is the authoritative id; the agent's own ACP notification id is
+      // ignored. A text-only turn has no bridge and keeps its exact shape.
+      //
+      // Parked ids are captured the moment each call is raised: reading the
+      // bridge's map later is wrong, because the agent may finish a call
+      // immediately and the entry is gone by then.
+      const raised = [];
+      // A turn that parks must still unwind if the worker is retired underneath
+      // it (caller abort, idle reaping, pool close), or its `finally` — which
+      // closes the bridge and drops the warm binding — would never run and the
+      // listening socket would leak.
+      let parkFailed;
+      const parkDead = new Promise((_, reject) => { parkFailed = reject; });
+      const unwind = () => parkFailed?.(this.failure ?? new AcpError('worker_failed'));
+      this.unwind = unwind;
+      if (bridge) bridge.onParked = invocation => {
+        raised.push(invocation.id);
+        if (typeof onToolCall === 'function') {
+          onToolCall({ id: invocation.id, name: invocation.name, arguments: invocation.arguments });
+        }
+        // The agent is now blocked inside this MCP request, so the prompt will
+        // not be answered until the caller returns a result.
+        parkedNow?.();
+      };
+      const promptDone = this.rpc.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] });
+      // A parked turn abandons its prompt; the agent answers it later, once the
+      // caller's result unblocks its MCP request. Swallow that late answer so
+      // it cannot surface as an unhandled rejection on the warm worker.
+      promptDone.catch(() => {});
+      const outcome = resume
+        ? await promptDone
+        : await Promise.race([promptDone, parked, parkDead]);
+      // A turn that parked a tool call is not finished: keep the session warm
+      // and report the parked ids so the caller knows to answer. The parked ids
+      // — not the prompt's outcome — are what the caller acts on, so a turn that
+      // parked has no stop reason to report.
+      if (hasTools && raised.length) {
+        return { parked: [...raised] };
+      }
+      if (outcome === undefined) throw new AcpError('protocol_error');
+      const { stopReason } = outcome;
       if (!STOP_REASONS.has(stopReason)) throw new AcpError('protocol_error');
-      const usage = promptUsage(result);
+      const usage = promptUsage(outcome);
       return usage ? { stopReason, usage } : { stopReason };
     } finally {
       this.rpc.sessionId = null;
       this.rpc.onText = null;
+      this.rpc.onToolCall = null;
+      this.rpc.parked = null;
+      this.unwind = null;
+      if (bridge?.onParked) bridge.onParked = null;
+      // A binding stays warm only while a tool call is parked. Every other
+      // exit — including a session/new that threw before an id existed — must
+      // drop it, or a later turn would reuse a dead session.
+      if (this.binding && this.binding.bridge?.pending?.size === 0) await this.closeBinding();
       await rm(cwd, { recursive: true, force: true });
     }
+  }
+
+  /**
+   * Drop the warm binding. The session id stays in `this.sessions` for the
+   * worker's lifetime, so an agent that reuses an id is still rejected as a
+   * protocol violation.
+   */
+  async closeBinding() {
+    const binding = this.binding;
+    this.binding = null;
+    if (!binding) return;
+    // The parked turn left its prompt in flight on this worker's rpc. Drop it
+    // first, or the next turn's request would collide with it and the whole
+    // worker would fail with a protocol error. A retired worker has already
+    // settled it, so there is nothing to abandon.
+    if (!this.failure) this.rpc?.abandon();
+    await binding.bridge?.close().catch(() => {});
   }
 
   async run(request, apiKey, timeoutMs) {
@@ -245,7 +350,11 @@ class Worker {
     try {
       const result = await Promise.race([this.task, interrupted]);
       this.check();
-      if (this.sessions.size >= MAX_SESSIONS) this.retire(new AcpError('closed'));
+      // Retiring on session-count exhaustion would close the bridge of a call
+      // the caller is still waiting to answer, so only reap an idle worker.
+      if (!this.binding?.bridge?.pending?.size && this.sessions.size >= MAX_SESSIONS) {
+        this.retire(new AcpError('closed'));
+      }
       else this.idleTimer = setTimeout(() => this.retire(new AcpError('closed')), IDLE_MS).unref();
       return result;
     } catch (error) {
@@ -266,7 +375,16 @@ class Worker {
   retire(error) {
     if (this.cleanup) return this.cleanup;
     this.failure = error;
+    // Unwind a turn that is parked on a tool call, so its `finally` runs and
+    // the bridge it holds is closed rather than left listening.
+    this.unwind?.();
     clearTimeout(this.idleTimer);
+    // A warm binding's parked calls must never outlive the worker: closing the
+    // bridge settles them as errors so a waiting MCP request cannot hang the
+    // caller.
+    const binding = this.binding;
+    this.binding = null;
+    binding?.bridge?.close().catch(() => {});
     this.rpc?.stop(error);
     const child = this.child;
     child?.stdin.destroy();
@@ -312,23 +430,55 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
   const workers = new Set();
   let closed = false;
   return {
+    /**
+     * The tool bridge whose parked calls are exactly the ones this caller is
+     * answering. Matching on the ids keeps two interleaved conversations from
+     * stealing each other's bridge — and therefore each other's ACP session.
+     */
+    toolBridge(ids) {
+      const wanted = ids instanceof Set ? ids : new Set(ids ?? []);
+      for (const worker of workers) {
+        const bridge = worker.toolBridge?.();
+        if (!bridge) continue;
+        const parked = [...bridge.pending.keys()];
+        // A strict bijection, not a subset: a caller that quotes more ids than
+        // are parked — including ids borrowed from another conversation — must
+        // not be able to resume a bridge it does not own.
+        if (parked.length && parked.length === wanted.size && parked.every(id => wanted.has(id))) {
+          return bridge;
+        }
+      }
+      return undefined;
+    },
     async run(request) {
       if (closed) throw new AcpError('closed');
-      const { model, thinking, prompt, signal, onText } = request ?? {};
+      const { model, thinking, prompt, signal, onText, onToolCall, bridge, resume } = request ?? {};
       if (signal != null && !(signal instanceof AbortSignal)) throw new AcpError('invalid_request');
       if (signal?.aborted) throw new AcpError('cancelled');
       if (typeof prompt !== 'string' || typeof model !== 'string' || !model || model.length > 1024 ||
           (thinking != null && (typeof thinking !== 'string' || !thinking || thinking.length > 128)) ||
           typeof onText !== 'function') throw new AcpError('invalid_request');
+      // A bridge is the plugin's own object; only shape is checked here.
+      if (bridge != null && (typeof bridge.descriptor !== 'function' || !(bridge.pending instanceof Map))) {
+        throw new AcpError('invalid_request');
+      }
       if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) throw new AcpError('input_limit');
       if (!oauth && !credential?.trim()) throw new AcpError('auth_required');
-      let worker = [...workers].find(candidate => !candidate.task && !candidate.failure);
+      // A resume turn must land on the worker that holds its bridge: that is
+      // where the parked call and the warm ACP session live.
+      let worker = resume
+        ? [...workers].find(candidate => candidate.binding?.bridge === bridge && !candidate.task && !candidate.failure)
+        // Any other turn must avoid a worker holding a live parked call, which is
+        // reserved for the resume that will answer it — taking it over would tear
+        // that call down. A binding with nothing parked is not reserved.
+        : [...workers].find(candidate => !candidate.task && !candidate.failure &&
+            !(candidate.binding?.bridge?.pending?.size > 0));
       if (!worker) {
         if (workers.size >= maxWorkers) throw new AcpError('busy');
         worker = new Worker(binary, authMethod, retired => workers.delete(retired), log);
         workers.add(worker);
       }
-      return worker.run({ model, thinking, prompt, signal, onText }, credential, timeoutMs);
+      return worker.run({ model, thinking, prompt, signal, onText, onToolCall, bridge, resume }, credential, timeoutMs);
     },
     /** Pool reset without closing: every live or idle worker is retired so the
      * next run() respawns with fresh settings. Connect and disconnect use this

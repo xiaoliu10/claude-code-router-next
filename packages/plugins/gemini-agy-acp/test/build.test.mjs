@@ -281,7 +281,8 @@ test('built plugin.js activates in a standalone Node process under a temporary H
   await mkdir(source);
   await mkdir(join(source, 'src'));
   for (const file of ['package.json', 'plugin.json', 'scripts', 'src/account.mjs', 'src/chat.mjs', 'src/card.mjs', 'src/plugin.mjs',
-    'src/settings.mjs', 'src/admin-routes.mjs', 'src/acp-errors.mjs', 'src/install.mjs']) {
+    'src/settings.mjs', 'src/admin-routes.mjs', 'src/acp-errors.mjs', 'src/install.mjs',
+    'src/agy-tools.mjs', 'src/agy-tool-bridge.mjs']) {
     await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
   }
   await writeFile(join(source, 'src', 'transport.mjs'), `

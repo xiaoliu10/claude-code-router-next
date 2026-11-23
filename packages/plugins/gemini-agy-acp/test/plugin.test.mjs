@@ -78,7 +78,7 @@ test('aggregate passes ordered text, exact model and separate effort, disregards
   assert.equal(input.thinking, 'high');
   assert.deepEqual(JSON.parse(input.prompt.split('\n')[1]), [...request.messages.slice(0, 3), { role: 'user', content: 'Next' }]);
   assert.deepEqual(Object.keys(input).sort(), ['model', 'onText', 'prompt', 'signal', 'thinking']);
-  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 1, timeoutMs: 60000 }]);
+  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 2, timeoutMs: 60000 }]);
   assert.equal(req.enableFallback, false);
   await p.dispatch({ ...body, reasoning: { effort: 'max' } }, { body: { ...body, output_config: { effort: 'xhigh' } } });
   assert.equal(run.mock.calls[1].arguments[0].thinking, 'xhigh');
@@ -86,14 +86,24 @@ test('aggregate passes ordered text, exact model and separate effort, disregards
 
 test('rejects unsupported original/normalized content and out-of-catalog model before ACP', async t => {
   const p = await activate(t, settings);
-  for (const extra of [{ tools: [{}] }, { tool_choice: 'auto' }, { functions: [{}] }, { modalities: ['audio'] },
-    { system: [{ type: 'image' }] }, { messages: [{ role: 'assistant', tool_calls: [], content: '' }] },
-    { messages: [{ role: 'tool', content: 'result' }] }, { messages: [{ role: 'developer', content: 'x' }] },
+  // Content and model errors stay terminal. Tool *declarations* are no longer
+  // rejected here — they take the tool path, whose own rejections are asserted
+  // by the tool-calling tests.
+  for (const extra of [{ modalities: ['audio'] },
+    { system: [{ type: 'image' }] }, { messages: [{ role: 'developer', content: 'x' }] },
     { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }, { type: 'image_url' }] }] }]) {
     const invalid = { ...body, ...extra };
     await assert.rejects(p.transformer.transformRequestIn(body, provider, { req: { body: invalid } }), { code: 'agy_unsupported_request' });
     await assert.rejects(p.dispatch(invalid), { code: 'agy_unsupported_request' });
   }
+  // A malformed tool entry (no name) is a request error, not a silent drop.
+  for (const extra of [{ tools: [{}] }, { functions: [{}] }]) {
+    await assert.rejects(p.dispatch({ ...body, ...extra }), { code: 'agy_unsupported_request' });
+  }
+  // A tool_choice with nothing to choose has no tool path either.
+  await assert.rejects(p.dispatch({ ...body, tool_choice: 'auto' }), { code: 'agy_unsupported_request' });
+  // A tool result without any declared tool is just an ignored message: the
+  // request stays on the text-only path rather than becoming a tool turn.
   for (const extra of [{ model: 'model' }, { reasoning_effort: 'other' }]) {
     await assert.rejects(p.dispatch({ ...body, ...extra }), { statusCode: 400 });
   }

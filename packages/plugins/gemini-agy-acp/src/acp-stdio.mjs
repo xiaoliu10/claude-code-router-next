@@ -12,6 +12,11 @@ export class AcpStdio {
     this.nextId = 1;
     this.partial = Buffer.alloc(0);
     this.partialBytes = 0;
+    this.onText = null;
+    this.onToolCall = null;
+    this.onPermission = null;
+    // Set for the duration of a prompt that may park on a tool call.
+    this.parked = null;
     this.resetBudget();
     child.stdout.on('data', chunk => {
       if (this.failure) return;
@@ -70,6 +75,18 @@ export class AcpStdio {
     return new Promise((resolve, reject) => { this.pending = { id, method, resolve, reject, errorCode }; });
   }
 
+  /**
+   * Drop an in-flight request without failing the worker. Used when a turn
+   * parks on a tool call: the agent will answer that prompt later, once the
+   * caller's result unblocks its MCP request, and a resume turn then issues a
+   * fresh prompt on the same session.
+   */
+  abandon() {
+    if (this.pending?.method !== 'session/prompt') return;
+    this.pending.reject(new AcpError('cancelled'));
+    this.pending = null;
+  }
+
   receive(frame) {
     if (frame?.jsonrpc !== '2.0' || Array.isArray(frame)) throw new AcpError('protocol_error');
     if (Object.hasOwn(frame, 'method')) {
@@ -79,7 +96,18 @@ export class AcpStdio {
       if (Object.hasOwn(frame, 'id')) {
         if (typeof frame.id !== 'string' && !Number.isSafeInteger(frame.id)) throw new AcpError('protocol_error');
         if (frame.method === 'session/request_permission') {
-          this.send({ id: frame.id, result: { outcome: { outcome: 'cancelled' } } });
+          // The caller owns every permission decision. No handler means deny,
+          // which is also the safe default for an unsolicited request.
+          const handler = this.onPermission;
+          if (!handler) {
+            this.send({ id: frame.id, result: { outcome: { outcome: 'cancelled' } } });
+          } else {
+            Promise.resolve(handler(frame.params)).then(outcome => {
+              this.send({ id: frame.id, result: { outcome } });
+            }).catch(() => {
+              this.send({ id: frame.id, result: { outcome: { outcome: 'cancelled' } } });
+            });
+          }
         } else {
           this.send({ id: frame.id, error: { code: -32601, message: 'Method not supported' } });
         }
@@ -89,6 +117,12 @@ export class AcpStdio {
         if (update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') {
           if (typeof update.content.text !== 'string') throw new AcpError('protocol_error');
           this.onText(update.content.text);
+        } else if (update?.sessionUpdate === 'tool_call' && this.onToolCall) {
+          // A raised call parks the turn: the agent is now blocked inside its
+          // own MCP request and will not answer the prompt until the caller
+          // does. Let the transport stop waiting on the prompt.
+          this.parked?.();
+          this.onToolCall(normalizeToolCall(update));
         }
       }
       return;
@@ -114,5 +148,28 @@ export class AcpStdio {
     this.pending?.reject(error);
     this.pending = null;
     this.onText = null;
+    this.onToolCall = null;
+    this.onPermission = null;
+    this.parked = null;
   }
+}
+
+/**
+ * ACP tool_call update → the caller's tool-call shape. Only the fields the
+ * caller needs are read; anything malformed is dropped rather than guessed.
+ */
+function normalizeToolCall(update) {
+  const id = typeof update.toolCallId === 'string' && update.toolCallId ? update.toolCallId : undefined;
+  const title = typeof update.title === 'string' ? update.title : '';
+  if (!id || !title) return null;
+  let args = {};
+  const raw = update.rawInput;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) args = raw;
+  else if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed;
+    } catch { /* keep empty */ }
+  }
+  return { id, name: title, arguments: args };
 }

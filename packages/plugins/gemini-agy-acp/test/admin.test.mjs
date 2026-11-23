@@ -173,7 +173,7 @@ test('connect happy path with a mock executable persists 0600 settings and loads
   assert.equal((await stat(sidecarPath(p.configDir))).mode & 0o777, 0o600);
   assert.equal(p.transports.length, 1);
   assert.deepEqual(p.transports[0].options,
-    { binary, authMethod: 'gemini-api-key', maxWorkers: 1, timeoutMs: 60000, log: p.transports[0].options.log });
+    { binary, authMethod: 'gemini-api-key', maxWorkers: 2, timeoutMs: 60000, log: p.transports[0].options.log });
   assert.equal(typeof p.transports[0].options.log.info, 'function');
   // Chat requests run against the freshly connected settings without a restart.
   await assert.doesNotReject(p.dispatch());
@@ -260,7 +260,7 @@ test('oauth-personal connect verifies the real handshake, persists no key and sy
   assert.ok(!('apiKey' in saved));
   assert.equal((await stat(sidecarPath(p.configDir))).mode & 0o777, 0o600);
   assert.deepEqual(p.transports[0].options,
-    { binary, authMethod: 'oauth-personal', maxWorkers: 1, timeoutMs: 60000, log: p.transports[0].options.log });
+    { binary, authMethod: 'oauth-personal', maxWorkers: 2, timeoutMs: 60000, log: p.transports[0].options.log });
   assert.equal('apiKey' in p.transports[0].options, false);
   assert.doesNotReject(p.dispatch());
   // Model sync runs without any credential: the worker authenticates the

@@ -11,11 +11,11 @@ test('settingsPath pins the sidecar next to the CCR config', () => {
 test('enabledSettings accepts both auth methods and resolves the optional gemini apiKey', () => {
   const base = { enabled: true, binary: '/fixture/agy' };
   assert.deepEqual(enabledSettings({ ...base, authMethod: 'gemini-api-key' }),
-    { binary: '/fixture/agy', authMethod: 'gemini-api-key', timeoutMs: 60000, maxWorkers: 1 });
+    { binary: '/fixture/agy', authMethod: 'gemini-api-key', timeoutMs: 60000, maxWorkers: 2 });
   assert.deepEqual(enabledSettings({ ...base, authMethod: 'gemini-api-key', apiKey: 'k' }),
-    { binary: '/fixture/agy', authMethod: 'gemini-api-key', timeoutMs: 60000, maxWorkers: 1, apiKey: 'k' });
+    { binary: '/fixture/agy', authMethod: 'gemini-api-key', timeoutMs: 60000, maxWorkers: 2, apiKey: 'k' });
   assert.deepEqual(enabledSettings({ ...base, authMethod: 'oauth-personal' }),
-    { binary: '/fixture/agy', authMethod: 'oauth-personal', timeoutMs: 60000, maxWorkers: 1 });
+    { binary: '/fixture/agy', authMethod: 'oauth-personal', timeoutMs: 60000, maxWorkers: 2 });
   assert.deepEqual(AUTH_METHODS, ['gemini-api-key', 'oauth-personal']);
 });
 

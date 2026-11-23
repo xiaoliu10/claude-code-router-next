@@ -58,7 +58,7 @@ function objectOrNothing(raw) {
  * the transport factory arguments. */
 export function enabledSettings(raw) {
   if (raw?.enabled !== true) return null;
-  const { binary, authMethod, timeoutMs = 60000, maxWorkers = 1, apiKey } = raw;
+  const { binary, authMethod, timeoutMs = 60000, maxWorkers = 2, apiKey } = raw;
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.includes(authMethod) ||
       !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300000 ||
       !Number.isSafeInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8 ||
