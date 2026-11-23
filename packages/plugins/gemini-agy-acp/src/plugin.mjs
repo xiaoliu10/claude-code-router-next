@@ -112,10 +112,34 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     return !rebuilding || force ? queueTransportUpdate(() => applyTransport(force)) : rebuilding;
   }
 
-  async function connected() {
+  async function connected(req) {
     await requireTransport();
-    if (!transport) throw failure('agy_disabled', 503);
-    return transport;
+    if (transport) return transport;
+
+    // Only a same-machine client may initiate installation. Read the actual
+    // TCP peer and port, never a forwarded address or model-supplied path.
+    const socket = req?.raw?.socket;
+    // A loopback proxy can rewrite every request header. The server owner's
+    // opt-in authorizes the fixed vendor download independently of the peer.
+    const forwarded = Object.keys(req?.headers ?? {}).some(key => /^(?:forwarded$|x-forwarded-|x-real-ip$|via$)/i.test(key));
+    if (process.env.CCR_AGY_INSTALL_ON_USE === '1' && !forwarded &&
+        ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(socket?.remoteAddress) && socket.localPort) {
+      const hosts = ['localhost', '127.0.0.1', '[::1]'].map(host => host + ':' + socket.localPort);
+      const host = req.headers?.host;
+      const origin = req.headers?.origin;
+      if (hosts.includes(host) && (origin === undefined || origin === 'http://' + host || origin === 'https://' + host)) {
+        const { existed } = await readSidecar(configDir);
+        if (!existed) {
+          if (installError) throw failure(installError.code, 503);
+          if (installedBinary || statSync(installer.targetBinary, { throwIfNoEntry: false })?.isFile()) {
+            throw failure('agy_connect_required', 503);
+          }
+          void startInstall();
+          throw failure('agy_install_in_progress', 503);
+        }
+      }
+    }
+    throw failure('agy_disabled', 503);
   }
 
   // Single-flight background install of the official agy binary for this
@@ -415,8 +439,8 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     async transformRequestIn(body, provider, context) {
       if (provider?.name === NAME && context?.req) context.req.enableFallback = false;
       assertProvider(provider);
-      await connected();
       if (context?.req?.body) textTurns(context.req.body);
+      await connected(context?.req);
       return { body };
     }
   }
@@ -444,8 +468,8 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     async dispatchRequest({ requestBody, req, config, provider }) {
       if (req) req.enableFallback = false;
       assertProvider(provider);
-      const local = await connected();
       if (req?.body) textTurns(req.body);
+      const local = await connected(req);
       return chatResponse(local, toPrompt(requestBody, provider, req?.body), requestBody.stream === true, req, config);
     },
   });

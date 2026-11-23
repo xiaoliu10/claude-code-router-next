@@ -53,6 +53,10 @@ Use ACP as a **primary route** in an isolated instance with effective `Router.en
 
 ## Automatic agy install
 
+For headless clients, the gateway operator can set `CCR_AGY_INSTALL_ON_USE=1` in the CCR process environment to permit installation on first local model use. With no sidecar or default binary, a direct loopback request starts the same background download and returns `agy_install_in_progress`. After installation, open the local card and connect the account. A saved disconnect is respected. Use the card to retry a failed download.
+
+无界面客户端可在 CCR 网关进程环境设置 `CCR_AGY_INSTALL_ON_USE=1`。首次通过本机直接调用模型时，若尚无连接配置和默认 CLI，会启动后台下载并返回 `agy_install_in_progress`。安装完成后，在本机管理卡连接账号；下载失败可在卡片上重试。
+
 When the settings card first opens and no `agy` is detected (no sidecar binary and nothing at the official default location), it starts the official install automatically for the current OS and CPU architecture — macOS/Linux/Windows on x64 or arm64, including the Linux musl builds. The flow mirrors the vendor bootstrappers step for step: the release manifest is queried from the pinned Antigravity updater, the payload downloads over HTTPS only (curl inherits the gateway's `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` environment), the SHA-512 checksum is verified before anything is placed, and payload URLs are restricted to the vendor's own hosts. The binary lands at `~/.local/bin/agy` on unix and `%LOCALAPPDATA%\agy\bin\agy.exe` on Windows; no remote script is ever piped into a shell.
 
 The install runs in the background (single-flight) while the card polls status; a failure shows a stable error code with an explicit **Install agy** retry button and is never retried automatically. Installing never writes the sidecar and never enables the provider — **Connect** remains the only action that persists settings and starts workers. `POST /api/gemini-agy-acp/install` triggers the same flow manually (local-only guard).

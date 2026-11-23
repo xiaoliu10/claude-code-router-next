@@ -105,7 +105,7 @@ async function activate(t, { local, fixtureMode, fixtureAuth, host, installer, p
   return {
     call,
     configDir,
-    dispatch: () => runtime.dispatchRequest({ requestBody: body, req: { body }, config: {}, provider }),
+    dispatch: (req = {}) => runtime.dispatchRequest({ requestBody: body, req: { body, ...req }, config: {}, provider }),
     transports,
     fixture: fixtureMode === undefined ? undefined : await fixtureBinary(t, fixtureMode, fixtureAuth),
     sidecar: () => readFile(sidecarPath(configDir), 'utf8').then(JSON.parse),
@@ -635,6 +635,41 @@ test('admin routes answer a constant 503 envelope while no service is wired', as
     assert.equal(status, 503);
     assert.deepEqual(reported, { ok: false, success: false, error: 'agy_route_failed' });
   }
+});
+
+test('first local model use shares one install with the card and still requires connect', async t => {
+  const client = { raw: { socket: { remoteAddress: '::1', localPort: 43781 } }, headers: { host: 'localhost:43781' } };
+  let finish;
+  const dir = await mkdtemp(join(tmpdir(), 'agy-first-use-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const binary = join(dir, 'agy.exe');
+  const install = t.mock.fn(() => new Promise(resolve => { finish = resolve; }));
+  const p = await activate(t, { installer: { targetBinary: binary, install } });
+  const previousOptIn = process.env.CCR_AGY_INSTALL_ON_USE;
+  t.after(() => {
+    if (previousOptIn === undefined) delete process.env.CCR_AGY_INSTALL_ON_USE;
+    else process.env.CCR_AGY_INSTALL_ON_USE = previousOptIn;
+  });
+  delete process.env.CCR_AGY_INSTALL_ON_USE;
+  await assert.rejects(p.dispatch(client), { code: 'agy_disabled' });
+  process.env.CCR_AGY_INSTALL_ON_USE = '1';
+  for (const req of [{}, { ...client, headers: { ...client.headers, forwarded: 'for=external' } }, { ...client, raw: { socket: { remoteAddress: 'not-loopback', localPort: 43781 } } },
+    { ...client, headers: { host: 'example.com:43781' } },
+    { ...client, headers: { ...client.headers, origin: 'https://example.com' } }]) {
+    await assert.rejects(p.dispatch(req), { code: 'agy_disabled' });
+  }
+  assert.equal(install.mock.callCount(), 0);
+  await Promise.all([p.dispatch(client), p.dispatch(client)].map(result => assert.rejects(result, { code: 'agy_install_in_progress' })));
+  await p.call('POST', INSTALL_URL, { body: {} });
+  assert.equal(install.mock.callCount(), 1);
+  await writeFile(binary, 'fixture');
+  finish({ binary });
+  await delay(0);
+  await assert.rejects(p.dispatch(client), { code: 'agy_connect_required' });
+  await assert.rejects(p.sidecar(), { code: 'ENOENT' });
+  await p.writeSidecar({ enabled: false });
+  await assert.rejects(p.dispatch(client), { code: 'agy_disabled' });
+  assert.equal(install.mock.callCount(), 1);
 });
 
 test('install kicks off the single-flight background installer and never touches the sidecar', async t => {
