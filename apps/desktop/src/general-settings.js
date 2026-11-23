@@ -30,7 +30,7 @@
   }
 
   function preview() {
-    const state = { values: { ...defaults }, apiKeyConfigured: false, proxyConfigured: false };
+    const state = { values: { ...defaults }, portFromEnv: false, apiKeyConfigured: false, proxyConfigured: false };
     let revision = 1;
     const snapshot = () => ({ ...state, values: { ...state.values }, revision: String(revision) });
     return async function (command, args) {
@@ -71,6 +71,7 @@
     function valueOf(field) {
       const type = field.getAttribute('type');
       if (type === 'checkbox') return field.checked;
+      if (field.dataset.setting === 'PORT' && snapshot.portFromEnv && field.value === '' && !field.validity?.badInput) return undefined;
       if (type === 'number') return field.value.trim() ? Number(field.value) : NaN;
       return field.value;
     }
@@ -102,14 +103,19 @@
     }
     function adopt(next, keep) {
       if (!next || typeof next.revision !== 'string' || !next.revision || !next.values ||
-        fields.some(f => typeof next.values[f.dataset.setting] !== typeof defaults[f.dataset.setting]) ||
+        typeof next.portFromEnv !== 'boolean' ||
+        fields.some(({dataset: {setting}}) => setting === 'PORT' && next.portFromEnv
+          ? owns(next.values, 'PORT') : typeof next.values[setting] !== typeof defaults[setting]) ||
         typeof next.apiKeyConfigured !== 'boolean' || typeof next.proxyConfigured !== 'boolean') throw new Error('Invalid projection');
       snapshot = next;
+      id('settings-port-status').hidden = !next.portFromEnv;
+      if (next.portFromEnv) id('set-port').setAttribute('aria-describedby', 'settings-port-status');
+      else id('set-port').removeAttribute('aria-describedby');
       for (const field of fields) {
         if (keep.has(field)) continue;
         const value = next.values[field.dataset.setting];
         if (typeof value === 'boolean') field.checked = value;
-        else field.value = String(value);
+        else field.value = value === undefined ? '' : String(value);
         field.removeAttribute('aria-invalid');
       }
       id('settings-revision').textContent = '修订 ' + next.revision;
