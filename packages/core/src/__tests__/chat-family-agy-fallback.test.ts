@@ -72,6 +72,8 @@ afterEach(async () => {
 
 it.each([
   ["tools", { tools: [tool] }],
+  ["legacy functions", { functions: [tool.function], function_call: "auto" }],
+  ["legacy named function", { function_call: { name: "lookup" } }],
   ["tool choice", { tool_choice: "auto" }],
   ["assistant tool call", { messages: [...messages, { role: "assistant", tool_calls: [toolCall] }] }],
   ["tool result", { messages: [{ role: "tool", tool_call_id: "call-1", content: "result" }] }],
@@ -113,6 +115,7 @@ it("preserves a terminal 400 from the next capable provider", async () => {
 it.each([
   ["explicit target", `${agy},${model}`, { tools: [tool] }],
   ["malformed tools", "ccr-opus", { tools: [{ type: "function" }] }],
+  ["invalid legacy choice", "ccr-opus", { functions: [tool.function], function_call: "invalid" }],
   ["invalid choice", "ccr-opus", { tools: [tool], tool_choice: "invalid" }],
   ["empty tool history", "ccr-opus", { messages: [{ role: "assistant", content: "hello", tool_calls: [] }] }],
 ] as const)("preserves the Agy 400 for %s", async (_label, target, body) => {
