@@ -220,6 +220,12 @@ async function handleTransformerEndpoint(
     });
   }
 
+  // A still-unresolved Chat alias must not enter catalog lookup: the CLI's
+  // preset self provider advertises these names and points back to CCR.
+  if (isChat && !req.provider && typeof body?.model === "string" && CCR_FAMILY_ALIAS.test(body.model)) {
+    throw createApiError("No upstream route configured for this model family", 404, "provider_not_found");
+  }
+
   // Direct Chat requests skip router(), which normally copies Router.fallback
   // onto the request. Preserve a family's project-specific fallback settings.
   if (isChat && !(req as any).strictProjectRouting) {
