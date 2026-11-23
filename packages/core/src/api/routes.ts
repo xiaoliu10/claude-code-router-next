@@ -8,7 +8,7 @@ import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
-import { type PluginRegistry, pluginErrorFrom } from "../provider-plugins/registry";
+import { type PluginRegistry, isPluginClassifiedError, pluginErrorFrom } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, pluginTerminalFailure, rememberPluginFailure } from "./plugin-request-state";
 import { pluginResponseError, describeTransportFailure } from "./plugin-response-error";
 import {
@@ -1900,6 +1900,9 @@ function isRateLimitError(text: string): boolean {
 // Preserve the provider's rate-limit classification even when it uses a 4xx
 // other than 429. A request timeout can also recover on the next attempt.
 function isTerminalChatError(error: any): boolean {
+  // Managed plugins classify failures within their own account budget. Keep
+  // their cross-provider recovery behavior (including exhausted accounts).
+  if (isPluginClassifiedError(error)) return false;
   const status = error?.statusCode;
   return status >= 400 && status < 500 && status !== 408 && status !== 429 && !error.isRateLimit;
 }
