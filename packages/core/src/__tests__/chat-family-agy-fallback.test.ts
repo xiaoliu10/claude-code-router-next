@@ -26,7 +26,7 @@ const run = vi.fn(async ({ onText }) => { onText("local answer"); return { stopR
 
 async function setup(primary: string, fallbacks: string[], failureStatus = 503) {
   const config = { providers, Router: { enableFamilyRouting: true, enableFallback: true,
-    families: { opus: { default: `${primary},${model}`, fallback: { default: fallbacks.map(name => `${name},${model}`) } } } } };
+    families: { opus: { default: primary ? `${primary},${model}` : "", fallback: { default: fallbacks.map(name => `${name},${model}`) } } } } };
   server = new Server({ logger: false, useJsonFile: false, initialConfig: config });
   await server.ready();
   await writeFile(join(configDir, `${agy}.json`), JSON.stringify({ enabled: true, binary: process.execPath, authMethod: "gemini-api-key" }));
@@ -89,6 +89,14 @@ it.each([
   expect(run).not.toHaveBeenCalled();
   expect((await chat({ tools: [] })).json().choices[0].message.content).toBe("local answer");
   expect(run).toHaveBeenCalledTimes(1);
+});
+
+it("routes through a fallback-only family and skips its text-only candidate for tools", async () => {
+  const attempts = await setup("", [agy, "backup"]);
+  const response = await chat({ tools: [tool] });
+  expect(response.statusCode, response.body).toBe(200);
+  expect(attempts).toEqual(["backup"]);
+  expect((await chat({})).json().choices[0].message.content).toBe("local answer");
 });
 
 it("skips Agy backups after a real primary failure and books only the attempted providers", async () => {
