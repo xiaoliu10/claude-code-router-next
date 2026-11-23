@@ -320,6 +320,14 @@ async function handleTransformerEndpoint(
   // Store codex flags on the request so handleFallback can propagate them
   (req as any).isCodexOnMessagesEndpoint = isCodexOnMessagesEndpoint;
 
+  const familyChatUsesTools = isChat && CCR_FAMILY_ALIAS.test((req as any).originalModel) && chatUsesTools(body);
+  if (familyChatUsesTools && isAgyRoute(provider, body.model, fastify.pluginRegistry)) {
+    // The plugin disables fallback when entered. Skip it before an attempt exists.
+    const result = await handleFallback(req, reply, fastify, transformer, undefined, familyChatUsesTools);
+    if (result) return result;
+    throw createApiError("No configured Chat route supports this tool request", 400, "agy_unsupported_request");
+  }
+
   try {
     // Safety net: convert any Responses API (Codex) body that was not already
     // normalized above (idempotent — the guard is false once converted).
@@ -455,7 +463,7 @@ async function handleTransformerEndpoint(
       }
     }
     // Handle fallback for any request error (timeout, network, API errors)
-    const fallbackResult = await handleFallback(req, reply, fastify, transformer, error);
+    const fallbackResult = await handleFallback(req, reply, fastify, transformer, error, familyChatUsesTools);
     if (fallbackResult) {
       return fallbackResult;
     }
@@ -605,7 +613,8 @@ async function handleFallback(
   reply: FastifyReply,
   fastify: FastifyInstance,
   transformer: any,
-  error: any
+  error: any,
+  familyChatUsesTools: boolean
 ): Promise<any> {
   const scenarioType = (req as any).scenarioType || 'default';
   const familyFallback = (req as any).familyFallback;
@@ -634,7 +643,8 @@ async function handleFallback(
     (error?.rawBody && isRateLimitError(error.rawBody)) ||
     (error?.message && isRateLimitError(error.message));
 
-  if (originalProvider && originalModel) {
+  if (originalProvider && originalModel) attemptedFallbacks.add(`${originalProvider},${originalModel}`);
+  if (error && originalProvider && originalModel) {
     // Provider plugins own their precise account/model cooldowns (booked by
     // the managed runtime's own credential store before this point); the
     // shared health store isolates generically: classified 429s via the
@@ -648,7 +658,6 @@ async function handleFallback(
     } else {
       healthStore.recordFailure(originalProvider, originalModel, error?.message);
     }
-    attemptedFallbacks.add(`${originalProvider},${originalModel}`);
 
     if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
     // Record failed primary model attempt in usage stats
@@ -752,6 +761,7 @@ async function handleFallback(
   const totalFallbacks = fallbackStages.reduce((total, stage) => total + stage.models.length, 0);
   req.log.warn(`Request failed for ${scenarioType}, trying ${totalFallbacks} fallback models across ${fallbackStages.length} fallback stage(s)`);
 
+  let lastFallbackError;
   for (const fallbackStage of fallbackStages) {
     req.log.info(`Trying ${fallbackStage.name} fallback stage with ${fallbackStage.models.length} models`);
 
@@ -791,6 +801,8 @@ async function handleFallback(
       // Shorthand aliases used throughout the try/catch
       const fbProviderName = configuredFallback.provider.name;
       const fbModel = configuredFallback.model;
+
+      if (familyChatUsesTools && isAgyRoute(configuredFallback.provider, fbModel, fastify.pluginRegistry)) continue;
 
       // Skip if model is in fail pool (open state)
       if (!healthStore.isAvailable(fbProviderName, fbModel, configuredFallback.provider.apiKey?.startsWith("ccr-managed-") === true)) {
@@ -884,7 +896,7 @@ async function handleFallback(
           // This ensures all clients skip the failing primary until TTL expires.
           // In strict project mode, skip global promotion so project requests
           // don't pollute the global promotion store and vice versa.
-          if (originalProvider && originalModel && !(req as any).strictProjectRouting) {
+          if (error && originalProvider && originalModel && !(req as any).strictProjectRouting) {
             const fallbackPromotion = getFallbackPromotionStore();
             fallbackPromotion.promote(
               originalProvider,
@@ -915,7 +927,7 @@ async function handleFallback(
           // that just succeeded, so subsequent requests in this session stick to
           // it (and the in-flight lease follows the new model). No-op when the
           // request did not participate in concurrency-priority routing.
-          rebindSessionModel(req, `${fbProviderName},${fbModel}`);
+          if (error) rebindSessionModel(req, `${fbProviderName},${fbModel}`);
 
           // Format and return response
           return formatResponse(finalResponse, reply, newBody, fastify);
@@ -934,6 +946,7 @@ async function handleFallback(
         }
       }
 
+      lastFallbackError = fallbackError;
       healthStore.recordFailure(fbProviderName, fbModel, fallbackError?.message);
       req.log.warn(`Fallback model ${fbProviderName},${fbModel} failed after retry: ${fallbackError?.message}`);
 
@@ -957,6 +970,7 @@ async function handleFallback(
   }
 
   req.log.error(`All fallback models failed for ${scenarioType}`);
+  if (!error && lastFallbackError) throw lastFallbackError;
   return null;
 }
 
@@ -1940,6 +1954,41 @@ function isTerminalChatError(error: any): boolean {
   const status = error?.statusCode;
   const rateLimited = error?.isRateLimit && (typeof error.rawBody !== "string" || isRateLimitError(error.rawBody, false));
   return status >= 400 && status < 500 && status !== 408 && status !== 429 && !rateLimited;
+}
+
+const AGY_PLUGIN = "gemini-agy-acp";
+
+function isAgyRoute(provider: LLMProvider, model: string, registry: PluginRegistry): boolean {
+  const usesAgy = (transformers?: Transformer[]) => transformers?.some(t => t.name === AGY_PLUGIN);
+  return registry.getManagedRuntimeFor(provider)?.name === AGY_PLUGIN ||
+    !!usesAgy(provider.transformer?.use) || !!usesAgy(provider.transformer?.[model]?.use);
+}
+
+function chatUsesTools(body: any): boolean {
+  const named = (name: unknown) => typeof name === "string" && name.trim().length > 0;
+  const namedTool = (tool: any) =>
+    (tool?.type === "function" || tool?.type === "custom") && named(tool[tool.type]?.name);
+  const tools = body.tools;
+  if (tools !== undefined && !(Array.isArray(tools) && tools.every(namedTool))) return false;
+
+  const choice = body.tool_choice;
+  if (choice != null) {
+    if (["auto", "none", "required"].includes(choice) || namedTool(choice)) return true;
+    const allowed = choice.allowed_tools;
+    return choice.type === "allowed_tools" && ["auto", "required"].includes(allowed?.mode) &&
+      Array.isArray(allowed.tools) && allowed.tools.length > 0 && allowed.tools.every(namedTool);
+  }
+  if (tools?.length) return true;
+
+  return Array.isArray(body.messages) && body.messages.some((message: any) => {
+    if (message?.role === "tool") return named(message.tool_call_id) && message.content != null;
+    if (message?.role === "function") return named(message.name) && message.content != null;
+    if (message?.role !== "assistant") return false;
+    if (named(message.function_call?.name) && typeof message.function_call.arguments === "string") return true;
+    return Array.isArray(message.tool_calls) && message.tool_calls.length > 0 && message.tool_calls.every((call: any) =>
+      namedTool(call) && named(call.id) &&
+      (call.type === "function" ? typeof call.function.arguments === "string" : typeof call.custom.input === "string"));
+  });
 }
 
 function isLoopbackPreset(provider: LLMProvider): boolean {
