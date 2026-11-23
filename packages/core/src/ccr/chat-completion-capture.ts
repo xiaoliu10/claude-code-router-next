@@ -1,20 +1,27 @@
 import { createParser } from "eventsource-parser";
 import { mergeUsageCapture, normalizeUsagePayload } from "./usage-merge";
+import { isRateLimitMessage } from "../services/rate-limit";
 import type { Usage } from "../utils/cache";
 
 export interface ChatCompletionCapture {
   usage?: Usage & { usage_estimated?: boolean };
   ttft?: number;
-  stream?: boolean;
   finished?: boolean;
-  error?: string;
+  streamError?: boolean;
+  rateLimited?: boolean;
+  // The latest upstream response, shared by primary and fallback request copies.
+  // Failover clears it once it books that provider.
+  unbookedAttempt?: { provider: string; model: string };
   model?: string;
+}
+
+export function hasChatFinishReason(choice: { finish_reason?: unknown } | null): boolean {
+  return typeof choice?.finish_reason === "string" && choice.finish_reason.trim().length > 0;
 }
 
 // Observe the bytes Fastify actually sends. A usage trailer may follow the
 // finish choice, and [DONE] by itself does not finish a truncated answer.
 export function captureChatStream(capture: ChatCompletionCapture, startTime: number) {
-  capture.stream = true;
   const decoder = new TextDecoder();
   const choices = new Map<number, boolean>();
   let endsWithCR = false;
@@ -25,7 +32,11 @@ export function captureChatStream(capture: ChatCompletionCapture, startTime: num
       sawDone = true;
       return;
     }
-    if (event === "error") capture.error = "Chat stream returned an error";
+    if (event === "error") {
+      capture.streamError = true;
+      capture.rateLimited ||= isRateLimitMessage(200, data);
+      return;
+    }
     let frame;
     try {
       frame = JSON.parse(data);
@@ -33,8 +44,8 @@ export function captureChatStream(capture: ChatCompletionCapture, startTime: num
       return;
     }
     if (frame?.error || frame?.type === "error") {
-      const message = frame.error?.message;
-      capture.error = typeof message === "string" && message ? message : "Chat stream returned an error";
+      capture.streamError = true;
+      capture.rateLimited ||= isRateLimitMessage(200, data);
       return;
     }
     if (typeof frame?.model === "string" && frame.model.trim() && frame.model !== "unknown") {
@@ -44,7 +55,7 @@ export function captureChatStream(capture: ChatCompletionCapture, startTime: num
     if (!Array.isArray(frame?.choices)) return;
     for (const choice of frame.choices) {
       const index = choice?.index ?? 0;
-      const finished = typeof choice?.finish_reason === "string" && choice.finish_reason.trim().length > 0;
+      const finished = hasChatFinishReason(choice);
       if (!choices.get(index)) choices.set(index, finished);
       const delta = choice?.delta;
       if (delta?.content || delta?.reasoning_content || delta?.tool_calls?.length || delta?.function_call) {

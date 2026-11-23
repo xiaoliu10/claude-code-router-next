@@ -26,7 +26,7 @@ import { ProviderService } from "@/services/provider";
 import { TransformerService } from "@/services/transformer";
 import { Transformer } from "@/types/transformer";
 import { getHealthStore } from "@/services/provider-health";
-import { captureRateLimitHeaders } from "@/services/rate-limit";
+import { captureRateLimitHeaders, isRateLimitMessage } from "@/services/rate-limit";
 import { getFallbackPromotionStore } from "@/utils/fallback-promotion";
 import { rebindSessionModel } from "@/utils/concurrency-router";
 import { OpenAIResponsesTransformer } from "../transformer/openai.responses.transformer";
@@ -189,6 +189,7 @@ async function handleTransformerEndpoint(
   transformer: any
 ) {
   const body = req.body as any;
+  if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
   ((req as any).ccrHookOrder ||= []).push("handler");
   // Initialize on the original request before any fallback spreads it.
   ensurePluginRequestState(req);
@@ -407,7 +408,7 @@ async function handleTransformerEndpoint(
       transformerContext
     );
 
-    finalResponse = await validateStreamingResponse(body, finalResponse, provider.name || providerName);
+    finalResponse = await validateStreamingResponse(body, finalResponse, provider.name || providerName, req.chatCompletionCapture);
 
     const result = formatResponse(finalResponse, reply, body, fastify);
 
@@ -473,7 +474,8 @@ async function handleTransformerEndpoint(
 async function validateStreamingResponse(
   body: any,
   finalResponse: any,
-  providerName?: string
+  providerName?: string,
+  chat?: ChatCompletionCapture
 ): Promise<any> {
   if (!finalResponse?.body) {
     return finalResponse;
@@ -523,6 +525,10 @@ async function validateStreamingResponse(
 
   if (accText.includes("event: error")) {
     reader.releaseLock();
+    if (chat) {
+      chat.streamError = true;
+      chat.rateLimited = isRateLimitMessage(200, accText);
+    }
     const errMsg = accText.length < 500 ? accText : accText.slice(0, 500);
     throw createApiError(
       `Provider ${providerName} returned error in SSE stream: ${errMsg}`,
@@ -644,6 +650,7 @@ async function handleFallback(
     }
     attemptedFallbacks.add(`${originalProvider},${originalModel}`);
 
+    if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
     // Record failed primary model attempt in usage stats
     fastify.recordUsage?.({
       provider: originalProvider,
@@ -798,6 +805,7 @@ async function handleFallback(
       if (fallbackRuntime && pluginTerminalFailure(req, fallbackRuntime, { name: fbProviderName }, fbModel)) continue;
       let fallbackError: any;
       for (let attempt = 1; attempt <= 2; attempt++) {
+        if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
         try {
           req.log.info(`Trying fallback model: ${fbProviderName},${fbModel}${attempt > 1 ? " (retry)" : ""}`);
 
@@ -865,7 +873,7 @@ async function handleFallback(
             bypass,
             fbContext
           );
-          finalResponse = await validateStreamingResponse(newBody, finalResponse, fbProviderName);
+          finalResponse = await validateStreamingResponse(newBody, finalResponse, fbProviderName, req.chatCompletionCapture);
 
           req.log.info(`Fallback model ${fbProviderName},${fbModel} succeeded`);
 
@@ -929,6 +937,7 @@ async function handleFallback(
       healthStore.recordFailure(fbProviderName, fbModel, fallbackError?.message);
       req.log.warn(`Fallback model ${fbProviderName},${fbModel} failed after retry: ${fallbackError?.message}`);
 
+      if (req.chatCompletionCapture) delete req.chatCompletionCapture.unbookedAttempt;
       // Record failed fallback attempt in usage stats
       fastify.recordUsage?.({
         provider: fbProviderName,
@@ -1338,6 +1347,8 @@ async function sendProviderAttempt(
   );
   try {
     response = await dispatchUpstream();
+    const chat: ChatCompletionCapture | undefined = context.req.chatCompletionCapture;
+    if (chat) chat.unbookedAttempt = { provider: context.req.provider, model: context.req.body.model };
   } catch (sendError: any) {
     if (pluginRuntime) throw await pluginResponseError(pluginRuntime, 0, undefined, geminiSystemText(requestBody), describeTransportFailure(sendError), managedRequest);
     throw sendError;
@@ -1382,8 +1393,10 @@ async function sendProviderAttempt(
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
     );
+    const errorDetail = context.req.chatCompletionCapture && (isEventStreamResponse(response) || looksLikeSSE(errorText))
+      ? "Upstream SSE error" : errorText;
     const error = createApiError(
-      `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
+      `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorDetail}`,
       response.status,
       "provider_response_error"
     );
