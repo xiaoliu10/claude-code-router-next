@@ -106,6 +106,7 @@ function expectFinish(chunks: ReturnType<typeof chatChunks>, reason: string) {
   const choices = chunks.flatMap((chunk) => chunk.choices);
   expect(choices.filter((choice) => choice.finish_reason != null)).toHaveLength(1);
   expect(choices.at(-1)).toMatchObject({ index: 0, finish_reason: reason });
+  for (const chunk of chunks.filter((chunk) => chunk.choices.length)) expect(chunk.usage).toBeNull();
   expect(chunks.map((chunk) => chunk.usage)).toContainEqual(expect.objectContaining(chatUsage));
 }
 
@@ -116,6 +117,24 @@ describe("/v1/chat/completions with a native Anthropic upstream", () => {
     const chunks = chatChunks(response.body);
     const choices = chunks.flatMap((chunk) => chunk.choices);
     expect(choices.map((choice) => choice.delta.content ?? "").join("")).toBe("hello");
+    expectFinish(chunks, "stop");
+  });
+
+  it.each(["\r", "\r\n"])("accepts native SSE with delimiter %j across reads", async (delimiter) => {
+    const response = await injectChat(true, (model) => {
+      const frames = [messageStart(model), ...textBlock, ...messageEnd("end_turn")];
+      const parts = frames.flatMap((frame) => ["event: " + frame.type, "data: " + JSON.stringify(frame), ""]);
+      const body = new ReadableStream<Uint8Array>({ start(controller) {
+        for (const line of parts) {
+          controller.enqueue(new TextEncoder().encode(line + "\r"));
+          if (delimiter.length === 2) controller.enqueue(Uint8Array.of(10));
+        }
+        controller.close();
+      } });
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    });
+    const chunks = chatChunks(response.body);
+    expect(chunks.flatMap(chunk => chunk.choices.map((c: any) => c.delta.content ?? "")).join("")).toBe("hello");
     expectFinish(chunks, "stop");
   });
 

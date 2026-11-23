@@ -77,6 +77,7 @@ function chatStream(body: ReadableStream<Uint8Array>, cacheMode: CacheMode, incl
   let nextTool = 0;
   const tools = new Map<number, { index: number; hasArguments: boolean }>();
   let pendingLine = "";
+  let previousEndedWithCR = false;
   let eventName = "";
   let dataLines: string[] = [];
 
@@ -86,7 +87,7 @@ function chatStream(body: ReadableStream<Uint8Array>, cacheMode: CacheMode, incl
   }
   function chunk(output: Output, delta: Record<string, unknown>, finish: string | null = null) {
     if (!identity) throw new Error("Expected Anthropic message_start before a Chat chunk");
-    emit(output, { ...identity, ...envelope, choices: [{ index: 0, delta, finish_reason: finish }] });
+    emit(output, { ...identity, ...envelope, ...(includeUsage && { usage: null }), choices: [{ index: 0, delta, finish_reason: finish }] });
   }
   function handleEvent(event: MessageStreamEvent, output: Output) {
     switch (event.type) {
@@ -152,10 +153,14 @@ function chatStream(body: ReadableStream<Uint8Array>, cacheMode: CacheMode, incl
 
   return body.pipeThrough(new TextDecoderStream()).pipeThrough(new TransformStream<string, Uint8Array>({
     transform(text, output) {
-      const lines = (pendingLine + text).split("\n");
+      if (!text) return;
+      // Consume CR immediately (it can delimit a complete final event). A
+      // following LF belongs to the same delimiter, even across reads.
+      if (previousEndedWithCR && text.startsWith("\n")) text = text.slice(1);
+      previousEndedWithCR = text.endsWith("\r");
+      const lines = (pendingLine + text).split(/\r\n|[\r\n]/);
       pendingLine = lines.pop()!;
-      for (const raw of lines) {
-        const line = raw.replace(/\r$/, "");
+      for (const line of lines) {
         if (line.startsWith("event:")) eventName = line.slice(6).trim();
         if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
         if (line !== "") continue;
