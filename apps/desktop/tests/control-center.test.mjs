@@ -250,6 +250,50 @@ test("routing: saves serialize; second save uses the revision from the first res
   assert.equal(c.state().snapshot.revision, "rev-3")
 })
 
+test("routing: batch conflict preserves drafts and a retry preserves later edits", async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createRoutingController({ invoke: ipc.fn })
+  c.refresh()
+  ipc.resolve(0, routingSnap()); await flush()
+  const opus = Q.routeKey('opus', 'default')
+  const sonnet = Q.routeKey('sonnet', 'default')
+  c.setTarget(opus, 'beta,b1')
+  c.setTarget(sonnet, 'alpha,a1')
+  c.saveGroups(); c.saveGroups(); c.refresh()
+  assert.equal(ipc.calls.length, 2)
+  ipc.reject(1, 'stale revision'); await flush()
+  assert.deepEqual(plain(c.state().dirtyGroupKeys), [opus, sonnet])
+  assert.equal(c.state().saveError.message, 'stale revision')
+  c.refresh()
+  const fresh = routingSnap({ revision: 'rev-2' })
+  ipc.resolve(2, fresh); await flush()
+  c.saveGroups()
+  const batch = plain(ipc.calls[3].args.changes)
+  assert.ok(batch.every(change => change.revision === 'rev-2'))
+  c.setTarget(opus, 'alpha,a2') // Revert to the old snapshot while the batch is in flight.
+  c.addFallback(sonnet, 'beta,b1')
+  ipc.resolve(3, bumpRev(batch.reduce(applyRoutingChange, fresh))); await flush()
+  assert.deepEqual(plain(c.state().dirtyGroupKeys), [opus, sonnet])
+  assert.equal(c.state().draft(opus).target, 'alpha,a2')
+  assert.deepEqual(plain(c.state().draft(sonnet).fallback), ['beta,b1'])
+});
+
+test("routing: a successful row save clears the old group error but keeps group drafts", async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createRoutingController({ invoke: ipc.fn })
+  const original = routingSnap()
+  c.refresh()
+  ipc.resolve(0, original); await flush()
+  const opus = Q.routeKey('opus', 'default')
+  const global = Q.routeKey('global', 'default')
+  c.setTarget(opus, 'beta,b1'); c.saveGroups()
+  ipc.reject(1, 'Could not save model groups'); await flush()
+  c.setTarget(global, 'alpha,a2'); c.saveRow(global)
+  ipc.resolve(2, bumpRev(applyRoutingChange(original, ipc.calls[2].args.change))); await flush()
+  assert.equal(c.state().saveError, null)
+  assert.deepEqual(plain(c.state().dirtyGroupKeys), [opus])
+});
+
 test("routing: flags payload carries both flags and revision; failure keeps canonical state", async () => {
   const ipc = fakeInvoke()
   const c = Q.createRoutingController({ invoke: ipc.fn })

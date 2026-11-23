@@ -206,9 +206,9 @@ test("preview: routing_save applies target/fallback/clear and rejects stale revi
   assert.equal(updated.target, "beta,glm-5")
   assert.deepEqual(Array.from(updated.fallback), ["alpha,claude-sonnet-4-5"], "null fallback preserved")
 
-  // empty target clears the override
+  // Clearing target and fallback removes the override.
   const cleared = await previewCall(invoke, "routing_save", {
-    change: { revision: again.revision, scope: "opus", field: "webSearch", target: null, fallback: null },
+    change: { revision: again.revision, scope: "opus", field: "webSearch", target: null, fallback: [] },
   })
   assert.equal(cleared.routes.find((r) => r.scope === "opus" && r.field === "webSearch"), undefined, "cleared override removed")
 
@@ -222,6 +222,26 @@ test("preview: routing_save applies target/fallback/clear and rejects stale revi
     previewCall(invoke, "routing_save", { change: { revision: currentRev, scope: "global", field: "", target: "a,b", fallback: null } }),
     /字段/,
   )
+})
+
+test("preview: group saves validate the whole batch and preserve fallback-only routes", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const before = await previewCall(invoke, "routing_snapshot", {})
+  const opus = { revision: before.revision, scope: "opus", field: "default", target: null, fallback: null }
+  const sonnet = { revision: before.revision, scope: "sonnet", field: "think", target: "beta.example.com,glm-5", fallback: [] }
+  for (const invalid of [[], [opus, { ...opus, field: " default " }], [opus, { ...sonnet, field: "background" }], [opus, { ...sonnet, revision: "stale" }]]) {
+    await assert.rejects(previewCall(invoke, "routing_save_groups", { changes: invalid }))
+  }
+  const unchanged = await previewCall(invoke, "routing_snapshot", {})
+  assert.equal(unchanged.revision, before.revision)
+  assert.equal(unchanged.routes.find(r => r.scope === "opus" && r.field === "default").target,
+    before.routes.find(r => r.scope === "opus" && r.field === "default").target)
+  const after = await previewCall(invoke, "routing_save_groups", { changes: [opus, sonnet] })
+  assert.notEqual(after.revision, before.revision)
+  const fallbackOnly = after.routes.find(r => r.scope === "opus" && r.field === "default")
+  assert.equal(fallbackOnly.target, null)
+  assert.deepEqual(Array.from(fallbackOnly.fallback), Array.from(before.routes.find(r => r.scope === "opus" && r.field === "default").fallback))
+  assert.equal(after.routes.find(r => r.scope === "sonnet" && r.field === "think").target, sonnet.target)
 })
 
 test("preview: routing_flags toggles both flags and returns a fresh snapshot", async () => {

@@ -156,6 +156,45 @@ test('interaction: background is editable only in global routing, including with
   }
 });
 
+test('interaction: one save button commits edits across model groups only', async () => {
+  const h = harness({ routing_save_groups: ({ changes }) => {
+    for (const change of changes) h.route.routes.push(change);
+    h.route.revision = '2';
+    return structuredClone(h.route);
+  } });
+  await flush(); h.id('tab-routing').click(); await flush();
+  const body = h.id('routing-body');
+  const save = h.id('routing-save-groups');
+  const selectScope = scope => h.id('routing-scopes').querySelectorAll('[data-scope]')
+    .find(button => button.dataset.scope === scope).click();
+  const edit = (key, value) => {
+    const input = body.querySelectorAll('.route').find(row => row.dataset.key === key).querySelector('.route-input');
+    input.value = value;
+    input.fire('input');
+  };
+  assert.equal(save.hidden, true);
+  edit('global|default', 'alpha,two');
+  selectScope('opus');
+  assert.equal(save.disabled, true);
+  assert.equal(body.querySelectorAll('.route-save').length, 0);
+  edit('opus|default', 'alpha,one');
+  edit('opus|think', 'alpha,two');
+  selectScope('sonnet');
+  edit('sonnet|default', 'alpha,two');
+  assert.equal(save.textContent, '保存模型组（3 项）');
+  save.click(); await flush();
+  const writes = h.calls.filter(call => call.cmd.startsWith('routing_save'));
+  assert.deepEqual(writes.map(call => call.cmd), ['routing_save_groups']);
+  assert.deepEqual(Array.from(writes[0].args.changes, x => [x.scope, x.field, x.revision]), [
+    ['opus', 'default', '1'], ['opus', 'think', '1'], ['sonnet', 'default', '1'],
+  ]);
+  assert.equal(save.disabled, true);
+  assert.match(h.id('routing-msg').textContent, /已保存 3 项/);
+  selectScope('global');
+  assert.equal(body.querySelector('.route-input').value, 'alpha,two');
+  assert.equal(body.querySelector('.route-save').disabled, false);
+});
+
 test('interaction: fallback add fires once, keyboard add, move/remove and explicit save', async () => {
   const h = harness(); await flush(); h.id('tab-routing').click(); await flush();
   const card = h.id('routing-body').children[0];
