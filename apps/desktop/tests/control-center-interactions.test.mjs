@@ -67,7 +67,7 @@ class Element {
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
 }
-export function harness(overrides = {}) {
+export function harness(overrides = {}, options = {}) {
   const doc = { readyState: 'loading', activeElement: null, events: {},
     addEventListener(type, fn) { this.events[type] = fn; },
     createElement(tag) { return new Element(tag, this); },
@@ -92,6 +92,7 @@ export function harness(overrides = {}) {
   const responses = {
     quota_snapshot: () => ({ providers: [], online: false, error: null, updatedAt: null }),
     service_snapshot: () => ({ mode: 'external', running: true, message: '' }),
+    config_reload: () => ({ success: true, restartRequired: [] }),
     routing_snapshot: () => structuredClone(route),
     routing_save: args => {
       const c = args.change; route.revision = String(+route.revision + 1);
@@ -109,7 +110,8 @@ export function harness(overrides = {}) {
     calls.push({ cmd, args });
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };
-  vm.runInNewContext(projectsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, setTimeout, setInterval, clearInterval });
+  // options.setTimeout lets tests capture toast auto-hide timers deterministically.
+  vm.runInNewContext(projectsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, setTimeout: options.setTimeout || setTimeout, setInterval, clearInterval });
   doc.events.DOMContentLoaded();
   return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus() };
 }
@@ -416,4 +418,81 @@ test('interaction: charts and records fall back to the shared empty note when a 
   assert.equal(numCell('成功率').textContent, '—', 'total=0 keeps the success rate unset');
   assert.equal(numCell('平均 TTFT').textContent, '—');
   assert.equal(numCell('生成速度').textContent, '—');
+});
+
+test('interaction: reload button sits between stop and refresh and reloads a running gateway once', async () => {
+  const h = harness(); await flush();
+  const ids = h.id('service-reload').parentNode.children.map(n => n.getAttribute('id'));
+  assert.ok(ids.indexOf('service-stop') < ids.indexOf('service-reload'), 'reload after stop');
+  assert.ok(ids.indexOf('service-reload') < ids.indexOf('service-refresh'), 'reload before refresh');
+  assert.equal(h.id('service-reload').disabled, false, 'external running gateway is reloadable');
+  h.id('service-reload').click(); await flush();
+  assert.equal(h.calls.filter(c => c.cmd === 'config_reload').length, 1);
+  assert.equal(h.id('service-reload-msg').hidden, false);
+  assert.equal(h.id('service-reload-msg').textContent, '配置已重载');
+  assert.equal(h.id('service-reload').disabled, false, 're-enabled after success');
+});
+
+test('interaction: reload success lists restart-required keys', async () => {
+  const h = harness({ config_reload: () => ({ success: true, restartRequired: ['PORT', 'HOST'] }) }); await flush();
+  h.id('service-reload').click(); await flush();
+  assert.equal(h.id('service-reload-msg').textContent, '配置已重载；PORT/HOST 变更需停止后重新启动服务才能生效');
+  assert.equal(h.id('service-reload-msg').getAttribute('data-tone'), 'warn');
+});
+
+test('interaction: reload is disabled when the service is stopped', async () => {
+  const h = harness({ service_snapshot: () => ({ mode: 'stopped', running: false, message: '' }) }); await flush();
+  assert.equal(h.id('service-reload').disabled, true);
+  h.id('service-reload').click(); await flush();
+  assert.equal(h.calls.some(c => c.cmd === 'config_reload'), false);
+});
+
+test('interaction: pending reload disables repeat clicks until the call settles', async () => {
+  let resolveReload;
+  const h = harness({ config_reload: () => new Promise(resolve => { resolveReload = resolve; }) }); await flush();
+  h.id('service-reload').click();
+  assert.equal(h.id('service-reload').disabled, true, 'pending reload disables the button');
+  h.id('service-reload').click(); await flush();
+  assert.equal(h.calls.filter(c => c.cmd === 'config_reload').length, 1, 'no repeat call while pending');
+  resolveReload({ success: true, restartRequired: [] }); await flush();
+  assert.equal(h.id('service-reload').disabled, false);
+  assert.equal(h.id('service-reload-msg').textContent, '配置已重载');
+});
+
+test('interaction: failed reload shows the error toast and re-enables the button', async () => {
+  const h = harness({ config_reload: () => Promise.reject(new Error('Config reload failed')) }); await flush();
+  h.id('service-reload').click(); await flush();
+  assert.equal(h.id('service-reload-msg').textContent, '重载配置失败：Config reload failed');
+  assert.equal(h.id('service-reload-msg').getAttribute('data-tone'), 'error');
+  assert.equal(h.id('service-reload').disabled, false);
+});
+
+test('interaction: reload is disabled while a service action is pending', async () => {
+  let resolveAction;
+  const h = harness({
+    service_snapshot: () => ({ mode: 'owned', running: true, message: '' }),
+    service_action: () => new Promise(resolve => { resolveAction = resolve; }),
+  }); await flush();
+  assert.equal(h.id('service-reload').disabled, false);
+  h.id('service-stop').click();
+  assert.equal(h.id('service-reload').disabled, true, 'busy service state disables reload');
+  await flush(); // the deferred service_action factory runs on a microtask
+  resolveAction({ mode: 'stopped', running: false, message: '' }); await flush();
+  assert.equal(h.id('service-reload').disabled, true, 'stopped gateway stays disabled');
+});
+
+test('interaction: reload toast auto-hides after 5s and stale timers never hide newer messages', async () => {
+  const timers = [];
+  const h = harness({}, { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; } });
+  await flush();
+  h.id('service-reload').click(); await flush();
+  assert.equal(h.id('service-reload-msg').hidden, false);
+  assert.deepEqual(timers.map(t => t.ms), [5000], 'one deterministic auto-hide timer per message');
+  h.id('service-reload').click(); await flush();
+  assert.equal(timers.length, 2);
+  timers[0].fn(); // stale auto-hide from the first message
+  assert.equal(h.id('service-reload-msg').hidden, false, 'stale timer keeps the newer message');
+  timers[1].fn();
+  assert.equal(h.id('service-reload-msg').hidden, true);
+  assert.equal(h.calls.filter(c => c.cmd === 'config_reload').length, 2);
 });

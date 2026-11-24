@@ -294,6 +294,14 @@ test("preview: service_snapshot/service_action follow the lifecycle contract", a
   await assert.rejects(previewCall(invoke, "service_action", { action: "reboot" }), /无效/)
 })
 
+test("preview: config_reload follows the {success, restartRequired} contract", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const r = await previewCall(invoke, "config_reload", {})
+  assert.equal(r.success, true)
+  assert.ok(Array.isArray(r.restartRequired))
+  for (const k of r.restartRequired) assert.ok(["PORT", "HOST"].includes(k), `restart key ${k} is a known contract key`)
+})
+
 test("preview: quota_credentials_status/save follow the {name, configured} contract without secrets", async () => {
   const invoke = Q.createPreviewInvoke()
   const assertStatus = (s, label) => {
@@ -388,7 +396,7 @@ test("wiring: routing scope buttons and service controls exist", () => {
   for (const scope of Q.ROUTING_SCOPES) {
     assert.ok(html.includes(`data-scope="${scope}"`), `scope button ${scope} present`)
   }
-  for (const id of ["service-chip", "service-text", "service-start", "service-stop", "service-refresh"]) {
+  for (const id of ["service-chip", "service-text", "service-start", "service-stop", "service-reload", "service-reload-msg", "service-refresh"]) {
     assert.ok(ids.has(id), `${id} exists`)
   }
 })
