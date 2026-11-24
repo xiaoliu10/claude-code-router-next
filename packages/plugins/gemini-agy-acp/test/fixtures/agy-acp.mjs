@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { appendFileSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -67,17 +68,68 @@ if (argv[0] === '--version') {
   let denied = new Set();
   const mcpBySession = new Map();
   const toolSettledBySession = new Map();
+  // The raised call of a session while its result is still travelling back
+  // over the stdio bridge: sessionId → promise that settles once the result
+  // is recorded.
+  const callInFlightBySession = new Map();
+  const mcpChildren = new Set();
+  const killMcpChildren = () => { for (const child of mcpChildren) child.kill('SIGKILL'); };
+  // Adopt the session's stdio MCP server exactly as the real agent does:
+  // spawn the given command with the given env merged over a minimal env and
+  // speak newline JSON-RPC over its stdin/stdout.
+  const adoptMcp = async server => {
+    assert.equal(server.name, 'ccr-caller-tools');
+    assert.equal(typeof server.command, 'string');
+    assert.ok(server.command.length > 0);
+    assert.ok(Array.isArray(server.args));
+    assert.ok(Array.isArray(server.env));
+    const env = { PATH: process.env.PATH };
+    for (const entry of server.env) {
+      assert.equal(typeof entry.name, 'string');
+      assert.equal(typeof entry.value, 'string');
+      env[entry.name] = entry.value;
+    }
+    assert.ok(env.CCR_MCP_ENDPOINT);
+    assert.ok(env.CCR_MCP_TOKEN);
+    // The bearer token travels in env only, never on the command line.
+    assert.ok(!server.args.some(arg => arg.includes(env.CCR_MCP_TOKEN)));
+    const child = spawn(server.command, server.args, { env, stdio: ['pipe', 'pipe', 'ignore'] });
+    mcpChildren.add(child);
+    const pending = new Map();
+    const settleAll = () => {
+      for (const { reject } of pending.values()) reject(new Error('mcp server went away'));
+      pending.clear();
+    };
+    child.on('exit', () => { mcpChildren.delete(child); settleAll(); });
+    child.stdin.on('error', settleAll);
+    createInterface({ input: child.stdout }).on('line', line => {
+      const message = JSON.parse(line);
+      const entry = pending.get(message.id);
+      if (!entry) return;
+      pending.delete(message.id);
+      entry.resolve(message);
+    });
+    let nextId = 0;
+    const request = (method, params) => new Promise((resolve, reject) => {
+      const id = ++nextId;
+      pending.set(id, { resolve, reject });
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    });
+    const notify = method => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method }) + '\n');
+    const initialized = await request('initialize', { protocolVersion: '2025-11-25', capabilities: {},
+      clientInfo: { name: 'agy-fixture', version: '1.5.1' } });
+    assert.equal(initialized.result.protocolVersion, '2025-11-25');
+    notify('notifications/initialized');
+    return { request };
+  };
   const mcp = async (method, params) => {
     const target = mcpBySession.get(sessionId);
     // A text-only session was given no bridge: a real agent would simply not
     // have this tool available, so report that instead of crashing.
     if (!target) throw new Error('no MCP bridge for this session');
-    const response = await fetch(target.url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${target.token}` },
-      body: JSON.stringify({ jsonrpc: '2.0', id: Math.random(), method, params }),
-    });
-    return (await response.json()).result;
+    const response = await target.request(method, params);
+    if (response.error) throw new Error(response.error.message);
+    return response.result;
   };
   function configOptions() {
     const options = [{ id: mode === 'wrong-category' ? 'model' : 'agentModel', category: mode === 'wrong-category' ? 'mode' : 'model', type: 'select', currentValue: model, options: [
@@ -92,6 +144,12 @@ if (argv[0] === '--version') {
   const chunk = (text, sid = sessionId) => send({ method: 'session/update', params: { sessionId: sid,
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } });
   const input = createInterface({ input: process.stdin });
+  if (mcpMode) {
+    // Spawned forwarders never outlive the agent: session end (stdin close)
+    // and any process exit kill them.
+    process.on('exit', killMcpChildren);
+    input.on('close', () => { killMcpChildren(); process.exit(0); });
+  }
   input.on('line', async line => {
     const { id, method, params, result, error } = JSON.parse(line);
     assert.equal(JSON.parse(line).jsonrpc, '2.0');
@@ -154,16 +212,12 @@ if (argv[0] === '--version') {
       sessionNumber++;
       sessionId = mode === 'duplicate-session' ? 'one' : `sess-${sessionNumber}`;
       if (mcpMode) {
-        // Adopt the caller's MCP server exactly as a real agent does, so the
-        // fixture can call the tool over HTTP like the production agent would.
         // The bridge is per session: two interleaved conversations must each
-        // talk to the bridge their own session was given. A text-only session
-        // advertises nothing, which a real agent also serves without tools.
+        // talk to the forwarder their own session was given. A text-only
+        // session advertises nothing, which a real agent also serves without
+        // tools.
         const [server] = params.mcpServers;
-        if (server) {
-          assert.equal(server.type, 'http');
-          mcpBySession.set(sessionId, { url: server.url, token: server.headers[0].value.replace('Bearer ', '') });
-        }
+        if (server) mcpBySession.set(sessionId, await adoptMcp(server));
       } else {
         assert.deepEqual(params.mcpServers, []);
       }
@@ -222,6 +276,11 @@ if (argv[0] === '--version') {
             reply({ stopReason: 'max_tokens' });
             return;
           }
+          // A resume prompt can arrive while the parked call's result is still
+          // travelling back over the stdio bridge. The real agent finishes its
+          // in-flight turn before acting on a new prompt, so let the raised
+          // call settle first instead of treating the resume as a fresh turn.
+          if (callInFlightBySession.has(sessionId)) await callInFlightBySession.get(sessionId);
           if (mcpMode && !toolSettledBySession.has(sessionId)) {
             // Discover the caller's tools over MCP, then raise a call. The call
             // stays parked until the caller answers, so this prompt never
@@ -236,9 +295,14 @@ if (argv[0] === '--version') {
               .catch(() => ({ content: [{ type: 'text', text: 'bridge closed' }], isError: true }));
             send({ method: 'session/update', params: { sessionId, update: { sessionUpdate: 'tool_call',
               toolCallId: 'agent-side-id', title: 'lookup', rawInput: { key: 'answer' } } } });
-            const settled = await call;
-            record('mcp-call', { text: settled.content?.[0]?.text, isError: settled.isError === true });
-            toolSettledBySession.set(sessionId, settled.content?.[0]?.text ?? '');
+            const settling = (async () => {
+              const settled = await call;
+              record('mcp-call', { text: settled.content?.[0]?.text, isError: settled.isError === true });
+              toolSettledBySession.set(sessionId, settled.content?.[0]?.text ?? '');
+            })();
+            callInFlightBySession.set(sessionId, settling);
+            await settling;
+            callInFlightBySession.delete(sessionId);
             chunk(toolSettledBySession.get(sessionId) ?? '');
             reply({ stopReason: 'end_turn' });
             return;

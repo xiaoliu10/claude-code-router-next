@@ -293,16 +293,18 @@ class Worker {
    * One ACP turn.
    *
    * When the caller declared tools, `bridge` is the live MCP bridge the plugin
-   * already started; its descriptor goes into `session/new` so the agent can
-   * discover the tools, and the session stays warm in `this.binding` while a
-   * call is parked, so a follow-up request can resume the same ACP turn.
+   * already started; its stdio descriptor goes into `session/new` so the agent
+   * spawns the forwarder and discovers the tools through it (the agent's HTTP
+   * MCP path does not surface bridged tools to the model), and the session
+   * stays warm in `this.binding` while a call is parked, so a follow-up
+   * request can resume the same ACP turn.
    */
   async turn({ model, thinking, prompt, onText, onToolCall, bridge, resume }, apiKey) {
     if (!this.rpc) await this.start(apiKey);
     this.check();
     const cwd = await mkdtemp(join(this.authMethod === OAUTH_METHOD ? tmpdir() : this.root, 'session-'));
     const hasTools = !!bridge && !bridge.empty;
-    const descriptor = hasTools ? bridge.descriptor() : undefined;
+    const descriptor = hasTools ? bridge.stdioDescriptor() : undefined;
     const mcpServers = descriptor ? [descriptor] : [];
     let sessionId;
     try {
@@ -549,8 +551,10 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
       if (typeof prompt !== 'string' || typeof model !== 'string' || !model || model.length > 1024 ||
           (thinking != null && (typeof thinking !== 'string' || !thinking || thinking.length > 128)) ||
           typeof onText !== 'function') throw new AcpError('invalid_request');
-      // A bridge is the plugin's own object; only shape is checked here.
-      if (bridge != null && (typeof bridge.descriptor !== 'function' || !(bridge.pending instanceof Map))) {
+      // A bridge is the plugin's own object; only shape is checked here. Both
+      // descriptors are required: stdio for session/new, HTTP for internal use.
+      if (bridge != null && (typeof bridge.descriptor !== 'function' || typeof bridge.stdioDescriptor !== 'function' ||
+          !(bridge.pending instanceof Map))) {
         throw new AcpError('invalid_request');
       }
       if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) throw new AcpError('input_limit');

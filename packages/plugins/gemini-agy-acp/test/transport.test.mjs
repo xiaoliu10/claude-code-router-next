@@ -532,8 +532,8 @@ test('session/new eagerly connects the bridge only when antigravity meta is adve
     const parked = await transport.run({ ...input, prompt: 'go', onToolCall() {}, bridge });
     assert.equal(parked.parked.length, 1);
     const session = (await events()).find(record => record.event === 'session/new');
-    // The eager name is exactly the descriptor's server name.
-    assert.deepEqual(session.meta, { antigravity: { eagerMcpServers: [bridge.descriptor().name] } });
+    // The eager name is exactly the stdio descriptor's server name.
+    assert.deepEqual(session.meta, { antigravity: { eagerMcpServers: [bridge.stdioDescriptor().name] } });
     assert.equal(session.meta.antigravity.eagerMcpServers[0], 'ccr-caller-tools');
   });
   await t.test('a live bridge without the advertised capability', async t => {

@@ -5,12 +5,17 @@
  * (e.g. Pi) executes the tool and returns its result on the next request. The
  * bridge never executes a tool itself.
  *
+ * This HTTP server is an internal backend: `session/new` advertises the stdio
+ * forwarder (agy-mcp-stdio-bridge.mjs), which the agent spawns and which
+ * relays its JSON-RPC here. The HTTP descriptor stays for internal callers.
+ *
  * Security: listens on 127.0.0.1 only, on an ephemeral port, and requires a
  * random per-bridge bearer token compared with timingSafeEqual. Request bodies
  * and advertised schemas are bounded.
  */
 import { createServer } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { fitToolsToBudget } from './agy-tool-budget.mjs';
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -236,6 +241,25 @@ export class AgyToolBridge {
       name: 'ccr-caller-tools',
       url: this.url,
       headers: [{ name: 'Authorization', value: `Bearer ${this.token}` }],
+    };
+  }
+
+  /**
+   * ACP stdio MCP server for `session/new`: the agent spawns the forwarder
+   * with the current node runtime (no shell) and reaches this bridge through
+   * it. The endpoint and bearer token travel in env, never on the command
+   * line. The forwarder file sits next to this module in src and dist alike.
+   */
+  stdioDescriptor() {
+    if (!this.url) throw new Error('bridge_not_listening');
+    return {
+      name: 'ccr-caller-tools',
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./agy-mcp-stdio-bridge.mjs', import.meta.url))],
+      env: [
+        { name: 'CCR_MCP_ENDPOINT', value: this.url },
+        { name: 'CCR_MCP_TOKEN', value: this.token },
+      ],
     };
   }
 
