@@ -422,6 +422,23 @@ test('a spawned worker receives the configured proxy end-to-end', async t => {
   await transport.close();
 });
 
+test('retireIdle lets an in-flight turn finish and retires idle workers for a fresh spawn', async t => {
+  const hanging = await setup(t, 'hang-init');
+  const pending = hanging.transport.run(input);
+  await delay(80);
+  await hanging.transport.retireIdle();
+  const state = await Promise.race([pending.then(() => 'done', () => 'err'), delay(120).then(() => 'pending')]);
+  assert.equal(state, 'pending');
+  await hanging.transport.close();
+  await assert.rejects(pending);
+  const { transport, events } = await setup(t, 'ok');
+  await transport.run(input);
+  await transport.retireIdle();
+  await transport.run(input);
+  assert.equal((await events()).filter(record => record.event === 'spawn').length, 2);
+  await transport.close();
+});
+
 test('model sync is bounded and fails closed on protocol deviations', async t => {
   const hanging = await setup(t, 'hang-version');
   await rejects(syncModelOptions({ binary: hanging.binary, apiKey: 'fixture-value' }), 'timeout', 504);

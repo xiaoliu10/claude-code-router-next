@@ -90,6 +90,9 @@ function interpolateString(value) {
 // mtime-gated snapshot cache: the request path must not re-read and re-parse
 // the whole config on every turn. Keyed by host so tests stay isolated.
 const configSnapshots = new WeakMap();
+// Dedupe rejected-proxy diagnostics per host: a persistent bad value must
+// not warn on every turn.
+const proxyWarnState = new WeakMap();
 
 async function readConfigSnapshot(host) {
   // Non-fatal raw read only: readConfigFile exits the process on parse errors
@@ -102,7 +105,17 @@ async function readConfigSnapshot(host) {
     const cached = configSnapshots.get(host);
     if (cached && cached.key === cacheKey) return cached.raw;
   } catch { /* no usable stat: read uncached */ }
-  const raw = await host.readRawConfig();
+  // One retry softens the torn-read window of the core's non-atomic save.
+  let raw;
+  try {
+    raw = await host.readRawConfig();
+  } catch {
+    try {
+      raw = await host.readRawConfig();
+    } catch {
+      return undefined;
+    }
+  }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   if (cacheKey) configSnapshots.set(host, { key: cacheKey, raw });
   return raw;
@@ -120,16 +133,25 @@ export async function resolveProxyUrl(host, providerName = 'gemini-agy-acp', log
   for (const key of PROXY_URL_KEYS) {
     const value = raw[key];
     if (value === undefined || value === null) continue;
-    const normalized = String(value).trim();
-    if (normalized) { proxyUrl = interpolateString(normalized); break; }
+    // Interpolate before trimming, matching the core read-then-normalize order.
+    const normalized = interpolateString(String(value)).trim();
+    if (normalized) { proxyUrl = normalized; break; }
   }
   if (!proxyUrl) return undefined;
   if (!/^https?:\/\//i.test(proxyUrl)) {
     // Diagnostics carry the scheme or the placeholder fact only — never the
     // value, which can embed credentials.
     const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(proxyUrl)?.[1];
-    if (scheme) log?.warn?.(`gemini-agy-acp ignored a configured proxy with unsupported scheme (${scheme})`);
-    else if (proxyUrl.startsWith('$')) log?.warn?.('gemini-agy-acp ignored a configured proxy with an unresolved environment placeholder');
+    const kind = scheme ? 'scheme:' + scheme : proxyUrl.startsWith('$') ? 'placeholder' : null;
+    if (kind) {
+      const last = host && typeof host === 'object' ? proxyWarnState.get(host) : undefined;
+      if (last !== kind) {
+        if (host && typeof host === 'object') proxyWarnState.set(host, kind);
+        log?.warn?.(scheme
+          ? 'gemini-agy-acp ignored a configured proxy with unsupported scheme (' + scheme + ')'
+          : 'gemini-agy-acp ignored a configured proxy with an unresolved environment placeholder');
+      }
+    }
     return undefined;
   }
   const flag = typeof raw.PROXY_GLOBAL_ENABLED === 'string' ? interpolateString(raw.PROXY_GLOBAL_ENABLED) : raw.PROXY_GLOBAL_ENABLED;
