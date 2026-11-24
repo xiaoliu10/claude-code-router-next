@@ -10,16 +10,18 @@ const { readConfigFileMock, writeConfigFileMock, backupConfigFileMock } = vi.hoi
   backupConfigFileMock: vi.fn(),
 }));
 
-// POST /api/config/reload reads ~/.claude-code-router/config.json through the
-// interpolated request-path reader. Keep this suite hermetic: the read result
-// is controlled per test, and the persistence spies prove the route never
-// writes to (or rotates backups of) a developer's real configuration.
+// POST /api/config/reload reads config.json through the non-exiting safe
+// reader. Keep this suite hermetic: the read result is controlled per test,
+// and the persistence spies prove the route never writes to (or rotates
+// backups of) a developer's real configuration. Real-file failure modes
+// (parse exit, ENOENT auto-create) are covered by config-reload-realfile.test.ts.
 vi.mock("../ccr/config", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../ccr/config")>();
   return {
     ...actual,
     backupConfigFile: backupConfigFileMock,
     readConfigFile: readConfigFileMock,
+    readConfigFileSafe: readConfigFileMock,
     writeConfigFile: writeConfigFileMock,
   };
 });
@@ -131,6 +133,16 @@ describe("POST /api/config/reload", () => {
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ success: true, restartRequired: ["PORT"] });
+  });
+
+  it("reports a HOST-only change in restartRequired", async () => {
+    server = await buildAdminRuntime();
+    readConfigFileMock.mockResolvedValue(reloadedConfig({ HOST: "0.0.0.0" }));
+
+    const res = await server.app.inject({ method: "POST", url: "/api/config/reload" });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ success: true, restartRequired: ["HOST"] });
   });
 
   it("answers a fixed 500 and leaves the runtime untouched when the read fails", async () => {

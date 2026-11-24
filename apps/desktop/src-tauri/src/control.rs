@@ -380,10 +380,28 @@ impl ControlService {
     /// fixed {success, restartRequired} contract; transport and non-200
     /// failures collapse to one safe message, never an upstream body.
     pub(crate) async fn config_reload(&self) -> Result<Value, String> {
-        self.client()?
+        let body = self
+            .client()?
             .post_json_and_parse("/api/config/reload")
             .await
-            .map_err(|_| ERR_CONFIG_RELOAD.to_string())
+            .map_err(|_| ERR_CONFIG_RELOAD.to_string())?;
+        // Project the declared contract only: in external mode the gateway can
+        // be any local process, so extra 200-body fields must never cross IPC.
+        if body.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(ERR_CONFIG_RELOAD.to_string());
+        }
+        let restart_required: Vec<String> = body
+            .get("restartRequired")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(json!({ "success": true, "restartRequired": restart_required }))
     }
 }
 
@@ -1892,13 +1910,32 @@ mod tests {
 
     #[tokio::test]
     async fn config_reload_returns_the_gateway_contract_json() {
-        let payload = json!({"success": true, "restartRequired": ["PORT"]});
-        let mock = Mock::new(vec![response(payload.clone())]);
+        let payload = json!({"success": true, "restartRequired": ["PORT"], "extra": "LEAK_SECRET"});
+        let mock = Mock::new(vec![response(payload)]);
         let service = ControlService::new(Some(mock.client()));
-        assert_eq!(service.config_reload().await.unwrap(), payload);
+        assert_eq!(
+            service.config_reload().await.unwrap(),
+            json!({"success": true, "restartRequired": ["PORT"]})
+        );
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("POST /api/config/reload "));
+    }
+
+    #[tokio::test]
+    async fn config_reload_rejects_non_contract_bodies() {
+        for body in [
+            json!(["array"]),
+            json!({"success": false}),
+            json!({"success": "yes"}),
+        ] {
+            let mock = Mock::new(vec![response(body)]);
+            let service = ControlService::new(Some(mock.client()));
+            assert_eq!(
+                service.config_reload().await.unwrap_err(),
+                ERR_CONFIG_RELOAD
+            );
+        }
     }
 
     #[tokio::test]

@@ -9,8 +9,8 @@ import { resolveProviderProxyUrl } from "../services/proxy";
  * existed, every managed subscription provider carried its own
  * copy — the plugin API exists to end exactly that kind of duplication.
  */
-export function reloadProviderRuntime(server: any, config: any, log: { info(msg: string): void; warn(msg: string): void; error(msg: string): void }): void {
-  if (!server?.configService) return;
+export function reloadProviderRuntime(server: any, config: any, log: { info(msg: string): void; warn(msg: string): void; error(msg: string): void }, sourceLabel = "Config saved"): boolean {
+  if (!server?.configService) return false;
   try {
     server.configService.reload();
     if (server.reloadProviders) server.reloadProviders(config);
@@ -37,7 +37,9 @@ export function reloadProviderRuntime(server: any, config: any, log: { info(msg:
       log,
       (key: string) => server.configService.get(key)
     );
+    return true;
   } catch (error: any) {
-    log.warn(`Config saved but runtime reload failed: ${error?.message || error}`);
+    log.warn(`${sourceLabel} but runtime reload failed: ${error?.message || error}`);
+    return false;
   }
 }

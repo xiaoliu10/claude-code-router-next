@@ -19,7 +19,7 @@ import { clearProviderHealth } from "./health-reconcile";
 import { reloadProviderRuntime } from "../provider-plugins/host";
 import { describeInstalledPlugins } from "../provider-plugins/loader";
 import { registerPluginMarketRoutes } from "./plugin-install-routes";
-import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
+import { readConfigFile, readConfigFileRaw, readConfigFileSafe, writeConfigFile, backupConfigFile } from "./config";
 import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -347,7 +347,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
 
     let newConfig: any;
     try {
-      newConfig = await readConfigFile();
+      newConfig = await readConfigFileSafe();
     } catch {
       reply.status(500);
       return { success: false, error: "config file unreadable" };
@@ -357,25 +357,35 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       return { success: false, error: "config file invalid" };
     }
 
+    let reloaded = false;
     try {
-      reloadProviderRuntime(server, newConfig, _app.log);
-      // configService.reload() inside reloadProviderRuntime replays its own
-      // sources (JSON file / initialConfig). Overlay the interpolated config
-      // just read so runtime values (e.g. Router) match the request-path read
-      // even when the JSON source is disabled or holds un-interpolated values.
-      for (const [key, value] of Object.entries(newConfig)) {
-        server.configService.set(key, value);
+      reloaded = reloadProviderRuntime(server, newConfig, _app.log, "Config reload requested");
+      if (reloaded) {
+        // configService.reload() inside reloadProviderRuntime replays its own
+        // sources (JSON file / initialConfig). Overlay the interpolated config
+        // just read so runtime values (e.g. Router) match the request-path read
+        // even when the JSON source is disabled or holds un-interpolated values.
+        for (const [key, value] of Object.entries(newConfig)) {
+          server.configService.set(key, value);
+        }
       }
     } catch (error: any) {
       _app.log?.warn?.(`Config reload failed: ${error?.message || error}`);
+      reloaded = false;
+    }
+    if (!reloaded) {
       reply.status(500);
       return { success: false, error: "runtime reload failed" };
     }
 
     // Listener settings cannot be hot-applied; report them so the caller can
-    // prompt for a restart. Missing vs present counts as a change.
+    // prompt for a restart. Missing vs present counts as a change. Compare as
+    // strings so an interpolated "$PORT" ("3456") matches the numeric listener
+    // port. Listener values forced at startup (HOST without APIKEY, the
+    // SERVICE_PORT override) can differ from the file even when it is
+    // unchanged; such setups will report a restart on every reload.
     const restartRequired = (["PORT", "HOST"] as const).filter(
-      (key) => JSON.stringify(before[key]) !== JSON.stringify(newConfig[key])
+      (key) => String(before[key]) !== String(newConfig[key])
     );
     return { success: true, restartRequired };
   });
