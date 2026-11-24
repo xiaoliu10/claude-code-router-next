@@ -84,19 +84,12 @@ export function proxyEnvOverlay(env, proxyUrl) {
     // NO_PROXY exclusion the injected http_proxy could route the agent's
     // local tools/list and tools/call through the upstream proxy.
     const loopback = ['127.0.0.1', 'localhost', '::1'];
-    const existing = env.NO_PROXY || env.no_proxy;
-    if (!existing) {
-      overlay.NO_PROXY = loopback.join(',');
-      overlay.no_proxy = loopback.join(',');
-    } else {
-      const entries = existing.split(',').map(item => item.trim()).filter(Boolean);
-      const missing = loopback.filter(host => !entries.includes(host));
-      if (missing.length) {
-        const merged = [...entries, ...missing].join(',');
-        overlay.NO_PROXY = merged;
-        overlay.no_proxy = merged;
-      }
-    }
+    const entries = (env.NO_PROXY || env.no_proxy || '').split(',').map(item => item.trim()).filter(Boolean);
+    const missing = loopback.filter(host => !entries.includes(host));
+    // Mirror both case variants so a lowercase-only client also exempts loopback.
+    const merged = [...entries, ...missing].join(',');
+    overlay.NO_PROXY = merged;
+    overlay.no_proxy = merged;
   }
   return Object.keys(overlay).length ? overlay : undefined;
 }

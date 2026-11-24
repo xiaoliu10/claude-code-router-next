@@ -459,13 +459,15 @@ test('createTransport rejects unsupported proxy values before any spawn', async 
 });
 
 test('oauth worker environment applies the same proxy fallback and respects ALL_PROXY', async t => {
-  const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'];
+  const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
   const previous = new Map(keys.map(key => [key, process.env[key]]));
   t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
   for (const key of keys) delete process.env[key];
   const env = oauthEnvironment('http://127.0.0.1:7897');
   assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:7897');
   assert.equal(env.https_proxy, 'http://127.0.0.1:7897');
+  assert.equal(env.NO_PROXY, '127.0.0.1,localhost,::1');
+  assert.equal(env.no_proxy, '127.0.0.1,localhost,::1');
   process.env.ALL_PROXY = 'http://127.0.0.1:2';
   const all = oauthEnvironment('http://127.0.0.1:7897');
   assert.equal(all.HTTPS_PROXY, undefined);
