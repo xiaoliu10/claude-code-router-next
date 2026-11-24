@@ -38,6 +38,23 @@ function clientVersion() {
 }
 const clientInfo = { name: 'ccr-gemini-agy-acp', version: clientVersion() };
 
+/**
+ * Scoped permission answer for agy's session/request_permission. Only a call
+ * that names our own caller-tool bridge server is approved — the caller
+ * declared those tools and executes them itself. Anything else (native agent
+ * tools) stays cancelled, so the agent can never run host commands through
+ * an approved permission.
+ */
+export function bridgePermissionOutcome(params) {
+  let text;
+  try { text = JSON.stringify(params ?? {}); } catch { return { outcome: 'cancelled' }; }
+  if (!text.includes('ccr-caller-tools')) return { outcome: 'cancelled' };
+  const options = Array.isArray(params?.options) ? params.options : [];
+  const allow = options.find(option => option?.kind === 'allow_once') ??
+    options.find(option => typeof option?.kind === 'string' && option.kind.startsWith('allow'));
+  return allow && allow.optionId != null ? { outcome: 'selected', optionId: allow.optionId } : { outcome: 'cancelled' };
+}
+
 function cliVersion(output) {
   const versions = [...output.matchAll(/(?:^|[\s:(])v?(\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?)(?=$|[\s,)])/gi)];
   return versions.length === 1 ? versions[0][1] : null;
@@ -241,6 +258,11 @@ class Worker {
     child.once('exit', () => this.retire(new AcpError('worker_failed')));
     child.stdout.once('end', () => this.retire(new AcpError('worker_failed')));
     this.rpc = new AcpStdio(child, error => this.retire(error));
+    // agy may ask permission before an MCP tool call. The caller already
+    // sanctioned its own bridged tools by declaring them, and the caller —
+    // never the agent — executes them, so approve only those; every native
+    // agent tool stays denied.
+    this.rpc.onPermission = bridgePermissionOutcome;
     const init = await this.rpc.request('initialize', { protocolVersion: 1, clientInfo, clientCapabilities: {} });
     if (init.protocolVersion !== 1) throw new AcpError('protocol_error');
     if (!Array.isArray(init.authMethods) || !init.authMethods.some(method => method?.id === this.authMethod &&

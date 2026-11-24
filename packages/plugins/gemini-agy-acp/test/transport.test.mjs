@@ -603,3 +603,23 @@ test('model sync is bounded and fails closed on protocol deviations', async t =>
   const old = await setup(t, 'old');
   await rejects(probeVersion(old.binary), 'unsupported_version', 502);
 });
+
+test('permission answers approve only the caller-tool bridge, never native tools', async t => {
+  const { bridgePermissionOutcome } = await import('../src/transport.mjs');
+  const options = [
+    { optionId: 'once', kind: 'allow_once', name: 'Allow' },
+    { optionId: 'always', kind: 'allow_always', name: 'Always' },
+    { optionId: 'no', kind: 'reject_once', name: 'Reject' },
+  ];
+  // A bridged caller tool: approved with the one-shot allow option.
+  const bridged = { sessionId: 's', toolCall: { title: 'mcp_ccr-caller-tools_ccr_calculator', rawInput: { expr: '2+2' } }, options };
+  assert.deepEqual(bridgePermissionOutcome(bridged), { outcome: 'selected', optionId: 'once' });
+  // A native agent tool: never approved, even with allow options present.
+  const native = { sessionId: 's', toolCall: { title: 'run_command', rawInput: { command: 'dir' } }, options };
+  assert.deepEqual(bridgePermissionOutcome(native), { outcome: 'cancelled' });
+  // No usable allow option or malformed params: fail closed.
+  assert.deepEqual(bridgePermissionOutcome({ toolCall: { title: 'ccr-caller-tools' }, options: [{ optionId: 'no', kind: 'reject_once' }] }), { outcome: 'cancelled' });
+  assert.deepEqual(bridgePermissionOutcome(undefined), { outcome: 'cancelled' });
+  const circular = {}; circular.self = circular;
+  assert.deepEqual(bridgePermissionOutcome(circular), { outcome: 'cancelled' });
+});
