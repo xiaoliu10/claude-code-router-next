@@ -283,6 +283,7 @@ test('built plugin.js activates in a standalone Node process under a temporary H
       if (binary !== '/test/fixture') throw new Error('wrong binary');
       return { async run({onText}) { onText('fixture reply'); return {stopReason:'end_turn'}; } };
     }
+    export function proxyEnvOverlay() { return undefined; }
   `);
   const env = { HOME: root, USERPROFILE: root, CCR_CONFIG_DIR: configDir };
   execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: source, env });

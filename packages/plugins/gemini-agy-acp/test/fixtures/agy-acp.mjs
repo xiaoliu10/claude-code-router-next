@@ -50,7 +50,7 @@ if (argv[0] === '--version') {
 } else {
   assert.deepEqual(argv, ['acp', '--sandbox']);
   assert.equal(process.env.GEMINI_API_KEY, isolated ? 'fixture-value' : undefined);
-  record('spawn', isolated ? { root } : { cwd: process.cwd(), home: process.env.HOME });
+  record('spawn', isolated ? { root, httpsProxy: process.env.HTTPS_PROXY ?? null } : { cwd: process.cwd(), home: process.env.HOME, httpsProxy: process.env.HTTPS_PROXY ?? null });
   let authenticated = false;
   let sessionNumber = 0;
   let sessionId;
