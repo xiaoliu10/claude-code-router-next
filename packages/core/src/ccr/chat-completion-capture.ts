@@ -1,3 +1,4 @@
+import { captureInputUsage, type InputUsageCapture } from "./effective-input-usage";
 import { createParser } from "eventsource-parser";
 import { mergeUsageCapture, normalizeUsagePayload } from "./usage-merge";
 import { isRateLimitMessage } from "../services/rate-limit";
@@ -5,6 +6,7 @@ import type { Usage } from "../utils/cache";
 
 export interface ChatCompletionCapture {
   usage?: Usage & { usage_estimated?: boolean };
+  inputUsage?: InputUsageCapture;
   ttft?: number;
   finished?: boolean;
   streamError?: boolean;
@@ -48,6 +50,7 @@ function errorCodeOf(frame: ErrorFrame): string | undefined {
 // Observe the bytes Fastify actually sends. A usage trailer may follow the
 // finish choice, and [DONE] by itself does not finish a truncated answer.
 export function captureChatStream(capture: ChatCompletionCapture, startTime: number) {
+  capture.inputUsage = { format: "chat", usage: {} };
   const decoder = new TextDecoder();
   const choices = new Map<number, boolean>();
   let endsWithCR = false;
@@ -79,6 +82,7 @@ export function captureChatStream(capture: ChatCompletionCapture, startTime: num
     if (typeof frame?.model === "string" && frame.model.trim() && frame.model !== "unknown") {
       capture.model ??= frame.model;
     }
+    captureInputUsage(capture.inputUsage, frame?.usage);
     if (frame?.usage) capture.usage = mergeUsageCapture(capture.usage, normalizeUsagePayload(frame.usage), false);
     if (!Array.isArray(frame?.choices)) return;
     for (const choice of frame.choices) {

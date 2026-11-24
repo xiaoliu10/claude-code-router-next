@@ -123,6 +123,7 @@ describe("SQL usage summary", () => {
     expect(summary.byModel.m1).toEqual({
       count: 3,
       inputTokens: 600,
+      effectiveInputTokens: 600,
       outputTokens: 90,
       cacheReadInputTokens: 30,
       cacheCreationInputTokens: 5,
@@ -169,6 +170,7 @@ describe("SQL usage summary", () => {
   it("returns empty aggregates without matching rows", () => {
     const empty = querySummary("2030-01-01T00:00:00.000Z", "2030-01-02T00:00:00.000Z");
     expect(empty.totalRequests).toBe(0);
+    expect(empty.totalEffectiveInputTokens).toBe(0);
     expect(empty.successCount).toBe(0);
     expect(empty.errorCount).toBe(0);
     expect(empty.avgTtft).toBeNull();
@@ -228,5 +230,39 @@ describe("non-stream ttft/tps semantics", () => {
     // avgTtft ignores non-stream rows; only pre-seeded stream rows count.
     const after = querySummary();
     expect(after.avgTtft).toBe(summaryBefore.avgTtft);
+  });
+});
+
+
+describe("inclusive input SQL aggregation", () => {
+  it("sums known counts and historical lower bounds per successful row in every bucket", () => {
+    const provider = "effective-test";
+    for (const record of [
+      { id: "net", inputTokens: 2, cacheReadInputTokens: 100, cacheCreationInputTokens: 8, effectiveInputTokens: 110 },
+      { id: "inclusive", inputTokens: 110, cacheReadInputTokens: 100, cacheCreationInputTokens: 8, effectiveInputTokens: 110 },
+      { id: "legacy-small-input", inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7 },
+      { id: "legacy-large-input", inputTokens: 75, cacheReadInputTokens: 7 },
+      { id: "legacy-no-cache", inputTokens: 14 },
+      { id: "estimated", inputTokens: 17, effectiveInputTokens: 17, effectiveInputTokensSource: "estimated" as const },
+      { id: "error", status: "error" as const, inputTokens: 99, effectiveInputTokens: 99 },
+      { id: "net-zero-cache", inputTokens: 10, cacheReadInputTokens: 0, effectiveInputTokens: 10 },
+    ]) append(makeRecord({ ...record, provider }));
+    const { records, summary } = query({ provider });
+    const expected = 110 + 110 + 67 + 75 + 14 + 17 + 10;
+    expect(summary.totalEffectiveInputTokens).toBe(expected);
+    for (const buckets of [summary.byModel, summary.byDay, summary.byFamily, summary.byClient, summary.byScenario, summary.byProvider]) {
+      expect(Object.values(buckets).map(row => row.effectiveInputTokens)).toEqual([expected]);
+    }
+    const byId = Object.fromEntries(records.map(row => [row.id, row]));
+    expect(byId["legacy-small-input"]).toMatchObject({ effectiveInputTokens: 67, effectiveInputTokensSource: "historical" });
+    expect(byId["legacy-large-input"]).toMatchObject({ effectiveInputTokens: 75, effectiveInputTokensSource: "historical" });
+    expect(byId["legacy-no-cache"].effectiveInputTokensSource).toBeUndefined();
+    expect(byId.estimated.effectiveInputTokensSource).toBe("estimated");
+    expect(byId.net.effectiveInputTokensSource).toBeUndefined();
+    const beforeZero = querySummary().totalEffectiveInputTokens;
+    append(makeRecord({ id: "zero-effective", provider, inputTokens: 14, effectiveInputTokens: 0 }));
+    expect(query({ provider }).records.find(row => row.id === "zero-effective")?.effectiveInputTokens).toBe(0);
+    expect(querySummary().totalEffectiveInputTokens).toBe(beforeZero);
+    expect(query({ provider, status: "error" }).summary.totalEffectiveInputTokens).toBe(0);
   });
 });

@@ -80,7 +80,7 @@ describe("Chat final request accounting", () => {
     expect(finalRows()).toHaveLength(1);
     expect(finalRows()[0]).toMatchObject({ provider: "backup", model: "backup-model", originalModel: "ccr-opus",
       modelFamily: "opus", upstreamModel: text.model, stream, status: "success", sessionId,
-      inputTokens: 17, outputTokens: 5, cacheReadInputTokens: 4, ttft: stream ? expect.any(Number) : null });
+      inputTokens: 17, effectiveInputTokens: 17, outputTokens: 5, cacheReadInputTokens: 4, ttft: stream ? expect.any(Number) : null });
     expect(success.mock.calls).toEqual([["backup", "backup-model"]]);
   });
 

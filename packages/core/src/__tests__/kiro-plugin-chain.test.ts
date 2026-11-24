@@ -255,11 +255,14 @@ describe("kiro -> core transformer -> request pipeline statistics", () => {
       expect(appendUsage).toHaveBeenLastCalledWith(expect.objectContaining(estimated ? {
         usageEstimated: true,
         inputTokens: captured.input_tokens,
+        effectiveInputTokens: captured.input_tokens,
+        effectiveInputTokensSource: "estimated",
         outputTokens: 2,
         // Do not invent cache hits by subtracting two independent estimates.
         cacheReadInputTokens: 0,
       } : {
         inputTokens: 12,
+        effectiveInputTokens: 46,
         outputTokens: 8,
         cacheReadInputTokens: 30,
         cacheCreationInputTokens: 4,
@@ -327,7 +330,9 @@ it("preserves ordinary provider cache-read inference without an estimated marker
   };
   await hooks.get("onResponse")![0](req, { statusCode: 200 });
   expect(appendUsage).toHaveBeenLastCalledWith(expect.objectContaining({
-    inputTokens: 50, outputTokens: 3, cacheReadInputTokens: 50, cacheCreationInputTokens: 0,
+    inputTokens: 50, outputTokens: 3, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+    effectiveInputTokens: 100,
+    effectiveInputTokensSource: "estimated",
   }));
   expect(appendUsage.mock.lastCall![0]).not.toHaveProperty("usageEstimated");
 });

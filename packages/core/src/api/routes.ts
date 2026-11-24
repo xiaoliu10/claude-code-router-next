@@ -174,6 +174,7 @@ declare module "fastify" {
   interface FastifyRequest {
     provider?: string;
     chatCompletionCapture?: ChatCompletionCapture;
+    sourceInputUsage?: import("../ccr/effective-input-usage").InputUsageCapture;
   }
 }
 
@@ -920,6 +921,7 @@ async function handleFallback(
           }
 
           // Write back to original req so onResponse hook records correct provider/model
+          req.sourceInputUsage = newReq.sourceInputUsage;
           req.provider = fbProviderName;
           req.body = newBody;
 
@@ -1543,6 +1545,7 @@ async function processResponseTransformers(
   bypass: boolean,
   context: any
 ) {
+  delete context.req.sourceInputUsage; // Each retry/fallback has its own source counters.
   let finalResponse = response;
 
   // Execute provider-level response transformers

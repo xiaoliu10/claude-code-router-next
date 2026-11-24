@@ -72,7 +72,7 @@ it.skipIf(process.platform === 'win32')('routes text chat through the installed 
       for (const streaming of [false, true]) {
         expect(appendUsage).toHaveBeenCalledWith(expect.objectContaining({
           provider: name, stream: streaming, status: 'success', model: 'm2',
-          inputTokens: 16, cacheReadInputTokens: 21, cacheCreationInputTokens: 2, outputTokens: 9,
+          inputTokens: 16, effectiveInputTokens: 39, cacheReadInputTokens: 21, cacheCreationInputTokens: 2, outputTokens: 9,
         }));
       }
     });

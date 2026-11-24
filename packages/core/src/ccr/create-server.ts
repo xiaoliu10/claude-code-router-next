@@ -217,6 +217,8 @@ export async function createCcrServer(options: CcrRunOptions = {}) {
           clientType,
           stream: data.stream ?? false,
           inputTokens: data.inputTokens || 0,
+          effectiveInputTokens: data.inputTokens || 0,
+          ...(data.inputTokens ? { effectiveInputTokensSource: "estimated" as const } : {}),
           outputTokens: 0,
           cacheReadInputTokens: data.cacheReadInputTokens || 0,
           cacheCreationInputTokens: data.cacheCreationInputTokens || 0,
