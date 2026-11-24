@@ -10,6 +10,7 @@ import { execFile } from 'node:child_process';
 import { createReadStream, existsSync } from 'node:fs';
 import { chmod, copyFile, mkdir, mkdtemp, rename, rm, stat } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
+import { proxyEnvOverlay } from './transport.mjs';
 import { dirname, join } from 'node:path';
 import { failure } from './chat.mjs';
 
@@ -75,12 +76,13 @@ export function validateManifest(text) {
 
 /** execFile wrapper: the inherited environment carries the gateway's proxy
  * variables and curl applies them itself; no shell is involved anywhere. */
-function defaultRun(command, args, { timeoutMs, capture = false } = {}) {
+function defaultRun(command, args, { timeoutMs, capture = false, env } = {}) {
   return new Promise((resolve, reject) => {
     execFile(command, args, {
       timeout: timeoutMs,
       windowsHide: true,
       maxBuffer: capture ? 1024 * 1024 : 64 * 1024,
+      ...(env ? { env } : {}),
     }, (error, stdout) => {
       if (error) reject(error); else resolve(capture ? String(stdout) : '');
     });
@@ -95,11 +97,17 @@ export function createInstaller(options = {}) {
     arch = process.arch,
     env = process.env,
     home = homedir(),
-    run = defaultRun,
+    run: baseRun = defaultRun,
+    proxyUrl,
     maxPayloadBytes = MAX_PAYLOAD_BYTES,
     manifestTimeoutMs = MANIFEST_TIMEOUT_MS,
     downloadTimeoutMs = DOWNLOAD_TIMEOUT_MS,
   } = options;
+  // curl and the agy installer honor the standard proxy variables; fill them
+  // from the gateway config when the inherited environment sets none.
+  const overlay = proxyEnvOverlay(env, proxyUrl);
+  const installEnv = overlay ? { ...env, ...overlay } : undefined;
+  const run = (command, args, opts = {}) => baseRun(command, args, installEnv ? { ...opts, env: installEnv } : opts);
   const targetBinary = defaultBinaryPath(platform, env, home);
   const curl = platform === 'win32' ? 'curl.exe' : 'curl';
   const tar = platform === 'win32' ? 'tar.exe' : 'tar';

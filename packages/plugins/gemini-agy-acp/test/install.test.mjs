@@ -124,6 +124,29 @@ test('windows install places the raw exe without tar and uses curl.exe', async t
   assert.ok(calls[0].args.at(-1).endsWith('/manifests/windows_amd64.json'));
 });
 
+test('the configured proxy reaches installer commands unless the environment already sets one', async t => {
+  const calls = [];
+  const base = fakeRun({ manifestText: manifestOf(UNIX_URL), calls });
+  const seen = [];
+  const installer = createInstaller({
+    platform: 'darwin', arch: 'arm64', home: await installerHome(t), env: {},
+    proxyUrl: 'http://127.0.0.1:7897',
+    run: (command, args, opts) => { seen.push(opts?.env); return base(command, args, opts); },
+  });
+  await installer.install();
+  assert.ok(seen.length > 0);
+  assert.ok(seen.every(env => env?.HTTPS_PROXY === 'http://127.0.0.1:7897' && env?.HTTP_PROXY === 'http://127.0.0.1:7897'));
+  const explicit = [];
+  const installer2 = createInstaller({
+    platform: 'darwin', arch: 'arm64', home: await installerHome(t),
+    env: { HTTPS_PROXY: 'http://127.0.0.1:1', HTTP_PROXY: 'http://127.0.0.1:1' }, proxyUrl: 'http://127.0.0.1:7897',
+    run: (command, args, opts) => { explicit.push(opts?.env); return base(command, args, opts); },
+  });
+  await installer2.install();
+  assert.ok(explicit.length > 0);
+  assert.ok(explicit.every(env => env === undefined));
+});
+
 test('a checksum mismatch aborts before anything is placed', async t => {
   const home = await installerHome(t);
   const installer = createInstaller({

@@ -65,21 +65,28 @@ const OAUTH_ENV_VARS = ['PATH', 'HOME', 'USERPROFILE', 'LANG', 'TMPDIR', 'TEMP',
 // standard variables the CLI honors. A desktop-managed gateway typically
 // inherits no proxy variables at all, which left the CLI dialing Google
 // directly and every turn timing out behind a regional network.
-function withConfiguredProxy(env, proxyUrl) {
-  if (proxyUrl) {
-    // Case variants are one setting: an explicit value in either case wins
-    // for the whole pair, so the fallback never mixes two proxies.
-    for (const [upper, lower] of [['HTTPS_PROXY', 'https_proxy'], ['HTTP_PROXY', 'http_proxy']]) {
-      if (!env[upper] && !env[lower]) {
-        env[upper] = proxyUrl;
-        env[lower] = proxyUrl;
-      }
+export function proxyEnvOverlay(env, proxyUrl) {
+  if (!proxyUrl) return undefined;
+  // An explicit ALL_PROXY is the operator's chosen route for every protocol;
+  // injecting protocol-specific variables would shadow it.
+  if (env.ALL_PROXY || env.all_proxy) return undefined;
+  const overlay = {};
+  // Case variants are one setting: an explicit value in either case wins
+  // for the whole pair, so the fallback never mixes two proxies.
+  for (const [upper, lower] of [['HTTPS_PROXY', 'https_proxy'], ['HTTP_PROXY', 'http_proxy']]) {
+    if (!env[upper] && !env[lower]) {
+      overlay[upper] = proxyUrl;
+      overlay[lower] = proxyUrl;
     }
   }
-  return env;
+  return Object.keys(overlay).length ? overlay : undefined;
 }
 
-function oauthEnvironment(proxyUrl) {
+function withConfiguredProxy(env, proxyUrl) {
+  return Object.assign(env, proxyEnvOverlay(env, proxyUrl) ?? {});
+}
+
+export function oauthEnvironment(proxyUrl) {
   const env = {};
   for (const name of OAUTH_ENV_VARS) {
     const value = process.env[name];
@@ -514,6 +521,12 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
      * to drop stale billing identities immediately. */
     async retireExisting() {
       await Promise.all([...workers].map(worker => worker.retire(new AcpError('closed'))));
+    },
+    /** Drain only idle workers: busy turns keep their spawn environment and
+     * finish on this pool, then idle-retire naturally. Used for proxy-only
+     * pool swaps so a config edit never SIGKILLs an in-flight turn. */
+    async retireIdle() {
+      await Promise.all([...workers].filter(worker => !worker.task && !worker.failure).map(worker => worker.retire(new AcpError('closed'))));
     },
     async close() {
       closed = true;

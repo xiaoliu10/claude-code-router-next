@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { after, before, test } from 'node:test';
-import { createTransport, isolatedEnvironment, probeVersion, syncModelOptions, verifyOauthHandshake } from '../src/transport.mjs';
+import { createTransport, isolatedEnvironment, oauthEnvironment, probeVersion, syncModelOptions, verifyOauthHandshake } from '../src/transport.mjs';
 import { chatResponse } from '../src/chat.mjs';
 
 test('oauth-personal runs the whitelisted real environment, authenticates the CLI login and never creates an isolated root', async t => {
@@ -450,6 +450,38 @@ test('the configured proxy fills absent worker variables and never overrides exp
   delete process.env.HTTPS_PROXY;
   const bare = await isolatedEnvironment(roots[2]);
   assert.equal(bare.env.HTTPS_PROXY, undefined);
+});
+
+test('createTransport rejects unsupported proxy values before any spawn', async () => {
+  for (const proxyUrl of ['socks5://127.0.0.1:1080', 'ftp://fixture.example.com', 42, {}]) {
+    assert.throws(() => createTransport({ binary: '/fixture/agy', proxyUrl }), { code: 'acp_invalid_config' });
+  }
+});
+
+test('oauth worker environment applies the same proxy fallback and respects ALL_PROXY', async t => {
+  const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'];
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  for (const key of keys) delete process.env[key];
+  const env = oauthEnvironment('http://127.0.0.1:7897');
+  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:7897');
+  assert.equal(env.https_proxy, 'http://127.0.0.1:7897');
+  process.env.ALL_PROXY = 'http://127.0.0.1:2';
+  const all = oauthEnvironment('http://127.0.0.1:7897');
+  assert.equal(all.HTTPS_PROXY, undefined);
+  assert.equal(all.ALL_PROXY, 'http://127.0.0.1:2');
+});
+
+test('a spawned worker receives the configured proxy end-to-end', async t => {
+  const keys = ['HTTPS_PROXY', 'https_proxy'];
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  for (const key of keys) delete process.env[key];
+  const { transport, events } = await setup(t, 'ok', { proxyUrl: 'http://127.0.0.1:7897' });
+  await transport.run(input);
+  const spawn = (await events()).find(record => record.event === 'spawn');
+  assert.equal(spawn.httpsProxy, 'http://127.0.0.1:7897');
+  await transport.close();
 });
 
 test('model sync is bounded and fails closed on protocol deviations', async t => {
