@@ -6,6 +6,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { HOME_DIR } from "@wengine-ai/claude-code-router-shared";
 
+/**
+ * Classify rate-limit responses from any upstream provider. Used to isolate
+ * rate-limited models in the health store (time-based auto-recover) instead of
+ * applying the generic 3-failure breaker threshold.
+ */
+export function isRateLimitMessage(statusCode: number, message?: string): boolean {
+  return statusCode === 429 ||
+    Boolean(message && /rate[\s_]limit|too many|限流|频率限制|qps_limit|token_limit|quota exhausted|usage limit|limit reached/i.test(message));
+}
+
 export interface RateLimitInfo {
   provider: string;
   remaining: number | null;

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { AcpError } from './acp-errors.mjs';
 import { AgyToolBridge } from './agy-tool-bridge.mjs';
-import { declaresTools, declaredTools, hasCompleteResults, historyToolCalls, toolResultPrompt, toolResults } from './agy-tools.mjs';
+import { declaresTools, declaredTools, hasCompleteResults, historyToolCalls, toolChoiceShapeOk, toolResultPrompt, toolResults } from './agy-tools.mjs';
 import { registerAdminRoutes } from './admin-routes.mjs';
 import { accountEmailShapeOk } from './account.mjs';
 import { chatResponse, failure, textTurns, textTurnsOnly, toPrompt } from './chat.mjs';
@@ -487,8 +487,11 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
       assertProvider(provider);
       // A tool-bearing request is served by the runtime's tool path, which
       // does its own validation; only a text-only request is rejected here.
+      // A malformed tool choice is not a tool request at all: it must fail
+      // here, before the runtime could route it as one.
       if (context?.req?.body) {
-        if (declaresTools(context.req.body)) textTurnsOnly(context.req.body);
+        const declared = declaresTools(context.req.body) && toolChoiceShapeOk(context.req.body);
+        if (declared) textTurnsOnly(context.req.body);
         else textTurns(context.req.body);
       }
       await connected(context?.req);
@@ -521,7 +524,7 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
       assertProvider(provider);
       const local = await connected(req);
       const tools = declaresTools(requestBody) ? declaredTools(requestBody) : [];
-      if (!tools.length) {
+      if (!tools.length || !toolChoiceShapeOk(requestBody)) {
         if (req?.body) textTurns(req.body);
         return chatResponse(local, toPrompt(requestBody, provider, req?.body), requestBody.stream === true, req, config);
       }

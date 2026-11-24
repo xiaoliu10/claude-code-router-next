@@ -36,6 +36,8 @@ import {
   normalizeUsagePayload,
   mergeUsageCapture,
 } from "./usage-merge";
+import { isRateLimitMessage } from "../services/rate-limit";
+import { captureChatStream, hasChatFinishReason, type ChatCompletionCapture } from "./chat-completion-capture";
 import type { IAgent } from "./agents/type";
 import agentsManager from "./agents";
 import { apiKeyAuth } from "./auth";
@@ -52,15 +54,7 @@ import { normalizeResponsesBody } from "../api/routes";
  */
 const USAGE_CAPTURE_DRAIN_MS = 1500;
 
-/**
- * Classify rate-limit responses from any upstream provider. Used to isolate
- * rate-limited models in the health store (time-based auto-recover) instead of
- * applying the generic 3-failure breaker threshold.
- */
-export function isRateLimitMessage(statusCode: number, message?: string): boolean {
-  return statusCode === 429 ||
-    Boolean(message && /rate[\s_]limit|too many|限流|频率限制|qps_limit|token_limit|quota exhausted|usage limit|limit reached/i.test(message));
-}
+export { isRateLimitMessage };
 
 const event = new EventEmitter();
 
@@ -72,10 +66,6 @@ function ensureClientContext(req: any, config: Record<string, unknown>): void {
   if (!req.clientContext || !req.usageCacheKey || !req.usageSessionId) {
     applyClientAdapter(req, config);
   }
-}
-
-function isAcpChatCompletion(req: any): boolean {
-  return req.provider === "gemini-agy-acp" && req.pathname?.endsWith("/v1/chat/completions") === true;
 }
 
 function getUsageSessionId(req: any): string {
@@ -109,7 +99,7 @@ function getRequestModel(req: any): string {
 // usage and the upstream model. Fastify hands onSend a serialized string or
 // Buffer, so callers must use this parsed body (not the raw payload) for any
 // field lookup — otherwise non-stream responses never populate req.upstreamModel.
-function extractNonStreamMeta(payload: any): { usage?: any; model?: string } | undefined {
+function extractNonStreamMeta(payload: any): { usage?: any; model?: string; choices?: any[] } | undefined {
   if (!payload) return undefined;
 
   let body = payload;
@@ -124,7 +114,7 @@ function extractNonStreamMeta(payload: any): { usage?: any; model?: string } | u
     }
   }
 
-  if (typeof body !== "object") return undefined;
+  if (!body || typeof body !== "object") return undefined;
 
   // Anthropic /v1/messages non-stream response.
   const usage = body.usage
@@ -136,8 +126,7 @@ function extractNonStreamMeta(payload: any): { usage?: any; model?: string } | u
   // Upstream-reported model (Anthropic payload.model, Responses payload.response.model).
   const model = body.model || body.response?.model;
 
-  if (!usage && !model) return undefined;
-  return { usage, model };
+  return { usage, model, choices: body.choices };
 }
 
 /**
@@ -242,8 +231,10 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       return;
     }
     req.pathname = url.pathname;
-    if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/responses") ||
-        url.pathname.endsWith("/v1/chat/completions")) && !req.requestStartTime) {
+    if (req.method === "POST" && url.pathname.endsWith("/v1/chat/completions")) {
+      req.chatCompletionCapture = {};
+    }
+    if ((req.chatCompletionCapture || url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/responses")) && !req.requestStartTime) {
       req.requestStartTime = performance.now();
     }
   });
@@ -283,10 +274,22 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
   // Hook 3: onSend — agent tool rewrite + SSE usage capture + upstream model capture
   serverInstance.addHook("onSend", (req: any, reply: any, payload: any, done: any) => {
     (req.ccrHookOrder ||= []).push("onSend");
+    const chat: ChatCompletionCapture | undefined = req.chatCompletionCapture;
+    if (chat && reply.statusCode < 400 && req.provider) {
+      ensureClientContext(req, config);
+      if (payload instanceof ReadableStream) {
+        return done(null, payload.pipeThrough(captureChatStream(chat, req.requestStartTime)));
+      }
+      const meta = extractNonStreamMeta(payload);
+      chat.finished = Array.isArray(meta?.choices) && meta.choices.length > 0 && meta.choices.every(hasChatFinishReason);
+      chat.usage = meta?.usage;
+      if (isRealUpstreamModel(meta?.model)) chat.model = meta.model;
+      return done(null, payload);
+    }
     const isMessages = req.pathname?.endsWith("/v1/messages");
     const isResponses = req.pathname?.endsWith("/v1/responses");
-    const isAcpChat = isAcpChatCompletion(req);
-    if (isMessages || isResponses || isAcpChat) {
+    const isChatCompletion = !!req.chatCompletionCapture;
+    if (isMessages || isResponses || isChatCompletion) {
       ensureClientContext(req, config);
       const usageSessionId = getUsageSessionId(req);
       const usageCacheKey = getUsageCacheKey(req);
@@ -452,15 +455,6 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
                 req.upstreamModel = data.response.model;
               }
 
-              if (isAcpChat) {
-                // ACP Chat reports usage once, in the terminal completion chunk.
-                // Keep it request-local so missing usage never reuses a prior turn.
-                if (data?.usage) req.acpChatUsage = normalizeUsagePayload(data.usage);
-                if (!req.upstreamModel && isRealUpstreamModel(data?.model)) req.upstreamModel = data.model;
-                if (data?.choices?.some?.((choice: any) => choice?.delta?.content)) req.contentDelivered = true;
-                if (data?.error && typeof data.error === "object") req.sseError = data.error;
-                continue;
-              }
 
               // Capture usage from Anthropic SSE (message_delta, message_start)
               if (data?.usage) {
@@ -583,7 +577,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
 
       const nonStreamMeta = extractNonStreamMeta(payload);
       if (nonStreamMeta?.usage) {
-        if (isAcpChat) req.acpChatUsage = nonStreamMeta.usage;
+        if (isChatCompletion) req.chatCompletionCapture.usage = mergeUsageCapture(req.chatCompletionCapture.usage, nonStreamMeta.usage, false);
         else sessionUsageCache.put(usageCacheKey, nonStreamMeta.usage);
       }
       // Capture upstream model for non-stream responses from the parsed body
@@ -610,7 +604,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     event.emit('onSend', req, reply, payload);
     // Capture error response body for usage stats
     if (reply.statusCode >= 400 && (req.pathname?.endsWith("/v1/messages") ||
-        req.pathname?.endsWith("/v1/responses") || isAcpChatCompletion(req))) {
+        req.pathname?.endsWith("/v1/responses") || !!req.chatCompletionCapture)) {
       try {
         if (typeof payload === 'string') {
           req.errorResponseBody = payload;
@@ -638,8 +632,11 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     // Release the concurrency-priority in-flight lease (no-op when the request
     // did not go through concurrency-priority routing).
     releaseRequestLease(req);
-    const isAcpChat = isAcpChatCompletion(req);
-    if (!req.pathname?.endsWith("/v1/messages") && !req.pathname?.endsWith("/v1/responses") && !isAcpChat) return;
+    const chat: ChatCompletionCapture | undefined = req.chatCompletionCapture;
+    const hardFailed = reply.statusCode >= 400;
+    const unbookedAttempt = hardFailed ? chat?.unbookedAttempt : undefined;
+    if (chat && (!req.provider || (hardFailed && !unbookedAttempt))) return;
+    if (!chat && !req.pathname?.endsWith("/v1/messages") && !req.pathname?.endsWith("/v1/responses")) return;
     try {
       // Bounded drain: the usage/TTFT readers tee the response and normally end
       // with the client, but an upstream that stops mid-stream would otherwise
@@ -662,6 +659,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       };
       await drain(req.usageCapturePromise);
       await drain(req.tokenSpeedCapturePromise);
+      if (unbookedAttempt) ensureClientContext(req, config);
       const usageSessionId = getUsageSessionId(req);
       // Two distinct keys with different jobs:
       // - speedStatsKey: per-request stats-file key. It MUST equal the key the
@@ -681,15 +679,17 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // record this failure with the predecessor's input/cache tokens. Ignore the
       // slot on hard failure and fall back to the router's own token estimate.
       const hardFailed = reply.statusCode >= 400;
-      const usage = hardFailed ? undefined : isAcpChat ? req.acpChatUsage : sessionUsageCache.get(getUsageCacheKey(req));
-      const speedStats = readTokenSpeedStats(speedStatsKey);
+      const usage = chat ? chat.usage : hardFailed ? undefined : sessionUsageCache.get(getUsageCacheKey(req));
+      const speedStats = chat ? { ttft: chat.ttft ?? null, tokensPerSecond: null } : readTokenSpeedStats(speedStatsKey);
       const healthStore = getHealthStore();
+      const provider = unbookedAttempt?.provider || req.provider || "";
+      const model = unbookedAttempt?.model || getRequestModel(req);
 
       // Extract error message if request failed
       let errorMessage: string | undefined;
       let errorResponseBody: string | undefined;
       // Check for SSE stream error (errors inside HTTP 200 response).
-      const sseError = req.sseError;
+      const sseError = chat ? undefined : req.sseError;
       const hasSseError = sseError && (sseError.type || sseError.code || sseError.message);
       const hasOutputTokens = usage?.output_tokens && usage.output_tokens > 0;
       // The transformer stamps this once a content block is actually enqueued
@@ -701,29 +701,35 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // (thrown before the stream is forwarded) and a genuine error-only stream
       // are still judged as failures here.
       const contentDelivered = req.contentDelivered === true;
-      // ACP emits a terminal error instead of a finish chunk when a turn fails.
-      const isFailedRequest = hardFailed || (hasSseError && (isAcpChat || (!hasOutputTokens && !contentDelivered)));
+      let chatError: string | undefined;
+      if (chat) {
+        if (chat.streamError) chatError = chat.streamErrorCode ? `Chat stream returned an error (${chat.streamErrorCode})` : "Chat stream returned an error";
+        else if (hardFailed) chatError = `Chat upstream request failed (HTTP ${reply.statusCode})`;
+        else if (!chat.finished) chatError = "Chat completion ended without a finish_reason";
+      }
+      const isFailedRequest = Boolean(chatError) || hardFailed || (hasSseError && !hasOutputTokens && !contentDelivered);
       if (isFailedRequest) {
-        errorMessage = req.errorMessage || reply.errorMessage || (req.error?.message || req.error?.toString?.() || undefined);
+        errorMessage = chatError || req.errorMessage || reply.errorMessage || (req.error?.message || req.error?.toString?.() || undefined);
         if (hasSseError) {
           errorMessage = errorMessage || JSON.stringify(sseError);
           errorResponseBody = JSON.stringify(sseError);
         }
-        errorResponseBody = errorResponseBody || req.errorResponseBody;
+        if (!chat) errorResponseBody = errorResponseBody || req.errorResponseBody;
         // Record failure to health store
-        const model = getRequestModel(req);
         // Classify rate-limit errors — use markRateLimited to immediately isolate
         // (bypasses the 3-failure threshold) with a time-based auto-recover.
-        const isRateLimit = isRateLimitMessage(reply.statusCode, errorMessage);
-        if (isRateLimit) {
-          healthStore.markRateLimited(req.provider || "", model, 120, errorMessage);
-        } else {
-          healthStore.recordFailure(req.provider || "", model, errorMessage);
+        // Terminal Chat rejections bypass failover. A rejected client request
+        // gets a row but says nothing about the provider's health.
+        if (!unbookedAttempt || chat?.streamError) {
+          if (chat?.rateLimited || isRateLimitMessage(reply.statusCode, errorMessage)) {
+            healthStore.markRateLimited(provider, model, 120, errorMessage);
+          } else {
+            healthStore.recordFailure(provider, model, errorMessage);
+          }
         }
       } else {
         // Record success to health store
-        const model = getRequestModel(req);
-        healthStore.recordSuccess(req.provider || "", model);
+        healthStore.recordSuccess(provider, model);
       }
 
       // Compute cache read input tokens.
@@ -737,8 +743,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // usage.input_tokens is missing OR zero, so a zeroed usage frame can't wipe
       // out the input token count for the whole request.
       const reportedInputTokens = usage?.input_tokens || 0;
-      const rawInputTokens = isAcpChat && usage ? reportedInputTokens : reportedInputTokens || req.tokenCount || 0;
-      if (!isAcpChat && !usage?.usage_estimated && !cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
+      const rawInputTokens = reportedInputTokens || (chat ? 0 : req.tokenCount) || 0;
+      if (!chat && !usage?.usage_estimated && !cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
         cacheReadInputTokens = req.tokenCount - usage.input_tokens;
         if (cacheReadInputTokens) {
           console.log('[Usage] Inferred cache tokens:', {
@@ -768,14 +774,14 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         timestamp: new Date().toISOString(),
         sessionId,
-        provider: req.provider || "",
+        provider,
         originalModel: req.originalModel || req.body?.model || "",
-        model: getRequestModel(req),
+        model,
         // Never persist a bare placeholder: when no upstream lifecycle event
         // carried a model, the routed model is the truthful best answer and
         // matches what the client was told. `unknown` in the UI looked like a
         // routing bug rather than a missing upstream echo.
-        upstreamModel: req.upstreamModel || getRequestModel(req) || undefined,
+        upstreamModel: chat?.model || req.upstreamModel || model || undefined,
         ...(usage?.usage_estimated === true ? { usageEstimated: true } : {}),
         modelFamily: req.modelFamily || "",
         scenarioType: req.scenarioType || "default",
@@ -798,7 +804,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         errorMessage,
         responseBody: errorResponseBody,
       });
-      if (!isAcpChat && req.clientContext?.usageScope !== "session") {
+      if (!chat && req.clientContext?.usageScope !== "session") {
         sessionUsageCache.delete(getUsageCacheKey(req));
       }
     } catch (e) {

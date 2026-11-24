@@ -7,6 +7,7 @@ import {
   CLAUDE_PROJECTS_DIR,
   HOME_DIR,
   getClaudeProjectId,
+  isCcrSelfProvider,
   isZcodeProjectTakeoverActive,
 } from "@wengine-ai/claude-code-router-shared";
 import { ConfigService } from "../services/config";
@@ -845,8 +846,10 @@ function resolveFamilyModel(
     req.log.warn(`Family: think model unavailable (fail pool), skipping`);
   }
 
-  if (familyConfig.default) {
-    const model = resolveConfiguredModel(familyConfig.default, providers, false, 'default', enableFallback, allowPromotion, isStrictProject);
+  if (familyConfig.default || (enableFallback && familyConfig.fallback?.default?.length)) {
+    const model = familyConfig.default
+      ? resolveConfiguredModel(familyConfig.default, providers, false, 'default', enableFallback, allowPromotion, isStrictProject)
+      : null;
     if (model) {
       return { model, scenarioType: 'default', isFallback: false };
     }
@@ -859,7 +862,7 @@ function resolveFamilyModel(
       return { model: fallbackResult, scenarioType: 'default', isFallback: true };
     }
 
-    if (isStrictProject) {
+    if (isStrictProject && familyConfig.default) {
       const lastResort = throwStrictProjectError(req, familyConfig.default, providers, 'default');
       if (lastResort) return { model: lastResort, scenarioType: 'default', isFallback: false };
     }
@@ -945,6 +948,9 @@ const getUseModel = async (
   if (!isStrictProject && normalizedModelPart) {
     for (const provider of providers) {
       if (provider?.enabled === false || !Array.isArray(provider?.models)) continue;
+      // The CLI advertises these aliases on its own loopback provider. That
+      // entry is a client-facing address, not an upstream owner for Chat.
+      if (req.pathname?.endsWith('/v1/chat/completions') && isCcrSelfProvider(provider)) continue;
       const found = provider.models.find(
         (m: any) => typeof m === 'string' && m.toLowerCase() === normalizedModelPart
       );

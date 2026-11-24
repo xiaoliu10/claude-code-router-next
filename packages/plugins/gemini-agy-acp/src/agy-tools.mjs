@@ -32,6 +32,22 @@ export function declaresTools(body) {
   return Array.isArray(body.functions) && body.functions.some(fn => typeof fn?.name === 'string' && fn.name.trim());
 }
 
+/**
+ * True when a tool choice is one the bridge can honour. Anything else — an
+ * unknown string, a forced specific function, or a non-object — is rejected
+ * rather than silently ignored, so the caller is never told a tool was
+ * available when the agent would not have been steered to it.
+ */
+export function toolChoiceShapeOk(body) {
+  const choice = body?.tool_choice ?? body?.function_call;
+  if (choice == null) return true;
+  if (typeof choice === 'string') return choice === 'auto' || choice === 'none';
+  if (typeof choice !== 'object') return false;
+  const fn = choice.function ?? choice;
+  // A named function choice has no equivalent the bridge can enforce.
+  return !(typeof fn?.name === 'string' && fn.name.trim());
+}
+
 /** Normalize a caller tool declaration into the OpenAI shape. */
 export function declaredTools(body) {
   const output = [];

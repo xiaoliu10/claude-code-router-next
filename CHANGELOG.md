@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2435] - 2026-11-23
+
+### Fixed
+
+Fix Codex rejection of streaming Chat requests that ask for token usage. CCR now removes the Chat-only include_usage field when converting the request to Responses.
+
+### 修复
+
+修复流式 Chat 请求启用用量统计时被 Codex 拒绝的问题。CCR 转为 Responses 请求时会移除 Chat 专用的 include_usage 字段。
+
+## [2.3.2434] - 2026-11-23
+
+### Fixed
+
+Chat Completions now follow model-family fallback rules, preserve the Chat response format on Anthropic backups, and record the final outcome against the serving provider. Family routes skip text-only Agy ACP for tool requests and use the configured backups when the family primary is empty.
+
+### 修复
+
+Chat Completions 按模型族配置切换备用通道。Anthropic 备用通道返回标准 Chat 格式，调用记录按实际服务方记入最终结果。带工具的模型族请求会跳过纯文本 Agy ACP。模型族主通道为空时也能使用已配置的备用通道。
+
 ## [2.3.2433] - 2026-11-18
 
 ### Added

@@ -37,8 +37,12 @@ export function assertNoTools(body) {
 }
 
 /**
- * Message and content validation shared by both paths. Tool-bearing messages
- * are allowed here; their payload is carried through, never executed.
+ * Message and content validation shared by both paths.
+ *
+ * Tool-bearing messages are allowed here, but only when they actually carry a
+ * call: an assistant turn with `tool_calls: []` and a `tool` role result have
+ * no tool turn behind them, so they stay a text-only rejection. Their payload
+ * is carried through, never executed.
  */
 export function textTurnsOnly(body) {
   if (!Array.isArray(body.messages) || !body.messages.length) unsupported('Expected one or more messages.');
@@ -47,8 +51,19 @@ export function textTurnsOnly(body) {
   for (const msg of body.messages) {
     if (!['system', 'user', 'assistant', 'tool', 'function'].includes(msg?.role)) unsupported('Unsupported message role.');
     if (['audio', 'refusal'].some(key => msg[key] != null)) unsupported('Only unnamed text messages are supported.');
+    // A tool-bearing message is allowed here, but only when it actually carries
+    // a call: `tool_calls: []` declares nothing, so it stays a text-only
+    // rejection. A `tool` role message is itself the result, and its id is what
+    // ties it back to the call, so that is not an unnamed-text violation either.
+    const carriesCall = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+    const isToolResult = msg.role === 'tool';
+    const toolKeys = ['tool_call_id', 'function_call', 'thinking', 'name'];
+    if (!carriesCall && !isToolResult &&
+        (toolKeys.some(key => msg[key] != null) || msg.tool_calls != null)) {
+      unsupported('Only unnamed text messages are supported.');
+    }
     // An assistant turn that only carries tool calls, and a tool result, have no
-    // text of their own. Their payload is carried through, never executed.
+    // text of their own.
     const content = msg.content == null ? '' : contentText(msg.content);
     turns.push({ role: msg.role, content });
   }
