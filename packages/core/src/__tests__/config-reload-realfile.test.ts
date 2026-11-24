@@ -127,6 +127,18 @@ describe("POST /api/config/reload with real files", () => {
     expect(server.configService.getAll()).toEqual(before);
   });
 
+  it("answers a fixed 500 when the file root is not an object", async () => {
+    server = await buildAdminRuntime();
+    const before = server.configService.getAll();
+    writeConfig('["Providers"]');
+
+    const res = await server.app.inject({ method: "POST", url: "/api/config/reload" });
+
+    expect(res.statusCode).toBe(500);
+    expect(JSON.parse(res.body)).toEqual({ success: false, error: "config file unreadable" });
+    expect(server.configService.getAll()).toEqual(before);
+  });
+
   it("hot-applies an interpolated $VAR Router target from disk", async () => {
     server = await buildAdminRuntime();
     process.env.CCR_RELOAD_TEST_TARGET = "reloaded-provider,reloaded-model";

@@ -87,7 +87,10 @@ export async function loadInstalledPlugins(deps: {
     readConfig: () => readConfigFile(),
     readRawConfig: () => readConfigFileRaw(),
     writeConfig: (next: any) => writeConfigFile(next),
-    reloadRuntime: async (config?: any) => reloadProviderRuntime(deps.getServer(), config ?? (await readConfigFile()), log),
+    reloadRuntime: async (config?: any) => {
+      // Discard the host result: the plugin API contract is Promise<void>.
+      reloadProviderRuntime(deps.getServer(), config ?? (await readConfigFile()), log);
+    },
     getDirectDispatcher,
     // Fixed subscription origins honor the explicit SUBSCRIPTION_PROXY_URL
     // opt-in from the live server config; isolated hosts without a server
