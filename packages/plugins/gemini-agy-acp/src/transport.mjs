@@ -58,16 +58,37 @@ const OAUTH_ENV_VARS = ['PATH', 'HOME', 'USERPROFILE', 'LANG', 'TMPDIR', 'TEMP',
   'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'SystemRoot', 'COMSPEC', 'PATHEXT',
   'DBUS_SESSION_BUS_ADDRESS', 'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', ...PROXY_ENV_VARS];
 
-function oauthEnvironment() {
+// Mirror the core proxy policy for the agy CLI's own upstream calls. The
+// process environment always wins (it is what an operator set explicitly);
+// otherwise the gateway's configured proxy — applied when the global proxy
+// is enabled (the core default) or the managed provider opts in — fills the
+// standard variables the CLI honors. A desktop-managed gateway typically
+// inherits no proxy variables at all, which left the CLI dialing Google
+// directly and every turn timing out behind a regional network.
+function withConfiguredProxy(env, proxyUrl) {
+  if (proxyUrl) {
+    // Case variants are one setting: an explicit value in either case wins
+    // for the whole pair, so the fallback never mixes two proxies.
+    for (const [upper, lower] of [['HTTPS_PROXY', 'https_proxy'], ['HTTP_PROXY', 'http_proxy']]) {
+      if (!env[upper] && !env[lower]) {
+        env[upper] = proxyUrl;
+        env[lower] = proxyUrl;
+      }
+    }
+  }
+  return env;
+}
+
+function oauthEnvironment(proxyUrl) {
   const env = {};
   for (const name of OAUTH_ENV_VARS) {
     const value = process.env[name];
     if (value !== undefined) env[name] = value;
   }
-  return env;
+  return withConfiguredProxy(env, proxyUrl);
 }
 
-export async function isolatedEnvironment(root) {
+export async function isolatedEnvironment(root, proxyUrl) {
   const dirs = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'runtime', 'work']
     .map(name => [name, join(root, name)]));
   await Promise.all(Object.values(dirs).map(path => mkdir(path, { mode: 0o700 })));
@@ -85,12 +106,13 @@ export async function isolatedEnvironment(root) {
     env.SystemRoot = process.env.SystemRoot;
     env.PATH = join(env.SystemRoot, 'System32');
   }
-  return { env, cwd: dirs.work };
+  return { env: withConfiguredProxy(env, proxyUrl), cwd: dirs.work };
 }
 
 class Worker {
-  constructor(binary, authMethod, onRetired, log, { captureStderr = false } = {}) {
+  constructor(binary, authMethod, onRetired, log, { captureStderr = false, proxyUrl } = {}) {
     this.binary = binary;
+    this.proxyUrl = proxyUrl;
     this.authMethod = authMethod;
     this.onRetired = onRetired;
     this.log = log;
@@ -153,9 +175,9 @@ class Worker {
       this.root = await mkdtemp(join(tmpdir(), 'ccr-agy-acp-'));
       if (this.authMethod === OAUTH_METHOD) {
         this.cwd = this.root;
-        this.spawnEnv = oauthEnvironment();
+        this.spawnEnv = oauthEnvironment(this.proxyUrl);
       } else {
-        const isolation = await isolatedEnvironment(this.root);
+        const isolation = await isolatedEnvironment(this.root, this.proxyUrl);
         this.cwd = isolation.cwd;
         this.spawnEnv = isolation.env;
       }
@@ -414,8 +436,15 @@ class Worker {
   }
 }
 
-export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 60_000, maxWorkers = 2, apiKey, log } = {}) {
+function validProxyUrl(proxyUrl) {
+  if (proxyUrl == null || proxyUrl === '') return undefined;
+  if (typeof proxyUrl !== 'string' || !/^https?:\/\//i.test(proxyUrl)) throw new AcpError('invalid_config');
+  return proxyUrl;
+}
+
+export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 60_000, maxWorkers = 2, apiKey, log, proxyUrl } = {}) {
   const oauth = authMethod === OAUTH_METHOD;
+  proxyUrl = validProxyUrl(proxyUrl);
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod) ||
       !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000 ||
       !Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8 ||
@@ -475,7 +504,7 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
             !(candidate.binding?.bridge?.pending?.size > 0));
       if (!worker) {
         if (workers.size >= maxWorkers) throw new AcpError('busy');
-        worker = new Worker(binary, authMethod, retired => workers.delete(retired), log);
+        worker = new Worker(binary, authMethod, retired => workers.delete(retired), log, { proxyUrl });
         workers.add(worker);
       }
       return worker.run({ model, thinking, prompt, signal, onText, onToolCall, bridge, resume }, credential, timeoutMs);
@@ -498,11 +527,11 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
  * the connect route's only look at the binary — no ACP child is spawned. The
  * probe runs in the same auth mode as the pool that follows (oauth probes
  * use the whitelisted real environment; gemini probes the isolated one). */
-export async function probeVersion(binary, authMethod = AUTH_METHOD) {
+export async function probeVersion(binary, authMethod = AUTH_METHOD, proxyUrl) {
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod)) {
     throw new AcpError('invalid_config');
   }
-  const worker = new Worker(binary, authMethod, () => {});
+  const worker = new Worker(binary, authMethod, () => {}, undefined, { proxyUrl });
   const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), PROBE_MS);
   try {
     return await worker.probe();
@@ -520,9 +549,9 @@ export async function probeVersion(binary, authMethod = AUTH_METHOD) {
  * THIS handshake's explicit ACP account metadata or this child's own bounded
  * diagnostics tail; never from stale logs, other processes or token stores,
  * and only the validated email ever leaves this function. */
-export async function verifyOauthHandshake({ binary, log } = {}) {
+export async function verifyOauthHandshake({ binary, log, proxyUrl } = {}) {
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0')) throw new AcpError('invalid_config');
-  const worker = new Worker(binary, OAUTH_METHOD, () => {}, log, { captureStderr: true });
+  const worker = new Worker(binary, OAUTH_METHOD, () => {}, log, { captureStderr: true, proxyUrl });
   const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), OAUTH_VERIFY_MS);
   try {
     await worker.start();
@@ -551,11 +580,11 @@ export async function verifyOauthHandshake({ binary, log } = {}) {
  * handshake with the resolved key, session/new, then the advertised model
  * selector options from the session config. Never touches the request pool.
  * oauth-personal syncs authenticate the CLI's own login without any key. */
-export async function syncModelOptions({ binary, authMethod = AUTH_METHOD, apiKey, log } = {}) {
+export async function syncModelOptions({ binary, authMethod = AUTH_METHOD, apiKey, log, proxyUrl } = {}) {
   const oauth = authMethod === OAUTH_METHOD;
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod) ||
       (oauth ? apiKey != null : typeof apiKey !== 'string' || !apiKey.trim())) throw new AcpError('invalid_config');
-  const worker = new Worker(binary, authMethod, () => {}, log);
+  const worker = new Worker(binary, authMethod, () => {}, log, { proxyUrl });
   const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), MODEL_SYNC_MS);
   try {
     await worker.start(oauth ? undefined : apiKey);

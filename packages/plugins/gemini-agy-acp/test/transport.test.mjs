@@ -434,6 +434,24 @@ test('the isolated worker environment forwards only standard proxy variables', a
   assert.equal(env.HOME, join(root, 'home'));
 });
 
+test('the configured proxy fills absent worker variables and never overrides explicit ones', async t => {
+  const roots = await Promise.all([1, 2, 3].map(() => mkdtemp(join(tmpdir(), 'agy-env-fallback-'))));
+  t.after(() => Promise.all(roots.map(root => rm(root, { recursive: true, force: true }))));
+  const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'];
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  for (const key of keys) delete process.env[key];
+  const { env } = await isolatedEnvironment(roots[0], 'http://127.0.0.1:7897');
+  for (const key of keys) assert.equal(env[key], 'http://127.0.0.1:7897');
+  process.env.HTTPS_PROXY = 'http://127.0.0.1:1';
+  const explicit = await isolatedEnvironment(roots[1], 'http://127.0.0.1:7897');
+  assert.equal(explicit.env.HTTPS_PROXY, 'http://127.0.0.1:1');
+  assert.equal(explicit.env.https_proxy, undefined);
+  delete process.env.HTTPS_PROXY;
+  const bare = await isolatedEnvironment(roots[2]);
+  assert.equal(bare.env.HTTPS_PROXY, undefined);
+});
+
 test('model sync is bounded and fails closed on protocol deviations', async t => {
   const hanging = await setup(t, 'hang-version');
   await rejects(syncModelOptions({ binary: hanging.binary, apiKey: 'fixture-value' }), 'timeout', 504);

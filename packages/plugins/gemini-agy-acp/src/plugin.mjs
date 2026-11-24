@@ -108,6 +108,46 @@ async function assertExecutable(binary) {
   }
 }
 
+// Resolve the proxy the agy CLI must use for its own upstream calls, with the
+// same semantics as the core's resolveProviderProxyUrl: the configured proxy
+// (compatibility keys included) applies when the global proxy is enabled (the
+// core default when unset) or when this managed provider entry opts in.
+// Reads never throw: an unreadable config simply yields no proxy.
+const PROXY_URL_KEYS = ['HTTPS_PROXY', 'https_proxy', 'httpsProxy', 'PROXY_URL'];
+
+function globalProxyEnabled(value) {
+  if (value === undefined || value === null || value === '') return true;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'false' || normalized === '0') return false;
+    if (normalized === 'true' || normalized === '1') return true;
+    return Boolean(normalized);
+  }
+  return Boolean(value);
+}
+
+export async function resolveProxyUrl(host, providerName = 'gemini-agy-acp') {
+  let config;
+  try {
+    config = await host?.readConfig?.();
+  } catch {
+    return undefined;
+  }
+  if (!config || typeof config !== 'object') return undefined;
+  let proxyUrl;
+  for (const key of PROXY_URL_KEYS) {
+    const value = config[key];
+    if (value === undefined || value === null) continue;
+    const normalized = String(value).trim();
+    if (normalized) { proxyUrl = normalized; break; }
+  }
+  if (!/^https?:\/\//i.test(proxyUrl ?? '')) return undefined;
+  if (globalProxyEnabled(config.PROXY_GLOBAL_ENABLED)) return proxyUrl;
+  const providers = Array.isArray(config.Providers) ? config.Providers : Array.isArray(config.providers) ? config.providers : [];
+  const entry = providers.find(item => item?.name === providerName);
+  return entry?.proxyEnabled === true || entry?.proxy_enabled === true ? proxyUrl : undefined;
+}
+
 export async function activateWithTransport(ctx, createTransport, options = {}) {
   const installer = options.installer ?? createInstaller();
   const configDir = ctx.host.configDir;
@@ -132,11 +172,14 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     lastError = { code: safeCode(error), at: Date.now() };
     return error;
   };
-  const fingerprintOf = settings => JSON.stringify([settings.binary, settings.authMethod, settings.apiKey ?? null, settings.timeoutMs, settings.maxWorkers]);
+  const fingerprintOf = settings => JSON.stringify([settings.binary, settings.authMethod, settings.apiKey ?? null, settings.timeoutMs, settings.maxWorkers, settings.proxyUrl ?? null]);
 
   async function applyTransport(force = false) {
     const snapshot = await cache.read();
-    const settings = enabledSettings(snapshot.raw);
+    const base = enabledSettings(snapshot.raw);
+    // Re-resolve on every (re)build so a proxy config change swaps the pool.
+    const proxyUrl = base ? await resolveProxyUrl(ctx.host) : undefined;
+    const settings = base ? { ...base, ...(proxyUrl ? { proxyUrl } : {}) } : undefined;
     const next = settings ? fingerprintOf(settings) : null;
     if (!force && next === fingerprint) return;
     const previous = transport;
@@ -285,7 +328,7 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     // never enables a broken binary. The probe runs in the same auth mode as
     // the pool that follows.
     const { probeVersion } = await loadTransportModule();
-    const version = await probeVersion(merged.binary, authMethod);
+    const version = await probeVersion(merged.binary, authMethod, await resolveProxyUrl(ctx.host));
     let accountEmail = null;
     if (oauth) {
       // A `--version` probe cannot prove the OS-keyring Google login works:
@@ -294,7 +337,7 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
       // maps to auth_required so the card surfaces the terminal-login hint.
       const { verifyOauthHandshake } = await loadTransportModule();
       try {
-        ({ accountEmail } = await verifyOauthHandshake({ binary: merged.binary, log }));
+        ({ accountEmail } = await verifyOauthHandshake({ binary: merged.binary, log, proxyUrl: await resolveProxyUrl(ctx.host) }));
       } catch (error) {
         log?.warn?.(`gemini-agy-acp oauth handshake failed (${safeCode(error)})`);
         throw new AcpError('auth_required');
@@ -320,7 +363,8 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
         // replacing the saved credentials or the live pool.
         await writeSidecar(configDir, payload, async next => {
           settings = enabledSettings(next);
-          replacement = await createTransport({ ...settings, ...(log ? { log } : {}) });
+          const proxyUrl = await resolveProxyUrl(ctx.host);
+          replacement = await createTransport({ ...settings, ...(proxyUrl ? { proxyUrl } : {}), ...(log ? { log } : {}) });
           if (!replacement) throw failure('agy_config_invalid', 503);
         });
       } catch (error) {
@@ -410,9 +454,10 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     // the CLI's own login, exactly like the request pool.
     const apiKey = oauth ? undefined : settings.apiKey ?? process.env.GEMINI_API_KEY;
     if (!oauth && !apiKey?.trim()) throw new AcpError('auth_required');
+    const proxyUrl = await resolveProxyUrl(ctx.host);
     const { models, version } = await syncModelOptions(oauth
-      ? { binary: settings.binary, authMethod: 'oauth-personal', log }
-      : { binary: settings.binary, apiKey, log });
+      ? { binary: settings.binary, authMethod: 'oauth-personal', log, proxyUrl }
+      : { binary: settings.binary, apiKey, log, proxyUrl });
     const modelsSyncedAt = Date.now();
     // The operator's hide set survives re-syncs; ids that disappeared
     // upstream are dropped from it silently (always persisted so a pruned
