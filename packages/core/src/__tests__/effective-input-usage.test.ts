@@ -37,6 +37,18 @@ describe("effective input capture", () => {
     expect(row.effectiveInputTokensSource).toBeUndefined();
   });
 
+  it("keeps inclusive total and cache reads separate so the UI can subtract (77000 total, 76000 read => 1000 uncached)", async () => {
+    const req = request("/v1/responses");
+    const usage = { input_tokens: 77000, input_tokens_details: { cached_tokens: 76000 } };
+    const row = await record(req, JSON.stringify({ object: "response", usage }));
+    // Core stores the inclusive total and the read bucket independently; the
+    // page derives uncached input as total - read, never double-subtracting.
+    expect(row.effectiveInputTokens).toBe(77000);
+    expect(row.cacheReadInputTokens).toBe(76000);
+    expect(row.effectiveInputTokens - row.cacheReadInputTokens).toBe(1000);
+    expect(row.effectiveInputTokensSource).toBeUndefined();
+  });
+
   it.each([
     { input_tokens: 0, cache_read_input_tokens: 50, cache_creation_input_tokens: 5, expected: 55 },
     { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 5, expected: 15 },
