@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { after, before, test } from 'node:test';
 import { createTransport, isolatedEnvironment, oauthEnvironment, probeVersion, syncModelOptions, verifyOauthHandshake } from '../src/transport.mjs';
+import { AgyToolBridge } from '../src/agy-tool-bridge.mjs';
 import { chatResponse } from '../src/chat.mjs';
 
 test('oauth-personal runs the whitelisted real environment, authenticates the CLI login and never creates an isolated root', async t => {
@@ -508,6 +509,73 @@ test('retireIdle lets an in-flight turn finish and retires idle workers for a fr
   await transport.run(input);
   assert.equal((await events()).filter(record => record.event === 'spawn').length, 2);
   await transport.close();
+});
+
+test('workers spawn acp --process-per-session and never the sandbox flag', async t => {
+  const { transport, events } = await setup(t);
+  await transport.run(input);
+  const spawn = (await events()).find(record => record.event === 'spawn');
+  assert.deepEqual(spawn.args, ['acp', '--process-per-session']);
+  assert.ok(!spawn.args.includes('--sandbox'));
+});
+
+test('session/new eagerly connects the bridge only when antigravity meta is advertised', async t => {
+  const makeBridge = async () => {
+    const bridge = new AgyToolBridge([{ type: 'function', function: { name: 'lookup',
+      parameters: { type: 'object', properties: { key: { type: 'string' } } } } }], () => new Promise(() => {}));
+    await bridge.start();
+    return bridge;
+  };
+  await t.test('advertised capability and a live bridge', async t => {
+    const { transport, events } = await setup(t, 'mcp-tool-meta');
+    const bridge = await makeBridge();
+    const parked = await transport.run({ ...input, prompt: 'go', onToolCall() {}, bridge });
+    assert.equal(parked.parked.length, 1);
+    const session = (await events()).find(record => record.event === 'session/new');
+    // The eager name is exactly the descriptor's server name.
+    assert.deepEqual(session.meta, { antigravity: { eagerMcpServers: [bridge.descriptor().name] } });
+    assert.equal(session.meta.antigravity.eagerMcpServers[0], 'ccr-caller-tools');
+  });
+  await t.test('a live bridge without the advertised capability', async t => {
+    const { transport, events } = await setup(t, 'mcp-tool');
+    const bridge = await makeBridge();
+    const parked = await transport.run({ ...input, prompt: 'go', onToolCall() {}, bridge });
+    assert.equal(parked.parked.length, 1);
+    const session = (await events()).find(record => record.event === 'session/new');
+    assert.equal(session.meta, null);
+  });
+  await t.test('advertised capability but no bridge', async t => {
+    const { transport, events } = await setup(t, 'antigravity-meta');
+    await transport.run(input);
+    const session = (await events()).find(record => record.event === 'session/new');
+    assert.equal(session.meta, null);
+  });
+});
+
+test('a startup auth race on authenticate is retried exactly once', async t => {
+  const { transport, events } = await setup(t, 'auth-race');
+  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+  assert.equal((await events()).filter(record => record.event === 'authenticate').length, 2);
+});
+
+test('a persistent auth-race message fails closed after one bounded retry', async t => {
+  const { transport, events } = await setup(t, 'auth-race-persistent');
+  await rejects(transport.run(input), 'auth_required', 401);
+  assert.equal((await events()).filter(record => record.event === 'authenticate').length, 2);
+});
+
+test('quota and credential failures are never retried even with a race message', async t => {
+  for (const mode of ['auth-quota-race', 'auth-invalid-grant']) await t.test(mode, async t => {
+    const { transport, events } = await setup(t, mode);
+    await rejects(transport.run(input), 'auth_required', 401);
+    assert.equal((await events()).filter(record => record.event === 'authenticate').length, 1);
+  });
+});
+
+test('a startup auth race on session/new is retried exactly once', async t => {
+  const { transport, events } = await setup(t, 'session-auth-race');
+  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+  assert.equal((await events()).filter(record => record.event === 'session/new').length, 2);
 });
 
 test('model sync is bounded and fails closed on protocol deviations', async t => {

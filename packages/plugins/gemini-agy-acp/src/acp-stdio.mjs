@@ -133,7 +133,17 @@ export class AcpStdio {
     if (!this.pending || frame.id !== this.pending.id) return; // stale response
     const { resolve, reject, errorCode } = this.pending;
     this.pending = null;
-    if (Object.hasOwn(frame, 'error')) reject(new AcpError(errorCode));
+    if (Object.hasOwn(frame, 'error')) {
+      const failure = new AcpError(errorCode);
+      // Keep the agent's own error text for internal classification only (the
+      // startup auth-race retry). Non-enumerable and never copied into the
+      // caller-facing `message`, so diagnostics cannot leak through responses
+      // or serialization.
+      if (typeof frame.error?.message === 'string') {
+        Object.defineProperty(failure, 'agentMessage', { value: frame.error.message });
+      }
+      reject(failure);
+    }
     else if (!frame.result || typeof frame.result !== 'object' || Array.isArray(frame.result)) {
       reject(new AcpError('protocol_error'));
     } else resolve(frame.result);

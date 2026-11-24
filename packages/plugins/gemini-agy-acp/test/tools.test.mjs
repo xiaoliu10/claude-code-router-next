@@ -140,6 +140,44 @@ async function activateTool(t, agent) {
   return { dispatch, runtime };
 }
 
+test('tools/list marks every entry alwaysLoad and keeps name, description and schema', async t => {
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const bridge = new AgyToolBridge([tool], () => new Promise(() => {}));
+  await bridge.start();
+  t.after(() => bridge.close());
+  const listed = await speakMcp(bridge.url, bridge.token, 'tools/list', {});
+  assert.equal(listed.tools.length, 1);
+  const entry = listed.tools[0];
+  assert.equal(entry.name, 'ccr_lookup');
+  assert.equal(entry.description, 'Look up a value.');
+  assert.deepEqual(entry.inputSchema, { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] });
+  assert.equal(entry._meta['antigravity/alwaysLoad'], true);
+});
+
+test('an over-budget tools/list keeps every tool and schema while trimming descriptions', async t => {
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const { TOOL_TOKEN_BUDGET } = await import('../src/agy-tool-budget.mjs');
+  // 64 tools with 1024-byte descriptions exceed agy's customization budget.
+  const prose = 'Look up a value in the store. '.repeat(40).slice(0, 1024);
+  const many = Array.from({ length: 64 }, (_, i) => ({ type: 'function', function: {
+    name: `lookup_${i}`, description: prose,
+    parameters: { type: 'object', properties: { key: { type: 'string', enum: ['a', 'b'] } }, required: ['key'] },
+  } }));
+  const bridge = new AgyToolBridge(many, () => new Promise(() => {}));
+  await bridge.start();
+  t.after(() => bridge.close());
+  const listed = await speakMcp(bridge.url, bridge.token, 'tools/list', {});
+  assert.equal(listed.tools.length, 64);
+  const tokens = listed.tools.reduce((total, entry) => total + Math.ceil(Buffer.byteLength(JSON.stringify(entry), 'utf8') / 3), 0);
+  assert.ok(tokens <= TOOL_TOKEN_BUDGET, `${tokens} tokens exceeds the budget`);
+  for (const [i, entry] of listed.tools.entries()) {
+    assert.equal(entry.name, `ccr_lookup_${i}`);
+    assert.equal(entry._meta['antigravity/alwaysLoad'], true);
+    assert.deepEqual(entry.inputSchema, { type: 'object', properties: { key: { type: 'string', enum: ['a', 'b'] } }, required: ['key'] });
+    assert.ok(entry.description.length < prose.length);
+  }
+});
+
 test('bridges the caller tools, parks the agent call and resumes with the result', async t => {
   const observed = { listed: [], texts: [], parked: new Map() };
   const agent = makeAgent(observed);

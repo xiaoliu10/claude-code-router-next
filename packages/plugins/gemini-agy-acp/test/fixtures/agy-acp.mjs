@@ -13,6 +13,10 @@ const mode = readFileSync(join(fixtureDir, 'mode'), 'utf8');
 let authMethod = 'gemini-api-key';
 try { authMethod = readFileSync(join(fixtureDir, 'authMethod'), 'utf8').trim(); } catch { /* default */ }
 const isolated = authMethod === 'gemini-api-key';
+// The mcp-tool modes adopt the caller's MCP bridge; the -meta variants also
+// advertise the official antigravity capability extension at initialize.
+const mcpMode = mode === 'mcp-tool' || mode === 'mcp-tool-meta';
+const antigravityMeta = mode === 'antigravity-meta' || mode === 'mcp-tool-meta';
 const record = (event, data = {}) => appendFileSync(join(fixtureDir, 'events'), JSON.stringify({ event, pid: process.pid, ...data }) + '\n');
 const send = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
 const argv = process.argv.slice(2);
@@ -48,10 +52,13 @@ if (argv[0] === '--version') {
   else if (mode === 'long-version') process.stdout.write('0'.repeat(4097));
   else console.log(`agy version ${mode === 'old' ? '1.5.0' : mode === 'prerelease' ? '1.5.1-rc1' : '1.5.1'}`);
 } else {
-  assert.deepEqual(argv, ['acp', '--sandbox']);
+  assert.deepEqual(argv, ['acp', '--process-per-session']);
   assert.equal(process.env.GEMINI_API_KEY, isolated ? 'fixture-value' : undefined);
-  record('spawn', isolated ? { root, httpsProxy: process.env.HTTPS_PROXY ?? null, noProxy: process.env.NO_PROXY ?? null } : { cwd: process.cwd(), home: process.env.HOME, httpsProxy: process.env.HTTPS_PROXY ?? null, noProxy: process.env.NO_PROXY ?? null });
+  record('spawn', { args: argv, ...(isolated ? { root } : { cwd: process.cwd(), home: process.env.HOME }),
+    httpsProxy: process.env.HTTPS_PROXY ?? null, noProxy: process.env.NO_PROXY ?? null });
   let authenticated = false;
+  let authAttempts = 0;
+  let sessionAttempts = 0;
   let sessionNumber = 0;
   let sessionId;
   let model;
@@ -95,14 +102,15 @@ if (argv[0] === '--version') {
       if (denied.size === 4) send({ id: promptId, result: { stopReason: 'end_turn' } });
       return;
     }
-    record(method, params?.cwd ? { cwd: params.cwd } : {});
+    record(method, params?.cwd ? { cwd: params.cwd, ...(method === 'session/new' ? { meta: params._meta ?? null } : {}) } : {});
     const reply = result => send({ id, result });
     if (method === 'initialize') {
       assert.equal(params.protocolVersion, 1);
       assert.equal(params.clientInfo.name, 'ccr-gemini-agy-acp');
       assert.match(params.clientInfo.version, /^\d+\.\d+\.\d+/);
       assert.deepEqual(params.clientCapabilities, {});
-      if (mode !== 'hang-init') reply({ protocolVersion: mode === 'v2' ? 2 : 1, agentCapabilities: {},
+      if (mode !== 'hang-init') reply({ protocolVersion: mode === 'v2' ? 2 : 1,
+        agentCapabilities: antigravityMeta ? { _meta: { antigravity: { systemPrompt: { append: true } } } } : {},
         authMethods: [{ id: 'consumer' }, ...(mode === 'no-key-method' ? [] : [{ id: authMethod,
           ...(isolated && mode === 'terminal-auth' && { type: 'terminal' }),
           ...(isolated && mode === 'env-auth' && { type: 'env_var' }) }])],
@@ -111,9 +119,17 @@ if (argv[0] === '--version') {
           { accountInfo: { email: 'metadata-account@example.com' } }) });
     } else if (method === 'authenticate') {
       assert.deepEqual(params, { methodId: authMethod });
+      authAttempts++;
       if (mode === 'auth-failure') {
         process.stderr.write('fixture-secret-diagnostic\n');
         send({ id, error: { code: -32000, message: 'fixture-secret-diagnostic' } });
+      } else if ((mode === 'auth-race' && authAttempts === 1) || mode === 'auth-race-persistent') {
+        // The transient startup auth race: the login state is still loading.
+        send({ id, error: { code: -32000, message: 'Not logged into Antigravity' } });
+      } else if (mode === 'auth-quota-race') {
+        send({ id, error: { code: -32000, message: 'authentication required: 429 RESOURCE_EXHAUSTED quota exceeded' } });
+      } else if (mode === 'auth-invalid-grant') {
+        send({ id, error: { code: -32000, message: 'authentication required: invalid_grant' } });
       } else {
         authenticated = true;
         // The verifying child's own login diagnostic, written to stderr so
@@ -127,9 +143,14 @@ if (argv[0] === '--version') {
       assert.equal(authenticated, true);
       assert.equal(dirname(params.cwd), isolated ? root : tmpdir());
       assert.deepEqual(readdirSync(params.cwd), []);
+      sessionAttempts++;
+      if (mode === 'session-auth-race' && sessionAttempts === 1) {
+        send({ id, error: { code: -32000, message: 'Not logged into Antigravity' } });
+        return;
+      }
       sessionNumber++;
       sessionId = mode === 'duplicate-session' ? 'one' : `sess-${sessionNumber}`;
-      if (mode === 'mcp-tool') {
+      if (mcpMode) {
         // Adopt the caller's MCP server exactly as a real agent does, so the
         // fixture can call the tool over HTTP like the production agent would.
         // The bridge is per session: two interleaved conversations must each
@@ -192,13 +213,13 @@ if (argv[0] === '--version') {
             ['write', 'fs/write_text_file'], ['terminal', 'terminal/create']]) send({ id: key, method: callback, params: { sessionId } });
           break;
         default:
-          if (mode === 'mcp-tool' && !mcpBySession.has(sessionId)) {
+          if (mcpMode && !mcpBySession.has(sessionId)) {
             // Text-only session: answer plainly, exactly as the ok mode does.
             chunk('from previous turn', `sess-${sessionNumber - 1}`);
             reply({ stopReason: 'max_tokens' });
             return;
           }
-          if (mode === 'mcp-tool' && !toolSettledBySession.has(sessionId)) {
+          if (mcpMode && !toolSettledBySession.has(sessionId)) {
             // Discover the caller's tools over MCP, then raise a call. The call
             // stays parked until the caller answers, so this prompt never
             // finishes until the follow-up request resolves it.
@@ -219,7 +240,7 @@ if (argv[0] === '--version') {
             reply({ stopReason: 'end_turn' });
             return;
           }
-          if (mode === 'mcp-tool') {
+          if (mcpMode) {
             // The follow-up turn carries the caller's result: relay it and end.
             chunk(`resumed with ${toolSettledBySession.get(sessionId) ?? ''}`);
             reply({ stopReason: 'end_turn' });

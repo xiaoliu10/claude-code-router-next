@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { configureSession, modelOptions, modelSelector } from './acp-config.mjs';
 import { AcpError } from './acp-errors.mjs';
 import { AcpStdio } from './acp-stdio.mjs';
@@ -20,6 +21,12 @@ const MODEL_SYNC_MS = 5000;
 const OAUTH_VERIFY_MS = 10_000;
 const MAX_STDERR_TAIL_BYTES = 64 * 1024;
 const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'max_turn_requests', 'refusal', 'cancelled']);
+// Startup auth race: right after spawn the CLI can reject authenticate or
+// session/new with a transient "not logged in" style error while its login
+// state is still loading (observed on the plugin-MCP path). Real credential
+// failures and rate/quota errors are never retried.
+const AUTH_RACE_MESSAGE = /authentication required|auth_required|not logged in|not signed in/i;
+const AUTH_NO_RETRY_MESSAGE = /invalid_grant|api.?key|429|resource_exhausted|quota/i;
 
 function clientVersion() {
   try {
@@ -226,7 +233,9 @@ class Worker {
     await this.probe();
     this.check();
 
-    const child = this.spawnChild(['acp', '--sandbox'],
+    // --process-per-session is required for client HTTP MCP; --sandbox
+    // restricts the agent toolset and excludes session MCP tools entirely.
+    const child = this.spawnChild(['acp', '--process-per-session'],
       this.authMethod === OAUTH_METHOD ? this.spawnEnv : { ...this.spawnEnv, GEMINI_API_KEY: apiKey },
       this.captureStderr);
     child.once('exit', () => this.retire(new AcpError('worker_failed')));
@@ -236,13 +245,38 @@ class Worker {
     if (init.protocolVersion !== 1) throw new AcpError('protocol_error');
     if (!Array.isArray(init.authMethods) || !init.authMethods.some(method => method?.id === this.authMethod &&
         (method.type == null || method.type === 'agent'))) throw new AcpError('auth_required');
-    await this.rpc.request('authenticate', { methodId: this.authMethod }, 'auth_required');
+    // The official `_meta.antigravity` session extensions are only valid when
+    // the agent advertises the capability object at initialize; gate on it.
+    const antigravity = init.agentCapabilities?._meta?.antigravity;
+    this.antigravityMeta = antigravity && typeof antigravity === 'object' && !Array.isArray(antigravity) ? antigravity : null;
+    await this.retryStartupAuthRace(() => this.rpc.request('authenticate', { methodId: this.authMethod }, 'auth_required'));
     // Explicit ACP account metadata of THIS handshake, when the CLI reports
     // it; verified against the bounded email shape before it is kept.
     this.initAccountEmail = accountEmailShapeOk(init.accountInfo?.email) ? init.accountInfo.email : null;
     // One bounded spawn log per worker start: binary path and CLI version only,
     // never key material or prompt content.
     this.log?.info?.(`gemini-agy-acp worker started (agy ${this.version}, binary: ${this.binary})`);
+  }
+
+  /**
+   * One bounded retry for the startup auth race only: a transient "not logged
+   * in" style rejection inside the first 2s of the attempt is retried once
+   * after 250ms. Credential failures (invalid_grant, api key) and rate/quota
+   * errors (429, RESOURCE_EXHAUSTED) are rethrown immediately, and a retired
+   * worker never retries.
+   */
+  async retryStartupAuthRace(call) {
+    const started = Date.now();
+    try {
+      return await call();
+    } catch (error) {
+      const text = typeof error.agentMessage === 'string' ? error.agentMessage : error.message;
+      if (this.failure || Date.now() - started >= 2000 ||
+          !AUTH_RACE_MESSAGE.test(text) || AUTH_NO_RETRY_MESSAGE.test(text)) throw error;
+      await delay(250, undefined, { ref: false });
+      if (this.failure) throw error;
+      return call();
+    }
   }
 
   /**
@@ -267,7 +301,8 @@ class Worker {
     this.check();
     const cwd = await mkdtemp(join(this.authMethod === OAUTH_METHOD ? tmpdir() : this.root, 'session-'));
     const hasTools = !!bridge && !bridge.empty;
-    const mcpServers = hasTools ? [bridge.descriptor()] : [];
+    const descriptor = hasTools ? bridge.descriptor() : undefined;
+    const mcpServers = descriptor ? [descriptor] : [];
     let sessionId;
     try {
       if (resume && this.binding?.sessionId && this.binding.bridge === bridge) {
@@ -277,7 +312,14 @@ class Worker {
         this.rpc.abandon();
       } else {
         if (this.binding) await this.closeBinding();
-        const session = await this.rpc.request('session/new', { cwd, mcpServers });
+        const params = { cwd, mcpServers };
+        // Eager connect avoids the preload race where the first prompt runs
+        // before the CLI has connected to the session's MCP server. Sent only
+        // when initialize advertised the antigravity capability object.
+        if (descriptor && this.antigravityMeta) {
+          params._meta = { antigravity: { eagerMcpServers: [descriptor.name] } };
+        }
+        const session = await this.retryStartupAuthRace(() => this.rpc.request('session/new', params));
         sessionId = session.sessionId;
         if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 4096 || this.sessions.has(sessionId)) {
           throw new AcpError('protocol_error');

@@ -11,6 +11,7 @@
  */
 import { createServer } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { fitToolsToBudget } from './agy-tool-budget.mjs';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_TOOLS = 64;
@@ -292,9 +293,13 @@ export class AgyToolBridge {
       return;
     }
     if (method === 'tools/list') {
-      reply({ tools: this.tools.map(tool => ({
+      // alwaysLoad keeps each entry loaded even when agy's shared
+      // customization budget would otherwise drop it; the fitter then trims
+      // only description prose so every tool stays listed, schema intact.
+      reply({ tools: fitToolsToBudget(this.tools.map(tool => ({
         name: tool.mcpName, description: tool.description, inputSchema: tool.inputSchema,
-      })) });
+        _meta: { ...(tool.meta || {}), 'antigravity/alwaysLoad': true },
+      }))) });
       return;
     }
     if (method === 'tools/call') {
