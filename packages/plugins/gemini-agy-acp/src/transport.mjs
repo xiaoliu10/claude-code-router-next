@@ -266,12 +266,13 @@ class Worker {
    * worker never retries.
    */
   async retryStartupAuthRace(call) {
-    const started = Date.now();
+    // Monotonic clock: a wall-clock NTP step or suspend/resume must not widen the retry window.
+    const started = performance.now();
     try {
       return await call();
     } catch (error) {
       const text = typeof error.agentMessage === 'string' ? error.agentMessage : error.message;
-      if (this.failure || Date.now() - started >= 2000 ||
+      if (this.failure || performance.now() - started >= 2000 ||
           !AUTH_RACE_MESSAGE.test(text) || AUTH_NO_RETRY_MESSAGE.test(text)) throw error;
       await delay(250, undefined, { ref: false });
       if (this.failure) throw error;

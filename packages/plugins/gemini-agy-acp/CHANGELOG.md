@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-11-24
+
+Reliable MCP tool exposure and desktop-gateway proxy support. The worker now spawns `agy acp --process-per-session` instead of `agy acp --sandbox`: the sandbox mode restricted the agent toolset and excluded the session MCP servers, so caller tools never reached the model. A session is eagerly connected to the caller's MCP server through the capability-gated `_meta.antigravity.eagerMcpServers` extension, every advertised tool carries `antigravity/alwaysLoad`, and a 18,000-token budget fitter trims only description prose (never schema keys, and it never drops a tool) to stay inside agy's customization limit. A single bounded 250 ms retry absorbs the startup "not logged in" authentication race; quota, 429 and credential failures are never retried. Desktop gateways without inherited proxy variables now resolve the configured proxy and inject it into every agy child, with a loopback `NO_PROXY` exclusion so the local MCP bridge is never proxied. Native agent tools are deliberately left enabled and no client fingerprint is spoofed.
+
+可靠的 MCP 工具暴露与桌面网关代理支持。worker 现在以 `agy acp --process-per-session` 而非 `agy acp --sandbox` 启动：sandbox 模式会限制 agent 工具集并排除会话 MCP 服务，导致调用方工具无法到达模型。会话通过能力门控的 `_meta.antigravity.eagerMcpServers` 扩展主动连接调用方 MCP 服务，每个工具带 `antigravity/alwaysLoad` 标记，并由 18,000 token 预算拟合器只裁剪描述文本（绝不改 schema 键、绝不丢工具）以控制在 agy 定制预算内。单次有界 250ms 重试吸收启动期「未登录」认证竞态；配额、429 与凭据失败绝不重试。无继承代理变量的桌面网关现在会解析配置代理并注入每个 agy 子进程，同时加环回 `NO_PROXY` 排除，确保本地 MCP 桥不走代理。agent 原生工具按合规要求保持启用，且不伪造客户端指纹。
+
 ## 0.2.0 — 2026-11-24
 
 Tool calling. A request that declares tools used to be rejected with `400 agy_unsupported_request`; it is now served. The plugin publishes the caller's tools to the agent through an MCP server bound to `127.0.0.1` (ephemeral port, random bearer token compared with `timingSafeEqual`), the agent raises a call, and the caller receives it as `tool_calls`. The ACP session and the MCP call stay warm, so the next request carrying the caller's results resumes the same turn instead of starting a new conversation.

@@ -59,8 +59,10 @@ test('over budget: every tool and schema constraint stays, only descriptions shr
     // Every schema key and constraint is untouched, including nested ones.
     assert.deepEqual(withoutDescriptions(entry.inputSchema), withoutDescriptions(original.inputSchema));
     assert.ok(Buffer.byteLength(entry.description, 'utf8') < Buffer.byteLength(prose, 'utf8'));
-    // The cut never splits a multi-byte code point: JSON round-trips cleanly.
+    // The cut never splits a multi-byte code point: a JSON round-trip alone
+    // cannot prove it (lone surrogates survive), so assert UTF-8 byte symmetry.
     assert.deepEqual(JSON.parse(JSON.stringify(entry)), entry);
+    assert.equal(Buffer.from(entry.description, 'utf8').toString('utf8'), entry.description);
   }
 });
 

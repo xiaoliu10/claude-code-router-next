@@ -126,6 +126,9 @@ if (argv[0] === '--version') {
       } else if ((mode === 'auth-race' && authAttempts === 1) || mode === 'auth-race-persistent') {
         // The transient startup auth race: the login state is still loading.
         send({ id, error: { code: -32000, message: 'Not logged into Antigravity' } });
+      } else if (mode === 'auth-race-late' && authAttempts === 1) {
+        // The same race message arriving after the 2s window must not be retried.
+        setTimeout(() => send({ id, error: { code: -32000, message: 'Not logged into Antigravity' } }), 2100);
       } else if (mode === 'auth-quota-race') {
         send({ id, error: { code: -32000, message: 'authentication required: 429 RESOURCE_EXHAUSTED quota exceeded' } });
       } else if (mode === 'auth-invalid-grant') {

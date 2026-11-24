@@ -564,6 +564,23 @@ test('a persistent auth-race message fails closed after one bounded retry', asyn
   assert.equal((await events()).filter(record => record.event === 'authenticate').length, 2);
 });
 
+test('a race message arriving after the 2s window is not retried', async t => {
+  const { transport, events } = await setup(t, 'auth-race-late');
+  await rejects(transport.run(input), 'auth_required', 401);
+  // The delayed error lands outside the startup window, so authenticate ran once.
+  assert.equal((await events()).filter(record => record.event === 'authenticate').length, 1);
+});
+
+test('the agent error text stays non-enumerable so it cannot leak into serialised output', async t => {
+  const { transport } = await setup(t, 'auth-race-persistent');
+  await assert.rejects(transport.run(input), error => {
+    assert.equal(error.agentMessage, 'Not logged into Antigravity');
+    assert.equal(Object.keys(error).includes('agentMessage'), false);
+    assert.doesNotMatch(JSON.stringify(error), /Not logged into Antigravity/);
+    return true;
+  });
+});
+
 test('quota and credential failures are never retried even with a race message', async t => {
   for (const mode of ['auth-quota-race', 'auth-invalid-grant']) await t.test(mode, async t => {
     const { transport, events } = await setup(t, mode);
