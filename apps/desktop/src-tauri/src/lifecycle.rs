@@ -171,12 +171,21 @@ impl RuntimeBundle {
     /// Fixed resource launch path: `<resources>/runtime/node` (portable node;
     /// `node.exe` on Windows, where an extension is required to execute).
     pub fn node(&self) -> PathBuf {
-        self.root.join(if cfg!(windows) { "node.exe" } else { "node" })
+        self.root
+            .join(if cfg!(windows) { "node.exe" } else { "node" })
     }
     /// Fixed resource entry: `<resources>/runtime/service/entry.cjs` (the
     /// bundled desktop service entry reusing the core runtime directly).
     pub fn entry(&self) -> PathBuf {
         self.root.join("service/entry.cjs")
+    }
+    // Tauri returns a verbatim resource path on Windows. Node's CommonJS main
+    // loader rejects that form in argv. Use the equivalent regular path when
+    // it is safe to do so, preserving the parent's cwd and OS path semantics.
+    fn launch_command(&self) -> Command {
+        let mut command = Command::new(self.node());
+        command.arg(dunce::simplified(&self.entry()));
+        command
     }
     /// PATH precedence for child processes: bundled `node`/`npm`/`npx` win so
     /// plugin installs use the bundled npm instead of a global one.
@@ -304,7 +313,8 @@ fn spawn_gateway(
     if guard.is_some() {
         return Err("Gateway already owns the launch slot".into());
     }
-    let mut child = spawn_with(&bundle.node(), &[bundle.entry().into_os_string()])
+    let mut child = bundle
+        .launch_command()
         .env("PATH", path)
         .env(MANAGED_ENV, "1")
         .stdin(Stdio::null())
@@ -331,14 +341,6 @@ fn spawn_gateway(
         let _ = child.wait();
         Err("Gateway already owns the launch slot".into())
     }
-}
-
-/// Builds the gateway command with explicit program/args so tests can drive
-/// the exact launch path with fake executables.
-fn spawn_with(program: &Path, args: &[OsString]) -> Command {
-    let mut command = Command::new(program);
-    command.args(args);
-    command
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -710,12 +712,9 @@ mod tests {
     fn fake_bundle() -> RuntimeBundle {
         let dir = std::env::temp_dir().join(format!("ccr-lifecycle-fake-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("service")).unwrap();
-        let node = dir.join("node");
-        if !node.exists() {
-            std::fs::write(&node, "#!/bin/sh\nexit 0\n").unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // These paths exercise attach/cancel only; no executable is launched.
+        let node = RuntimeBundle { root: dir.clone() }.node();
+        std::fs::write(node, "fixture").unwrap();
         std::fs::write(dir.join("service/entry.cjs"), "// fixture\n").unwrap();
         RuntimeBundle { root: dir }
     }
@@ -820,6 +819,7 @@ mod tests {
         };
         assert!(!config_text_matches("{PORT:4000}", addr, &env));
     }
+    #[cfg(unix)]
     #[test]
     fn bundled_path_prepends_bundle_dirs_before_inherited() {
         let bundle = fake_bundle();
@@ -867,6 +867,7 @@ mod tests {
             .spawn()
             .unwrap()
     }
+    #[cfg(unix)]
     #[test]
     fn stop_owned_gateway_terminates_a_live_fake_child() {
         let dir = std::env::temp_dir().join(format!("ccr-lifecycle-test-{}", std::process::id()));
@@ -877,6 +878,7 @@ mod tests {
         assert!(matches!(child.try_wait(), Ok(Some(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(unix)]
     #[test]
     fn stop_owned_gateway_on_exited_child_never_signals_again() {
         let dir = std::env::temp_dir().join(format!("ccr-lifecycle-exit-{}", std::process::id()));
@@ -889,6 +891,7 @@ mod tests {
         assert!(stop_owned_gateway(&mut child));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(unix)]
     #[test]
     fn graceful_sigterm_runs_before_bounded_kill() {
         let dir = std::env::temp_dir().join(format!("ccr-lifecycle-grace-{}", std::process::id()));
@@ -923,6 +926,23 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(windows)]
+    #[test]
+    fn node_main_uses_a_regular_absolute_windows_path() {
+        let bundle = RuntimeBundle {
+            root: PathBuf::from(r"\\?\E:\CCR Desktop\runtime"),
+        };
+        let cmd = bundle.launch_command();
+        assert_eq!(cmd.get_program(), bundle.node());
+        assert_eq!(cmd.get_current_dir(), None);
+        let args: Vec<_> = cmd.get_args().map(Path::new).collect();
+        assert_eq!(
+            args,
+            [Path::new(r"E:\CCR Desktop\runtime\service\entry.cjs")]
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn spawn_bundled_publishes_child_into_shared_slot() {
         // detect() expects the bundle under <resource_dir>/runtime — mirror the
@@ -930,7 +950,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ccr-lifecycle-bundle-{}", std::process::id()));
         let runtime = dir.join("runtime");
         std::fs::create_dir_all(runtime.join("service")).unwrap();
-        let node = fake_child_script(&runtime, "node", false);
+        fake_child_script(&runtime, "node", false);
         std::fs::write(runtime.join("service/entry.cjs"), "// fake entry\n").unwrap();
         let bundle = RuntimeBundle {
             root: runtime.clone(),
@@ -938,7 +958,8 @@ mod tests {
         assert!(RuntimeBundle::detect(Some(&dir)).is_some());
         assert!(RuntimeBundle::detect(Some(&dir.join("missing"))).is_none());
         let slot: Mutex<Option<Child>> = Mutex::new(None);
-        let child = spawn_with(&node, &[bundle.entry().into_os_string()])
+        let child = bundle
+            .launch_command()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
