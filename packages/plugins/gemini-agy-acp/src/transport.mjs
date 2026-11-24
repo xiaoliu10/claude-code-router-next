@@ -528,7 +528,7 @@ function validProxyUrl(proxyUrl) {
   return proxyUrl;
 }
 
-export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 60_000, maxWorkers = 2, apiKey, log, proxyUrl } = {}) {
+export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 60_000, maxWorkers = 4, apiKey, log, proxyUrl } = {}) {
   const oauth = authMethod === OAUTH_METHOD;
   proxyUrl = validProxyUrl(proxyUrl);
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod) ||

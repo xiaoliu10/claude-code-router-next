@@ -248,9 +248,9 @@ test('rejects missing key, oversized prompt, unsupported model and effort', asyn
   assert.ok(!(await events()).some(record => record.event === 'session/prompt'));
 });
 
-test('pool grants two leases by default, rejects overload and replaces cancelled workers', async t => {
+test('pool grants four leases by default, rejects overload and replaces cancelled workers', async t => {
   const { transport, events } = await setup(t);
-  const controllers = [new AbortController(), new AbortController()];
+  const controllers = [new AbortController(), new AbortController(), new AbortController(), new AbortController()];
   const pending = controllers.map(c => rejects(transport.run({ ...input, prompt: 'hang', signal: c.signal }), 'cancelled', 499));
   await rejects(transport.run(input), 'busy', 503);
   await waitForEvent(events, 'session/prompt');
@@ -604,7 +604,7 @@ test('model sync is bounded and fails closed on protocol deviations', async t =>
   await rejects(probeVersion(old.binary), 'unsupported_version', 502);
 });
 
-test('permission answers approve only the caller-tool bridge, never native tools', async t => {
+test('permission answers approve only the caller-tool bridge, never native tools', async () => {
   const { bridgePermissionOutcome } = await import('../src/transport.mjs');
   const options = [
     { optionId: 'once', kind: 'allow_once', name: 'Allow' },

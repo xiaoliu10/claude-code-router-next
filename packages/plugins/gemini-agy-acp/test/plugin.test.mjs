@@ -171,7 +171,7 @@ test('aggregate passes ordered text, exact model and separate effort, disregards
   assert.equal(input.thinking, 'high');
   assert.deepEqual(JSON.parse(input.prompt.split('\n')[1]), [...request.messages.slice(0, 3), { role: 'user', content: 'Next' }]);
   assert.deepEqual(Object.keys(input).sort(), ['model', 'onText', 'prompt', 'signal', 'thinking']);
-  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 2, timeoutMs: 60000 }]);
+  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 4, timeoutMs: 60000 }]);
   assert.equal(req.enableFallback, false);
   await p.dispatch({ ...body, reasoning: { effort: 'max' } }, { body: { ...body, output_config: { effort: 'xhigh' } } });
   assert.equal(run.mock.calls[1].arguments[0].thinking, 'xhigh');

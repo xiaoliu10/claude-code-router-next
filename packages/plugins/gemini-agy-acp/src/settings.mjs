@@ -58,7 +58,10 @@ function objectOrNothing(raw) {
  * the transport factory arguments. */
 export function enabledSettings(raw) {
   if (raw?.enabled !== true) return null;
-  const { binary, authMethod, timeoutMs = 60000, maxWorkers = 2, apiKey } = raw;
+  // Four warm workers by default: a parked tool call holds one until the caller
+  // answers, so two interleaved tool conversations plus text turns fit without
+  // a 503 acp_busy. Override per sidecar; the hard ceiling stays 8.
+  const { binary, authMethod, timeoutMs = 60000, maxWorkers = 4, apiKey } = raw;
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.includes(authMethod) ||
       !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300000 ||
       !Number.isSafeInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8 ||

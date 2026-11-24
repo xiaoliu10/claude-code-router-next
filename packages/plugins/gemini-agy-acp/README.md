@@ -90,7 +90,7 @@ Connect writes the sidecar `$CCR_CONFIG_DIR/gemini-agy-acp.json` (mode 0600). Th
 }
 ```
 
-An `apiKey` written by Connect is stored inside this file with 0600 permissions and never appears in logs, config.json, transcripts or responses; oauth-personal mode persists no `apiKey` at all. Worker limit is 1–8 (default 1) and timeout is 1–300000 ms (default 60000). Choose an unused test port and restrict access to these files and the process environment.
+An `apiKey` written by Connect is stored inside this file with 0600 permissions and never appears in logs, config.json, transcripts or responses; oauth-personal mode persists no `apiKey` at all. Worker limit is 1–8 (default 4) and timeout is 1–300000 ms (default 60000). Choose an unused test port and restrict access to these files and the process environment.
 
 Supply `GEMINI_API_KEY` through the isolated CCR process environment (together with your proxy variables), or store the key once via Connect. An explicit sidecar `apiKey` takes precedence; without one the transport captures the environment key at pool start. Keep the key out of request headers, JSON files other than the 0600 sidecar, transcripts and source control. Supported `authMethod` values are `gemini-api-key` (optional key with environment fallback) and `oauth-personal` (no key allowed; any key alongside it fails closed). A missing key in API-key mode or an unsupported auth method fails the request.
 
