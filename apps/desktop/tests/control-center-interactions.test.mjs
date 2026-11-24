@@ -159,15 +159,18 @@ test('interaction: fallback add fires once, keyboard add, move/remove and explic
 });
 
 test('interaction: usage totals and model/provider/date cache preserve exact counts across periods', async () => {
-  const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250,
-    byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-input', outputTokens: 100 }],
-    byProvider: [{ name: '<img src=provider>', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-output', inputTokens: 100 }],
-    byDay: [{ name: '2026-11-17', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: '2026-11-16', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: '2026-11-15', outputTokens: 100 }], updatedAt: 1 }) });
+  const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, effectiveInputTokens: args.period === '7d' ? 10001250 : 9001250, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250,
+    byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, effectiveInputTokens: 9001250, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-input', outputTokens: 100 }],
+    byProvider: [{ name: '<img src=provider>', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, effectiveInputTokens: args.period === '7d' ? 10001250 : 9001250, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-output', inputTokens: 100 }],
+    byDay: [{ name: '2026-11-17', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, effectiveInputTokens: args.period === '7d' ? 10001250 : 9001250, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: '2026-11-16', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: '2026-11-15', outputTokens: 100 }], updatedAt: 1 }) });
   await flush(); h.id('tab-usage').click(); await flush();
   const body = h.id('usage-body');
   const total = body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens'));
   assert.match(total.textContent, /9.25M/);
   assert.equal(total.querySelector('.usage-num').title, '9,251,250');
+  const cell = label => body.querySelectorAll('.usage-cell').find(n => n.textContent.includes(label)).querySelector('.usage-num');
+  assert.equal(cell('缓存命中率').textContent, '88.9%');
+  assert.equal(cell('输入（未命中）').title, '1,001,250');
   const models = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按模型'));
   assert.ok(models.textContent.includes('缓存（读 / 写）'));
   assert.equal(models.querySelectorAll('th').at(-1).textContent, '总 tokens');
@@ -181,10 +184,11 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   assert.equal(models.querySelectorAll('img').length, 0);
   assert.ok(models.querySelectorAll('td').some(n => n.title === '缓存读 8,000,000 / 缓存写 1,250'));
   const providers = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按提供方'));
-  assert.deepEqual(providers.querySelectorAll('th').map(n => n.textContent), ['提供方', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens']);
+  assert.deepEqual(providers.querySelectorAll('th').map(n => n.textContent), ['提供方', '请求', '输入（未命中）', '输出', '缓存（读 / 写）', '总 tokens']);
   const providerRows = providers.querySelectorAll('tbody')[0].children;
   assert.equal(providerRows[0].children.at(-1).textContent, '9.25M');
   assert.equal(providerRows[0].children.at(-1).title, '9,251,250');
+  assert.equal(providerRows[0].children[2].title, '1,001,250');
   assert.equal(providerRows[0].children[4].textContent, '8M / 1.25K');
   assert.equal(providerRows[0].children[4].title, '缓存读 8,000,000 / 缓存写 1,250');
   assert.equal(providerRows[1].children.at(-1).textContent, '0');
@@ -193,7 +197,7 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   assert.equal(providerRows[2].children[4].textContent, '— / —');
   assert.equal(providers.querySelectorAll('img').length, 0);
   const days = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
-  assert.deepEqual(days.querySelectorAll('th').map(n => n.textContent), ['日期', '请求', '输入', '输出', '缓存（读 / 写）', '总 tokens']);
+  assert.deepEqual(days.querySelectorAll('th').map(n => n.textContent), ['日期', '请求', '输入（未命中）', '输出', '缓存（读 / 写）', '总 tokens']);
   const dayRows = days.querySelectorAll('tbody')[0].children;
   assert.equal(dayRows[0].children.at(-1).textContent, '9.25M');
   assert.equal(dayRows[0].children.at(-1).title, '9,251,250');
@@ -209,6 +213,25 @@ test('interaction: usage totals and model/provider/date cache preserve exact cou
   assert.equal(refreshedProviders.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '10.25M');
   const refreshedDays = body.querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
   assert.equal(refreshedDays.querySelectorAll('tbody')[0].children[0].children.at(-1).textContent, '10.25M');
+});
+
+test('interaction: ambiguous legacy cache leaves derived totals, inputs and hit rates unavailable', async () => {
+  const row = { inputTokens: 100, outputTokens: 5, cacheReadTokens: 50, cacheWriteTokens: 30 };
+  const h = harness({
+    usage_snapshot: () => ({ ...row, byModel: [{ ...row, name: 'model' }], byDay: [{ ...row, name: '2026-11-17' }] }),
+    usage_records: () => ({ records: [row, { ...row, effectiveInputTokens: 180, usageEstimated: true }] }),
+  });
+  await openUsage(h);
+  const body = h.id('usage-body');
+  const cell = label => body.querySelectorAll('.usage-cell').find(n => n.textContent.includes(label)).querySelector('.usage-num');
+  assert.equal(cell('缓存命中率').textContent, '—');
+  assert.equal(cell('输入（未命中）').textContent, '—');
+  assert.equal(cell('总 tokens').textContent, '—');
+  assert.equal(cell('缓存读').textContent, '50');
+  assert.equal(body.querySelector('.usage-hbar-total').textContent, '—');
+  const rows = recordsCard(body).querySelector('tbody').children;
+  assert.equal(rows[0].children[4].textContent, '—');
+  assert.equal(rows[1].children[4].textContent, '≈130');
 });
 
 test('interaction: restore is local confirmation then single individual IPC; usage uses safe text', async () => {
@@ -310,11 +333,11 @@ test('interaction: records table never echoes responseBody/sessionId and keeps X
   assert.equal(errorCell.textContent.includes('上游提供方返回 429'), false, 'error message stays a tooltip');
   const successCell = statusCells.find(td => td.querySelector('.record-dot').getAttribute('data-tone') === 'ok');
   assert.equal(successCell.title, '成功');
-  // Estimated record: ≈ prefix on the input and output cells (exact value in title).
+  // Estimated record: ≈ prefix on cells and their tooltips.
   const estimatedRow = rows.find(r => r.children[4].textContent.startsWith('≈'));
   assert.ok(estimatedRow, 'estimated row carries the ≈ prefix');
   assert.equal(estimatedRow.children[5].textContent.startsWith('≈'), true);
-  assert.ok(estimatedRow.children[4].title.match(/^\d/), 'exact token count lives in the tooltip');
+  assert.match(estimatedRow.children[4].title, /^≈\d/, 'tooltip also marks the estimated count');
   // Model chain column: originalModel/routed model chain in text, full chain as title.
   const modelCell = rows[0].children[2];
   assert.equal(modelCell.className.includes('cell-truncate'), true);
@@ -348,7 +371,7 @@ test('interaction: records error surfaces a failed note while the usage summary 
 test('interaction: summary gains ttft/speed/success cells and css charts sort, floor and cap at 10', async () => {
   const models = Array.from({ length: 12 }, (_, i) => ({
     name: 'model-' + i, requests: i + 1,
-    inputTokens: i === 11 ? 5000 : i * 100, outputTokens: i === 11 ? 1000 : i * 10,
+    inputTokens: i === 11 ? 5000 : i * 100, effectiveInputTokens: i === 11 ? 5010 : i * 100 + 10, outputTokens: i === 11 ? 1000 : i * 10,
     cacheReadTokens: 7, cacheWriteTokens: 3,
   }));
   const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 10, successCount: 8, errorCount: 2,
@@ -376,7 +399,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(bars.length, 3);
   assert.ok(bars[0].title.startsWith('2026-11-16'), 'bars ordered by date ascending');
   assert.equal(bars[0].style.height, '100%');
-  assert.equal(bars[0].title.includes('输入 900（900）'), true);
+  assert.equal(bars[0].title.includes('输入（未命中） 900（900）'), true);
   assert.ok(bars[0].title.includes('总量 1.3K（1,300）'));
   assert.equal(bars[1].title.startsWith('2026-11-17'), true);
   assert.equal(bars[1].style.height, '4%', 'zero-token days floor at the minimum height');
@@ -392,7 +415,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.ok(rows[1].textContent.includes('model-10'));
   assert.ok(!rows.some(r => r.textContent.includes('model-0')), 'smallest models are cut by the top-10 cap');
   assert.equal(rows[0].querySelector('.usage-hbar-fill').style.width, '100%');
-  assert.ok(rows[0].querySelector('.usage-hbar-name').title.includes('请求 12 · 输入 5,000 · 输出 1,000 · 缓存读 7 / 缓存写 3'));
+  assert.ok(rows[0].querySelector('.usage-hbar-name').title.includes('请求 12 · 输入（未命中） 5,003 · 输出 1,000 · 缓存读 7 / 缓存写 3'));
   assert.ok(rows[0].querySelector('.usage-hbar-total').textContent.includes('6.01K'), 'model-11 effective total 6010');
   // Structural safeguards against horizontal overflow at 440px (visual check in preview browser).
   assert.ok(dayCard.querySelector('.usage-bars'));

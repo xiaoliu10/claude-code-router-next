@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { usageTokens } from "@/utils/usageTokens";
 import { api } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -43,6 +44,7 @@ interface UsageRecord {
   stream: boolean;
   usageEstimated?: boolean;
   inputTokens: number;
+  effectiveInputTokens?: number | null;
   cacheReadInputTokens?: number | null;
   cacheCreationInputTokens?: number | null;
   outputTokens: number;
@@ -57,6 +59,7 @@ interface UsageRecord {
 interface ModelDayData {
   count: number;
   inputTokens: number;
+  effectiveInputTokens?: number | null;
   outputTokens: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
@@ -68,6 +71,7 @@ interface UsageSummary {
   successCount: number;
   errorCount: number;
   totalInputTokens: number;
+  totalEffectiveInputTokens?: number | null;
   totalOutputTokens: number;
   totalCacheReadInputTokens: number;
   totalCacheCreationInputTokens: number;
@@ -81,38 +85,12 @@ interface UsageSummary {
   byClient: Record<string, ModelDayData>;
 }
 
-/**
- * Compute effective input tokens based on provider format.
- * - Inclusive format: inputTokens is already total (cache hit/creation already included).
- *   Detected by inputTokens being approximately equal to cacheRead + cacheCreation.
- * - Separated format: inputTokens is non-cache input only.
- *   Effective input = inputTokens + cacheRead + cacheCreation.
- */
-function computeEffectiveInputTokens(
-  inputTokens: number,
-  cacheReadInputTokens?: number | null,
-  cacheCreationInputTokens?: number | null
-): number {
-  const cacheRead = cacheReadInputTokens ?? 0;
-  const cacheCreation = cacheCreationInputTokens ?? 0;
-  const cacheTotal = cacheRead + cacheCreation;
-
-  if (cacheTotal <= 0) {
-    return inputTokens;
-  }
-
-  // Some providers round inputTokens and cache tokens separately, so exact
-  // equality is unreliable. Use a tolerance: 2% of input or 500 tokens.
-  const tolerance = Math.max(500, inputTokens * 0.02);
-  if (Math.abs(inputTokens - cacheTotal) <= tolerance) {
-    return inputTokens; // inclusive format
-  }
-
-  // separated format
-  return inputTokens + cacheTotal;
+function formatTokens(n: number | null, estimated = false): string {
+  if (n === null) return "—";
+  return (estimated ? "≈" : "") + compactTokens(n);
 }
 
-function formatTokens(n: number): string {
+function compactTokens(n: number): string {
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + "B";
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
@@ -311,7 +289,7 @@ export function UsageStats() {
     .sort(([a], [b]) => a.localeCompare(b))
     : [];
   const maxDailyTokens = Math.max(1, ...dailyData.map(([, d]) =>
-    computeEffectiveInputTokens(d.inputTokens, d.cacheReadInputTokens, d.cacheCreationInputTokens) + d.outputTokens
+    usageTokens(d).total ?? 0
   ));
 
   return (
@@ -443,12 +421,14 @@ export function UsageStats() {
       <CardContent className="flex-1 overflow-auto pt-4">
           {/* Summary Cards */}
           {summary && (() => {
-            const effectiveInputTokens = computeEffectiveInputTokens(
-              summary.totalInputTokens,
-              summary.totalCacheReadInputTokens,
-              summary.totalCacheCreationInputTokens
-            );
-            const effectiveTotalTokens = effectiveInputTokens + summary.totalOutputTokens;
+            const tokens = usageTokens({
+              inputTokens: summary.totalInputTokens,
+              effectiveInputTokens: summary.totalEffectiveInputTokens,
+              cacheReadInputTokens: summary.totalCacheReadInputTokens,
+              cacheCreationInputTokens: summary.totalCacheCreationInputTokens,
+              outputTokens: summary.totalOutputTokens,
+            });
+            const estimated = (summary.estimatedCount ?? 0) > 0;
             return (
               <div className="grid grid-cols-5 gap-2 mb-3">
               <div className="rounded-lg border bg-blue-50 p-2 text-center">
@@ -463,15 +443,15 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.success_rate")}</div>
               </div>
               <div className="rounded-lg border bg-green-50 p-2 text-center">
-                <div className="text-lg font-bold text-green-600">{formatTokens(effectiveInputTokens)}</div>
+                <div className="text-lg font-bold text-green-600">{formatTokens(tokens.cacheMissInput, estimated)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_input_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-yellow-50 p-2 text-center">
-                <div className="text-lg font-bold text-yellow-600">{formatTokens(summary.totalOutputTokens)}</div>
+                <div className="text-lg font-bold text-yellow-600">{formatTokens(summary.totalOutputTokens, estimated)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_output_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
-                <div className="text-lg font-bold text-indigo-600">{formatTokens(effectiveTotalTokens)}</div>
+                <div className="text-lg font-bold text-indigo-600">{formatTokens(tokens.total, estimated)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-emerald-50 p-2 text-center">
@@ -484,7 +464,7 @@ export function UsageStats() {
               </div>
               <div className="rounded-lg border bg-cyan-50 p-2 text-center">
                 <div className="text-lg font-bold text-cyan-600">
-                  {effectiveInputTokens > 0 ? ((summary.totalCacheReadInputTokens / effectiveInputTokens) * 100).toFixed(1) + "%" : "-"}
+                  {tokens.hitRate === null ? "—" : (estimated ? "≈" : "") + (tokens.hitRate * 100).toFixed(1) + "%"}
                 </div>
                 <div className="text-xs text-gray-500">{t("usage.cache_hit_rate")}</div>
               </div>
@@ -496,6 +476,7 @@ export function UsageStats() {
                 <div className="text-lg font-bold text-pink-600">{formatSpeed(summary.avgTokensPerSecond)}</div>
                 <div className="text-xs text-gray-500">{t("usage.avg_speed")}</div>
               </div>
+              <p className="col-span-full text-xs text-gray-500">{t("usage.token_accounting")}</p>
             </div>
             );
           })()}
@@ -509,23 +490,20 @@ export function UsageStats() {
               </div>
               <div className="flex items-end gap-1 h-14">
                 {dailyData.map(([day, data]) => {
-                  const effectiveInput = computeEffectiveInputTokens(
-                    data.inputTokens, data.cacheReadInputTokens, data.cacheCreationInputTokens
-                  );
-                  const totalTokens = effectiveInput + data.outputTokens;
-                  const height = Math.max(4, (totalTokens / maxDailyTokens) * 100);
+                  const { cacheMissInput, total } = usageTokens(data);
+                  const height = total === null ? 0 : Math.max(4, (total / maxDailyTokens) * 100);
                   return (
                     <Tooltip key={day}>
                       <TooltipTrigger asChild>
                         <div className="flex-1 h-full flex items-end cursor-pointer">
-                          <div className="w-full min-h-1 bg-blue-400 rounded-t hover:bg-blue-500 transition-colors" style={{ height: `${height}%` }} />
+                          <div className="w-full bg-blue-400 rounded-t hover:bg-blue-500 transition-colors" style={{ height: `${height}%` }} />
                         </div>
                       </TooltipTrigger>
                       <TooltipContent side="top" className="text-xs">
                         <div className="font-medium mb-1">{day}</div>
-                        <div>{t("usage.input_tokens")}: {formatTokens(effectiveInput)}</div>
+                        <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
                         <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
-                        <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(totalTokens)}</div>
+                        <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(total)}</div>
                       </TooltipContent>
                     </Tooltip>
                   );
@@ -620,7 +598,7 @@ export function UsageStats() {
                     <td className="p-1.5">{r.provider}</td>
                     <td className="p-1.5 max-w-[280px] truncate" title={fullChain}>{modelDisplay}</td>
                     <td className="p-1.5">{r.modelFamily ? `${r.modelFamily}/${r.scenarioType}` : r.scenarioType}</td>
-                    <td className="text-right p-1.5">{r.usageEstimated ? <span title="Estimated usage / 估算用量">≈</span> : null}{formatTokens(r.inputTokens)}</td>
+                    <td className="text-right p-1.5">{formatTokens(usageTokens(r).cacheMissInput, r.usageEstimated)}</td>
                     <td className="text-right p-1.5">{r.usageEstimated ? "≈" : ""}{formatTokens(r.outputTokens)}</td>
                     <td className="text-right p-1.5">{formatTokens(r.cacheReadInputTokens ?? 0)}</td>
                     <td className="text-right p-1.5">{formatTokens(r.cacheCreationInputTokens ?? 0)}</td>
@@ -680,24 +658,16 @@ export function UsageStats() {
               {(() => {
                 const modelData = Object.entries(summary.byModel)
                   .map(([model, data]) => {
-                    const effectiveInput = computeEffectiveInputTokens(
-                      data.inputTokens, data.cacheReadInputTokens, data.cacheCreationInputTokens
-                    );
-                    return {
-                      model,
-                      count: data.count,
-                      effectiveInput,
-                      totalTokens: effectiveInput + data.outputTokens,
-                      outputTokens: data.outputTokens,
-                    };
+                    const { cacheMissInput, total } = usageTokens(data);
+                    return { model, count: data.count, cacheMissInput, total, outputTokens: data.outputTokens };
                   })
-                  .sort((a, b) => b.totalTokens - a.totalTokens)
+                  .sort((a, b) => (b.total ?? -1) - (a.total ?? -1))
                   .slice(0, 10);
-                const maxModelTokens = Math.max(1, ...modelData.map(p => p.totalTokens));
+                const maxModelTokens = Math.max(1, ...modelData.map(p => p.total ?? 0));
                 return (
                   <div className="space-y-2">
-                    {modelData.map(({ model, count, totalTokens, effectiveInput, outputTokens }) => {
-                      const width = Math.max(8, (totalTokens / maxModelTokens) * 100);
+                    {modelData.map(({ model, count, total, cacheMissInput, outputTokens }) => {
+                      const width = total === null ? 0 : Math.max(8, (total / maxModelTokens) * 100);
                       const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
                       return (
                         <Tooltip key={model}>
@@ -713,16 +683,16 @@ export function UsageStats() {
                                 />
                               </div>
                               <div className="w-[70px] text-sm text-gray-500 text-right">
-                                {formatTokens(totalTokens)}
+                                {formatTokens(total)}
                               </div>
                             </div>
                           </TooltipTrigger>
                           <TooltipContent side="top" className="text-xs">
                             <div className="font-medium mb-1">{model}</div>
                             <div>{t("usage.requests")}: {count}</div>
-                            <div>{t("usage.input_tokens")}: {formatTokens(effectiveInput)}</div>
+                            <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
                             <div>{t("usage.output_tokens")}: {formatTokens(outputTokens)}</div>
-                            <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(totalTokens)}</div>
+                            <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(total)}</div>
                           </TooltipContent>
                         </Tooltip>
                       );
