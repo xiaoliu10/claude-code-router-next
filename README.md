@@ -93,6 +93,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2436** | Agy ACP 供应商支持工具调用：插件把调用方的工具通过只监听 127.0.0.1 的本地 MCP 服务发布给 agent，调用方收到 `tool_calls`，带回结果的后续请求续跑同一个 ACP 回合；agent 不执行任何工具，桥的凭据只传给 agent 子进程。卡片补全连接/断开/模型同步/模型隐藏闭环，并支持 agy 首次使用自动安装与 Google 账号登录。用量记录保留上游稳定错误码，Chat Completions 的最终结果按实际服务方记入。 |
 | **v2.3.2435** | 修复流式 Chat 请求启用用量统计时被 Codex 拒绝的问题。CCR 转为 Responses 请求时会移除 Chat 专用的 include_usage 字段。 |
 | **v2.3.2434** | Chat Completions 按模型族配置切换备用通道。Anthropic 备用通道返回标准 Chat 格式，调用记录按实际服务方记入最终结果。带工具的模型族请求会跳过纯文本 Agy ACP。 |
 | **v2.3.2433** | <ul><li>**桌面控制中心套件**：菜单栏全供应商额度面板（K/M/B + 焦点看门狗防卡死）、独立本地控制中心与内置网关运行时、项目配置页（按项目路由/别名/客户端接管）。</li><li>**桌面用量分析**：缓存感知有效输入总 tokens（不重复计数）、模型/提供方/日期缓存列、纯 CSS 图表、分页调用记录（成功率/TTFT/速度）。</li><li>**火山 Coding Plan 配额**（AK/SK 本地凭证面板 + SigV4 适配）；**Kimi 5h 窗口恢复**（上游缺 remaining 时不再消失）。</li><li>**Codex 套餐升级配额恢复 + UI HTML 协商缓存 + 卡片确认居中模态 + 冷却中同步模型可点**；插件：codex 1.0.14 / kiro 0.1.3 / workbuddy 1.0.3 / gemini-oauth 1.0.14。</li></ul> |
@@ -102,7 +103,6 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 | **v2.3.2429** | <ul><li>**Codex 手动用量重置**：卡片展示赠送的重置次数（来自上游），确认弹窗是唯一消耗入口；同步锁拒绝并发重复点击，重试复用幂等键，丢失响应不双花；kiro 0.1.1 随包发布。</li><li>**Gemini 传输与配额修复**：省略 Content-Type 时识别 Code Assist SSE；配额走共享管线；恢复后不再残留失败横幅。</li><li>**精确模型路由修复**：供应商显式暴露的模型 id 短路家族路由，Gemini 的 Claude 模型可按名称直达。</li><li>**Codex 掉登录修复**：剥离 Responses input 中的 thinking 字段（上游 400 根因）；成功输出清除错误残留。</li></ul> |
 | **v2.3.2428** | <ul><li>**配额适配器 gzip 修复**：经代理的配额请求固定 `Accept-Encoding: identity`，避免 undici 未解压 gzip 导致解析失败、卡片不显示用量（智谱等供应商恢复配额展示）。</li></ul> |
 | **v2.3.2427** | <ul><li>**配额窗口过期修复**：重置时间已过的窗口不再被当作当前用量展示，卡片回退到本地 token 统计，不再卡死在旧百分比上。</li></ul> |
-| **v2.3.2426** | <ul><li>**Gemini (Antigravity) 模型隐藏/恢复**：卡片列出可见模型 chips（带隐藏按钮）与隐藏列表（恢复/全部恢复）；隐藏时自动清理 Router 引用并回退默认路由，失败完整回滚。</li></ul> |
 
 > 仅保留最近 10 个版本，更早版本的发布摘要见 [CHANGELOG-archive.md](./CHANGELOG-archive.md)，完整详细变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
