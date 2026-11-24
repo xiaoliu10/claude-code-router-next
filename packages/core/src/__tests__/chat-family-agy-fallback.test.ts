@@ -35,7 +35,8 @@ async function setup(primary: string, fallbacks: string[], failureStatus = 503) 
   });
   const plugin = await import(join(__dirname, "../../../plugins/gemini-agy-acp/src/plugin.mjs"));
   await plugin.activateWithTransport(activation.context, () => ({ run }));
-  await activation.commit();
+  // The plugin registers admin routes, so commit needs a host app for them.
+  await activation.commit(undefined, server.app);
   server.reloadProviders(config);
   server.recordUsage = attemptFailure;
   registerRequestPipeline(server, config);
@@ -120,8 +121,11 @@ it("preserves a terminal 400 from the next capable provider", async () => {
   expect(vi.mocked(usageStore.append).mock.calls.map(([row]) => row.provider)).toEqual(["primary"]);
 });
 
+// A tool request that Agy can actually serve is no longer a 400: the plugin
+// bridges it to the agent. These cases stay rejections because they are not
+// servable tool requests — no usable tool, a choice the bridge cannot honour,
+// or an empty tool history that declares nothing.
 it.each([
-  ["explicit target", `${agy},${model}`, { tools: [tool] }],
   ["malformed tools", "ccr-opus", { tools: [{ type: "function" }] }],
   ["invalid legacy choice", "ccr-opus", { functions: [tool.function], function_call: "invalid" }],
   ["invalid choice", "ccr-opus", { tools: [tool], tool_choice: "invalid" }],
@@ -133,4 +137,15 @@ it.each([
   expect(response.json().error.code).toBe("agy_unsupported_request");
   expect(attempts).toEqual([]);
   expect(run).not.toHaveBeenCalled();
+});
+
+// An explicitly targeted Agy request with a usable tool is served by Agy's tool
+// path rather than rejected: the agent discovers the tool over the local MCP
+// bridge and the caller executes it.
+it("serves an explicitly targeted Agy tool request instead of rejecting it", async () => {
+  const attempts = await setup(agy, ["backup"]);
+  const response = await chat({ tools: [tool] }, `${agy},${model}`);
+  expect(response.statusCode, response.body).toBe(200);
+  expect(attempts).toEqual([]);
+  expect(run).toHaveBeenCalledTimes(1);
 });

@@ -22,7 +22,7 @@ import { convertAnthropicChatResponse } from "./anthropic-chat-response";
 import { formatBase64 } from "@/utils/image";
 import { convertToAnthropic } from "@/utils/converter";
 import { modelSupportsImages } from "@/utils/router";
-import { getUsageCacheCreationInputTokens, mergeUsageCapture } from "../ccr/usage-merge";
+import { getAcpUncachedPromptTokens, getUsageCacheCreationInputTokens, mergeUsageCapture } from "../ccr/usage-merge";
 
 /**
  * Read a client's thinking switch. "adaptive" and boolean true both mean the
@@ -47,7 +47,8 @@ function isThinkingEnabled(type: unknown): boolean | undefined {
 function supportsCacheCreationUsage(usage: unknown): boolean {
   if (!usage || typeof usage !== "object") return false;
   const metadata = usage as Record<string, unknown>;
-  return metadata.usage_source === "kiro" || metadata.usage_estimated === true || metadata.kiro_estimated === true;
+  return metadata.usage_source === "kiro" || getAcpUncachedPromptTokens(usage) !== undefined ||
+    metadata.usage_estimated === true || metadata.kiro_estimated === true;
 }
 
 /** Usage frame accumulated for the terminal message_delta SSE event. */
@@ -792,8 +793,7 @@ export class AnthropicTransformer implements Transformer {
                     chunk.usage?.prompt_cache_hit_tokens ??
                     0;
                   const promptTokens = chunk.usage?.prompt_tokens || 0;
-                  // Keep Anthropic protocol semantics for Claude Code: input_tokens is net of cache reads.
-                  const inputTokens = promptTokens - cachedTokens;
+                  const inputTokens = getAcpUncachedPromptTokens(chunk.usage) ?? (promptTokens - cachedTokens);
                   const completionTokens = chunk.usage?.completion_tokens || 0;
                   this.logger?.info({
                     debug_log: true,
@@ -1381,8 +1381,8 @@ export class AnthropicTransformer implements Transformer {
         openaiResponse.usage?.prompt_tokens_details?.cached_tokens ??
         openaiResponse.usage?.prompt_cache_hit_tokens ??
         0;
-      const inputTokens =
-        (openaiResponse.usage?.prompt_tokens || 0) - cachedTokens;
+      const inputTokens = getAcpUncachedPromptTokens(openaiResponse.usage) ??
+        ((openaiResponse.usage?.prompt_tokens || 0) - cachedTokens);
       const result = {
         id: openaiResponse.id?.startsWith("msg_")
           ? openaiResponse.id
@@ -1403,7 +1403,6 @@ export class AnthropicTransformer implements Transformer {
             : "end_turn",
         stop_sequence: null,
         usage: {
-          // Keep Anthropic protocol semantics for Claude Code: input_tokens is net of cache reads.
           input_tokens: inputTokens,
           cache_creation_input_tokens: supportsCacheCreationUsage(openaiResponse.usage)
             ? getUsageCacheCreationInputTokens(openaiResponse.usage)

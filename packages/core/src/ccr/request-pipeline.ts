@@ -288,7 +288,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     }
     const isMessages = req.pathname?.endsWith("/v1/messages");
     const isResponses = req.pathname?.endsWith("/v1/responses");
-    if (isMessages || isResponses) {
+    const isChatCompletion = !!req.chatCompletionCapture;
+    if (isMessages || isResponses || isChatCompletion) {
       ensureClientContext(req, config);
       const usageSessionId = getUsageSessionId(req);
       const usageCacheKey = getUsageCacheKey(req);
@@ -454,6 +455,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
                 req.upstreamModel = data.response.model;
               }
 
+
               // Capture usage from Anthropic SSE (message_delta, message_start)
               if (data?.usage) {
                 const existingUsage = sessionUsageCache.get(usageCacheKey) || {};
@@ -575,7 +577,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
 
       const nonStreamMeta = extractNonStreamMeta(payload);
       if (nonStreamMeta?.usage) {
-        sessionUsageCache.put(usageCacheKey, nonStreamMeta.usage);
+        if (isChatCompletion) req.chatCompletionCapture.usage = mergeUsageCapture(req.chatCompletionCapture.usage, nonStreamMeta.usage, false);
+        else sessionUsageCache.put(usageCacheKey, nonStreamMeta.usage);
       }
       // Capture upstream model for non-stream responses from the parsed body
       // (Anthropic payload.model, Responses API payload.response.model).
@@ -600,7 +603,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
   serverInstance.addHook("onSend", async (req: any, reply: any, payload: any) => {
     event.emit('onSend', req, reply, payload);
     // Capture error response body for usage stats
-    if (reply.statusCode >= 400 && (req.pathname?.endsWith("/v1/messages") || req.pathname?.endsWith("/v1/responses"))) {
+    if (reply.statusCode >= 400 && (req.pathname?.endsWith("/v1/messages") ||
+        req.pathname?.endsWith("/v1/responses") || !!req.chatCompletionCapture)) {
       try {
         if (typeof payload === 'string') {
           req.errorResponseBody = payload;
@@ -674,6 +678,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // keep it as the next request's routing baseline). Reading it here would
       // record this failure with the predecessor's input/cache tokens. Ignore the
       // slot on hard failure and fall back to the router's own token estimate.
+      const hardFailed = reply.statusCode >= 400;
       const usage = chat ? chat.usage : hardFailed ? undefined : sessionUsageCache.get(getUsageCacheKey(req));
       const speedStats = chat ? { ttft: chat.ttft ?? null, tokensPerSecond: null } : readTokenSpeedStats(speedStatsKey);
       const healthStore = getHealthStore();
@@ -698,7 +703,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       const contentDelivered = req.contentDelivered === true;
       let chatError: string | undefined;
       if (chat) {
-        if (chat.streamError) chatError = "Chat stream returned an error";
+        if (chat.streamError) chatError = chat.streamErrorCode ? `Chat stream returned an error (${chat.streamErrorCode})` : "Chat stream returned an error";
         else if (hardFailed) chatError = `Chat upstream request failed (HTTP ${reply.statusCode})`;
         else if (!chat.finished) chatError = "Chat completion ended without a finish_reason";
       }

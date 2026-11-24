@@ -200,6 +200,7 @@ export const tokenSpeedPlugin: CCRPlugin = {
 
     // Add onSend hook to intercept both streaming and non-streaming responses
     fastify.addHook('onSend', async (request, _reply, payload) => {
+      if (!shouldTrackTokenSpeed(request.url)) return;
       const startTime = (request as any).requestStartTime;
       // Chat measures its own first delta in the final-response capture.
       if (!startTime || (request as any).chatCompletionCapture) return;

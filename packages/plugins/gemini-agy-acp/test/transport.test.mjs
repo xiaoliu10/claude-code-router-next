@@ -3,10 +3,81 @@ import { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { after, before, test } from 'node:test';
-import { createTransport } from '../src/transport.mjs';
+import { createTransport, isolatedEnvironment, probeVersion, syncModelOptions, verifyOauthHandshake } from '../src/transport.mjs';
+import { chatResponse } from '../src/chat.mjs';
+
+test('oauth-personal runs the whitelisted real environment, authenticates the CLI login and never creates an isolated root', async t => {
+  const { transport, events } = await setup(t, 'ok', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+  const log = await events();
+  assert.deepEqual(log.map(record => record.event), ['version', 'spawn', 'initialize', 'authenticate',
+    'session/new', 'session/set_config_option', 'session/set_config_option', 'session/prompt']);
+  const spawn = log.find(record => record.event === 'spawn');
+  assert.equal(spawn.root, undefined); // no isolated root was ever created
+  assert.match(spawn.cwd, /ccr-agy-acp-/); // fresh cwd directly under the OS temp dir
+  assert.equal(spawn.home, process.env.HOME); // the CLI sees the real user's home (keyring login)
+  const session = log.find(record => record.event === 'session/new');
+  assert.equal(dirname(session.cwd), tmpdir()); // per-turn session cwds under the OS temp dir
+  await transport.close();
+  assert.equal(existsSync(spawn.cwd), false);
+  assert.throws(() => process.kill(spawn.pid, 0), { code: 'ESRCH' });
+  assert.equal(existsSync(session.cwd), false);
+});
+
+test('oauth transport rejects an apiKey; gemini transport still requires a captured credential', async t => {
+  assert.throws(() => createTransport({ binary: join('x', 'y'), authMethod: 'oauth-personal', apiKey: 'fixture-value' }),
+    { code: 'acp_invalid_config' });
+  delete process.env.GEMINI_API_KEY;
+  try {
+    const missing = await setup(t);
+    await rejects(missing.transport.run(input), 'auth_required', 401);
+    assert.deepEqual(await missing.events(), []);
+  } finally { process.env.GEMINI_API_KEY = variables.GEMINI_API_KEY; }
+});
+
+test('oauth handshake verification returns only this handshake\'s account email', async t => {
+  const metadata = await setup(t, 'ok', { authMethod: 'oauth-personal' });
+  // Explicit ACP metadata wins over the child's own stderr login line.
+  assert.deepEqual(await verifyOauthHandshake({ binary: metadata.binary }),
+    { version: '1.5.1', accountEmail: 'metadata-account@example.com' });
+  assert.deepEqual((await metadata.events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+  const stderr = await setup(t, 'stderr-login', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await verifyOauthHandshake({ binary: stderr.binary }),
+    { version: '1.5.1', accountEmail: 'stderr-account@example.com' });
+  const silent = await setup(t, 'silent-login', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await verifyOauthHandshake({ binary: silent.binary }),
+    { version: '1.5.1', accountEmail: null });
+  const versionOnly = await setup(t, 'version-email', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await verifyOauthHandshake({ binary: versionOnly.binary }),
+    { version: '1.5.1', accountEmail: null });
+  for (const record of await versionOnly.events()) {
+    if (record.cwd) assert.equal(existsSync(record.cwd), false);
+  }
+  // A rejected authenticate maps to auth_required without leaking diagnostics.
+  const failing = await setup(t, 'auth-failure', { authMethod: 'oauth-personal' });
+  await rejects(verifyOauthHandshake({ binary: failing.binary }), 'auth_required', 401);
+  for (const record of await failing.events()) {
+    if (record.cwd) assert.equal(existsSync(record.cwd), false);
+  }
+  for (const invalid of ['agy', '/x/\0y', 42]) {
+    await assert.rejects(verifyOauthHandshake({ binary: invalid }), { code: 'acp_invalid_config' });
+  }
+});
+
+test('model sync supports oauth-personal without any credential', async t => {
+  const { binary, events } = await setup(t, 'ok', { authMethod: 'oauth-personal' });
+  assert.deepEqual(await syncModelOptions({ binary, authMethod: 'oauth-personal' }),
+    { models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }], version: '1.5.1' });
+  assert.deepEqual((await events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+  await rejects(syncModelOptions({ binary, authMethod: 'oauth-personal', apiKey: 'fixture-value' }), 'invalid_config', 400);
+  assert.deepEqual((await events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+});
 
 const input = { model: 'Gemini Model', thinking: 'xhigh', prompt: '你好', onText() {} };
 const variables = { GEMINI_API_KEY: 'fixture-value', AGY_TEST_PARENT_ONLY: 'not-for-child',
@@ -30,6 +101,7 @@ async function setup(t, mode = 'ok', config = {}) {
   const source = await readFile(new URL('./fixtures/agy-acp.mjs', import.meta.url), 'utf8');
   await writeFile(binary, `#!${process.execPath}\n${source}`, { mode: 0o700 });
   await writeFile(join(dir, 'mode'), mode);
+  await writeFile(join(dir, 'authMethod'), config.authMethod === 'oauth-personal' ? 'oauth-personal' : 'gemini-api-key');
   await writeFile(join(dir, 'events'), '');
   const transport = createTransport({ binary, authMethod: 'gemini-api-key', ...config });
   const events = async () => (await readFile(join(dir, 'events'), 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
@@ -42,7 +114,7 @@ async function setup(t, mode = 'ok', config = {}) {
       }
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
-  return { transport, events };
+  return { transport, events, binary, dir };
 }
 
 function rejects(promise, code, statusCode) {
@@ -75,6 +147,67 @@ test('reuses an authenticated worker, creates fresh sessions, and forwards only 
   const dirs = log.filter(record => record.cwd).map(record => record.cwd);
   assert.equal(new Set(dirs).size, 2);
   assert.ok(dirs.every(cwd => !existsSync(cwd)));
+});
+
+test('prompt usage reaches chat completions and only the terminal stream chunk', async t => {
+  const { transport } = await setup(t, 'prompt-usage');
+  const quota = { quota: { token_count: { input_tokens: 81, output_tokens: 11 }, remaining: 'private' } };
+  const detailed = { usage_source: 'gemini-agy-acp', prompt_tokens: 39, completion_tokens: 9, total_tokens: 48,
+    prompt_tokens_details: { cached_tokens: 21, cache_write_tokens: 2 },
+    completion_tokens_details: { reasoning_tokens: 7 } };
+  const detailCounts = { cachedReadTokens: 21, cachedWriteTokens: 2, thoughtTokens: 7, totalTokens: 48 };
+  for (const [name, fields, expected] of [
+    ['current net input', { usage: { ...detailCounts, inputTokens: 16, outputTokens: 9 }, _meta: quota }, detailed],
+    ['legacy gross input and exclusive output', { usage: { ...detailCounts, inputTokens: 39, outputTokens: 2 } }, detailed],
+    ['gross input and inclusive output', { usage: { ...detailCounts, inputTokens: 39, outputTokens: 9 } }, detailed],
+    ['input includes reads only', { usage: { ...detailCounts, inputTokens: 37, outputTokens: 2 } }, detailed],
+    ['missing total uses current layout', { usage: { inputTokens: 16, outputTokens: 9,
+      cachedReadTokens: 21, cachedWriteTokens: 2, thoughtTokens: 7 } }, detailed],
+    ['legacy quota', { _meta: quota },
+      { usage_source: 'gemini-agy-acp', prompt_tokens: 81, completion_tokens: 11, total_tokens: 92 }],
+    ['quota fallback uses the whole pair when standard output is invalid',
+      { usage: { inputTokens: 0, outputTokens: -1, cachedReadTokens: 1.5 }, _meta: quota },
+      { usage_source: 'gemini-agy-acp', prompt_tokens: 81, completion_tokens: 11, total_tokens: 92 }],
+    ['quota input is already gross, even with partial standard cache details',
+      { usage: { inputTokens: -1, outputTokens: 9, cachedReadTokens: 21, cachedWriteTokens: 2 },
+        _meta: { quota: { token_count: { input_tokens: 39, output_tokens: 9 } } } },
+      { usage_source: 'gemini-agy-acp', prompt_tokens: 39, completion_tokens: 9, total_tokens: 48 }],
+    ['standard and quota fields cannot make a mixed pair',
+      { usage: { inputTokens: 16 }, _meta: { quota: { token_count: { output_tokens: 9 } } } }, undefined],
+    ['distinct splits matching the same total',
+      { usage: { ...detailCounts, inputTokens: 37, outputTokens: 9, thoughtTokens: 2 }, _meta: quota }, undefined],
+    ['distinct splits even when the current layout matches',
+      { usage: { ...detailCounts, inputTokens: 37, outputTokens: 25, thoughtTokens: 21, totalTokens: 85 } }, undefined],
+    ['no split matches the reported total',
+      { usage: { ...detailCounts, inputTokens: 16, outputTokens: 9, totalTokens: 49 }, _meta: quota }, undefined],
+    ['invalid reported total', { usage: { inputTokens: 16, outputTokens: 9, totalTokens: -1 } }, undefined],
+    ['explicit zeros and equivalent layouts', { usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
+      { usage_source: 'gemini-agy-acp', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }],
+    ['absent', {}, undefined],
+    ['malformed', { usage: { inputTokens: '3', outputTokens: 2.5 }, _meta: { quota: { token_count: {
+      input_tokens: -1, output_tokens: Number.MAX_SAFE_INTEGER + 1,
+    } } } }, undefined],
+    ['missing output', { usage: { inputTokens: 7, thoughtTokens: 3 } }, undefined],
+    ['unsafe sum', { usage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 } }, undefined],
+  ]) await t.test(name, async () => {
+    const prompt = { ...input, prompt: JSON.stringify(fields) };
+    const json = await (await chatResponse(transport, prompt, false)).text();
+    assert.doesNotMatch(json, /_meta|private/);
+    const completion = JSON.parse(json);
+    assert.deepEqual(completion.usage, expected);
+    assert.equal(completion.choices[0].message.content, 'fixture response');
+    const sse = await (await chatResponse(transport, prompt, true)).text();
+    assert.doesNotMatch(sse, /_meta|private/);
+    const frames = sse.trimEnd().split('\n\n').map(frame => frame.slice('data: '.length));
+    assert.equal(frames.pop(), '[DONE]');
+    const [role, text, finish] = frames.map(JSON.parse);
+    assert.equal(frames.length, 3);
+    assert.equal(role.usage, undefined);
+    assert.equal(text.usage, undefined);
+    assert.equal(text.choices[0].delta.content, 'fixture response');
+    assert.equal(finish.choices[0].finish_reason, 'stop');
+    assert.deepEqual(finish.usage, expected);
+  });
 });
 
 test('denies permission, read/write and terminal callbacks with protocol responses', async t => {
@@ -230,4 +363,82 @@ test('close waits for active startup, cancels a prompt, and reaps idle children'
     await transport.close();
     for (const { root } of await events()) if (root) assert.equal(existsSync(root), false);
   });
+});
+
+test('retireExisting drops pooled workers and the next run respawns fresh', async t => {
+  const { transport, events } = await setup(t, 'ok', { maxWorkers: 1 });
+  await transport.run(input);
+  await transport.retireExisting();
+  await transport.run(input);
+  assert.equal((await events()).filter(record => record.event === 'spawn').length, 2);
+  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+});
+
+test('worker start logs one bounded line with binary path and CLI version only', async t => {
+  const lines = [];
+  const { transport } = await setup(t, 'ok', { log: { info: message => lines.push(message) } });
+  await transport.run(input);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /agy 1\.5\.1/);
+  assert.match(lines[0], /binary: /);
+  assert.doesNotMatch(lines[0], /fixture-value|你好|prompt/);
+});
+
+test('an explicit pool apiKey overrides the environment capture at start', async t => {
+  process.env.GEMINI_API_KEY = 'test-key';
+  const { transport } = await setup(t, 'ok', { apiKey: 'fixture-value' });
+  try {
+    await transport.run(input);
+  } finally { process.env.GEMINI_API_KEY = variables.GEMINI_API_KEY; }
+  assert.throws(() => createTransport({ binary: join('x', 'y'), authMethod: 'gemini-api-key', apiKey: '  ' }),
+    { code: 'acp_invalid_config' });
+  assert.throws(() => createTransport({ binary: join('x', 'y'), authMethod: 'gemini-api-key', apiKey: 5 }),
+    { code: 'acp_invalid_config' });
+});
+
+test('probeVersion validates one binary in isolation without spawning ACP', async t => {
+  const { binary, events } = await setup(t);
+  assert.equal(await probeVersion(binary), '1.5.1');
+  assert.deepEqual((await events()).map(record => record.event), ['version']);
+  for (const invalid of ['agy', '/x/\0y', 42]) {
+    await assert.rejects(probeVersion(invalid), { code: 'acp_invalid_config' });
+  }
+  assert.deepEqual((await events()).map(record => record.event), ['version']);
+});
+
+test('model sync spawns one bounded temp worker and reads the advertised model options', async t => {
+  const { binary, events } = await setup(t);
+  assert.deepEqual(await syncModelOptions({ binary, apiKey: 'fixture-value' }),
+    { models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }], version: '1.5.1' });
+  assert.deepEqual((await events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+  await rejects(syncModelOptions({ binary, apiKey: 'fixture-value', authMethod: 'consumer-login' }),
+    'invalid_config', 400);
+  await rejects(syncModelOptions({ binary, apiKey: ' ' }), 'invalid_config', 400);
+  assert.deepEqual((await events()).map(record => record.event),
+    ['version', 'spawn', 'initialize', 'authenticate', 'session/new']);
+});
+
+test('the isolated worker environment forwards only standard proxy variables', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-env-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const previous = new Map(['HTTPS_PROXY', 'GEMINI_API_KEY', 'AWS_SECRET_ACCESS_KEY'].map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  process.env.HTTPS_PROXY = 'http://127.0.0.1:7897';
+  process.env.GEMINI_API_KEY = 'fixture-value';
+  process.env.AWS_SECRET_ACCESS_KEY = 'fixture-value';
+  const { env } = await isolatedEnvironment(root);
+  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:7897');
+  assert.equal(env.GEMINI_API_KEY, undefined);
+  assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
+  assert.equal(env.HOME, join(root, 'home'));
+});
+
+test('model sync is bounded and fails closed on protocol deviations', async t => {
+  const hanging = await setup(t, 'hang-version');
+  await rejects(syncModelOptions({ binary: hanging.binary, apiKey: 'fixture-value' }), 'timeout', 504);
+  const wrong = await setup(t, 'wrong-category');
+  await rejects(syncModelOptions({ binary: wrong.binary, apiKey: 'fixture-value' }), 'unsupported_option', 400);
+  const old = await setup(t, 'old');
+  await rejects(probeVersion(old.binary), 'unsupported_version', 502);
 });

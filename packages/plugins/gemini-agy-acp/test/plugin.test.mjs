@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { activateWithTransport } from '../src/plugin.mjs';
 
 const name = 'gemini-agy-acp';
@@ -18,11 +19,13 @@ async function activate(t, local, run = t.mock.fn(async () => end)) {
   if (local !== undefined) await writeFile(join(configDir, `${name}.json`), JSON.stringify(local));
   let transformer, runtime;
   const registerUiCard = t.mock.fn();
-  const factory = t.mock.fn(() => ({ run, async close() {} }));
+  const registerAdminRoutes = t.mock.fn();
+  const factory = t.mock.fn(() => ({ run, async close() {}, async retireExisting() {} }));
   await activateWithTransport({ host: { configDir }, registerTransformer(cls) { transformer = new cls(); },
-    registerManagedRuntime(value) { runtime = value; }, registerUiCard }, factory);
+    registerManagedRuntime(value) { runtime = value; }, registerUiCard, registerAdminRoutes }, factory);
   assert.equal(registerUiCard.mock.callCount(), 1);
   assert.deepEqual(registerUiCard.mock.calls[0].arguments, [{ cardPath: 'card.js' }]);
+  assert.equal(registerAdminRoutes.mock.callCount(), 1);
   const attempt = t.mock.fn(() => { throw Error('Unexpected HTTP attempt'); });
   t.after(() => assert.equal(attempt.mock.callCount(), 0));
   const dispatch = (requestBody = body, req = { body: requestBody }, config = {}) =>
@@ -39,7 +42,7 @@ test('reserved provider name is exact and the plugin remains disabled until loca
     }
     assert.equal(p.transformer.name, name);
     const req = { body, enableFallback: true };
-    assert.throws(() => p.transformer.transformRequestIn(body, provider, { req }), { code: 'agy_disabled' });
+    await assert.rejects(p.transformer.transformRequestIn(body, provider, { req }), { code: 'agy_disabled' });
     assert.equal(req.enableFallback, false);
     await assert.rejects(p.dispatch(), { code: 'agy_disabled' });
     assert.equal(p.factory.mock.callCount(), 0);
@@ -65,7 +68,7 @@ test('aggregate passes ordered text, exact model and separate effort, disregards
     reasoning_effort: 'high', messages: [{ role: 'system', content: 'Instruction' }, ...body.messages,
       { role: 'assistant', content: 'Previous' }, { role: 'user', content: [{ type: 'text', text: 'Next' }] }] };
   const req = { body: request, enableFallback: true };
-  const transformed = p.transformer.transformRequestIn(request, provider, { req });
+  const transformed = await p.transformer.transformRequestIn(request, provider, { req });
   const response = await (await p.dispatch(transformed.body, req)).json();
   assert.deepEqual(response.choices, [{ index: 0, message: { role: 'assistant', content: 'first second' }, finish_reason: 'length' }]);
   assert.equal(response.model, request.model);
@@ -75,7 +78,7 @@ test('aggregate passes ordered text, exact model and separate effort, disregards
   assert.equal(input.thinking, 'high');
   assert.deepEqual(JSON.parse(input.prompt.split('\n')[1]), [...request.messages.slice(0, 3), { role: 'user', content: 'Next' }]);
   assert.deepEqual(Object.keys(input).sort(), ['model', 'onText', 'prompt', 'signal', 'thinking']);
-  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 1, timeoutMs: 60000 }]);
+  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 2, timeoutMs: 60000 }]);
   assert.equal(req.enableFallback, false);
   await p.dispatch({ ...body, reasoning: { effort: 'max' } }, { body: { ...body, output_config: { effort: 'xhigh' } } });
   assert.equal(run.mock.calls[1].arguments[0].thinking, 'xhigh');
@@ -83,18 +86,28 @@ test('aggregate passes ordered text, exact model and separate effort, disregards
 
 test('rejects unsupported original/normalized content and out-of-catalog model before ACP', async t => {
   const p = await activate(t, settings);
-  for (const extra of [{ tools: [{}] }, { tool_choice: 'auto' }, { functions: [{}] }, { modalities: ['audio'] },
-    { system: [{ type: 'image' }] }, { messages: [{ role: 'assistant', tool_calls: [], content: '' }] },
-    { messages: [{ role: 'tool', content: 'result' }] }, { messages: [{ role: 'developer', content: 'x' }] },
+  // Content and model errors stay terminal. Tool *declarations* are no longer
+  // rejected here — they take the tool path, whose own rejections are asserted
+  // by the tool-calling tests.
+  for (const extra of [{ modalities: ['audio'] },
+    { system: [{ type: 'image' }] }, { messages: [{ role: 'developer', content: 'x' }] },
     { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }, { type: 'image_url' }] }] }]) {
     const invalid = { ...body, ...extra };
-    assert.throws(() => p.transformer.transformRequestIn(body, provider, { req: { body: invalid } }), { code: 'agy_unsupported_request' });
+    await assert.rejects(p.transformer.transformRequestIn(body, provider, { req: { body: invalid } }), { code: 'agy_unsupported_request' });
     await assert.rejects(p.dispatch(invalid), { code: 'agy_unsupported_request' });
   }
+  // A malformed tool entry (no name) is a request error, not a silent drop.
+  for (const extra of [{ tools: [{}] }, { functions: [{}] }]) {
+    await assert.rejects(p.dispatch({ ...body, ...extra }), { code: 'agy_unsupported_request' });
+  }
+  // A tool_choice with nothing to choose has no tool path either.
+  await assert.rejects(p.dispatch({ ...body, tool_choice: 'auto' }), { code: 'agy_unsupported_request' });
+  // A tool result without any declared tool is just an ignored message: the
+  // request stays on the text-only path rather than becoming a tool turn.
   for (const extra of [{ model: 'model' }, { reasoning_effort: 'other' }]) {
     await assert.rejects(p.dispatch({ ...body, ...extra }), { statusCode: 400 });
   }
-  assert.throws(() => p.transformer.transformRequestIn(body, { ...provider, apiKey: 'test-key' }, {}), { code: 'agy_provider_config_invalid' });
+  await assert.rejects(p.transformer.transformRequestIn(body, { ...provider, apiKey: 'test-key' }, {}), { code: 'agy_provider_config_invalid' });
   assert.equal(p.run.mock.callCount(), 0);
 });
 
@@ -148,13 +161,16 @@ test('Fastify socket disconnect, request abort and stream cancellation abort the
   for (const source of ['socket', 'aborted', 'reader']) {
     const raw = Object.assign(new EventEmitter(), { socket: new EventEmitter() });
     let signal;
-    const p = await activate(t, settings, async input => {
+    const p = await activate(t, settings, t.mock.fn(async input => {
       signal = input.signal;
       input.onText('started');
       await new Promise((resolve, reject) => signal.addEventListener('abort', reject, { once: true }));
-    });
+    }));
     const req = { body, raw };
     const result = p.dispatch({ ...body, stream: source === 'reader' }, req);
+    // The dispatcher awaits its settings refresh before wiring cancellation,
+    // so wait until the transport run has actually started.
+    for (let i = 0; p.run.mock.callCount() === 0 && i < 100; i++) await delay(5);
     raw.emit('close');
     assert.equal(signal.aborted, false);
     if (source === 'reader') await (await result).body.cancel();

@@ -9,6 +9,10 @@ export interface ChatCompletionCapture {
   finished?: boolean;
   streamError?: boolean;
   rateLimited?: boolean;
+  // A stable, code-shaped error identifier from the SSE error frame, if it
+  // carried one. Free-form upstream text is deliberately NOT kept: usage rows
+  // and health messages must never echo upstream prose.
+  streamErrorCode?: string;
   // The latest upstream response, shared by primary and fallback request copies.
   // Failover clears it once it books that provider.
   unbookedAttempt?: { provider: string; model: string };
@@ -17,6 +21,28 @@ export interface ChatCompletionCapture {
 
 export function hasChatFinishReason(choice: { finish_reason?: unknown } | null): boolean {
   return typeof choice?.finish_reason === "string" && choice.finish_reason.trim().length > 0;
+}
+
+/** A stable error code, or undefined for anything that is not one. Upstream
+ * prose, nested objects and unknown shapes all yield undefined: only a short
+ * snake_case/lowercase identifier survives, so a provider's own code reaches
+ * the usage row without its message. */
+type ErrorFrame = { error?: { code?: unknown } } | undefined;
+
+function safeParse(text: string): ErrorFrame {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null ? parsed as ErrorFrame : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function errorCodeOf(frame: ErrorFrame): string | undefined {
+  const code = (frame as { error?: { code?: unknown } })?.error?.code;
+  if (typeof code !== "string") return undefined;
+  const trimmed = code.trim();
+  return /^[a-z][a-z0-9_]{0,63}$/.test(trimmed) ? trimmed : undefined;
 }
 
 // Observe the bytes Fastify actually sends. A usage trailer may follow the
@@ -34,6 +60,7 @@ export function captureChatStream(capture: ChatCompletionCapture, startTime: num
     }
     if (event === "error") {
       capture.streamError = true;
+      capture.streamErrorCode ??= errorCodeOf(safeParse(data));
       capture.rateLimited ||= isRateLimitMessage(200, data);
       return;
     }
@@ -45,6 +72,7 @@ export function captureChatStream(capture: ChatCompletionCapture, startTime: num
     }
     if (frame?.error || frame?.type === "error") {
       capture.streamError = true;
+      capture.streamErrorCode ??= errorCodeOf(frame);
       capture.rateLimited ||= isRateLimitMessage(200, data);
       return;
     }

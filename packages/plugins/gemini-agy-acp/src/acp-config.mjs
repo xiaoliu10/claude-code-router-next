@@ -5,7 +5,7 @@ const selectorIds = {
   thought_level: ['thought_level', 'thinking', 'thinking_level'],
 };
 
-function select(options, category, requested) {
+function selectorFor(options, category) {
   if (!Array.isArray(options)) throw new AcpError('unsupported_option');
   const selectors = options.filter(option => option?.type === 'select' && (
     option.category == null ? selectorIds[category].includes(option.id) : option.category === category
@@ -15,6 +15,30 @@ function select(options, category, requested) {
   if (typeof selector.id !== 'string' || !Array.isArray(selector.options)) {
     throw new AcpError('unsupported_option');
   }
+  return selector;
+}
+
+/** The single advertised model selector, shared by session configuration and
+ * the model-sync route's catalog discovery. */
+export function modelSelector(options) {
+  return selectorFor(options, 'model');
+}
+
+/** Flat {id,name} options of a selector, deduplicated by wire value. */
+export function modelOptions(selector) {
+  const models = [];
+  const seen = new Set();
+  for (const entry of selector.options.flatMap(option => option?.options ?? [option])) {
+    if (typeof entry?.value !== 'string' || !entry.value || seen.has(entry.value)) continue;
+    seen.add(entry.value);
+    models.push({ id: entry.value, name: typeof entry.name === 'string' && entry.name ? entry.name : entry.value });
+    if (models.length >= 256) break;
+  }
+  return models;
+}
+
+function select(options, category, requested) {
+  const selector = selectorFor(options, category);
   const values = selector.options.flatMap(entry => entry?.options ?? [entry])
     .filter(entry => typeof entry?.value === 'string');
   const normalized = requested.toLowerCase();
