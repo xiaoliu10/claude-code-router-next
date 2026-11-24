@@ -752,7 +752,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         clientType: req.clientType || detectClientType(req),
         stream: req.body?.stream ?? false,
         inputTokens: rawInputTokens,
-        ...effectiveInputUsage(hardFailed ? undefined : req.sourceInputUsage ?? chat?.inputUsage ?? req.wireInputUsage, chat ? 0 : req.tokenCount),
+        ...effectiveInputUsage(hardFailed ? undefined : req.sourceInputUsage ?? chat?.inputUsage ?? req.wireInputUsage),
         outputTokens,
         cacheReadInputTokens,
         cacheCreationInputTokens: usage?.cache_creation_input_tokens || 0,

@@ -34,32 +34,36 @@ export function captureInputUsage(capture: InputUsageCapture | undefined, frame:
   usage.kiroChat ||= format === "chat" && frame.usage_source === "kiro";
 }
 
-/** Inclusive input: Chat/Responses prompts already contain cached tokens;
- * standard Anthropic counts add both cache buckets. Missing native cache reads
- * use the router estimate, explicitly marked as an estimate by the caller. */
-export function effectiveInputUsage(capture: InputUsageCapture | undefined, routerEstimate = 0) {
-  const { input = 0, read, write = 0, kiroChat, estimated } = capture?.usage ?? {};
-  const reported = capture && (capture.usage.input !== undefined || read !== undefined || capture.usage.write !== undefined);
-  const hasInput = input > 0 || (read ?? 0) + write > 0;
-  let total = input;
-  let inferred = false;
-  if (!reported || (!hasInput && !estimated)) {
-    total = routerEstimate;
-    inferred = routerEstimate > 0;
-  } else if (capture?.format === "anthropic") {
-    total += (read ?? 0) + write;
-    // When cache reads are omitted, the router estimates the whole prompt.
-    // Both reported writes and net input already occupy part of that estimate.
-    if (read === undefined && !estimated && routerEstimate > total) {
-      total = routerEstimate;
-      inferred = true;
-    }
+/** Inclusive input for a request whose source protocol was captured.
+ *
+ * Chat/Responses prompts already contain cached tokens; standard Anthropic
+ * counts add both cache buckets; Kiro Chat folds reads into prompt_tokens and
+ * reports writes separately. The total is normalized strictly from the reported
+ * counters (an omitted bucket is zero) — never padded with a router estimate.
+ * When no usage counters were reported at all the inclusive input is unknown and
+ * the result is null rather than an approximation. Provider-estimated counts keep
+ * their known-protocol normalization and stay flagged as estimated. */
+export function effectiveInputUsage(capture: InputUsageCapture | undefined): {
+  effectiveInputTokens: number | null;
+  effectiveInputTokensSource?: "estimated";
+} {
+  if (!capture) return { effectiveInputTokens: null };
+  const { input, read, write, kiroChat, estimated } = capture.usage;
+  const reported = input !== undefined || read !== undefined || write !== undefined;
+  if (!reported) return { effectiveInputTokens: null };
+  const uncached = input ?? 0;
+  const cacheRead = read ?? 0;
+  const cacheWrite = write ?? 0;
+  let total: number;
+  if (capture.format === "anthropic") {
+    total = uncached + cacheRead + cacheWrite;
   } else if (kiroChat) {
-    // Kiro Chat folds reads into prompt_tokens and reports writes separately.
-    total += write;
+    total = uncached + cacheWrite;
+  } else {
+    total = uncached;
   }
   return {
     effectiveInputTokens: total,
-    ...(estimated || inferred ? { effectiveInputTokensSource: "estimated" as const } : {}),
+    ...(estimated ? { effectiveInputTokensSource: "estimated" as const } : {}),
   };
 }

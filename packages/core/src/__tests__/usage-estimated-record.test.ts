@@ -92,7 +92,7 @@ describe("usage store estimated flag", () => {
     expect(querySummary().estimatedCount).toBe(0);
   });
 
-  it("migrates v3 rows without fabricating an inclusive count", () => {
+  it("migrates v3 cached rows to a null inclusive count, never an approximation", () => {
     clear();
     append(makeRecord({ id: "v3", inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7, effectiveInputTokens: 70 }));
     close();
@@ -102,23 +102,24 @@ describe("usage store estimated flag", () => {
     db.pragma("user_version = 3");
     db.close();
     const row = query({ sessionId: "session-est" }).records[0];
-    expect(row).toMatchObject({ effectiveInputTokens: 67, effectiveInputTokensSource: "historical" });
-    expect(querySummary().totalEffectiveInputTokens).toBe(67);
+    expect(row.effectiveInputTokens).toBeNull();
+    expect(row.effectiveInputTokensSource).toBeUndefined();
+    expect(querySummary().totalEffectiveInputTokens).toBeNull();
     close();
     const reopened = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
     expect(reopened.pragma("user_version", { simple: true })).toBe(4);
     reopened.close();
   });
 
-  it("imports legacy JSONL rows as historical lower bounds", () => {
+  it("imports legacy cached JSONL rows as null inclusive counts", () => {
     clear(); close();
     mkdirSync(join(tempHome, "data"), { recursive: true });
     writeFileSync(join(tempHome, "data", "usage.jsonl"), JSON.stringify(makeRecord({
       id: "jsonl-legacy", inputTokens: 2, cacheReadInputTokens: 60, cacheCreationInputTokens: 7,
     })) + "\n");
     const row = query({ sessionId: "session-est" }).records[0];
-    expect(row).toMatchObject({ effectiveInputTokens: 67, effectiveInputTokensSource: "historical" });
-    expect(querySummary().totalEffectiveInputTokens).toBe(67);
+    expect(row.effectiveInputTokens).toBeNull();
+    expect(querySummary().totalEffectiveInputTokens).toBeNull();
   });
 
   afterAll(() => {

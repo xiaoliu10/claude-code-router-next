@@ -45,15 +45,15 @@ describe("effective input capture", () => {
     // page derives uncached input as total - read, never double-subtracting.
     expect(row.effectiveInputTokens).toBe(77000);
     expect(row.cacheReadInputTokens).toBe(76000);
-    expect(row.effectiveInputTokens - row.cacheReadInputTokens).toBe(1000);
+    expect(row.effectiveInputTokens! - row.cacheReadInputTokens).toBe(1000);
     expect(row.effectiveInputTokensSource).toBeUndefined();
   });
 
   it.each([
     { input_tokens: 0, cache_read_input_tokens: 50, cache_creation_input_tokens: 5, expected: 55 },
     { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 5, expected: 15 },
-    { input_tokens: 10, cache_creation_input_tokens: 5, expected: 1000, source: "estimated" },
-    { input_tokens: 0, expected: 1000, source: "estimated" },
+    { input_tokens: 10, cache_creation_input_tokens: 5, expected: 15 },
+    { input_tokens: 0, expected: 0 },
     { input_tokens: 10, usage_estimated: true, expected: 10, source: "estimated" },
     { input_tokens: 0, usage_estimated: true, expected: 0, source: "estimated" },
   ])("preserves zero and missing Anthropic cache counts in $expected", async ({ expected, source, ...usage }) => {
