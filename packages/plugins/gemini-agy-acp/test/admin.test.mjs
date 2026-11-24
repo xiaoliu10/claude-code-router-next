@@ -491,18 +491,19 @@ test('model sync creates a missing provider entry with the managed marker and sk
 
 test('model sync rolls back the provider entry when the config write fails', async t => {
   const config = { Providers: [{ name, models: ['stale-model'] }], Router: { default: `${name},stale-model` } };
-  let writes = 0;
+  const writes = [];
   const p = await activate(t, { fixtureMode: 'ok', host: {
-    readConfig: async () => JSON.parse(JSON.stringify(config)),
-    writeConfig: async () => { writes += 1; if (writes === 1) throw Error('disk full'); },
+    readConfig: async () => config,
+    writeConfig: async next => { writes.push(next); if (writes.length === 1) throw Error('disk full'); },
   } });
   await p.call('POST', CONNECT_URL, { body: { binary: p.fixture.binary } });
   const { status, body: reported } = await p.call('POST', SYNC_URL, { body: {} });
   assert.equal(status, 500);
   assert.equal(reported.error, 'agy_config_write_failed');
-  assert.ok(writes >= 2, 'rollback write attempted after the failed write');
-  const saved = await p.sidecar();
-  assert.deepEqual(saved.models.map(model => model.id), ['m2', 'default'], 'sidecar keeps synced models for the next attempt');
+  assert.equal(writes.length, 2);
+  assert.deepEqual(writes[0].Providers[0].models, ['m2', 'default']);
+  assert.deepEqual(writes[1].Providers[0].models, ['stale-model']);
+  assert.equal((await p.sidecar()).models, undefined);
 });
 
 const providerModels = (writes) => writes.at(-1)?.Providers.find(entry => entry.name === name)?.models;
@@ -582,7 +583,25 @@ test('model visibility validates ids, persists the hide set and re-registers onl
   assert.deepEqual(providerModels(writes), ['default']);
 });
 
-test('model visibility keeps the persisted hide set when provider registration fails', async t => {
+test('concurrent sync and visibility changes preserve both hidden models', async t => {
+  let stored = { Providers: [{ name, models: ['m2', 'default'] }] };
+  const p = await activate(t, { fixtureMode: 'ok', host: {
+    readConfig: async () => stored,
+    writeConfig: async next => { stored = next; },
+  } });
+  await p.writeSidecar({ enabled: true, binary: p.fixture.binary, authMethod: 'gemini-api-key',
+    models: [{ id: 'm2', name: 'Gemini Model' }, { id: 'default', name: 'Default' }] });
+  const sync = p.call('POST', SYNC_URL, { body: {} });
+  const results = await Promise.all([sync,
+    p.call('POST', VISIBILITY_URL, { body: { hide: ['m2'] } }),
+    p.call('POST', VISIBILITY_URL, { body: { hide: ['default'] } }),
+  ]);
+  assert.deepEqual(results.map(result => result.status), [200, 200, 200]);
+  assert.deepEqual((await p.sidecar()).hiddenModels, ['m2', 'default']);
+  assert.deepEqual(stored.Providers[0].models, []);
+});
+
+test('model visibility preserves prior state when provider registration fails', async t => {
   let writes = 0;
   const p = await activate(t, { fixtureMode: 'ok', host: {
     readConfig: async () => ({ Providers: [{ name, models: ['m2', 'default'] }] }),
@@ -594,9 +613,7 @@ test('model visibility keeps the persisted hide set when provider registration f
   assert.equal(failure.status, 500);
   assert.equal(failure.body.error, 'agy_config_write_failed');
   assert.ok(writes >= 2, 'rollback write attempted after the failed write');
-  // The hide set itself persists, so a retried visibility or the next sync
-  // keeps the operator's intent.
-  assert.deepEqual((await p.sidecar()).hiddenModels, ['m2']);
+  assert.equal((await p.sidecar()).hiddenModels, undefined);
   const retried = await activate(t, { fixtureMode: 'ok', host: {
     readConfig: async () => ({ Providers: [{ name, models: ['m2', 'default'] }] }),
     writeConfig: async () => {},
