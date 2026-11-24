@@ -1,6 +1,5 @@
 import {
   FastifyInstance,
-  FastifyPluginAsync,
   FastifyRequest,
   FastifyReply,
 } from "fastify";
@@ -10,7 +9,7 @@ import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import type { ChatCompletionCapture } from "../ccr/chat-completion-capture";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
-import { type PluginRegistry, isPluginClassifiedError, pluginErrorFrom } from "../provider-plugins/registry";
+import { type PluginRegistry, isPluginClassifiedError } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, pluginTerminalFailure, rememberPluginFailure } from "./plugin-request-state";
 import { pluginResponseError, describeTransportFailure } from "./plugin-response-error";
 import {
@@ -38,7 +37,7 @@ import {
   readBodyForSSE,
 } from "../transformer/response-body";
 import { router, findProviderModel, ProjectRoutingError } from "@/utils/router";
-import { resolveProviderProxyUrl, getDirectDispatcher } from "@/services/proxy";
+import { resolveProviderProxyUrl } from "@/services/proxy";
 
 // Matches the CCR model-family aliases that CCR injects into managed clients
 // (e.g. "ccr-opus", "ccr-sonnet[1m]"). Codex sends one of these as a bare model
@@ -320,12 +319,20 @@ async function handleTransformerEndpoint(
   // Store codex flags on the request so handleFallback can propagate them
   (req as any).isCodexOnMessagesEndpoint = isCodexOnMessagesEndpoint;
 
-  const familyChatUsesTools = isChat && CCR_FAMILY_ALIAS.test((req as any).originalModel) && chatUsesTools(body);
-  if (familyChatUsesTools && isAgyRoute(provider, body.model, fastify.pluginRegistry)) {
+  // Family tool requests must skip the text-only Agy plugin on every wire, not
+  // just Chat: pi/Anthropic clients use /v1/messages, and letting a tool request
+  // reach Agy returns a terminal 400 that aborts the whole fallback chain.
+  const familyUsesTools = CCR_FAMILY_ALIAS.test((req as any).originalModel) &&
+    (isChat
+      ? chatUsesTools(body)
+      : transformer.endPoint === "/v1/messages"
+        ? anthropicUsesTools(body) || chatUsesTools(body)
+        : false);
+  if (familyUsesTools && isAgyRoute(provider, body.model, fastify.pluginRegistry)) {
     // The plugin disables fallback when entered. Skip it before an attempt exists.
-    const result = await handleFallback(req, reply, fastify, transformer, undefined, familyChatUsesTools);
+    const result = await handleFallback(req, reply, fastify, transformer, undefined, familyUsesTools);
     if (result) return result;
-    throw createApiError("No configured Chat route supports this tool request", 400, "agy_unsupported_request");
+    throw createApiError("No configured route supports this tool request", 400, "agy_unsupported_request");
   }
 
   try {
@@ -404,7 +411,7 @@ async function handleTransformerEndpoint(
       if (provider?.baseUrl && response?.headers) {
         captureRateLimitHeaders(providerName, provider.baseUrl, response.headers);
       }
-    } catch {}
+    } catch { /* best-effort rate-limit header capture; never fail the response */ }
 
     // Process response transformer chain
     let finalResponse = await processResponseTransformers(
@@ -425,7 +432,7 @@ async function handleTransformerEndpoint(
       if (!req.chatCompletionCapture && providerName && model) {
         getHealthStore().recordSuccess(providerName, model);
       }
-    } catch {}
+    } catch { /* best-effort health bookkeeping; never fail the response */ }
 
     return result;
   } catch (error: any) {
@@ -463,7 +470,7 @@ async function handleTransformerEndpoint(
       }
     }
     // Handle fallback for any request error (timeout, network, API errors)
-    const fallbackResult = await handleFallback(req, reply, fastify, transformer, error, familyChatUsesTools);
+    const fallbackResult = await handleFallback(req, reply, fastify, transformer, error, familyUsesTools);
     if (fallbackResult) {
       return fallbackResult;
     }
@@ -614,7 +621,7 @@ async function handleFallback(
   fastify: FastifyInstance,
   transformer: any,
   error: any,
-  familyChatUsesTools: boolean
+  familyUsesTools: boolean
 ): Promise<any> {
   const scenarioType = (req as any).scenarioType || 'default';
   const familyFallback = (req as any).familyFallback;
@@ -802,7 +809,7 @@ async function handleFallback(
       const fbProviderName = configuredFallback.provider.name;
       const fbModel = configuredFallback.model;
 
-      if (familyChatUsesTools && isAgyRoute(configuredFallback.provider, fbModel, fastify.pluginRegistry)) continue;
+      if (familyUsesTools && isAgyRoute(configuredFallback.provider, fbModel, fastify.pluginRegistry)) continue;
 
       // Skip if model is in fail pool (open state)
       if (!healthStore.isAvailable(fbProviderName, fbModel, configuredFallback.provider.apiKey?.startsWith("ccr-managed-") === true)) {
@@ -873,7 +880,7 @@ async function handleFallback(
             if (provider?.baseUrl && response?.headers) {
               captureRateLimitHeaders(fbProviderName, provider.baseUrl, response.headers);
             }
-          } catch {}
+          } catch { /* best-effort rate-limit header capture; never fail the response */ }
 
           // Process response transformer chain — propagate codex flags so the
           // fallback response also gets Responses API conversion when needed.
@@ -1750,7 +1757,7 @@ export const registerApiRoutes = async (
     },
     async (
       request: FastifyRequest<{ Body: RegisterProviderRequest }>,
-      reply: FastifyReply
+      _reply: FastifyReply
     ) => {
       // Validation
       const { name, baseUrl, apiKey, models } = request.body;
@@ -1850,7 +1857,7 @@ export const registerApiRoutes = async (
         Params: { id: string };
         Body: Partial<LLMProvider>;
       }>,
-      reply
+      _reply
     ) => {
       const provider = fastify.providerService.updateProvider(
         request.params.id,
@@ -1906,7 +1913,7 @@ export const registerApiRoutes = async (
         Params: { id: string };
         Body: { enabled: boolean };
       }>,
-      reply
+      _reply
     ) => {
       const success = fastify.providerService.toggleProvider(
         request.params.id,
@@ -1994,6 +2001,28 @@ function chatUsesTools(body: any): boolean {
       namedTool(call) && named(call.id) &&
       (call.type === "function" ? typeof call.function.arguments === "string" : typeof call.custom.input === "string"));
   });
+}
+
+/**
+ * Detect tool use in an Anthropic /v1/messages body. Only well-formed signals
+ * count (named tools, a usable tool_choice, or tool_use/tool_result history),
+ * so a purely malformed payload keeps its existing non-skipped behavior. Each
+ * signal is evaluated independently rather than short-circuiting on a malformed
+ * tools array like chatUsesTools does; this only ever skips more, which is the
+ * safe direction since a real tool signal reaching text-only Agy is a terminal
+ * 400. pi and other Anthropic clients send tools as {name, input_schema}.
+ */
+function anthropicUsesTools(body: any): boolean {
+  const named = (name: unknown) => typeof name === "string" && name.trim().length > 0;
+  const tools = body?.tools;
+  if (Array.isArray(tools) && tools.length > 0 && tools.every((tool: any) => named(tool?.name))) return true;
+  const choice = body?.tool_choice;
+  if (choice?.type === "auto" || choice?.type === "any") return true;
+  if (choice?.type === "tool" && named(choice.name)) return true;
+  return Array.isArray(body?.messages) && body.messages.some((message: any) =>
+    Array.isArray(message?.content) && message.content.some((block: any) =>
+      (block?.type === "tool_use" && named(block.name) && named(block.id)) ||
+      (block?.type === "tool_result" && named(block.tool_use_id))));
 }
 
 function isLoopbackPreset(provider: LLMProvider): boolean {
