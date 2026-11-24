@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-login-start-set"
+description = "Enables the login_start_set command without any pre-configured scope."
+commands.allow = ["login_start_set"]
+
+[[permission]]
+identifier = "deny-login-start-set"
+description = "Denies the login_start_set command without any pre-configured scope."
+commands.deny = ["login_start_set"]

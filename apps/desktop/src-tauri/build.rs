@@ -1,6 +1,8 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "login_start_status",
+            "login_start_set",
             "quota_snapshot",
             "quota_hide",
             "quota_open_ui",

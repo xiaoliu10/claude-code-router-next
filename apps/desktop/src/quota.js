@@ -1145,7 +1145,34 @@
   // In-memory fixtures covering every contract command, so the panel is fully
   // browsable outside Tauri. Never used when window.__TAURI__ is present.
 
+  function bindAutostart(invoke, toggle, message) {
+    var pending = false;
+    async function sync(requested) {
+      if (!invoke || pending) return;
+      pending = true;
+      toggle.disabled = true;
+      var writeFailed = false;
+      if (typeof requested === 'boolean') {
+        try { await invoke('login_start_set', { enabled: requested }); }
+        catch { writeFailed = true; }
+      }
+      try {
+        toggle.checked = await invoke('login_start_status');
+        toggle.indeterminate = false;
+        toggle.disabled = false;
+        message.textContent = writeFailed || (typeof requested === 'boolean' && toggle.checked !== requested)
+          ? '未能更改开机启动设置' : '';
+      } catch {
+        toggle.indeterminate = true;
+        message.textContent = '无法读取开机启动状态，请点击刷新重试';
+      } finally { pending = false; }
+    }
+    toggle.addEventListener('change', function () { return sync(toggle.checked); });
+    return function () { return sync(); };
+  }
+
   function createPreviewInvoke() {
+    var loginStart = false;
     var projectsPreview = typeof ProjectsUI !== 'undefined' ? ProjectsUI.createPreviewProjects() : null;
     var rev = 1;
     var routing = {
@@ -1305,6 +1332,11 @@
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
       if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
+      if (cmd === 'login_start_status') return Promise.resolve(loginStart);
+      if (cmd === 'login_start_set') {
+        loginStart = a.enabled;
+        return Promise.resolve();
+      }
       if (cmd === 'quota_snapshot') {
         return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
       }
@@ -1427,7 +1459,7 @@
     SERVICE_MODES: SERVICE_MODES, normalizeServiceState: normalizeServiceState,
     serviceView: serviceView, quitTitleFor: quitTitleFor, createServiceController: createServiceController,
     // preview fixtures (complete contracts, ?preview=1 only)
-    createPreviewInvoke: createPreviewInvoke,
+    createPreviewInvoke: createPreviewInvoke, bindAutostart: bindAutostart,
   };
   if (typeof globalThis !== 'undefined') globalThis.QuotaUI = QuotaUI;
 
@@ -2490,6 +2522,7 @@
       tabButtons[id] = document.getElementById('tab-' + id);
       panels[id] = document.getElementById('panel-' + id);
     });
+    var refreshAutostart = bindAutostart(invoke, document.getElementById('desktop-autostart'), document.getElementById('desktop-autostart-msg'));
     var activeTab = 'quota';
     var loadedTabs = { quota: true };
 
@@ -2511,6 +2544,7 @@
         tabButtons[id].tabIndex = on ? 0 : -1;
         panels[id].hidden = !on;
       });
+      if (name === 'clients') refreshAutostart();
       maybeLoadTab(name);
     }
 
@@ -2574,7 +2608,7 @@
       if (usageCtrl) usageCtrl.refresh();
       if (recordsCtrl) recordsCtrl.refresh();
     });
-    els.clientsRefresh.addEventListener('click', function () { if (clientsCtrl) clientsCtrl.refresh(); });
+    els.clientsRefresh.addEventListener('click', function () { refreshAutostart(); if (clientsCtrl) clientsCtrl.refresh(); });
     els.serviceStart.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('start'); });
     els.serviceStop.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('stop'); });
     els.serviceRefresh.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.refresh(); });
