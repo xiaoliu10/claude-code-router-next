@@ -502,6 +502,7 @@ export function UsageStats() {
                       <TooltipContent side="top" className="text-xs">
                         <div className="font-medium mb-1">{day}</div>
                         <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
+                        <div>{t("usage.cache_read")}: {formatTokens(data.cacheReadInputTokens ?? 0)}</div>
                         <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
                         <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(total)}</div>
                       </TooltipContent>
@@ -659,14 +660,14 @@ export function UsageStats() {
                 const modelData = Object.entries(summary.byModel)
                   .map(([model, data]) => {
                     const { cacheMissInput, total } = usageTokens(data);
-                    return { model, count: data.count, cacheMissInput, total, outputTokens: data.outputTokens };
+                    return { model, data, cacheMissInput, total };
                   })
                   .sort((a, b) => (b.total ?? -1) - (a.total ?? -1))
                   .slice(0, 10);
                 const maxModelTokens = Math.max(1, ...modelData.map(p => p.total ?? 0));
                 return (
                   <div className="space-y-2">
-                    {modelData.map(({ model, count, total, cacheMissInput, outputTokens }) => {
+                    {modelData.map(({ model, data, total, cacheMissInput }) => {
                       const width = total === null ? 0 : Math.max(8, (total / maxModelTokens) * 100);
                       const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
                       return (
@@ -689,9 +690,10 @@ export function UsageStats() {
                           </TooltipTrigger>
                           <TooltipContent side="top" className="text-xs">
                             <div className="font-medium mb-1">{model}</div>
-                            <div>{t("usage.requests")}: {count}</div>
+                            <div>{t("usage.requests")}: {data.count}</div>
                             <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
-                            <div>{t("usage.output_tokens")}: {formatTokens(outputTokens)}</div>
+                            <div>{t("usage.cache_read")}: {formatTokens(data.cacheReadInputTokens ?? 0)}</div>
+                            <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
                             <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(total)}</div>
                           </TooltipContent>
                         </Tooltip>

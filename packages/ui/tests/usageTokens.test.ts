@@ -19,3 +19,10 @@ test("legacy counts without cached tokens are usable and zero input has no hit r
   assert.deepEqual(usageTokens({ inputTokens: 100, outputTokens: 10 }), { cacheMissInput: 100, total: 110, hitRate: 0 });
   assert.deepEqual(usageTokens({ inputTokens: 0, effectiveInputTokens: 0, outputTokens: 10 }), { cacheMissInput: 0, total: 10, hitRate: null });
 });
+
+test("77k inclusive input with 76k cache reads displays 1k misses and a 98.7% hit rate", () => {
+  const tokens = usageTokens({ inputTokens: 750, effectiveInputTokens: 77000, cacheReadInputTokens: 76000, cacheCreationInputTokens: 250, outputTokens: 200 });
+  assert.equal(tokens.cacheMissInput, 1000);
+  assert.equal(tokens.total, 77200);
+  assert.equal(((tokens.hitRate ?? 0) * 100).toFixed(1), "98.7");
+});

@@ -2141,11 +2141,11 @@
         return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
           { text: formatCompact(input) || '—', title: formatInt(input) },
           { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
-          { text: (formatCompact(m.cacheReadTokens) || '—') + ' / ' + (formatCompact(m.cacheWriteTokens) || '—'),
-            title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') },
+          { text: formatCompact(m.cacheReadTokens) || '—', title: formatInt(m.cacheReadTokens) },
+          { text: formatCompact(m.cacheWriteTokens) || '—', title: formatInt(m.cacheWriteTokens) },
           { text: formatCompact(rowTotal) || '—', title: formatInt(rowTotal) }];
       }
-      var tokenHeaders = ['请求', '输入（未命中）', '输出', '缓存（读 / 写）', '总 tokens'];
+      var tokenHeaders = ['请求', '输入（未命中）', '输出', '缓存读', '缓存写', '总 tokens'];
       body.appendChild(usageTable('按模型', ['模型'].concat(tokenHeaders), u.byModel.map(tokenRow), 1));
       body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
       body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
@@ -2176,6 +2176,7 @@
         bar.hidden = v === null;
         var input = cacheMissInputTokens(d);
         bar.title = d.name + ' · 输入（未命中） ' + (formatCompact(input) || '—') + '（' + (formatInt(input) || '—') + '）'
+          + ' · 缓存读 ' + (formatInt(d.cacheReadTokens) || '—')
           + ' · 输出 ' + (formatCompact(d.outputTokens) || '—') + '（' + (formatInt(d.outputTokens) || '—') + '）'
           + ' · 总量 ' + (formatCompact(v) || '—') + '（' + (formatInt(v) || '—') + '）';
         col.title = bar.title;
