@@ -525,3 +525,24 @@ test('a real ACP agent discovers the tool over MCP and the same turn resumes', a
   // The agent relayed the caller's own result back as its answer text.
   assert.match(answered.choices[0].message.content, /^42resumed with 42$/);
 });
+
+test('the MCP bridge negotiates the protocol revision agy actually speaks', async t => {
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const tool = { type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: { key: { type: 'string' } } } } };
+  const bridge = new AgyToolBridge([tool], () => new Promise(() => {}));
+  await bridge.start();
+  t.after(() => bridge.close());
+  // agy 1.5.15 probes the modern sessionless discovery before initialize.
+  const discovered = await speakMcp(bridge.url, bridge.token, 'server/discover', {});
+  assert.equal(discovered.resultType, 'complete');
+  assert.ok(discovered.supportedVersions.includes('2025-11-25'));
+  assert.deepEqual(discovered.capabilities, { tools: {} });
+  assert.equal(typeof discovered.ttlMs, 'number');
+  // initialize must echo the string date revision, never a numeric version.
+  const init = await speakMcp(bridge.url, bridge.token, 'initialize', { protocolVersion: '2025-11-25' });
+  assert.equal(init.protocolVersion, '2025-11-25');
+  assert.deepEqual(init.capabilities, { tools: {} });
+  // An unknown revision falls back to the newest supported string revision.
+  const fallback = await speakMcp(bridge.url, bridge.token, 'initialize', { protocolVersion: '1999-01-01' });
+  assert.equal(fallback.protocolVersion, '2025-11-25');
+});

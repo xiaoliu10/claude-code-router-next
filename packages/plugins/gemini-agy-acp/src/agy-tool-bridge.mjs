@@ -284,9 +284,28 @@ export class AgyToolBridge {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }));
     };
-    if (method === 'initialize') {
+    if (method === 'server/discover') {
+      // MCP 2026-07-28 sessionless discovery (SEP-2575). agy probes this before
+      // initialize; advertise the legacy revisions we serve so it negotiates
+      // down to the initialize handshake instead of dropping the server.
       reply({
-        protocolVersion: typeof params?.protocolVersion === 'number' ? params.protocolVersion : 1,
+        resultType: 'complete',
+        supportedVersions: ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'],
+        capabilities: { tools: {} },
+        _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'ccr-caller-tools', version: '1.0.0' } },
+        ttlMs: 0,
+        cacheScope: 'private',
+      });
+      return;
+    }
+    if (method === 'initialize') {
+      // MCP protocolVersion is a string date revision, not a number. Echo the
+      // client's requested revision when it is one we serve; otherwise fall
+      // back to the newest supported so the handshake never mismatches.
+      const supported = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+      const requested = typeof params?.protocolVersion === 'string' ? params.protocolVersion : null;
+      reply({
+        protocolVersion: requested && supported.includes(requested) ? requested : '2025-11-25',
         capabilities: { tools: {} },
         serverInfo: { name: 'ccr-caller-tools', version: '1.0.0' },
       });
@@ -296,10 +315,11 @@ export class AgyToolBridge {
       // alwaysLoad keeps each entry loaded even when agy's shared
       // customization budget would otherwise drop it; the fitter then trims
       // only description prose so every tool stays listed, schema intact.
-      reply({ tools: fitToolsToBudget(this.tools.map(tool => ({
+      const listed = fitToolsToBudget(this.tools.map(tool => ({
         name: tool.mcpName, description: tool.description, inputSchema: tool.inputSchema,
         _meta: { ...(tool.meta || {}), 'antigravity/alwaysLoad': true },
-      }))) });
+      })));
+      reply({ tools: listed });
       return;
     }
     if (method === 'tools/call') {
