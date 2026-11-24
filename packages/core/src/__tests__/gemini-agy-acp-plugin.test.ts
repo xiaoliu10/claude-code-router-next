@@ -5,6 +5,13 @@ import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
 import Server from '../server';
 import { loadInstalledPlugins } from '../provider-plugins/loader';
+import { registerRequestPipeline } from '../ccr/request-pipeline';
+
+const { appendUsage } = vi.hoisted(() => ({ appendUsage: vi.fn() }));
+vi.mock('../ccr/usage-store', async importOriginal => ({
+  ...await importOriginal<typeof import('../ccr/usage-store')>(),
+  append: appendUsage,
+}));
 
 // Exercise both wire formats through the real loader, router and stdio worker.
 it.skipIf(process.platform === 'win32')('routes text chat through the installed ACP plugin with zero HTTP attempts', async () => {
@@ -42,6 +49,7 @@ it.skipIf(process.platform === 'win32')('routes text chat through the installed 
     const log = { info() {}, warn() {}, error() {} };
     const loaded = await loadInstalledPlugins({ configDir: dir, log, getServer: () => server });
     expect(loaded.loaded).toEqual([name]);
+    registerRequestPipeline(server, {});
     await server.registerNamespace('/');
     const model = name + ',m2';
     const messages = [{ role: 'user', content: 'echo this text' }];
@@ -53,15 +61,42 @@ it.skipIf(process.platform === 'win32')('routes text chat through the installed 
     expect(stream.statusCode, stream.body).toBe(200);
     expect(stream.body).toContain('"content":"echo this text"');
     expect(stream.body).toContain('[DONE]');
+    const streamedUsage = stream.body.split('\n')
+      .filter(line => line.startsWith('data: {'))
+      .map(line => JSON.parse(line.slice(6)))
+      .find(frame => frame.usage)?.usage;
+    for (const usage of [chat.json().usage, streamedUsage]) {
+      expect(usage).toMatchObject({ prompt_tokens: 39, completion_tokens: 9, total_tokens: 48 });
+    }
+    await vi.waitFor(() => {
+      for (const streaming of [false, true]) {
+        expect(appendUsage).toHaveBeenCalledWith(expect.objectContaining({
+          provider: name, stream: streaming, status: 'success', model: 'm2',
+          inputTokens: 16, cacheReadInputTokens: 21, cacheCreationInputTokens: 2, outputTokens: 9,
+        }));
+      }
+    });
+    expect(appendUsage).toHaveBeenCalledTimes(2);
     const anthropic = await post('/v1/messages', { max_tokens: 32 });
     expect(anthropic.statusCode, anthropic.body).toBe(200);
     expect(anthropic.json().content).toContainEqual({ type: 'text', text: messages[0].content });
     const failure = await post('/v1/chat/completions', { messages: [{ role: 'user', content: 'exit' }] });
     expect(failure.statusCode).toBe(502);
+    const partial = await post('/v1/chat/completions', {
+      stream: true, messages: [{ role: 'user', content: 'partial-error' }],
+    });
+    expect(partial.statusCode, partial.body).toBe(200);
+    expect(partial.body).toContain('partial fixture response');
+    expect(partial.body).toContain('"error":{"code":"acp_worker_failed"');
+    expect(partial.body).not.toContain('[DONE]');
+    await vi.waitFor(() => expect(appendUsage).toHaveBeenCalledWith(expect.objectContaining({
+      provider: name, stream: true, status: 'error', outputTokens: 0,
+      errorMessage: expect.stringContaining('acp_worker_failed'),
+    })));
     expect(network).not.toHaveBeenCalled();
     const events = (await readFile(join(dir, 'events'), 'utf8')).trim().split('\n').map(line => JSON.parse(line).event);
-    expect(events.filter(event => event === 'session/prompt')).toHaveLength(4);
-    expect(events.filter(event => event === 'spawn')).toHaveLength(1);
+    expect(events.filter(event => event === 'session/prompt')).toHaveLength(5);
+    expect(events.filter(event => event === 'spawn')).toHaveLength(2);
   } finally {
     await server.app.close();
     vi.unstubAllGlobals(); vi.unstubAllEnvs();

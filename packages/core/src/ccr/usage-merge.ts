@@ -25,6 +25,12 @@ export function getUsageCacheCreationInputTokens(usage: any): number {
   );
 }
 
+/** The ACP plugin's Chat prompt count includes both cache buckets. */
+export function getAcpUncachedPromptTokens(usage: any): number | undefined {
+  if (usage?.usage_source !== "gemini-agy-acp" || typeof usage.prompt_tokens !== "number") return undefined;
+  return usage.prompt_tokens - getUsageCacheReadInputTokens(usage) - getUsageCacheCreationInputTokens(usage);
+}
+
 /**
  * Normalize a raw usage object (from Anthropic, OpenAI Chat Completions, or
  * OpenAI Responses APIs) into a common shape with input_tokens / output_tokens
@@ -36,7 +42,7 @@ export function normalizeUsagePayload(usage: any): any {
   return {
     ...usage,
     ...(usage.kiro_estimated === true || usage.usage_estimated === true ? { usage_estimated: true } : {}),
-    input_tokens: usage.input_tokens ?? usage.prompt_tokens ?? 0,
+    input_tokens: usage.input_tokens ?? getAcpUncachedPromptTokens(usage) ?? usage.prompt_tokens ?? 0,
     output_tokens: usage.output_tokens ?? usage.completion_tokens ?? 0,
     cache_read_input_tokens: getUsageCacheReadInputTokens(usage),
     cache_creation_input_tokens: getUsageCacheCreationInputTokens(usage),

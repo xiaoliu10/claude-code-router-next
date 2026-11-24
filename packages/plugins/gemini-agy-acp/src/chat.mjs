@@ -118,7 +118,7 @@ export async function chatResponse(transport, prompt, stream, req, config) {
         emit(text);
       } });
       signal.throwIfAborted();
-      return finishReason(result?.stopReason);
+      return { finish_reason: finishReason(result?.stopReason), usage: result.usage };
     } catch (error) {
       throw overflow ?? (signal.aborted ? failure('agy_cancelled', 499) : safeFailure(error));
     } finally {
@@ -127,8 +127,8 @@ export async function chatResponse(transport, prompt, stream, req, config) {
   }
   if (!stream) {
     const parts = [];
-    const finish_reason = await run(text => parts.push(text));
-    return Response.json({ ...base, object: 'chat.completion', choices: [{ index: 0,
+    const { finish_reason, usage } = await run(text => parts.push(text));
+    return Response.json({ ...base, object: 'chat.completion', usage, choices: [{ index: 0,
       message: { role: 'assistant', content: parts.join('') }, finish_reason }] });
   }
 
@@ -141,8 +141,8 @@ export async function chatResponse(transport, prompt, stream, req, config) {
   const body = new ReadableStream({
     start(output) {
       function event(data) { output.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)); }
-      function chunk(delta, finish_reason = null) {
-        event({ ...base, object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason }] });
+      function chunk(delta, finish_reason = null, usage) {
+        event({ ...base, object: 'chat.completion.chunk', usage, choices: [{ index: 0, delta, finish_reason }] });
       }
       function begin() {
         if (started) return;
@@ -150,9 +150,9 @@ export async function chatResponse(transport, prompt, stream, req, config) {
         chunk({ role: 'assistant' });
         resolveReady();
       }
-      run(text => { begin(); chunk({ content: text }); }).then(reason => {
+      run(text => { begin(); chunk({ content: text }); }).then(({ finish_reason, usage }) => {
         begin();
-        chunk({}, reason);
+        chunk({}, finish_reason, usage);
         output.enqueue(encoder.encode('data: [DONE]\n\n'));
         output.close();
       }).catch(error => {

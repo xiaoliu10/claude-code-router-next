@@ -74,6 +74,10 @@ function ensureClientContext(req: any, config: Record<string, unknown>): void {
   }
 }
 
+function isAcpChatCompletion(req: any): boolean {
+  return req.provider === "gemini-agy-acp" && req.pathname?.endsWith("/v1/chat/completions") === true;
+}
+
 function getUsageSessionId(req: any): string {
   return req.usageSessionId || req.id;
 }
@@ -238,7 +242,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       return;
     }
     req.pathname = url.pathname;
-    if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/responses")) && !req.requestStartTime) {
+    if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/responses") ||
+        url.pathname.endsWith("/v1/chat/completions")) && !req.requestStartTime) {
       req.requestStartTime = performance.now();
     }
   });
@@ -280,7 +285,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     (req.ccrHookOrder ||= []).push("onSend");
     const isMessages = req.pathname?.endsWith("/v1/messages");
     const isResponses = req.pathname?.endsWith("/v1/responses");
-    if (isMessages || isResponses) {
+    const isAcpChat = isAcpChatCompletion(req);
+    if (isMessages || isResponses || isAcpChat) {
       ensureClientContext(req, config);
       const usageSessionId = getUsageSessionId(req);
       const usageCacheKey = getUsageCacheKey(req);
@@ -446,6 +452,16 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
                 req.upstreamModel = data.response.model;
               }
 
+              if (isAcpChat) {
+                // ACP Chat reports usage once, in the terminal completion chunk.
+                // Keep it request-local so missing usage never reuses a prior turn.
+                if (data?.usage) req.acpChatUsage = normalizeUsagePayload(data.usage);
+                if (!req.upstreamModel && isRealUpstreamModel(data?.model)) req.upstreamModel = data.model;
+                if (data?.choices?.some?.((choice: any) => choice?.delta?.content)) req.contentDelivered = true;
+                if (data?.error && typeof data.error === "object") req.sseError = data.error;
+                continue;
+              }
+
               // Capture usage from Anthropic SSE (message_delta, message_start)
               if (data?.usage) {
                 const existingUsage = sessionUsageCache.get(usageCacheKey) || {};
@@ -567,7 +583,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
 
       const nonStreamMeta = extractNonStreamMeta(payload);
       if (nonStreamMeta?.usage) {
-        sessionUsageCache.put(usageCacheKey, nonStreamMeta.usage);
+        if (isAcpChat) req.acpChatUsage = nonStreamMeta.usage;
+        else sessionUsageCache.put(usageCacheKey, nonStreamMeta.usage);
       }
       // Capture upstream model for non-stream responses from the parsed body
       // (Anthropic payload.model, Responses API payload.response.model).
@@ -592,7 +609,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
   serverInstance.addHook("onSend", async (req: any, reply: any, payload: any) => {
     event.emit('onSend', req, reply, payload);
     // Capture error response body for usage stats
-    if (reply.statusCode >= 400 && (req.pathname?.endsWith("/v1/messages") || req.pathname?.endsWith("/v1/responses"))) {
+    if (reply.statusCode >= 400 && (req.pathname?.endsWith("/v1/messages") ||
+        req.pathname?.endsWith("/v1/responses") || isAcpChatCompletion(req))) {
       try {
         if (typeof payload === 'string') {
           req.errorResponseBody = payload;
@@ -620,7 +638,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     // Release the concurrency-priority in-flight lease (no-op when the request
     // did not go through concurrency-priority routing).
     releaseRequestLease(req);
-    if (!req.pathname?.endsWith("/v1/messages") && !req.pathname?.endsWith("/v1/responses")) return;
+    const isAcpChat = isAcpChatCompletion(req);
+    if (!req.pathname?.endsWith("/v1/messages") && !req.pathname?.endsWith("/v1/responses") && !isAcpChat) return;
     try {
       // Bounded drain: the usage/TTFT readers tee the response and normally end
       // with the client, but an upstream that stops mid-stream would otherwise
@@ -662,7 +681,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // record this failure with the predecessor's input/cache tokens. Ignore the
       // slot on hard failure and fall back to the router's own token estimate.
       const hardFailed = reply.statusCode >= 400;
-      const usage = hardFailed ? undefined : sessionUsageCache.get(getUsageCacheKey(req));
+      const usage = hardFailed ? undefined : isAcpChat ? req.acpChatUsage : sessionUsageCache.get(getUsageCacheKey(req));
       const speedStats = readTokenSpeedStats(speedStatsKey);
       const healthStore = getHealthStore();
 
@@ -682,7 +701,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // (thrown before the stream is forwarded) and a genuine error-only stream
       // are still judged as failures here.
       const contentDelivered = req.contentDelivered === true;
-      const isFailedRequest = hardFailed || (hasSseError && !hasOutputTokens && !contentDelivered);
+      // ACP emits a terminal error instead of a finish chunk when a turn fails.
+      const isFailedRequest = hardFailed || (hasSseError && (isAcpChat || (!hasOutputTokens && !contentDelivered)));
       if (isFailedRequest) {
         errorMessage = req.errorMessage || reply.errorMessage || (req.error?.message || req.error?.toString?.() || undefined);
         if (hasSseError) {
@@ -717,8 +737,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // usage.input_tokens is missing OR zero, so a zeroed usage frame can't wipe
       // out the input token count for the whole request.
       const reportedInputTokens = usage?.input_tokens || 0;
-      const rawInputTokens = reportedInputTokens || req.tokenCount || 0;
-      if (!usage?.usage_estimated && !cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
+      const rawInputTokens = isAcpChat && usage ? reportedInputTokens : reportedInputTokens || req.tokenCount || 0;
+      if (!isAcpChat && !usage?.usage_estimated && !cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
         cacheReadInputTokens = req.tokenCount - usage.input_tokens;
         if (cacheReadInputTokens) {
           console.log('[Usage] Inferred cache tokens:', {
@@ -778,7 +798,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         errorMessage,
         responseBody: errorResponseBody,
       });
-      if (req.clientContext?.usageScope !== "session") {
+      if (!isAcpChat && req.clientContext?.usageScope !== "session") {
         sessionUsageCache.delete(getUsageCacheKey(req));
       }
     } catch (e) {
