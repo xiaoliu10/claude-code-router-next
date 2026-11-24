@@ -163,3 +163,18 @@ test('missing endpoint or token exits 1 silently', async () => {
     assert.equal(Buffer.concat(chunks).toString('utf8'), '');
   }
 });
+test('the stdio command strips a Windows verbatim executable path', async t => {
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const bridge = new AgyToolBridge([{ type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: {} } } }], () => new Promise(() => {}));
+  await bridge.start();
+  t.after(() => bridge.close());
+  const original = process.execPath;
+  try {
+    Object.defineProperty(process, 'execPath', { value: '\\\\?\\E:\\ccr-desktop\\runtime\\node.exe', configurable: true });
+    assert.equal(bridge.stdioDescriptor().command, 'E:\\ccr-desktop\\runtime\\node.exe');
+    Object.defineProperty(process, 'execPath', { value: 'E:\\plain\\node.exe', configurable: true });
+    assert.equal(bridge.stdioDescriptor().command, 'E:\\plain\\node.exe');
+  } finally {
+    Object.defineProperty(process, 'execPath', { value: original, configurable: true });
+  }
+});

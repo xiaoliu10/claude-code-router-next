@@ -254,7 +254,10 @@ export class AgyToolBridge {
     if (!this.url) throw new Error('bridge_not_listening');
     return {
       name: 'ccr-caller-tools',
-      command: process.execPath,
+      // The desktop shell may spawn us with a verbatim \\?\ executable path;
+      // Go's exec.LookPath cannot resolve that form, so agy would silently
+      // drop the server. Hand the agent a plain Win32 path instead.
+      command: process.execPath.replace(/^\\\\\?\\/, ''),
       args: [fileURLToPath(new URL('./agy-mcp-stdio-bridge.mjs', import.meta.url))],
       env: [
         { name: 'CCR_MCP_ENDPOINT', value: this.url },
