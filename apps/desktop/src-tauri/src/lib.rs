@@ -1,4 +1,5 @@
 mod api;
+mod autostart;
 mod control;
 mod credentials;
 mod lifecycle;
@@ -21,6 +22,8 @@ pub fn run() {
             let _ = app.run_on_main_thread(move || tray::open_window(&handle));
         }))
         .invoke_handler(tauri::generate_handler![
+            autostart::login_start_status,
+            autostart::login_start_set,
             popup::quota_snapshot,
             popup::quota_hide,
             popup::quota_open_ui,

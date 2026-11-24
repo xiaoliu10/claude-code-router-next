@@ -26,6 +26,8 @@
     "allow-quota-credentials-status",
     "allow-quota-credentials-save",
     "allow-service-snapshot",
-    "allow-service-action"
+    "allow-service-action",
+    "allow-login-start-set",
+    "allow-login-start-status"
   ]
 }
