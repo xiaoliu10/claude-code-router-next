@@ -470,6 +470,12 @@ test('oauth worker environment applies the same proxy fallback and respects ALL_
   const all = oauthEnvironment('http://127.0.0.1:7897');
   assert.equal(all.HTTPS_PROXY, undefined);
   assert.equal(all.ALL_PROXY, 'http://127.0.0.1:2');
+  delete process.env.ALL_PROXY;
+  process.env.NO_PROXY = 'example.com';
+  const merged = oauthEnvironment('http://127.0.0.1:7897');
+  assert.ok(merged.NO_PROXY.split(',').includes('example.com'));
+  assert.ok(merged.NO_PROXY.split(',').includes('127.0.0.1'));
+  assert.equal(merged.no_proxy, merged.NO_PROXY);
 });
 
 test('a spawned worker receives the configured proxy end-to-end', async t => {
@@ -481,6 +487,7 @@ test('a spawned worker receives the configured proxy end-to-end', async t => {
   await transport.run(input);
   const spawn = (await events()).find(record => record.event === 'spawn');
   assert.equal(spawn.httpsProxy, 'http://127.0.0.1:7897');
+  for (const host of ['127.0.0.1', 'localhost', '::1']) assert.ok(spawn.noProxy.split(',').includes(host));
   await transport.close();
 });
 

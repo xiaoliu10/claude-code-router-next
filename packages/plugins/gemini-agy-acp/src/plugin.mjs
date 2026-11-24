@@ -246,10 +246,14 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     const next = settings ? fingerprintOf(settings) : null;
     if (!force && next === fingerprint) return;
     const previous = transport;
-    transport = settings ? await createTransport({ ...settings, ...(log ? { log } : {}) }) : undefined;
     // A proxy-only change drains idle workers instead of killing in-flight
     // turns; busy workers finish on the old pool and idle-retire naturally.
     const proxyOnly = previous && base && baseKeyOf(base) === lastBaseKey;
+    // A parked tool call reserves its worker AND bridge on the current pool;
+    // the caller's resume is routed through the live transport, so defer the
+    // swap until the parked call resolves rather than orphaning its bridge.
+    if (proxyOnly && previous.hasParked?.()) return;
+    transport = settings ? await createTransport({ ...settings, ...(log ? { log } : {}) }) : undefined;
     fingerprint = next;
     lastBaseKey = base ? baseKeyOf(base) : null;
     await (proxyOnly ? previous.retireIdle() : previous?.retireExisting());

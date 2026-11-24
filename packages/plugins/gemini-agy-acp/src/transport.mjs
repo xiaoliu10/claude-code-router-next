@@ -79,6 +79,25 @@ export function proxyEnvOverlay(env, proxyUrl) {
       overlay[lower] = proxyUrl;
     }
   }
+  if (Object.keys(overlay).length) {
+    // The caller-tool MCP bridge is plain HTTP on loopback; without a
+    // NO_PROXY exclusion the injected http_proxy could route the agent's
+    // local tools/list and tools/call through the upstream proxy.
+    const loopback = ['127.0.0.1', 'localhost', '::1'];
+    const existing = env.NO_PROXY || env.no_proxy;
+    if (!existing) {
+      overlay.NO_PROXY = loopback.join(',');
+      overlay.no_proxy = loopback.join(',');
+    } else {
+      const entries = existing.split(',').map(item => item.trim()).filter(Boolean);
+      const missing = loopback.filter(host => !entries.includes(host));
+      if (missing.length) {
+        const merged = [...entries, ...missing].join(',');
+        overlay.NO_PROXY = merged;
+        overlay.no_proxy = merged;
+      }
+    }
+  }
   return Object.keys(overlay).length ? overlay : undefined;
 }
 
@@ -526,7 +545,14 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
      * finish on this pool, then idle-retire naturally. Used for proxy-only
      * pool swaps so a config edit never SIGKILLs an in-flight turn. */
     async retireIdle() {
-      await Promise.all([...workers].filter(worker => !worker.task && !worker.failure).map(worker => worker.retire(new AcpError('closed'))));
+      // A parked tool turn has no active task but reserves its worker and
+      // bridge for the caller's resume; draining it would SIGKILL the turn.
+      await Promise.all([...workers].filter(worker => !worker.task && !worker.failure &&
+        !(worker.binding?.bridge?.pending?.size > 0)).map(worker => worker.retire(new AcpError('closed'))));
+    },
+    /** True while any worker holds a parked caller tool call. */
+    hasParked() {
+      return [...workers].some(worker => worker.binding?.bridge?.pending?.size > 0);
     },
     async close() {
       closed = true;

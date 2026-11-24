@@ -241,6 +241,30 @@ test('closing the transport releases the warm bridge and its parked call', async
   assert.equal(await reachable(), false);
 });
 
+test('a proxy-only drain never kills a parked tool turn', async t => {
+  const { transport } = await openTransport(t, 'mcp-tool');
+  const tool = { type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: { key: { type: 'string' } } } } };
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const bridge = new AgyToolBridge([tool], () => new Promise(() => {}));
+  await bridge.start();
+  const port = Number(new URL(bridge.url).port);
+  const reachable = () => new Promise(resolve => {
+    const socket = connect({ host: '127.0.0.1', port });
+    socket.on('connect', () => { socket.destroy(); resolve(true); });
+    socket.on('error', () => resolve(false));
+  });
+  const parked = await transport.run({ model: 'Gemini Model', thinking: 'xhigh', prompt: 'go',
+    onText() {}, onToolCall() {}, bridge });
+  assert.equal(parked.parked.length, 1);
+  assert.equal(transport.hasParked(), true);
+  await transport.retireIdle();
+  assert.equal(bridge.pending.size, 1);
+  assert.equal(await reachable(), true);
+  assert.equal(transport.hasParked(), true);
+  await transport.close();
+  assert.equal(bridge.pending.size, 0);
+});
+
 test('an interleaved conversation does not steal another conversation\'s parked bridge', async t => {
   // The pool must hand back the bridge whose parked calls match the caller's
   // own tool_call ids. Matching on anything else lets a second conversation

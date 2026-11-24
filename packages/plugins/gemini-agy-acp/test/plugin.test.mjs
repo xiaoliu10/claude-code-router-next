@@ -97,6 +97,35 @@ test('the pool factory receives the resolved proxy and a proxy change rebuilds t
   assert.equal(pools[1].retireIdle.mock.callCount(), 0);
 });
 
+test('a proxy-only swap is deferred while the live pool holds a parked tool call', async t => {
+  const configDir = await mkdtemp(join(tmpdir(), 'agy-proxy-parked-'));
+  t.after(() => rm(configDir, { recursive: true, force: true }));
+  await writeFile(join(configDir, 'gemini-agy-acp.json'), JSON.stringify(settings));
+  let config = { PROXY_URL: 'http://127.0.0.1:7897' };
+  const pools = [];
+  const factory = t.mock.fn(() => {
+    const pool = { run: async () => end, async close() {}, retireExisting: t.mock.fn(async () => {}), retireIdle: t.mock.fn(async () => {}), hasParked: () => false };
+    pools.push(pool);
+    return pool;
+  });
+  let runtime;
+  await activateWithTransport({ host: { configDir, readRawConfig: async () => config }, registerTransformer() {},
+    registerManagedRuntime(value) { runtime = value; }, registerUiCard() {}, registerAdminRoutes() {} }, factory);
+  const dispatch = () => runtime.dispatchRequest({ requestBody: body, req: { body }, config: {}, provider, attempt: () => { throw Error('no http'); } });
+  await dispatch();
+  assert.equal(factory.mock.callCount(), 1);
+  pools[0].hasParked = () => true;
+  config = { PROXY_URL: 'http://127.0.0.1:7898' };
+  await dispatch();
+  assert.equal(factory.mock.callCount(), 1);
+  assert.equal(pools[0].retireIdle.mock.callCount(), 0);
+  pools[0].hasParked = () => false;
+  await dispatch();
+  assert.equal(factory.mock.callCount(), 2);
+  assert.equal(factory.mock.calls[1].arguments[0].proxyUrl, 'http://127.0.0.1:7898');
+  assert.equal(pools[0].retireIdle.mock.callCount(), 1);
+});
+
 test('reserved provider name is exact and the plugin remains disabled until local opt-in', async t => {
   for (const local of [undefined, {}, { ...settings, enabled: 'true' }, { ...settings, enabled: false }]) {
     const p = await activate(t, local);
