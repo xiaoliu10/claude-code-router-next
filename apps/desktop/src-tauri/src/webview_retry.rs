@@ -14,8 +14,9 @@ use tauri::{AppHandle, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 
-/// Delay waited before each retry; the first attempt runs immediately, so the
-/// attempts land at roughly 0s, 2s, 5s, 10s, 20s and 30s.
+/// Retry waits between attempts: the first attempt runs immediately, then
+/// the six attempts are separated by these five waits, landing at roughly
+/// 0s, 2s, 7s, 17s, 37s and 67s (the final attempt starts after ~67s).
 const RETRY_DELAYS_SECS: [u64; 5] = [2, 5, 10, 20, 30];
 
 /// Total creation attempts: one immediate attempt plus one per retry delay.
@@ -47,7 +48,26 @@ pub(crate) fn build_main_window(app: &AppHandle) -> tauri::Result<WebviewWindow>
 /// `what` label identifies the window in the logs. On exhaustion the process
 /// exits cleanly with a non-zero code rather than returning an error that
 /// Tauri would turn into a setup-hook panic/abort.
+///
+/// Any builder error is treated as potentially transient here. This is safe
+/// because a failed build never registers the window label (Tauri inserts it
+/// only on the success path), so label-collision and similar permanent
+/// errors cannot reach this loop; the realistic inputs are desktop-session
+/// and WebView2 environment failures.
 pub(crate) fn retry_webview_creation<T>(what: &str, create: impl Fn() -> tauri::Result<T>) -> T {
+    // Pre-flight on Windows: a missing WebView2 Runtime makes tauri-runtime-wry
+    // show a modal MessageBox before returning an error. In a non-interactive
+    // scheduled-task session nobody can dismiss it, which would stall the
+    // retry loop. Fail fast with the same clean exit instead.
+    #[cfg(windows)]
+    if tauri::webview::platform_webview_version().is_none() {
+        eprintln!(
+            "CCR Desktop cannot start: the WebView2 Runtime is not installed, so \
+             the {what} cannot be created. Install the Evergreen WebView2 Runtime \
+             and relaunch. Exiting now."
+        );
+        std::process::exit(1);
+    }
     let mut attempt = 0usize;
     loop {
         match create() {
