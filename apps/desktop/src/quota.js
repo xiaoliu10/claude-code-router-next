@@ -2287,8 +2287,14 @@
       pager.appendChild(info);
       pager.appendChild(next);
       root.appendChild(pager);
+      // The horizontal scroller lives in a sticky wrapper so its scrollbar
+      // floats at the bottom of the visible list instead of only at the end
+      // of a tall record set. refs.scroll keeps pointing at the actual
+      // scroller so every existing append/clear call is unchanged.
+      var sticky = el('div', 'records-scroll-sticky');
       var scroll = el('div', 'records-scroll');
-      root.appendChild(scroll);
+      sticky.appendChild(scroll);
+      root.appendChild(sticky);
       return { root: root, prev: prev, info: info, next: next, scroll: scroll };
     }
 
