@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 — 2026-11-24
+
+The default worker pool rises from 2 to 4. Each parked tool call holds a worker until the caller answers, so two interleaved tool conversations plus text turns could exhaust the old pool with a 503 `acp_busy`; four workers fit them without it. The per-sidecar override still validates 1–8.
+
+默认 worker 池由 2 提升到 4：每个挂起的工具调用都会占用一个 worker 直到调用方答复，旧默认下两个交错工具会话加文本轮就可能耗尽池并报 503 `acp_busy`；四个 worker 可避免这种情况。sidecar 覆盖值仍校验 1–8。
+
 ## 0.2.1 — 2026-11-24
 
 Reliable MCP tool exposure and desktop-gateway proxy support. The worker now spawns `agy acp --process-per-session` instead of `agy acp --sandbox`: the sandbox mode restricted the agent toolset and excluded the session MCP servers, so caller tools never reached the model. A session is eagerly connected to the caller's MCP server through the capability-gated `_meta.antigravity.eagerMcpServers` extension, every advertised tool carries `antigravity/alwaysLoad`, and a 18,000-token budget fitter trims only description prose (never schema keys, and it never drops a tool) to stay inside agy's customization limit. A single bounded 250 ms retry absorbs the startup "not logged in" authentication race; quota, 429 and credential failures are never retried. Desktop gateways without inherited proxy variables now resolve the configured proxy and inject it into every agy child, with a loopback `NO_PROXY` exclusion so the local MCP bridge is never proxied. Native agent tools are deliberately left enabled and no client fingerprint is spoofed. The MCP server handed to `session/new` now uses the stdio transport: the agent spawns a bundled newline JSON-RPC forwarder to the in-process loopback bridge, which works around agy's unreliable HTTP-MCP tool exposure and a Windows verbatim `\\?\` executable path that made the agent silently drop the server. The MCP handshake also answers `server/discover` and echoes the string protocol revision. Permission prompts are approved only for the caller-tool bridge and denied for every native agent tool, so the agent can never gain host command execution through an approved permission. The default worker pool rises from 2 to 4, since each parked tool call holds a worker until the caller answers; this lets two interleaved tool conversations and text turns coexist before a 503 `acp_busy`, with the per-sidecar override still bounded to 1–8.
