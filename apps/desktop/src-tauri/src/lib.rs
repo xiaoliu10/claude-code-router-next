@@ -7,9 +7,10 @@ mod projects;
 mod quota;
 mod settings;
 mod tray;
+mod webview_retry;
 
 use std::sync::Arc;
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -42,18 +43,17 @@ pub fn run() {
             lifecycle::service_action
         ])
         .setup(|app| {
-            popup::install(app.handle())?;
-            // The main window is the local control center: the same local
-            // quota.html as the popup, no remote Web UI navigation. Navigation
-            // and new-window rules mirror the popup so no remote page can load.
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("quota.html".into()))
-                .title("Claude Code Router")
-                .inner_size(1200.0, 800.0)
-                .min_inner_size(800.0, 600.0)
-                .visible(false)
-                .on_navigation(popup::trusted_url)
-                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
-                .build()?;
+            // Both webview/window creations are retried for the
+            // no-interactive-desktop case and exit cleanly if retries are
+            // exhausted; other setup errors below still propagate and fail
+            // fast. The popup must exist first so the main window never sees a
+            // missing quota label.
+            webview_retry::retry_webview_creation("quota popup window", || {
+                popup::install(app.handle())
+            });
+            webview_retry::retry_webview_creation("main control-center window", || {
+                webview_retry::build_main_window(app.handle())
+            });
             match settings::ConnectionSettings::from_environment().and_then(|settings| {
                 api::AdminClient::new(settings.clone()).map(|client| (settings, client))
             }) {
