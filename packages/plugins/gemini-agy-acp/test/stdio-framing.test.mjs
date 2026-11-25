@@ -12,6 +12,13 @@ const forwarderPath = fileURLToPath(new URL('../src/agy-mcp-stdio-bridge.mjs', i
  * A minimal loopback JSON-RPC backend standing in for the internal HTTP
  * bridge. It records concurrency so tests can prove the forwarder does not
  * serialize, and honors a per-request delay to interleave responses.
+ *
+ * Scope note (framing-only mock): this intentionally does NOT reproduce the
+ * real AgyToolBridge protocol rules — it skips the jsonrpc:"2.0" version
+ * check and answers notifications with a normal JSON body instead of the
+ * real bridge's empty 202. The forwarder's framing/reply-suppression behavior
+ * is what is under test here, not bridge protocol fidelity; see
+ * stdio-bridge.test.mjs for tests against the real AgyToolBridge.
  */
 async function withBackend(t, { respondDelayMs = 0 } = {}) {
   let inFlight = 0;
@@ -25,7 +32,16 @@ async function withBackend(t, { respondDelayMs = 0 } = {}) {
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
       try {
-        const message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        // Mirror the real bridge's rejection of an unparseable body with a
+        // 400 instead of throwing inside the server (agy-tool-bridge.mjs).
+        let message;
+        try {
+          message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        } catch {
+          response.writeHead(400, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700 } }));
+          return;
+        }
         if (respondDelayMs) await delay(respondDelayMs);
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ jsonrpc: '2.0', id: message.id ?? null, result: { echoed: message.method } }));
@@ -59,25 +75,33 @@ function startForwarder(t, env) {
     if (waiter) { pending.delete(message.id); waiter(message); }
   });
   let nextId = 0;
+  const REQUEST_TIMEOUT_MS = 5000;
   return {
     child,
     lines,
     rawText: () => Buffer.concat(rawChunks).toString('utf8'),
+    // Bounded so a forwarder regression that drops a reply fails the test
+    // instead of hanging the suite indefinitely (node:test has no default
+    // per-test timeout).
     request(method) {
-      return new Promise(resolve => {
+      return new Promise((resolve, reject) => {
         const id = ++nextId;
-        pending.set(id, resolve);
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`forwarder never replied to ${method} (id ${id}) within ${REQUEST_TIMEOUT_MS}ms`));
+        }, REQUEST_TIMEOUT_MS);
+        pending.set(id, message => { clearTimeout(timer); resolve(message); });
         child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method }) + '\n');
       });
     },
     writeRaw(text) { child.stdin.write(text); },
     nextId: () => ++nextId,
     waitFor(predicate, timeoutMs = 3000) {
-      const start = Date.now();
+      const start = performance.now();
       return new Promise((resolve, reject) => {
         const tick = () => {
           if (predicate(lines)) return resolve();
-          if (Date.now() - start > timeoutMs) return reject(new Error('timed out waiting for forwarder output'));
+          if (performance.now() - start > timeoutMs) return reject(new Error('timed out waiting for forwarder output'));
           setTimeout(tick, 10);
         };
         tick();
@@ -175,9 +199,13 @@ test('a burst of concurrent requests yields one whole JSON line each with no int
   await fwd.waitFor(l => l.length === BURST, 8000);
   assert.equal(fwd.lines.length, BURST);
   // Every stdout line was independently parseable (the line handler already
-  // asserted this) and each id is answered exactly once.
-  const answeredIds = fwd.lines.map(m => m.id).sort((a, b) => a - b);
-  assert.deepEqual(answeredIds, ids);
+  // asserted this). Pin cardinality, not just set membership: each requested
+  // id must appear exactly once, so a duplicated or swapped reply is caught
+  // even though completion order is not guaranteed under concurrency.
+  const replyCounts = new Map();
+  for (const m of fwd.lines) replyCounts.set(m.id, (replyCounts.get(m.id) ?? 0) + 1);
+  assert.equal(replyCounts.size, BURST);
+  for (const id of ids) assert.equal(replyCounts.get(id), 1, `id ${id} must be answered exactly once`);
   for (const m of fwd.lines) assert.ok(m.result && m.jsonrpc === '2.0');
   // Each line ends exactly at a newline boundary; no line contains two messages.
   for (const line of fwd.rawText().split('\n').filter(Boolean)) {
@@ -191,16 +219,22 @@ test('a burst of concurrent requests yields one whole JSON line each with no int
   assert.deepEqual(await fwd.exited, { code: 0, signal: null });
 });
 
-test('a notification (no id) gets no stdout line even while parked requests are in flight', async t => {
+test('a notification (no id) is forwarded but gets no stdout line even while parked requests are in flight', async t => {
   const backend = await withBackend(t, { respondDelayMs: 40 });
   const fwd = startForwarder(t, { CCR_MCP_ENDPOINT: backend.endpoint, CCR_MCP_TOKEN: 'fixture-token' });
   const parked = fwd.request('tools/call');
-  // A notification interleaved with a slow request must produce nothing.
+  // A notification interleaved with a slow request. The forwarder still POSTs
+  // it to the backend (the httpRequest is unconditional), but must suppress
+  // any stdout reply because there is no id to answer — so the contract is
+  // asserted on stdout lines, not on backend request count.
   fwd.writeRaw(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/progress', params: {} }) + '\n');
   const result = await parked;
   assert.ok(result.result);
-  await delay(30);
-  assert.equal(fwd.lines.length, 1, 'notification must not be answered');
+  // Wait longer than one backend round-trip (40ms) so a wrongly-emitted
+  // notification reply would have arrived before we assert.
+  await delay(100);
+  assert.equal(fwd.lines.length, 1, 'notification must not produce a stdout reply');
+  assert.equal(backend.seenAuth().length, 2, 'notification is still forwarded to the backend');
   fwd.child.stdin.end();
   assert.deepEqual(await fwd.exited, { code: 0, signal: null });
 });
