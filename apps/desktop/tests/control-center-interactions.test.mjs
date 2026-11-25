@@ -14,8 +14,8 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 // a detached scroller reports scrollLeft 0).
 function detachTree(node) {
   if (!node) return;
-  if ('scrollLeft' in node) node.scrollLeft = 0;
-  if ('scrollTop' in node) node.scrollTop = 0;
+  if ('_scrollLeft' in node) node._scrollLeft = 0;
+  if ('_scrollTop' in node) node._scrollTop = 0;
   (node.children || []).forEach(detachTree);
 }
 
@@ -25,6 +25,7 @@ class Element {
     this.children = []; this.parentNode = null; this.attrs = {}; this.dataset = {};
     this.listeners = {}; this._text = ''; this.value = ''; this.hidden = false;
     this.disabled = false; this.selectionStart = 0; this.selectionEnd = 0;
+    this._scrollLeft = 0; this._scrollTop = 0;
     // CSSOM write target: quota.js sets chart bar sizes via el.style (CSP-safe).
     this.style = {};
     this.classList = { toggle: (name, on) => {
@@ -35,6 +36,17 @@ class Element {
   }
   get className() { return this.attrs.class || ''; }
   set className(v) { this.attrs.class = v; }
+  // Emulate the browser: offsetParent is null when the element or any ancestor
+  // is hidden (display:none), so visibility checks match real layout behavior.
+  get offsetParent() {
+    let node = this;
+    while (node) { if (node.hidden) return null; node = node.parentNode; }
+    return { tag: 'BODY' };
+  }
+  get scrollLeft() { return this._scrollLeft; }
+  set scrollLeft(v) { this._scrollLeft = v; }
+  get scrollTop() { return this._scrollTop; }
+  set scrollTop(v) { this._scrollTop = v; }
   set textContent(v) { this._text = String(v ?? ''); this.children.forEach(n => { detachTree(n); n.parentNode = null; }); this.children = []; }
   get textContent() { return this._text + this.children.map(n => n.textContent).join(''); }
   setAttribute(k, v) {
@@ -281,22 +293,31 @@ test('interaction: usage auto-refreshes on an interval while open and stops on t
   const live = () => h.intervals.length - h.cleared.length;
   assert.ok(h.intervals.some(([, ms]) => ms === 10), 'auto-refresh interval is registered');
   assert.equal(live(), 1, 'exactly one live polling timer while the usage tab is open');
-  const count = () => h.calls.filter(c => c.cmd === 'usage_snapshot').length;
-  const first = count();
+  const count = cmd => h.calls.filter(c => c.cmd === cmd).length;
+  const firstSnap = count('usage_snapshot');
+  const firstRecs = count('usage_records');
   await new Promise(resolve => setTimeout(resolve, 45));
-  assert.ok(count() > first, 'snapshot reloads while the usage tab stays open');
+  // Each tick must reload BOTH the summary and the records; asserting only one
+  // command would let a deleted records refresh slip through.
+  assert.ok(count('usage_snapshot') > firstSnap, 'snapshot reloads while the usage tab stays open');
+  assert.ok(count('usage_records') > firstRecs, 'records reload on the same interval tick');
   h.id('tab-quota').click(); await flush();
   assert.equal(live(), 0, 'leaving the usage tab clears the timer');
-  const frozen = count();
+  const frozenSnap = count('usage_snapshot');
+  const frozenRecs = count('usage_records');
   await new Promise(resolve => setTimeout(resolve, 45));
-  assert.equal(count(), frozen, 'no usage polling after leaving the tab');
+  assert.equal(count('usage_snapshot'), frozenSnap, 'no snapshot polling after leaving the tab');
+  assert.equal(count('usage_records'), frozenRecs, 'no records polling after leaving the tab');
   h.id('tab-usage').click(); await flush();
   // Re-entry reloads at once rather than waiting up to one interval.
-  assert.ok(count() > frozen, 're-entry reloads immediately before the next interval');
+  assert.ok(count('usage_snapshot') > frozenSnap, 're-entry reloads the snapshot immediately');
+  assert.ok(count('usage_records') > frozenRecs, 're-entry reloads the records immediately');
   assert.equal(live(), 1, 're-entering the usage tab resumes exactly one interval');
-  const reentered = count();
+  const reenteredSnap = count('usage_snapshot');
+  const reenteredRecs = count('usage_records');
   await new Promise(resolve => setTimeout(resolve, 45));
-  assert.ok(count() > reentered, 'polling resumes on re-entry');
+  assert.ok(count('usage_snapshot') > reenteredSnap, 'snapshot polling resumes on re-entry');
+  assert.ok(count('usage_records') > reenteredRecs, 'records polling resumes on re-entry');
   // Leave the tab so the short test interval cannot fire into later cases.
   h.id('tab-quota').click(); await flush();
   assert.equal(live(), 0, 'no timer left running at the end of the test');
@@ -316,8 +337,15 @@ test('interaction: auto-refresh rebuild preserves the records horizontal scroll 
   await new Promise(resolve => setTimeout(resolve, 45));
   assert.ok(h.calls.filter(c => c.cmd === 'usage_snapshot').length > before, 'a refresh tick ran');
   assert.equal(scroller().scrollLeft, 320, 'horizontal scroll position is preserved across the rebuild');
+  // P1-1: switch away (panel hidden) and back. A real browser resets
+  // scrollLeft while display:none, so selectTab's pre-hide capture — not the
+  // detached node — must restore the position on re-entry.
+  h.id('tab-quota').click(); await flush();
+  h.id('tab-usage').click(); await flush();
+  assert.equal(scroller().scrollLeft, 320, 'scroll position survives a hidden tab re-entry');
   h.id('tab-quota').click(); await flush();
 });
+
 
 test('interaction: records pager walks pages, resets on period switch, shows page/total info', async () => {
   const h = recordsHarness(); await openUsage(h);
