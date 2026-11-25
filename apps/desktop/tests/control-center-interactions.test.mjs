@@ -8,6 +8,17 @@ const js = readFileSync(new URL('../src/quota.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../src/quota.html', import.meta.url), 'utf8');
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 
+// Real browsers reset scroll position when an element is detached from the
+// document. The fake DOM keeps plain properties, so emulate that reset to
+// avoid false confidence in scroll-preservation logic (verified in Chromium:
+// a detached scroller reports scrollLeft 0).
+function detachTree(node) {
+  if (!node) return;
+  if ('scrollLeft' in node) node.scrollLeft = 0;
+  if ('scrollTop' in node) node.scrollTop = 0;
+  (node.children || []).forEach(detachTree);
+}
+
 class Element {
   constructor(tag, doc) {
     this.tagName = tag.toUpperCase(); this.doc = doc;
@@ -24,7 +35,7 @@ class Element {
   }
   get className() { return this.attrs.class || ''; }
   set className(v) { this.attrs.class = v; }
-  set textContent(v) { this._text = String(v ?? ''); this.children.forEach(n => { n.parentNode = null; }); this.children = []; }
+  set textContent(v) { this._text = String(v ?? ''); this.children.forEach(n => { detachTree(n); n.parentNode = null; }); this.children = []; }
   get textContent() { return this._text + this.children.map(n => n.textContent).join(''); }
   setAttribute(k, v) {
     this.attrs[k] = String(v);
@@ -41,7 +52,7 @@ class Element {
     if (i < 0) this.children.push(n); else this.children.splice(i, 0, n);
     n.parentNode = this; return n;
   }
-  remove() { if (this.parentNode) this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); this.parentNode = null; }
+  remove() { if (this.parentNode) this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); detachTree(this); this.parentNode = null; }
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   fire(type, extra = {}) {
     const e = { target: this, preventDefault() {}, ...extra };

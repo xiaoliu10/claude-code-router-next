@@ -2092,6 +2092,11 @@
       els.usageUpdated.textContent = ts ? '更新于 ' + ts : (s.loading ? '正在读取…' : '');
       setBanner(els.usageMsg, s.error ? '用量读取失败：' + s.error : null, s.error ? 'error' : null);
       var body = els.usageBody;
+      // Real browsers reset scrollLeft when a scroller is detached, so capture
+      // the records position before usage-body is torn down and let
+      // renderRecords restore it onto the replacement scroller.
+      var recordsScroller = recordsRefs && recordsRefs.root.parentNode ? recordsRefs.scroll : null;
+      pendingRecordsScroll = recordsScroller ? recordsScroller.scrollLeft : 0;
       body.textContent = '';
       body.setAttribute('aria-busy', String(s.loading));
       if (!s.snapshot) {
@@ -2333,20 +2338,22 @@
     }
 
     var recordsRefs = null;
+    var pendingRecordsScroll = 0;
     function renderRecords(rs) {
       // renderUsage rebuilds usage-body on every emit, so the records card is
       // re-appended after it; records-only updates sync the existing card.
-      // Either path can rebuild the horizontal scroller's content, which would
-      // snap scrollLeft back to 0 under the 30s auto-refresh. Preserve the
-      // user's horizontal position across the (re)build; the browser clamps it
-      // if the new content is narrower.
-      var preservedScroll = recordsRefs ? recordsRefs.scroll.scrollLeft : 0;
-      if (!recordsRefs || !recordsRefs.root.parentNode) {
+      // The position captured by renderUsage survives the real-browser
+      // scrollLeft reset that happens when the old scroller is detached.
+      var preservedScroll = pendingRecordsScroll;
+      var attached = !!(recordsRefs && recordsRefs.root.parentNode);
+      if (attached) preservedScroll = recordsRefs.scroll.scrollLeft;
+      if (!attached) {
         recordsRefs = buildRecordsCard();
         els.usageBody.appendChild(recordsRefs.root);
       }
       syncRecordsCard(recordsRefs, rs);
       if (preservedScroll > 0) recordsRefs.scroll.scrollLeft = preservedScroll;
+      pendingRecordsScroll = 0;
     }
 
     // ---- clients tab ------------------------------------------------------
