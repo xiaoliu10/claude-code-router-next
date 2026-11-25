@@ -337,12 +337,22 @@ test('interaction: auto-refresh rebuild preserves the records horizontal scroll 
   await new Promise(resolve => setTimeout(resolve, 45));
   assert.ok(h.calls.filter(c => c.cmd === 'usage_snapshot').length > before, 'a refresh tick ran');
   assert.equal(scroller().scrollLeft, 320, 'horizontal scroll position is preserved across the rebuild');
+  // The latest position wins: move to a new offset and confirm the next tick
+  // preserves that value rather than a stale anchor.
+  scroller().scrollLeft = 180;
+  const before2 = h.calls.filter(c => c.cmd === 'usage_snapshot').length;
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.ok(h.calls.filter(c => c.cmd === 'usage_snapshot').length > before2, 'a second refresh tick ran');
+  assert.equal(scroller().scrollLeft, 180, 'the latest scroll position is preserved, not a stale anchor');
   // P1-1: switch away (panel hidden) and back. A real browser resets
   // scrollLeft while display:none, so selectTab's pre-hide capture — not the
   // detached node — must restore the position on re-entry.
+  const beforeHide = scroller();
   h.id('tab-quota').click(); await flush();
   h.id('tab-usage').click(); await flush();
-  assert.equal(scroller().scrollLeft, 320, 'scroll position survives a hidden tab re-entry');
+  const afterReentry = scroller();
+  assert.notEqual(afterReentry, beforeHide, 'the scroller node is rebuilt on hidden re-entry');
+  assert.equal(afterReentry.scrollLeft, 180, 'scroll position survives a hidden tab re-entry');
   h.id('tab-quota').click(); await flush();
 });
 
