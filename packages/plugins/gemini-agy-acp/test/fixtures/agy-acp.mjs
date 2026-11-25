@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { appendFileSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -13,6 +14,10 @@ const mode = readFileSync(join(fixtureDir, 'mode'), 'utf8');
 let authMethod = 'gemini-api-key';
 try { authMethod = readFileSync(join(fixtureDir, 'authMethod'), 'utf8').trim(); } catch { /* default */ }
 const isolated = authMethod === 'gemini-api-key';
+// The mcp-tool modes adopt the caller's MCP bridge; the -meta variants also
+// advertise the official antigravity capability extension at initialize.
+const mcpMode = mode === 'mcp-tool' || mode === 'mcp-tool-meta';
+const antigravityMeta = mode === 'antigravity-meta' || mode === 'mcp-tool-meta';
 const record = (event, data = {}) => appendFileSync(join(fixtureDir, 'events'), JSON.stringify({ event, pid: process.pid, ...data }) + '\n');
 const send = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
 const argv = process.argv.slice(2);
@@ -48,10 +53,13 @@ if (argv[0] === '--version') {
   else if (mode === 'long-version') process.stdout.write('0'.repeat(4097));
   else console.log(`agy version ${mode === 'old' ? '1.5.0' : mode === 'prerelease' ? '1.5.1-rc1' : '1.5.1'}`);
 } else {
-  assert.deepEqual(argv, ['acp', '--sandbox']);
+  assert.deepEqual(argv, ['acp', '--process-per-session']);
   assert.equal(process.env.GEMINI_API_KEY, isolated ? 'fixture-value' : undefined);
-  record('spawn', isolated ? { root } : { cwd: process.cwd(), home: process.env.HOME });
+  record('spawn', { args: argv, ...(isolated ? { root } : { cwd: process.cwd(), home: process.env.HOME }),
+    httpsProxy: process.env.HTTPS_PROXY ?? null, noProxy: process.env.NO_PROXY ?? null });
   let authenticated = false;
+  let authAttempts = 0;
+  let sessionAttempts = 0;
   let sessionNumber = 0;
   let sessionId;
   let model;
@@ -60,17 +68,68 @@ if (argv[0] === '--version') {
   let denied = new Set();
   const mcpBySession = new Map();
   const toolSettledBySession = new Map();
+  // The raised call of a session while its result is still travelling back
+  // over the stdio bridge: sessionId → promise that settles once the result
+  // is recorded.
+  const callInFlightBySession = new Map();
+  const mcpChildren = new Set();
+  const killMcpChildren = () => { for (const child of mcpChildren) child.kill('SIGKILL'); };
+  // Adopt the session's stdio MCP server exactly as the real agent does:
+  // spawn the given command with the given env merged over a minimal env and
+  // speak newline JSON-RPC over its stdin/stdout.
+  const adoptMcp = async server => {
+    assert.equal(server.name, 'ccr-caller-tools');
+    assert.equal(typeof server.command, 'string');
+    assert.ok(server.command.length > 0);
+    assert.ok(Array.isArray(server.args));
+    assert.ok(Array.isArray(server.env));
+    const env = { PATH: process.env.PATH };
+    for (const entry of server.env) {
+      assert.equal(typeof entry.name, 'string');
+      assert.equal(typeof entry.value, 'string');
+      env[entry.name] = entry.value;
+    }
+    assert.ok(env.CCR_MCP_ENDPOINT);
+    assert.ok(env.CCR_MCP_TOKEN);
+    // The bearer token travels in env only, never on the command line.
+    assert.ok(!server.args.some(arg => arg.includes(env.CCR_MCP_TOKEN)));
+    const child = spawn(server.command, server.args, { env, stdio: ['pipe', 'pipe', 'ignore'] });
+    mcpChildren.add(child);
+    const pending = new Map();
+    const settleAll = () => {
+      for (const { reject } of pending.values()) reject(new Error('mcp server went away'));
+      pending.clear();
+    };
+    child.on('exit', () => { mcpChildren.delete(child); settleAll(); });
+    child.stdin.on('error', settleAll);
+    createInterface({ input: child.stdout }).on('line', line => {
+      const message = JSON.parse(line);
+      const entry = pending.get(message.id);
+      if (!entry) return;
+      pending.delete(message.id);
+      entry.resolve(message);
+    });
+    let nextId = 0;
+    const request = (method, params) => new Promise((resolve, reject) => {
+      const id = ++nextId;
+      pending.set(id, { resolve, reject });
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    });
+    const notify = method => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method }) + '\n');
+    const initialized = await request('initialize', { protocolVersion: '2025-11-25', capabilities: {},
+      clientInfo: { name: 'agy-fixture', version: '1.5.1' } });
+    assert.equal(initialized.result.protocolVersion, '2025-11-25');
+    notify('notifications/initialized');
+    return { request };
+  };
   const mcp = async (method, params) => {
     const target = mcpBySession.get(sessionId);
     // A text-only session was given no bridge: a real agent would simply not
     // have this tool available, so report that instead of crashing.
     if (!target) throw new Error('no MCP bridge for this session');
-    const response = await fetch(target.url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${target.token}` },
-      body: JSON.stringify({ jsonrpc: '2.0', id: Math.random(), method, params }),
-    });
-    return (await response.json()).result;
+    const response = await target.request(method, params);
+    if (response.error) throw new Error(response.error.message);
+    return response.result;
   };
   function configOptions() {
     const options = [{ id: mode === 'wrong-category' ? 'model' : 'agentModel', category: mode === 'wrong-category' ? 'mode' : 'model', type: 'select', currentValue: model, options: [
@@ -85,6 +144,12 @@ if (argv[0] === '--version') {
   const chunk = (text, sid = sessionId) => send({ method: 'session/update', params: { sessionId: sid,
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } });
   const input = createInterface({ input: process.stdin });
+  if (mcpMode) {
+    // Spawned forwarders never outlive the agent: session end (stdin close)
+    // and any process exit kill them.
+    process.on('exit', killMcpChildren);
+    input.on('close', () => { killMcpChildren(); process.exit(0); });
+  }
   input.on('line', async line => {
     const { id, method, params, result, error } = JSON.parse(line);
     assert.equal(JSON.parse(line).jsonrpc, '2.0');
@@ -95,14 +160,15 @@ if (argv[0] === '--version') {
       if (denied.size === 4) send({ id: promptId, result: { stopReason: 'end_turn' } });
       return;
     }
-    record(method, params?.cwd ? { cwd: params.cwd } : {});
+    record(method, params?.cwd ? { cwd: params.cwd, ...(method === 'session/new' ? { meta: params._meta ?? null } : {}) } : {});
     const reply = result => send({ id, result });
     if (method === 'initialize') {
       assert.equal(params.protocolVersion, 1);
       assert.equal(params.clientInfo.name, 'ccr-gemini-agy-acp');
       assert.match(params.clientInfo.version, /^\d+\.\d+\.\d+/);
       assert.deepEqual(params.clientCapabilities, {});
-      if (mode !== 'hang-init') reply({ protocolVersion: mode === 'v2' ? 2 : 1, agentCapabilities: {},
+      if (mode !== 'hang-init') reply({ protocolVersion: mode === 'v2' ? 2 : 1,
+        agentCapabilities: antigravityMeta ? { _meta: { antigravity: { systemPrompt: { append: true } } } } : {},
         authMethods: [{ id: 'consumer' }, ...(mode === 'no-key-method' ? [] : [{ id: authMethod,
           ...(isolated && mode === 'terminal-auth' && { type: 'terminal' }),
           ...(isolated && mode === 'env-auth' && { type: 'env_var' }) }])],
@@ -111,9 +177,20 @@ if (argv[0] === '--version') {
           { accountInfo: { email: 'metadata-account@example.com' } }) });
     } else if (method === 'authenticate') {
       assert.deepEqual(params, { methodId: authMethod });
+      authAttempts++;
       if (mode === 'auth-failure') {
         process.stderr.write('fixture-secret-diagnostic\n');
         send({ id, error: { code: -32000, message: 'fixture-secret-diagnostic' } });
+      } else if ((mode === 'auth-race' && authAttempts === 1) || mode === 'auth-race-persistent') {
+        // The transient startup auth race: the login state is still loading.
+        send({ id, error: { code: -32000, message: 'Not logged into Antigravity' } });
+      } else if (mode === 'auth-race-late' && authAttempts === 1) {
+        // The same race message arriving after the 2s window must not be retried.
+        setTimeout(() => send({ id, error: { code: -32000, message: 'Not logged into Antigravity' } }), 2100);
+      } else if (mode === 'auth-quota-race') {
+        send({ id, error: { code: -32000, message: 'authentication required: 429 RESOURCE_EXHAUSTED quota exceeded' } });
+      } else if (mode === 'auth-invalid-grant') {
+        send({ id, error: { code: -32000, message: 'authentication required: invalid_grant' } });
       } else {
         authenticated = true;
         // The verifying child's own login diagnostic, written to stderr so
@@ -127,19 +204,20 @@ if (argv[0] === '--version') {
       assert.equal(authenticated, true);
       assert.equal(dirname(params.cwd), isolated ? root : tmpdir());
       assert.deepEqual(readdirSync(params.cwd), []);
+      sessionAttempts++;
+      if (mode === 'session-auth-race' && sessionAttempts === 1) {
+        send({ id, error: { code: -32000, message: 'Not logged into Antigravity' } });
+        return;
+      }
       sessionNumber++;
       sessionId = mode === 'duplicate-session' ? 'one' : `sess-${sessionNumber}`;
-      if (mode === 'mcp-tool') {
-        // Adopt the caller's MCP server exactly as a real agent does, so the
-        // fixture can call the tool over HTTP like the production agent would.
+      if (mcpMode) {
         // The bridge is per session: two interleaved conversations must each
-        // talk to the bridge their own session was given. A text-only session
-        // advertises nothing, which a real agent also serves without tools.
+        // talk to the forwarder their own session was given. A text-only
+        // session advertises nothing, which a real agent also serves without
+        // tools.
         const [server] = params.mcpServers;
-        if (server) {
-          assert.equal(server.type, 'http');
-          mcpBySession.set(sessionId, { url: server.url, token: server.headers[0].value.replace('Bearer ', '') });
-        }
+        if (server) mcpBySession.set(sessionId, await adoptMcp(server));
       } else {
         assert.deepEqual(params.mcpServers, []);
       }
@@ -192,13 +270,18 @@ if (argv[0] === '--version') {
             ['write', 'fs/write_text_file'], ['terminal', 'terminal/create']]) send({ id: key, method: callback, params: { sessionId } });
           break;
         default:
-          if (mode === 'mcp-tool' && !mcpBySession.has(sessionId)) {
+          if (mcpMode && !mcpBySession.has(sessionId)) {
             // Text-only session: answer plainly, exactly as the ok mode does.
             chunk('from previous turn', `sess-${sessionNumber - 1}`);
             reply({ stopReason: 'max_tokens' });
             return;
           }
-          if (mode === 'mcp-tool' && !toolSettledBySession.has(sessionId)) {
+          // A resume prompt can arrive while the parked call's result is still
+          // travelling back over the stdio bridge. The real agent finishes its
+          // in-flight turn before acting on a new prompt, so let the raised
+          // call settle first instead of treating the resume as a fresh turn.
+          if (callInFlightBySession.has(sessionId)) await callInFlightBySession.get(sessionId);
+          if (mcpMode && !toolSettledBySession.has(sessionId)) {
             // Discover the caller's tools over MCP, then raise a call. The call
             // stays parked until the caller answers, so this prompt never
             // finishes until the follow-up request resolves it.
@@ -212,14 +295,19 @@ if (argv[0] === '--version') {
               .catch(() => ({ content: [{ type: 'text', text: 'bridge closed' }], isError: true }));
             send({ method: 'session/update', params: { sessionId, update: { sessionUpdate: 'tool_call',
               toolCallId: 'agent-side-id', title: 'lookup', rawInput: { key: 'answer' } } } });
-            const settled = await call;
-            record('mcp-call', { text: settled.content?.[0]?.text, isError: settled.isError === true });
-            toolSettledBySession.set(sessionId, settled.content?.[0]?.text ?? '');
+            const settling = (async () => {
+              const settled = await call;
+              record('mcp-call', { text: settled.content?.[0]?.text, isError: settled.isError === true });
+              toolSettledBySession.set(sessionId, settled.content?.[0]?.text ?? '');
+            })();
+            callInFlightBySession.set(sessionId, settling);
+            await settling;
+            callInFlightBySession.delete(sessionId);
             chunk(toolSettledBySession.get(sessionId) ?? '');
             reply({ stopReason: 'end_turn' });
             return;
           }
-          if (mode === 'mcp-tool') {
+          if (mcpMode) {
             // The follow-up turn carries the caller's result: relay it and end.
             chunk(`resumed with ${toolSettledBySession.get(sessionId) ?? ''}`);
             reply({ stopReason: 'end_turn' });

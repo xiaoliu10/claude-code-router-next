@@ -1,7 +1,7 @@
 import { access, stat } from 'node:fs/promises';
 import { constants, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { AcpError } from './acp-errors.mjs';
 import { AgyToolBridge } from './agy-tool-bridge.mjs';
 import { declaresTools, declaredTools, hasCompleteResults, historyToolCalls, toolChoiceShapeOk, toolResultPrompt, toolResults } from './agy-tools.mjs';
@@ -108,10 +108,111 @@ async function assertExecutable(binary) {
   }
 }
 
+// Resolve the proxy the agy CLI must use for its own upstream calls, with the
+// same semantics as the core's resolveProviderProxyUrl: the configured proxy
+// (compatibility keys included) applies when the global proxy is enabled (the
+// core default when unset) or when this managed provider entry opts in.
+// Reads never throw: an unreadable config simply yields no proxy.
+const PROXY_URL_KEYS = ['HTTPS_PROXY', 'https_proxy', 'httpsProxy', 'PROXY_URL'];
+
+function globalProxyEnabled(value) {
+  if (value === undefined || value === null || value === '') return true;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'false' || normalized === '0') return false;
+    if (normalized === 'true' || normalized === '1') return true;
+    return Boolean(normalized);
+  }
+  return Boolean(value);
+}
+
+// Same $VAR/${VAR} interpolation the core read path applies, limited to the
+// few scalar values this resolver consumes.
+function interpolateString(value) {
+  return value.replace(/\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/g,
+    (match, braced, unbraced) => process.env[braced || unbraced] || match);
+}
+
+// mtime-gated snapshot cache: the request path must not re-read and re-parse
+// the whole config on every turn. Keyed by host so tests stay isolated.
+const configSnapshots = new WeakMap();
+// Dedupe rejected-proxy diagnostics per host: a persistent bad value must
+// not warn on every turn.
+const proxyWarnState = new WeakMap();
+
+async function readConfigSnapshot(host) {
+  // Non-fatal raw read only: readConfigFile exits the process on parse errors
+  // and auto-creates a default on ENOENT — never call it from the request path.
+  if (typeof host?.readRawConfig !== 'function') return undefined;
+  let cacheKey = null;
+  try {
+    const info = await stat(join(host.configDir, 'config.json'));
+    cacheKey = `${info.mtimeMs}:${info.size}`;
+    const cached = configSnapshots.get(host);
+    if (cached && cached.key === cacheKey) return cached.raw;
+  } catch { /* no usable stat: read uncached */ }
+  // One retry softens the torn-read window of the core's non-atomic save.
+  let raw;
+  try {
+    raw = await host.readRawConfig();
+  } catch {
+    try {
+      raw = await host.readRawConfig();
+    } catch {
+      return undefined;
+    }
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  if (cacheKey) configSnapshots.set(host, { key: cacheKey, raw });
+  return raw;
+}
+
+export async function resolveProxyUrl(host, providerName = 'gemini-agy-acp', log) {
+  let raw;
+  try {
+    raw = await readConfigSnapshot(host);
+  } catch {
+    return undefined;
+  }
+  if (!raw) return undefined;
+  let proxyUrl;
+  for (const key of PROXY_URL_KEYS) {
+    const value = raw[key];
+    if (value === undefined || value === null) continue;
+    // Interpolate before trimming, matching the core read-then-normalize order.
+    const normalized = interpolateString(String(value)).trim();
+    if (normalized) { proxyUrl = normalized; break; }
+  }
+  if (!proxyUrl) return undefined;
+  if (!/^https?:\/\//i.test(proxyUrl)) {
+    // Diagnostics carry the scheme or the placeholder fact only — never the
+    // value, which can embed credentials.
+    const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(proxyUrl)?.[1];
+    const kind = scheme ? 'scheme:' + scheme : proxyUrl.startsWith('$') ? 'placeholder' : null;
+    if (kind) {
+      const last = host && typeof host === 'object' ? proxyWarnState.get(host) : undefined;
+      if (last !== kind) {
+        if (host && typeof host === 'object') proxyWarnState.set(host, kind);
+        log?.warn?.(scheme
+          ? 'gemini-agy-acp ignored a configured proxy with unsupported scheme (' + scheme + ')'
+          : 'gemini-agy-acp ignored a configured proxy with an unresolved environment placeholder');
+      }
+    }
+    return undefined;
+  }
+  const flag = typeof raw.PROXY_GLOBAL_ENABLED === 'string' ? interpolateString(raw.PROXY_GLOBAL_ENABLED) : raw.PROXY_GLOBAL_ENABLED;
+  if (globalProxyEnabled(flag)) return proxyUrl;
+  const providers = Array.isArray(raw.Providers) ? raw.Providers : Array.isArray(raw.providers) ? raw.providers : [];
+  const entry = providers.find(item => item?.name === providerName);
+  return entry?.proxyEnabled === true || entry?.proxy_enabled === true ? proxyUrl : undefined;
+}
+
 export async function activateWithTransport(ctx, createTransport, options = {}) {
-  const installer = options.installer ?? createInstaller();
   const configDir = ctx.host.configDir;
   const log = ctx.log;
+  // Metadata-only default instance (targetBinary for status); the install
+  // kick below builds a proxy-aware instance per attempt.
+  const installer = options.installer ?? createInstaller();
   const cache = sidecarCache(configDir);
   let transport;
   // Fingerprint of the settings the live pool was built from; a changed
@@ -132,17 +233,30 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     lastError = { code: safeCode(error), at: Date.now() };
     return error;
   };
-  const fingerprintOf = settings => JSON.stringify([settings.binary, settings.authMethod, settings.apiKey ?? null, settings.timeoutMs, settings.maxWorkers]);
+  const baseKeyOf = settings => JSON.stringify([settings.binary, settings.authMethod, settings.apiKey ?? null, settings.timeoutMs, settings.maxWorkers]);
+  const fingerprintOf = settings => JSON.stringify([settings.binary, settings.authMethod, settings.apiKey ?? null, settings.timeoutMs, settings.maxWorkers, settings.proxyUrl ?? null]);
+  let lastBaseKey = null;
 
   async function applyTransport(force = false) {
     const snapshot = await cache.read();
-    const settings = enabledSettings(snapshot.raw);
+    const base = enabledSettings(snapshot.raw);
+    // Re-resolve on every (re)build so a proxy config change swaps the pool.
+    const proxyUrl = base ? await resolveProxyUrl(ctx.host, 'gemini-agy-acp', log) : undefined;
+    const settings = base ? { ...base, ...(proxyUrl ? { proxyUrl } : {}) } : undefined;
     const next = settings ? fingerprintOf(settings) : null;
     if (!force && next === fingerprint) return;
     const previous = transport;
+    // A proxy-only change drains idle workers instead of killing in-flight
+    // turns; busy workers finish on the old pool and idle-retire naturally.
+    const proxyOnly = previous && base && baseKeyOf(base) === lastBaseKey;
+    // A parked tool call reserves its worker AND bridge on the current pool;
+    // the caller's resume is routed through the live transport, so defer the
+    // swap until the parked call resolves rather than orphaning its bridge.
+    if (proxyOnly && previous.hasParked?.()) return;
     transport = settings ? await createTransport({ ...settings, ...(log ? { log } : {}) }) : undefined;
     fingerprint = next;
-    await previous?.retireExisting();
+    lastBaseKey = base ? baseKeyOf(base) : null;
+    await (proxyOnly ? previous.retireIdle() : previous?.retireExisting());
   }
 
   function queueTransportUpdate(update) {
@@ -196,7 +310,10 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
   function startInstall() {
     if (installing) return installing;
     installError = null;
-    installing = installer.install()
+    installing = (async () => {
+      const proxyUrl = await resolveProxyUrl(ctx.host, 'gemini-agy-acp', log);
+      return (options.installer ?? createInstaller({ proxyUrl })).install();
+    })()
       .then(result => { installedBinary = result.binary; })
       .catch(error => { installError = { code: safeCode(error), at: Date.now() }; })
       .finally(() => { installing = null; });
@@ -285,7 +402,7 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     // never enables a broken binary. The probe runs in the same auth mode as
     // the pool that follows.
     const { probeVersion } = await loadTransportModule();
-    const version = await probeVersion(merged.binary, authMethod);
+    const version = await probeVersion(merged.binary, authMethod, await resolveProxyUrl(ctx.host, 'gemini-agy-acp', log));
     let accountEmail = null;
     if (oauth) {
       // A `--version` probe cannot prove the OS-keyring Google login works:
@@ -294,7 +411,7 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
       // maps to auth_required so the card surfaces the terminal-login hint.
       const { verifyOauthHandshake } = await loadTransportModule();
       try {
-        ({ accountEmail } = await verifyOauthHandshake({ binary: merged.binary, log }));
+        ({ accountEmail } = await verifyOauthHandshake({ binary: merged.binary, log, proxyUrl: await resolveProxyUrl(ctx.host, 'gemini-agy-acp', log) }));
       } catch (error) {
         log?.warn?.(`gemini-agy-acp oauth handshake failed (${safeCode(error)})`);
         throw new AcpError('auth_required');
@@ -315,12 +432,14 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     await queueTransportUpdate(async () => {
       let replacement;
       let settings;
+      let proxyUrl;
       try {
         // Validate the complete merged settings and prepare the new pool before
         // replacing the saved credentials or the live pool.
         await writeSidecar(configDir, payload, async next => {
           settings = enabledSettings(next);
-          replacement = await createTransport({ ...settings, ...(log ? { log } : {}) });
+          proxyUrl = await resolveProxyUrl(ctx.host, 'gemini-agy-acp', log);
+          replacement = await createTransport({ ...settings, ...(proxyUrl ? { proxyUrl } : {}), ...(log ? { log } : {}) });
           if (!replacement) throw failure('agy_config_invalid', 503);
         });
       } catch (error) {
@@ -330,7 +449,8 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
       cache.invalidate();
       const previous = transport;
       transport = replacement;
-      fingerprint = fingerprintOf(settings);
+      fingerprint = fingerprintOf({ ...settings, ...(proxyUrl ? { proxyUrl } : {}) });
+      lastBaseKey = baseKeyOf(settings);
       lastError = undefined;
       await previous?.retireExisting().catch(error => {
         log?.warn?.(`gemini-agy-acp could not retire the previous worker pool (${safeCode(error)})`);
@@ -410,9 +530,10 @@ export async function activateWithTransport(ctx, createTransport, options = {}) 
     // the CLI's own login, exactly like the request pool.
     const apiKey = oauth ? undefined : settings.apiKey ?? process.env.GEMINI_API_KEY;
     if (!oauth && !apiKey?.trim()) throw new AcpError('auth_required');
+    const proxyUrl = await resolveProxyUrl(ctx.host, 'gemini-agy-acp', log);
     const { models, version } = await syncModelOptions(oauth
-      ? { binary: settings.binary, authMethod: 'oauth-personal', log }
-      : { binary: settings.binary, apiKey, log });
+      ? { binary: settings.binary, authMethod: 'oauth-personal', log, proxyUrl }
+      : { binary: settings.binary, apiKey, log, proxyUrl });
     const modelsSyncedAt = Date.now();
     // The operator's hide set survives re-syncs; ids that disappeared
     // upstream are dropped from it silently (always persisted so a pruned

@@ -140,6 +140,44 @@ async function activateTool(t, agent) {
   return { dispatch, runtime };
 }
 
+test('tools/list marks every entry alwaysLoad and keeps name, description and schema', async t => {
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const bridge = new AgyToolBridge([tool], () => new Promise(() => {}));
+  await bridge.start();
+  t.after(() => bridge.close());
+  const listed = await speakMcp(bridge.url, bridge.token, 'tools/list', {});
+  assert.equal(listed.tools.length, 1);
+  const entry = listed.tools[0];
+  assert.equal(entry.name, 'ccr_lookup');
+  assert.equal(entry.description, 'Look up a value.');
+  assert.deepEqual(entry.inputSchema, { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] });
+  assert.equal(entry._meta['antigravity/alwaysLoad'], true);
+});
+
+test('an over-budget tools/list keeps every tool and schema while trimming descriptions', async t => {
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const { TOOL_TOKEN_BUDGET } = await import('../src/agy-tool-budget.mjs');
+  // 64 tools with 1024-byte descriptions exceed agy's customization budget.
+  const prose = 'Look up a value in the store. '.repeat(40).slice(0, 1024);
+  const many = Array.from({ length: 64 }, (_, i) => ({ type: 'function', function: {
+    name: `lookup_${i}`, description: prose,
+    parameters: { type: 'object', properties: { key: { type: 'string', enum: ['a', 'b'] } }, required: ['key'] },
+  } }));
+  const bridge = new AgyToolBridge(many, () => new Promise(() => {}));
+  await bridge.start();
+  t.after(() => bridge.close());
+  const listed = await speakMcp(bridge.url, bridge.token, 'tools/list', {});
+  assert.equal(listed.tools.length, 64);
+  const tokens = listed.tools.reduce((total, entry) => total + Math.ceil(Buffer.byteLength(JSON.stringify(entry), 'utf8') / 3), 0);
+  assert.ok(tokens <= TOOL_TOKEN_BUDGET, `${tokens} tokens exceeds the budget`);
+  for (const [i, entry] of listed.tools.entries()) {
+    assert.equal(entry.name, `ccr_lookup_${i}`);
+    assert.equal(entry._meta['antigravity/alwaysLoad'], true);
+    assert.deepEqual(entry.inputSchema, { type: 'object', properties: { key: { type: 'string', enum: ['a', 'b'] } }, required: ['key'] });
+    assert.ok(entry.description.length < prose.length);
+  }
+});
+
 test('bridges the caller tools, parks the agent call and resumes with the result', async t => {
   const observed = { listed: [], texts: [], parked: new Map() };
   const agent = makeAgent(observed);
@@ -239,6 +277,30 @@ test('closing the transport releases the warm bridge and its parked call', async
   // The parked call is settled as an error and the socket is gone.
   assert.equal(bridge.pending.size, 0);
   assert.equal(await reachable(), false);
+});
+
+test('a proxy-only drain never kills a parked tool turn', async t => {
+  const { transport } = await openTransport(t, 'mcp-tool');
+  const tool = { type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: { key: { type: 'string' } } } } };
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const bridge = new AgyToolBridge([tool], () => new Promise(() => {}));
+  await bridge.start();
+  const port = Number(new URL(bridge.url).port);
+  const reachable = () => new Promise(resolve => {
+    const socket = connect({ host: '127.0.0.1', port });
+    socket.on('connect', () => { socket.destroy(); resolve(true); });
+    socket.on('error', () => resolve(false));
+  });
+  const parked = await transport.run({ model: 'Gemini Model', thinking: 'xhigh', prompt: 'go',
+    onText() {}, onToolCall() {}, bridge });
+  assert.equal(parked.parked.length, 1);
+  assert.equal(transport.hasParked(), true);
+  await transport.retireIdle();
+  assert.equal(bridge.pending.size, 1);
+  assert.equal(await reachable(), true);
+  assert.equal(transport.hasParked(), true);
+  await transport.close();
+  assert.equal(bridge.pending.size, 0);
 });
 
 test('an interleaved conversation does not steal another conversation\'s parked bridge', async t => {
@@ -462,4 +524,25 @@ test('a real ACP agent discovers the tool over MCP and the same turn resumes', a
   assert.equal(answered.choices[0].finish_reason, 'stop');
   // The agent relayed the caller's own result back as its answer text.
   assert.match(answered.choices[0].message.content, /^42resumed with 42$/);
+});
+
+test('the MCP bridge negotiates the protocol revision agy actually speaks', async t => {
+  const { AgyToolBridge } = await import('../src/agy-tool-bridge.mjs');
+  const tool = { type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: { key: { type: 'string' } } } } };
+  const bridge = new AgyToolBridge([tool], () => new Promise(() => {}));
+  await bridge.start();
+  t.after(() => bridge.close());
+  // agy 1.5.15 probes the modern sessionless discovery before initialize.
+  const discovered = await speakMcp(bridge.url, bridge.token, 'server/discover', {});
+  assert.equal(discovered.resultType, 'complete');
+  assert.ok(discovered.supportedVersions.includes('2025-11-25'));
+  assert.deepEqual(discovered.capabilities, { tools: {} });
+  assert.equal(typeof discovered.ttlMs, 'number');
+  // initialize must echo the string date revision, never a numeric version.
+  const init = await speakMcp(bridge.url, bridge.token, 'initialize', { protocolVersion: '2025-11-25' });
+  assert.equal(init.protocolVersion, '2025-11-25');
+  assert.deepEqual(init.capabilities, { tools: {} });
+  // An unknown revision falls back to the newest supported string revision.
+  const fallback = await speakMcp(bridge.url, bridge.token, 'initialize', { protocolVersion: '1999-01-01' });
+  assert.equal(fallback.protocolVersion, '2025-11-25');
 });

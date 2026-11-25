@@ -5,12 +5,18 @@
  * (e.g. Pi) executes the tool and returns its result on the next request. The
  * bridge never executes a tool itself.
  *
+ * This HTTP server is an internal backend: `session/new` advertises the stdio
+ * forwarder (agy-mcp-stdio-bridge.mjs), which the agent spawns and which
+ * relays its JSON-RPC here. The HTTP descriptor stays for internal callers.
+ *
  * Security: listens on 127.0.0.1 only, on an ephemeral port, and requires a
  * random per-bridge bearer token compared with timingSafeEqual. Request bodies
  * and advertised schemas are bounded.
  */
 import { createServer } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { fitToolsToBudget } from './agy-tool-budget.mjs';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_TOOLS = 64;
@@ -238,6 +244,28 @@ export class AgyToolBridge {
     };
   }
 
+  /**
+   * ACP stdio MCP server for `session/new`: the agent spawns the forwarder
+   * with the current node runtime (no shell) and reaches this bridge through
+   * it. The endpoint and bearer token travel in env, never on the command
+   * line. The forwarder file sits next to this module in src and dist alike.
+   */
+  stdioDescriptor() {
+    if (!this.url) throw new Error('bridge_not_listening');
+    return {
+      name: 'ccr-caller-tools',
+      // The desktop shell may spawn us with a verbatim \\?\ executable path;
+      // Go's exec.LookPath cannot resolve that form, so agy would silently
+      // drop the server. Hand the agent a plain Win32 path instead.
+      command: process.execPath.replace(/^\\\\\?\\/, ''),
+      args: [fileURLToPath(new URL('./agy-mcp-stdio-bridge.mjs', import.meta.url))],
+      env: [
+        { name: 'CCR_MCP_ENDPOINT', value: this.url },
+        { name: 'CCR_MCP_TOKEN', value: this.token },
+      ],
+    };
+  }
+
   async close() {
     this.closed = true;
     // Settle anything still parked so a waiting MCP request cannot hang.
@@ -283,18 +311,42 @@ export class AgyToolBridge {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }));
     };
-    if (method === 'initialize') {
+    if (method === 'server/discover') {
+      // MCP 2026-07-28 sessionless discovery (SEP-2575). agy probes this before
+      // initialize; advertise the legacy revisions we serve so it negotiates
+      // down to the initialize handshake instead of dropping the server.
       reply({
-        protocolVersion: typeof params?.protocolVersion === 'number' ? params.protocolVersion : 1,
+        resultType: 'complete',
+        supportedVersions: ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'],
+        capabilities: { tools: {} },
+        _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'ccr-caller-tools', version: '1.0.0' } },
+        ttlMs: 0,
+        cacheScope: 'private',
+      });
+      return;
+    }
+    if (method === 'initialize') {
+      // MCP protocolVersion is a string date revision, not a number. Echo the
+      // client's requested revision when it is one we serve; otherwise fall
+      // back to the newest supported so the handshake never mismatches.
+      const supported = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+      const requested = typeof params?.protocolVersion === 'string' ? params.protocolVersion : null;
+      reply({
+        protocolVersion: requested && supported.includes(requested) ? requested : '2025-11-25',
         capabilities: { tools: {} },
         serverInfo: { name: 'ccr-caller-tools', version: '1.0.0' },
       });
       return;
     }
     if (method === 'tools/list') {
-      reply({ tools: this.tools.map(tool => ({
+      // alwaysLoad keeps each entry loaded even when agy's shared
+      // customization budget would otherwise drop it; the fitter then trims
+      // only description prose so every tool stays listed, schema intact.
+      const listed = fitToolsToBudget(this.tools.map(tool => ({
         name: tool.mcpName, description: tool.description, inputSchema: tool.inputSchema,
-      })) });
+        _meta: { ...(tool.meta || {}), 'antigravity/alwaysLoad': true },
+      })));
+      reply({ tools: listed });
       return;
     }
     if (method === 'tools/call') {

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { configureSession, modelOptions, modelSelector } from './acp-config.mjs';
 import { AcpError } from './acp-errors.mjs';
 import { AcpStdio } from './acp-stdio.mjs';
@@ -20,6 +21,12 @@ const MODEL_SYNC_MS = 5000;
 const OAUTH_VERIFY_MS = 10_000;
 const MAX_STDERR_TAIL_BYTES = 64 * 1024;
 const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'max_turn_requests', 'refusal', 'cancelled']);
+// Startup auth race: right after spawn the CLI can reject authenticate or
+// session/new with a transient "not logged in" style error while its login
+// state is still loading (observed on the plugin-MCP path). Real credential
+// failures and rate/quota errors are never retried.
+const AUTH_RACE_MESSAGE = /authentication required|auth_required|not logged in|not signed in/i;
+const AUTH_NO_RETRY_MESSAGE = /invalid_grant|api.?key|429|resource_exhausted|quota/i;
 
 function clientVersion() {
   try {
@@ -30,6 +37,23 @@ function clientVersion() {
   }
 }
 const clientInfo = { name: 'ccr-gemini-agy-acp', version: clientVersion() };
+
+/**
+ * Scoped permission answer for agy's session/request_permission. Only a call
+ * that names our own caller-tool bridge server is approved — the caller
+ * declared those tools and executes them itself. Anything else (native agent
+ * tools) stays cancelled, so the agent can never run host commands through
+ * an approved permission.
+ */
+export function bridgePermissionOutcome(params) {
+  let text;
+  try { text = JSON.stringify(params ?? {}); } catch { return { outcome: 'cancelled' }; }
+  if (!text.includes('ccr-caller-tools')) return { outcome: 'cancelled' };
+  const options = Array.isArray(params?.options) ? params.options : [];
+  const allow = options.find(option => option?.kind === 'allow_once') ??
+    options.find(option => typeof option?.kind === 'string' && option.kind.startsWith('allow'));
+  return allow && allow.optionId != null ? { outcome: 'selected', optionId: allow.optionId } : { outcome: 'cancelled' };
+}
 
 function cliVersion(output) {
   const versions = [...output.matchAll(/(?:^|[\s:(])v?(\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?)(?=$|[\s,)])/gi)];
@@ -58,16 +82,56 @@ const OAUTH_ENV_VARS = ['PATH', 'HOME', 'USERPROFILE', 'LANG', 'TMPDIR', 'TEMP',
   'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'SystemRoot', 'COMSPEC', 'PATHEXT',
   'DBUS_SESSION_BUS_ADDRESS', 'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', ...PROXY_ENV_VARS];
 
-function oauthEnvironment() {
+// Mirror the core proxy policy for the agy CLI's own upstream calls. The
+// process environment always wins (it is what an operator set explicitly);
+// otherwise the gateway's configured proxy — applied when the global proxy
+// is enabled (the core default) or the managed provider opts in — fills the
+// standard variables the CLI honors. A desktop-managed gateway typically
+// inherits no proxy variables at all, which left the CLI dialing Google
+// directly and every turn timing out behind a regional network.
+export function proxyEnvOverlay(env, proxyUrl) {
+  if (!proxyUrl) return undefined;
+  // An explicit ALL_PROXY is the operator's chosen route for every protocol;
+  // injecting protocol-specific variables would shadow it.
+  if (env.ALL_PROXY || env.all_proxy) return undefined;
+  const overlay = {};
+  // Case variants are one setting: an explicit value in either case wins
+  // for the whole pair, so the fallback never mixes two proxies.
+  for (const [upper, lower] of [['HTTPS_PROXY', 'https_proxy'], ['HTTP_PROXY', 'http_proxy']]) {
+    if (!env[upper] && !env[lower]) {
+      overlay[upper] = proxyUrl;
+      overlay[lower] = proxyUrl;
+    }
+  }
+  if (Object.keys(overlay).length) {
+    // The caller-tool MCP bridge is plain HTTP on loopback; without a
+    // NO_PROXY exclusion the injected http_proxy could route the agent's
+    // local tools/list and tools/call through the upstream proxy.
+    const loopback = ['127.0.0.1', 'localhost', '::1'];
+    const entries = (env.NO_PROXY || env.no_proxy || '').split(',').map(item => item.trim()).filter(Boolean);
+    const missing = loopback.filter(host => !entries.includes(host));
+    // Mirror both case variants so a lowercase-only client also exempts loopback.
+    const merged = [...entries, ...missing].join(',');
+    overlay.NO_PROXY = merged;
+    overlay.no_proxy = merged;
+  }
+  return Object.keys(overlay).length ? overlay : undefined;
+}
+
+function withConfiguredProxy(env, proxyUrl) {
+  return Object.assign(env, proxyEnvOverlay(env, proxyUrl) ?? {});
+}
+
+export function oauthEnvironment(proxyUrl) {
   const env = {};
   for (const name of OAUTH_ENV_VARS) {
     const value = process.env[name];
     if (value !== undefined) env[name] = value;
   }
-  return env;
+  return withConfiguredProxy(env, proxyUrl);
 }
 
-export async function isolatedEnvironment(root) {
+export async function isolatedEnvironment(root, proxyUrl) {
   const dirs = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'runtime', 'work']
     .map(name => [name, join(root, name)]));
   await Promise.all(Object.values(dirs).map(path => mkdir(path, { mode: 0o700 })));
@@ -85,12 +149,13 @@ export async function isolatedEnvironment(root) {
     env.SystemRoot = process.env.SystemRoot;
     env.PATH = join(env.SystemRoot, 'System32');
   }
-  return { env, cwd: dirs.work };
+  return { env: withConfiguredProxy(env, proxyUrl), cwd: dirs.work };
 }
 
 class Worker {
-  constructor(binary, authMethod, onRetired, log, { captureStderr = false } = {}) {
+  constructor(binary, authMethod, onRetired, log, { captureStderr = false, proxyUrl } = {}) {
     this.binary = binary;
+    this.proxyUrl = proxyUrl;
     this.authMethod = authMethod;
     this.onRetired = onRetired;
     this.log = log;
@@ -153,9 +218,9 @@ class Worker {
       this.root = await mkdtemp(join(tmpdir(), 'ccr-agy-acp-'));
       if (this.authMethod === OAUTH_METHOD) {
         this.cwd = this.root;
-        this.spawnEnv = oauthEnvironment();
+        this.spawnEnv = oauthEnvironment(this.proxyUrl);
       } else {
-        const isolation = await isolatedEnvironment(this.root);
+        const isolation = await isolatedEnvironment(this.root, this.proxyUrl);
         this.cwd = isolation.cwd;
         this.spawnEnv = isolation.env;
       }
@@ -185,23 +250,56 @@ class Worker {
     await this.probe();
     this.check();
 
-    const child = this.spawnChild(['acp', '--sandbox'],
+    // --process-per-session is required for client HTTP MCP; --sandbox
+    // restricts the agent toolset and excludes session MCP tools entirely.
+    const child = this.spawnChild(['acp', '--process-per-session'],
       this.authMethod === OAUTH_METHOD ? this.spawnEnv : { ...this.spawnEnv, GEMINI_API_KEY: apiKey },
       this.captureStderr);
     child.once('exit', () => this.retire(new AcpError('worker_failed')));
     child.stdout.once('end', () => this.retire(new AcpError('worker_failed')));
     this.rpc = new AcpStdio(child, error => this.retire(error));
+    // agy may ask permission before an MCP tool call. The caller already
+    // sanctioned its own bridged tools by declaring them, and the caller —
+    // never the agent — executes them, so approve only those; every native
+    // agent tool stays denied.
+    this.rpc.onPermission = bridgePermissionOutcome;
     const init = await this.rpc.request('initialize', { protocolVersion: 1, clientInfo, clientCapabilities: {} });
     if (init.protocolVersion !== 1) throw new AcpError('protocol_error');
     if (!Array.isArray(init.authMethods) || !init.authMethods.some(method => method?.id === this.authMethod &&
         (method.type == null || method.type === 'agent'))) throw new AcpError('auth_required');
-    await this.rpc.request('authenticate', { methodId: this.authMethod }, 'auth_required');
+    // The official `_meta.antigravity` session extensions are only valid when
+    // the agent advertises the capability object at initialize; gate on it.
+    const antigravity = init.agentCapabilities?._meta?.antigravity;
+    this.antigravityMeta = antigravity && typeof antigravity === 'object' && !Array.isArray(antigravity) ? antigravity : null;
+    await this.retryStartupAuthRace(() => this.rpc.request('authenticate', { methodId: this.authMethod }, 'auth_required'));
     // Explicit ACP account metadata of THIS handshake, when the CLI reports
     // it; verified against the bounded email shape before it is kept.
     this.initAccountEmail = accountEmailShapeOk(init.accountInfo?.email) ? init.accountInfo.email : null;
     // One bounded spawn log per worker start: binary path and CLI version only,
     // never key material or prompt content.
     this.log?.info?.(`gemini-agy-acp worker started (agy ${this.version}, binary: ${this.binary})`);
+  }
+
+  /**
+   * One bounded retry for the startup auth race only: a transient "not logged
+   * in" style rejection inside the first 2s of the attempt is retried once
+   * after 250ms. Credential failures (invalid_grant, api key) and rate/quota
+   * errors (429, RESOURCE_EXHAUSTED) are rethrown immediately, and a retired
+   * worker never retries.
+   */
+  async retryStartupAuthRace(call) {
+    // Monotonic clock: a wall-clock NTP step or suspend/resume must not widen the retry window.
+    const started = performance.now();
+    try {
+      return await call();
+    } catch (error) {
+      const text = typeof error.agentMessage === 'string' ? error.agentMessage : error.message;
+      if (this.failure || performance.now() - started >= 2000 ||
+          !AUTH_RACE_MESSAGE.test(text) || AUTH_NO_RETRY_MESSAGE.test(text)) throw error;
+      await delay(250, undefined, { ref: false });
+      if (this.failure) throw error;
+      return call();
+    }
   }
 
   /**
@@ -217,16 +315,19 @@ class Worker {
    * One ACP turn.
    *
    * When the caller declared tools, `bridge` is the live MCP bridge the plugin
-   * already started; its descriptor goes into `session/new` so the agent can
-   * discover the tools, and the session stays warm in `this.binding` while a
-   * call is parked, so a follow-up request can resume the same ACP turn.
+   * already started; its stdio descriptor goes into `session/new` so the agent
+   * spawns the forwarder and discovers the tools through it (the agent's HTTP
+   * MCP path does not surface bridged tools to the model), and the session
+   * stays warm in `this.binding` while a call is parked, so a follow-up
+   * request can resume the same ACP turn.
    */
   async turn({ model, thinking, prompt, onText, onToolCall, bridge, resume }, apiKey) {
     if (!this.rpc) await this.start(apiKey);
     this.check();
     const cwd = await mkdtemp(join(this.authMethod === OAUTH_METHOD ? tmpdir() : this.root, 'session-'));
     const hasTools = !!bridge && !bridge.empty;
-    const mcpServers = hasTools ? [bridge.descriptor()] : [];
+    const descriptor = hasTools ? bridge.stdioDescriptor() : undefined;
+    const mcpServers = descriptor ? [descriptor] : [];
     let sessionId;
     try {
       if (resume && this.binding?.sessionId && this.binding.bridge === bridge) {
@@ -236,7 +337,14 @@ class Worker {
         this.rpc.abandon();
       } else {
         if (this.binding) await this.closeBinding();
-        const session = await this.rpc.request('session/new', { cwd, mcpServers });
+        const params = { cwd, mcpServers };
+        // Eager connect avoids the preload race where the first prompt runs
+        // before the CLI has connected to the session's MCP server. Sent only
+        // when initialize advertised the antigravity capability object.
+        if (descriptor && this.antigravityMeta) {
+          params._meta = { antigravity: { eagerMcpServers: [descriptor.name] } };
+        }
+        const session = await this.retryStartupAuthRace(() => this.rpc.request('session/new', params));
         sessionId = session.sessionId;
         if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 4096 || this.sessions.has(sessionId)) {
           throw new AcpError('protocol_error');
@@ -414,8 +522,15 @@ class Worker {
   }
 }
 
-export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 60_000, maxWorkers = 2, apiKey, log } = {}) {
+function validProxyUrl(proxyUrl) {
+  if (proxyUrl == null || proxyUrl === '') return undefined;
+  if (typeof proxyUrl !== 'string' || !/^https?:\/\//i.test(proxyUrl)) throw new AcpError('invalid_config');
+  return proxyUrl;
+}
+
+export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 60_000, maxWorkers = 4, apiKey, log, proxyUrl } = {}) {
   const oauth = authMethod === OAUTH_METHOD;
+  proxyUrl = validProxyUrl(proxyUrl);
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod) ||
       !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000 ||
       !Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8 ||
@@ -458,8 +573,10 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
       if (typeof prompt !== 'string' || typeof model !== 'string' || !model || model.length > 1024 ||
           (thinking != null && (typeof thinking !== 'string' || !thinking || thinking.length > 128)) ||
           typeof onText !== 'function') throw new AcpError('invalid_request');
-      // A bridge is the plugin's own object; only shape is checked here.
-      if (bridge != null && (typeof bridge.descriptor !== 'function' || !(bridge.pending instanceof Map))) {
+      // A bridge is the plugin's own object; only shape is checked here. Both
+      // descriptors are required: stdio for session/new, HTTP for internal use.
+      if (bridge != null && (typeof bridge.descriptor !== 'function' || typeof bridge.stdioDescriptor !== 'function' ||
+          !(bridge.pending instanceof Map))) {
         throw new AcpError('invalid_request');
       }
       if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) throw new AcpError('input_limit');
@@ -475,7 +592,7 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
             !(candidate.binding?.bridge?.pending?.size > 0));
       if (!worker) {
         if (workers.size >= maxWorkers) throw new AcpError('busy');
-        worker = new Worker(binary, authMethod, retired => workers.delete(retired), log);
+        worker = new Worker(binary, authMethod, retired => workers.delete(retired), log, { proxyUrl });
         workers.add(worker);
       }
       return worker.run({ model, thinking, prompt, signal, onText, onToolCall, bridge, resume }, credential, timeoutMs);
@@ -485,6 +602,19 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
      * to drop stale billing identities immediately. */
     async retireExisting() {
       await Promise.all([...workers].map(worker => worker.retire(new AcpError('closed'))));
+    },
+    /** Drain only idle workers: busy turns keep their spawn environment and
+     * finish on this pool, then idle-retire naturally. Used for proxy-only
+     * pool swaps so a config edit never SIGKILLs an in-flight turn. */
+    async retireIdle() {
+      // A parked tool turn has no active task but reserves its worker and
+      // bridge for the caller's resume; draining it would SIGKILL the turn.
+      await Promise.all([...workers].filter(worker => !worker.task && !worker.failure &&
+        !(worker.binding?.bridge?.pending?.size > 0)).map(worker => worker.retire(new AcpError('closed'))));
+    },
+    /** True while any worker holds a parked caller tool call. */
+    hasParked() {
+      return [...workers].some(worker => worker.binding?.bridge?.pending?.size > 0);
     },
     async close() {
       closed = true;
@@ -498,11 +628,11 @@ export function createTransport({ binary, authMethod = AUTH_METHOD, timeoutMs = 
  * the connect route's only look at the binary — no ACP child is spawned. The
  * probe runs in the same auth mode as the pool that follows (oauth probes
  * use the whitelisted real environment; gemini probes the isolated one). */
-export async function probeVersion(binary, authMethod = AUTH_METHOD) {
+export async function probeVersion(binary, authMethod = AUTH_METHOD, proxyUrl) {
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod)) {
     throw new AcpError('invalid_config');
   }
-  const worker = new Worker(binary, authMethod, () => {});
+  const worker = new Worker(binary, authMethod, () => {}, undefined, { proxyUrl });
   const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), PROBE_MS);
   try {
     return await worker.probe();
@@ -520,9 +650,9 @@ export async function probeVersion(binary, authMethod = AUTH_METHOD) {
  * THIS handshake's explicit ACP account metadata or this child's own bounded
  * diagnostics tail; never from stale logs, other processes or token stores,
  * and only the validated email ever leaves this function. */
-export async function verifyOauthHandshake({ binary, log } = {}) {
+export async function verifyOauthHandshake({ binary, log, proxyUrl } = {}) {
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0')) throw new AcpError('invalid_config');
-  const worker = new Worker(binary, OAUTH_METHOD, () => {}, log, { captureStderr: true });
+  const worker = new Worker(binary, OAUTH_METHOD, () => {}, log, { captureStderr: true, proxyUrl });
   const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), OAUTH_VERIFY_MS);
   try {
     await worker.start();
@@ -551,11 +681,11 @@ export async function verifyOauthHandshake({ binary, log } = {}) {
  * handshake with the resolved key, session/new, then the advertised model
  * selector options from the session config. Never touches the request pool.
  * oauth-personal syncs authenticate the CLI's own login without any key. */
-export async function syncModelOptions({ binary, authMethod = AUTH_METHOD, apiKey, log } = {}) {
+export async function syncModelOptions({ binary, authMethod = AUTH_METHOD, apiKey, log, proxyUrl } = {}) {
   const oauth = authMethod === OAUTH_METHOD;
   if (typeof binary !== 'string' || !isAbsolute(binary) || binary.includes('\0') || !AUTH_METHODS.has(authMethod) ||
       (oauth ? apiKey != null : typeof apiKey !== 'string' || !apiKey.trim())) throw new AcpError('invalid_config');
-  const worker = new Worker(binary, authMethod, () => {}, log);
+  const worker = new Worker(binary, authMethod, () => {}, log, { proxyUrl });
   const deadline = setTimeout(() => worker.retire(new AcpError('timeout')), MODEL_SYNC_MS);
   try {
     await worker.start(oauth ? undefined : apiKey);

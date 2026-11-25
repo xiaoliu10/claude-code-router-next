@@ -5,7 +5,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { activateWithTransport } from '../src/plugin.mjs';
+import { activateWithTransport, resolveProxyUrl } from '../src/plugin.mjs';
 
 const name = 'gemini-agy-acp';
 const provider = { name, apiKey: `ccr-managed-${name}`, models: ['model-1', 'model-high'] };
@@ -32,6 +32,99 @@ async function activate(t, local, run = t.mock.fn(async () => end)) {
     runtime.dispatchRequest({ requestBody, req, config, provider, attempt });
   return { dispatch, factory, run, runtime, transformer };
 }
+
+test('proxy resolution mirrors the core policy: global default on, opt-in otherwise', async () => {
+  const host = config => ({ readRawConfig: async () => config });
+  const entry = { name: 'gemini-agy-acp' };
+  assert.equal(await resolveProxyUrl(host({ PROXY_URL: 'http://127.0.0.1:7897' })), 'http://127.0.0.1:7897');
+  assert.equal(await resolveProxyUrl(host({ httpsProxy: 'http://127.0.0.1:7897', PROXY_GLOBAL_ENABLED: 'false', Providers: [{ ...entry, proxy_enabled: true }] })), 'http://127.0.0.1:7897');
+  assert.equal(await resolveProxyUrl(host({ PROXY_URL: 'http://127.0.0.1:7897', PROXY_GLOBAL_ENABLED: false, Providers: [entry] })), undefined);
+  assert.equal(await resolveProxyUrl(host({ PROXY_URL: 'http://127.0.0.1:7897', PROXY_GLOBAL_ENABLED: '0', providers: [{ ...entry, proxyEnabled: true }] })), 'http://127.0.0.1:7897');
+  assert.equal(await resolveProxyUrl(host({ PROXY_URL: 'socks5://127.0.0.1:1080' })), undefined);
+  assert.equal(await resolveProxyUrl(host({})), undefined);
+  assert.equal(await resolveProxyUrl({ readRawConfig: async () => { throw new Error('unreadable'); } }), undefined);
+  assert.equal(await resolveProxyUrl(undefined), undefined);
+  assert.equal(await resolveProxyUrl({ readConfig: async () => ({ PROXY_URL: 'http://127.0.0.1:7897' }) }), undefined);
+  process.env.CCR_AGY_TEST_PROXY = 'http://127.0.0.1:7899';
+  try {
+    assert.equal(await resolveProxyUrl(host({ PROXY_URL: '$CCR_AGY_TEST_PROXY' })), 'http://127.0.0.1:7899');
+  } finally { delete process.env.CCR_AGY_TEST_PROXY; }
+  const warnings = [];
+  const log = { warn: message => warnings.push(message) };
+  assert.equal(await resolveProxyUrl(host({ PROXY_URL: 'socks5://127.0.0.1:1080' }), 'gemini-agy-acp', log), undefined);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /socks5/);
+  assert.ok(!warnings[0].includes('127.0.0.1'));
+  assert.equal(await resolveProxyUrl(host({ PROXY_URL: '$CCR_AGY_MISSING_PROXY' }), 'gemini-agy-acp', log), undefined);
+  assert.match(warnings[1], /placeholder/);
+  const repeatHost = host({ PROXY_URL: 'socks5://127.0.0.1:1080' });
+  await resolveProxyUrl(repeatHost, 'gemini-agy-acp', log);
+  await resolveProxyUrl(repeatHost, 'gemini-agy-acp', log);
+  assert.equal(warnings.length, 3);
+  process.env.CCR_AGY_TEST_PAD = ' http://127.0.0.1:7899 ';
+  try {
+    assert.equal(await resolveProxyUrl(host({ PROXY_URL: '$CCR_AGY_TEST_PAD' })), 'http://127.0.0.1:7899');
+  } finally { delete process.env.CCR_AGY_TEST_PAD; }
+});
+
+test('the pool factory receives the resolved proxy and a proxy change rebuilds the pool', async t => {
+  const configDir = await mkdtemp(join(tmpdir(), 'agy-proxy-'));
+  t.after(() => rm(configDir, { recursive: true, force: true }));
+  await writeFile(join(configDir, 'gemini-agy-acp.json'), JSON.stringify(settings));
+  let config = { PROXY_URL: 'http://127.0.0.1:7897' };
+  const pools = [];
+  const factory = t.mock.fn(() => {
+    const pool = { run: async () => end, async close() {}, retireExisting: t.mock.fn(async () => {}), retireIdle: t.mock.fn(async () => {}) };
+    pools.push(pool);
+    return pool;
+  });
+  let runtime;
+  await activateWithTransport({ host: { configDir, readRawConfig: async () => config }, registerTransformer() {},
+    registerManagedRuntime(value) { runtime = value; }, registerUiCard() {}, registerAdminRoutes() {} }, factory);
+  await runtime.dispatchRequest({ requestBody: body, req: { body }, config: {}, provider, attempt: () => { throw Error('no http'); } });
+  assert.equal(factory.mock.calls[0].arguments[0].proxyUrl, 'http://127.0.0.1:7897');
+  config = { PROXY_URL: 'http://127.0.0.1:7898' };
+  await runtime.dispatchRequest({ requestBody: body, req: { body }, config: {}, provider, attempt: () => { throw Error('no http'); } });
+  assert.equal(factory.mock.callCount(), 2);
+  assert.equal(factory.mock.calls[1].arguments[0].proxyUrl, 'http://127.0.0.1:7898');
+  assert.equal(pools[0].retireIdle.mock.callCount(), 1);
+  assert.equal(pools[0].retireExisting.mock.callCount(), 0);
+  await writeFile(join(configDir, 'gemini-agy-acp.json'), JSON.stringify({ ...settings, binary: '/path/to/local/fixture-b' }));
+  config = { PROXY_URL: 'http://127.0.0.1:7899' };
+  await runtime.dispatchRequest({ requestBody: body, req: { body }, config: {}, provider, attempt: () => { throw Error('no http'); } });
+  assert.equal(factory.mock.callCount(), 3);
+  assert.equal(pools[1].retireExisting.mock.callCount(), 1);
+  assert.equal(pools[1].retireIdle.mock.callCount(), 0);
+});
+
+test('a proxy-only swap is deferred while the live pool holds a parked tool call', async t => {
+  const configDir = await mkdtemp(join(tmpdir(), 'agy-proxy-parked-'));
+  t.after(() => rm(configDir, { recursive: true, force: true }));
+  await writeFile(join(configDir, 'gemini-agy-acp.json'), JSON.stringify(settings));
+  let config = { PROXY_URL: 'http://127.0.0.1:7897' };
+  const pools = [];
+  const factory = t.mock.fn(() => {
+    const pool = { run: async () => end, async close() {}, retireExisting: t.mock.fn(async () => {}), retireIdle: t.mock.fn(async () => {}), hasParked: () => false };
+    pools.push(pool);
+    return pool;
+  });
+  let runtime;
+  await activateWithTransport({ host: { configDir, readRawConfig: async () => config }, registerTransformer() {},
+    registerManagedRuntime(value) { runtime = value; }, registerUiCard() {}, registerAdminRoutes() {} }, factory);
+  const dispatch = () => runtime.dispatchRequest({ requestBody: body, req: { body }, config: {}, provider, attempt: () => { throw Error('no http'); } });
+  await dispatch();
+  assert.equal(factory.mock.callCount(), 1);
+  pools[0].hasParked = () => true;
+  config = { PROXY_URL: 'http://127.0.0.1:7898' };
+  await dispatch();
+  assert.equal(factory.mock.callCount(), 1);
+  assert.equal(pools[0].retireIdle.mock.callCount(), 0);
+  pools[0].hasParked = () => false;
+  await dispatch();
+  assert.equal(factory.mock.callCount(), 2);
+  assert.equal(factory.mock.calls[1].arguments[0].proxyUrl, 'http://127.0.0.1:7898');
+  assert.equal(pools[0].retireIdle.mock.callCount(), 1);
+});
 
 test('reserved provider name is exact and the plugin remains disabled until local opt-in', async t => {
   for (const local of [undefined, {}, { ...settings, enabled: 'true' }, { ...settings, enabled: false }]) {
@@ -78,7 +171,7 @@ test('aggregate passes ordered text, exact model and separate effort, disregards
   assert.equal(input.thinking, 'high');
   assert.deepEqual(JSON.parse(input.prompt.split('\n')[1]), [...request.messages.slice(0, 3), { role: 'user', content: 'Next' }]);
   assert.deepEqual(Object.keys(input).sort(), ['model', 'onText', 'prompt', 'signal', 'thinking']);
-  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 2, timeoutMs: 60000 }]);
+  assert.deepEqual(p.factory.mock.calls[0].arguments, [{ binary: settings.binary, authMethod: 'gemini-api-key', maxWorkers: 4, timeoutMs: 60000 }]);
   assert.equal(req.enableFallback, false);
   await p.dispatch({ ...body, reasoning: { effort: 'max' } }, { body: { ...body, output_config: { effort: 'xhigh' } } });
   assert.equal(run.mock.calls[1].arguments[0].thinking, 'xhigh');

@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { after, before, test } from 'node:test';
-import { createTransport, isolatedEnvironment, probeVersion, syncModelOptions, verifyOauthHandshake } from '../src/transport.mjs';
+import { createTransport, isolatedEnvironment, oauthEnvironment, probeVersion, syncModelOptions, verifyOauthHandshake } from '../src/transport.mjs';
+import { AgyToolBridge } from '../src/agy-tool-bridge.mjs';
 import { chatResponse } from '../src/chat.mjs';
 
 test('oauth-personal runs the whitelisted real environment, authenticates the CLI login and never creates an isolated root', async t => {
@@ -247,9 +248,9 @@ test('rejects missing key, oversized prompt, unsupported model and effort', asyn
   assert.ok(!(await events()).some(record => record.event === 'session/prompt'));
 });
 
-test('pool grants two leases by default, rejects overload and replaces cancelled workers', async t => {
+test('pool grants four leases by default, rejects overload and replaces cancelled workers', async t => {
   const { transport, events } = await setup(t);
-  const controllers = [new AbortController(), new AbortController()];
+  const controllers = [new AbortController(), new AbortController(), new AbortController(), new AbortController()];
   const pending = controllers.map(c => rejects(transport.run({ ...input, prompt: 'hang', signal: c.signal }), 'cancelled', 499));
   await rejects(transport.run(input), 'busy', 503);
   await waitForEvent(events, 'session/prompt');
@@ -434,6 +435,166 @@ test('the isolated worker environment forwards only standard proxy variables', a
   assert.equal(env.HOME, join(root, 'home'));
 });
 
+test('the configured proxy fills absent worker variables and never overrides explicit ones', async t => {
+  const roots = await Promise.all([1, 2, 3].map(() => mkdtemp(join(tmpdir(), 'agy-env-fallback-'))));
+  t.after(() => Promise.all(roots.map(root => rm(root, { recursive: true, force: true }))));
+  const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'];
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  for (const key of keys) delete process.env[key];
+  const { env } = await isolatedEnvironment(roots[0], 'http://127.0.0.1:7897');
+  for (const key of keys) assert.equal(env[key], 'http://127.0.0.1:7897');
+  process.env.HTTPS_PROXY = 'http://127.0.0.1:1';
+  const explicit = await isolatedEnvironment(roots[1], 'http://127.0.0.1:7897');
+  assert.equal(explicit.env.HTTPS_PROXY, 'http://127.0.0.1:1');
+  assert.equal(explicit.env.https_proxy, undefined);
+  delete process.env.HTTPS_PROXY;
+  const bare = await isolatedEnvironment(roots[2]);
+  assert.equal(bare.env.HTTPS_PROXY, undefined);
+});
+
+test('createTransport rejects unsupported proxy values before any spawn', async () => {
+  for (const proxyUrl of ['socks5://127.0.0.1:1080', 'ftp://fixture.example.com', 42, {}]) {
+    assert.throws(() => createTransport({ binary: '/fixture/agy', proxyUrl }), { code: 'acp_invalid_config' });
+  }
+});
+
+test('oauth worker environment applies the same proxy fallback and respects ALL_PROXY', async t => {
+  const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  for (const key of keys) delete process.env[key];
+  const env = oauthEnvironment('http://127.0.0.1:7897');
+  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:7897');
+  assert.equal(env.https_proxy, 'http://127.0.0.1:7897');
+  assert.equal(env.NO_PROXY, '127.0.0.1,localhost,::1');
+  assert.equal(env.no_proxy, '127.0.0.1,localhost,::1');
+  process.env.ALL_PROXY = 'http://127.0.0.1:2';
+  const all = oauthEnvironment('http://127.0.0.1:7897');
+  assert.equal(all.HTTPS_PROXY, undefined);
+  assert.equal(all.ALL_PROXY, 'http://127.0.0.1:2');
+  delete process.env.ALL_PROXY;
+  process.env.NO_PROXY = 'example.com';
+  const merged = oauthEnvironment('http://127.0.0.1:7897');
+  assert.ok(merged.NO_PROXY.split(',').includes('example.com'));
+  assert.ok(merged.NO_PROXY.split(',').includes('127.0.0.1'));
+  assert.equal(merged.no_proxy, merged.NO_PROXY);
+});
+
+test('a spawned worker receives the configured proxy end-to-end', async t => {
+  const keys = ['HTTPS_PROXY', 'https_proxy'];
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  for (const key of keys) delete process.env[key];
+  const { transport, events } = await setup(t, 'ok', { proxyUrl: 'http://127.0.0.1:7897' });
+  await transport.run(input);
+  const spawn = (await events()).find(record => record.event === 'spawn');
+  assert.equal(spawn.httpsProxy, 'http://127.0.0.1:7897');
+  for (const host of ['127.0.0.1', 'localhost', '::1']) assert.ok(spawn.noProxy.split(',').includes(host));
+  await transport.close();
+});
+
+test('retireIdle lets an in-flight turn finish and retires idle workers for a fresh spawn', async t => {
+  const hanging = await setup(t, 'hang-init');
+  const pending = hanging.transport.run(input);
+  await delay(80);
+  await hanging.transport.retireIdle();
+  const state = await Promise.race([pending.then(() => 'done', () => 'err'), delay(120).then(() => 'pending')]);
+  assert.equal(state, 'pending');
+  await hanging.transport.close();
+  await assert.rejects(pending);
+  const { transport, events } = await setup(t, 'ok');
+  await transport.run(input);
+  await transport.retireIdle();
+  await transport.run(input);
+  assert.equal((await events()).filter(record => record.event === 'spawn').length, 2);
+  await transport.close();
+});
+
+test('workers spawn acp --process-per-session and never the sandbox flag', async t => {
+  const { transport, events } = await setup(t);
+  await transport.run(input);
+  const spawn = (await events()).find(record => record.event === 'spawn');
+  assert.deepEqual(spawn.args, ['acp', '--process-per-session']);
+  assert.ok(!spawn.args.includes('--sandbox'));
+});
+
+test('session/new eagerly connects the bridge only when antigravity meta is advertised', async t => {
+  const makeBridge = async () => {
+    const bridge = new AgyToolBridge([{ type: 'function', function: { name: 'lookup',
+      parameters: { type: 'object', properties: { key: { type: 'string' } } } } }], () => new Promise(() => {}));
+    await bridge.start();
+    return bridge;
+  };
+  await t.test('advertised capability and a live bridge', async t => {
+    const { transport, events } = await setup(t, 'mcp-tool-meta');
+    const bridge = await makeBridge();
+    const parked = await transport.run({ ...input, prompt: 'go', onToolCall() {}, bridge });
+    assert.equal(parked.parked.length, 1);
+    const session = (await events()).find(record => record.event === 'session/new');
+    // The eager name is exactly the stdio descriptor's server name.
+    assert.deepEqual(session.meta, { antigravity: { eagerMcpServers: [bridge.stdioDescriptor().name] } });
+    assert.equal(session.meta.antigravity.eagerMcpServers[0], 'ccr-caller-tools');
+  });
+  await t.test('a live bridge without the advertised capability', async t => {
+    const { transport, events } = await setup(t, 'mcp-tool');
+    const bridge = await makeBridge();
+    const parked = await transport.run({ ...input, prompt: 'go', onToolCall() {}, bridge });
+    assert.equal(parked.parked.length, 1);
+    const session = (await events()).find(record => record.event === 'session/new');
+    assert.equal(session.meta, null);
+  });
+  await t.test('advertised capability but no bridge', async t => {
+    const { transport, events } = await setup(t, 'antigravity-meta');
+    await transport.run(input);
+    const session = (await events()).find(record => record.event === 'session/new');
+    assert.equal(session.meta, null);
+  });
+});
+
+test('a startup auth race on authenticate is retried exactly once', async t => {
+  const { transport, events } = await setup(t, 'auth-race');
+  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+  assert.equal((await events()).filter(record => record.event === 'authenticate').length, 2);
+});
+
+test('a persistent auth-race message fails closed after one bounded retry', async t => {
+  const { transport, events } = await setup(t, 'auth-race-persistent');
+  await rejects(transport.run(input), 'auth_required', 401);
+  assert.equal((await events()).filter(record => record.event === 'authenticate').length, 2);
+});
+
+test('a race message arriving after the 2s window is not retried', async t => {
+  const { transport, events } = await setup(t, 'auth-race-late');
+  await rejects(transport.run(input), 'auth_required', 401);
+  // The delayed error lands outside the startup window, so authenticate ran once.
+  assert.equal((await events()).filter(record => record.event === 'authenticate').length, 1);
+});
+
+test('the agent error text stays non-enumerable so it cannot leak into serialised output', async t => {
+  const { transport } = await setup(t, 'auth-race-persistent');
+  await assert.rejects(transport.run(input), error => {
+    assert.equal(error.agentMessage, 'Not logged into Antigravity');
+    assert.equal(Object.keys(error).includes('agentMessage'), false);
+    assert.doesNotMatch(JSON.stringify(error), /Not logged into Antigravity/);
+    return true;
+  });
+});
+
+test('quota and credential failures are never retried even with a race message', async t => {
+  for (const mode of ['auth-quota-race', 'auth-invalid-grant']) await t.test(mode, async t => {
+    const { transport, events } = await setup(t, mode);
+    await rejects(transport.run(input), 'auth_required', 401);
+    assert.equal((await events()).filter(record => record.event === 'authenticate').length, 1);
+  });
+});
+
+test('a startup auth race on session/new is retried exactly once', async t => {
+  const { transport, events } = await setup(t, 'session-auth-race');
+  assert.deepEqual(await transport.run(input), { stopReason: 'max_tokens' });
+  assert.equal((await events()).filter(record => record.event === 'session/new').length, 2);
+});
+
 test('model sync is bounded and fails closed on protocol deviations', async t => {
   const hanging = await setup(t, 'hang-version');
   await rejects(syncModelOptions({ binary: hanging.binary, apiKey: 'fixture-value' }), 'timeout', 504);
@@ -441,4 +602,24 @@ test('model sync is bounded and fails closed on protocol deviations', async t =>
   await rejects(syncModelOptions({ binary: wrong.binary, apiKey: 'fixture-value' }), 'unsupported_option', 400);
   const old = await setup(t, 'old');
   await rejects(probeVersion(old.binary), 'unsupported_version', 502);
+});
+
+test('permission answers approve only the caller-tool bridge, never native tools', async () => {
+  const { bridgePermissionOutcome } = await import('../src/transport.mjs');
+  const options = [
+    { optionId: 'once', kind: 'allow_once', name: 'Allow' },
+    { optionId: 'always', kind: 'allow_always', name: 'Always' },
+    { optionId: 'no', kind: 'reject_once', name: 'Reject' },
+  ];
+  // A bridged caller tool: approved with the one-shot allow option.
+  const bridged = { sessionId: 's', toolCall: { title: 'mcp_ccr-caller-tools_ccr_calculator', rawInput: { expr: '2+2' } }, options };
+  assert.deepEqual(bridgePermissionOutcome(bridged), { outcome: 'selected', optionId: 'once' });
+  // A native agent tool: never approved, even with allow options present.
+  const native = { sessionId: 's', toolCall: { title: 'run_command', rawInput: { command: 'dir' } }, options };
+  assert.deepEqual(bridgePermissionOutcome(native), { outcome: 'cancelled' });
+  // No usable allow option or malformed params: fail closed.
+  assert.deepEqual(bridgePermissionOutcome({ toolCall: { title: 'ccr-caller-tools' }, options: [{ optionId: 'no', kind: 'reject_once' }] }), { outcome: 'cancelled' });
+  assert.deepEqual(bridgePermissionOutcome(undefined), { outcome: 'cancelled' });
+  const circular = {}; circular.self = circular;
+  assert.deepEqual(bridgePermissionOutcome(circular), { outcome: 'cancelled' });
 });

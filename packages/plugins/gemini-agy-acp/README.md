@@ -90,7 +90,7 @@ Connect writes the sidecar `$CCR_CONFIG_DIR/gemini-agy-acp.json` (mode 0600). Th
 }
 ```
 
-An `apiKey` written by Connect is stored inside this file with 0600 permissions and never appears in logs, config.json, transcripts or responses; oauth-personal mode persists no `apiKey` at all. Worker limit is 1–8 (default 1) and timeout is 1–300000 ms (default 60000). Choose an unused test port and restrict access to these files and the process environment.
+An `apiKey` written by Connect is stored inside this file with 0600 permissions and never appears in logs, config.json, transcripts or responses; oauth-personal mode persists no `apiKey` at all. Worker limit is 1–8 (default 4) and timeout is 1–300000 ms (default 60000). Choose an unused test port and restrict access to these files and the process environment.
 
 Supply `GEMINI_API_KEY` through the isolated CCR process environment (together with your proxy variables), or store the key once via Connect. An explicit sidecar `apiKey` takes precedence; without one the transport captures the environment key at pool start. Keep the key out of request headers, JSON files other than the 0600 sidecar, transcripts and source control. Supported `authMethod` values are `gemini-api-key` (optional key with environment fallback) and `oauth-personal` (no key allowed; any key alongside it fails closed). A missing key in API-key mode or an unsupported auth method fails the request.
 
@@ -118,6 +118,6 @@ Non-streaming requests return one OpenAI chat completion. Streaming emits role a
 
 The protocol fixture follows Google's documented ACP v1 invocation, API-key method ID, and session selectors. This prototype handles the protocol-driven authentication method (omitted type or `agent`) and rejects other method types before opening a session. The fixture is synthetic, including the `oauth-personal` method id, the `accountInfo` metadata and the stderr login line — the exact handshake and account-reporting shape of a production CLI build still needs verification.
 
-Local tests use synthetic text, credentials and subprocess fixtures. Live CLI authentication, model availability, actual sandbox guarantees, provider billing, production load and compatibility with other CCR versions remain unverified. CCR 2.3.2433 has no plugin shutdown callback. The transport retires idle workers and bounds each request.
+Local tests use synthetic text, credentials and subprocess fixtures. Live CLI authentication, model availability, provider billing, production load and compatibility with other CCR versions remain unverified. The plugin spawns `agy acp --process-per-session` without a sandbox flag, so it does not confine the agent's own built-in tools; only the caller-provided MCP tools are bridged, and every raised call is executed by the caller, not by the agent. CCR 2.3.2433 has no plugin shutdown callback. The transport retires idle workers and bounds each request.
 
 [Antigravity ACP documentation](https://antigravity.google/docs/ide/extensions/acp/) · [ACP session config options](https://agentclientprotocol.com/protocol/v1/session-config-options)

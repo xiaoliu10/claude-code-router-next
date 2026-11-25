@@ -8,6 +8,9 @@ if (pkg.version !== manifest.version) throw new Error('Plugin and package versio
 const modules = (await readdir(new URL('src/', root))).filter(file => file.endsWith('.mjs'));
 if (!modules.includes('transport.mjs')) throw new Error('Missing ACP transport source.');
 if (!modules.includes('card.mjs')) throw new Error('Missing management card source.');
+// The agent spawns this file by path at runtime, so it must ship in dist/src
+// next to agy-tool-bridge.mjs, which resolves it relative to itself.
+if (!modules.includes('agy-mcp-stdio-bridge.mjs')) throw new Error('Missing MCP stdio bridge source.');
 await rm(dist, { recursive: true, force: true });
 await mkdir(new URL('src/', dist), { recursive: true });
 for (const file of modules) {

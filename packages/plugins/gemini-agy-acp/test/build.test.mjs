@@ -8,7 +8,8 @@ test('build fails without destroying the previous dist when the card source is m
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = join(root, 'source');
   await mkdir(join(source, 'src'), { recursive: true });
-  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/transport.mjs', 'src/card.mjs', 'src/chat.mjs', 'src/plugin.mjs']) {
+  for (const file of ['package.json', 'plugin.json', 'scripts', 'src/transport.mjs', 'src/card.mjs', 'src/chat.mjs', 'src/plugin.mjs',
+    'src/agy-mcp-stdio-bridge.mjs']) {
     await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
   }
   execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: source });
@@ -282,7 +283,7 @@ test('built plugin.js activates in a standalone Node process under a temporary H
   await mkdir(join(source, 'src'));
   for (const file of ['package.json', 'plugin.json', 'scripts', 'src/account.mjs', 'src/chat.mjs', 'src/card.mjs', 'src/plugin.mjs',
     'src/settings.mjs', 'src/admin-routes.mjs', 'src/acp-errors.mjs', 'src/install.mjs',
-    'src/agy-tools.mjs', 'src/agy-tool-bridge.mjs']) {
+    'src/agy-tools.mjs', 'src/agy-tool-bridge.mjs', 'src/agy-tool-budget.mjs', 'src/agy-mcp-stdio-bridge.mjs']) {
     await cp(new URL(`../${file}`, import.meta.url), join(source, file), { recursive: true });
   }
   await writeFile(join(source, 'src', 'transport.mjs'), `
@@ -290,6 +291,7 @@ test('built plugin.js activates in a standalone Node process under a temporary H
       if (binary !== '/test/fixture') throw new Error('wrong binary');
       return { async run({onText}) { onText('fixture reply'); return {stopReason:'end_turn'}; } };
     }
+    export function proxyEnvOverlay() { return undefined; }
   `);
   const env = { HOME: root, USERPROFILE: root, CCR_CONFIG_DIR: configDir };
   execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: source, env });
@@ -299,6 +301,10 @@ test('built plugin.js activates in a standalone Node process under a temporary H
   assert.equal(manifest.name, 'gemini-agy-acp');
   assert.equal(manifest.coreApi, '1');
   assert.equal((await readFile(join(destination, 'card.js'), 'utf8')).includes('export default'), true);
+  // The spawned stdio forwarder must exist next to the bridge module in the
+  // installed layout: stdioDescriptor() resolves it relative to itself.
+  assert.ok((await readFile(join(destination, 'src', 'agy-mcp-stdio-bridge.mjs'), 'utf8')).includes('CCR_MCP_ENDPOINT'));
+  assert.ok((await readFile(join(destination, 'src', 'agy-tool-bridge.mjs'), 'utf8')).includes('stdioDescriptor'));
   await writeFile(join(configDir, 'gemini-agy-acp.json'), JSON.stringify({
     binary: '/test/fixture', enabled: true, authMethod: 'gemini-api-key',
   }));
