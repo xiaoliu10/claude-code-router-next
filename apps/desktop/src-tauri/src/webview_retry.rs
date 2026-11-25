@@ -58,9 +58,10 @@ pub(crate) fn retry_webview_creation<T>(what: &str, create: impl Fn() -> tauri::
     // Pre-flight on Windows: a missing WebView2 Runtime makes tauri-runtime-wry
     // show a modal MessageBox before returning an error. In a non-interactive
     // scheduled-task session nobody can dismiss it, which would stall the
-    // retry loop. Fail fast with the same clean exit instead.
+    // retry loop. Fail fast with the same clean exit instead. tauri re-exports
+    // wry's webview_version(); on Windows it is Err when the runtime is absent.
     #[cfg(windows)]
-    if tauri::webview::platform_webview_version().is_none() {
+    if tauri::webview_version().is_err() {
         eprintln!(
             "CCR Desktop cannot start: the WebView2 Runtime is not installed, so \
              the {what} cannot be created. Install the Evergreen WebView2 Runtime \
