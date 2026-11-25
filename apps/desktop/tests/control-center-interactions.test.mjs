@@ -265,20 +265,47 @@ test('interaction: usage auto-refreshes on an interval while open and stops on t
   const h = harness();
   h.win.__CCR_USAGE_REFRESH_MS__ = 10;
   await openUsage(h);
+  // Relative assertion: exactly one live usage timer, so a duplicated or
+  // leaked interval fails here instead of being hidden by an absolute count.
+  const live = () => h.intervals.length - h.cleared.length;
   assert.ok(h.intervals.some(([, ms]) => ms === 10), 'auto-refresh interval is registered');
+  assert.equal(live(), 1, 'exactly one live polling timer while the usage tab is open');
   const count = () => h.calls.filter(c => c.cmd === 'usage_snapshot').length;
   const first = count();
   await new Promise(resolve => setTimeout(resolve, 45));
   assert.ok(count() > first, 'snapshot reloads while the usage tab stays open');
   h.id('tab-quota').click(); await flush();
-  assert.ok(h.cleared.length >= 1, 'leaving the usage tab clears the timer');
+  assert.equal(live(), 0, 'leaving the usage tab clears the timer');
   const frozen = count();
   await new Promise(resolve => setTimeout(resolve, 45));
   assert.equal(count(), frozen, 'no usage polling after leaving the tab');
   h.id('tab-usage').click(); await flush();
-  assert.ok(h.intervals.length >= 2, 're-entering the usage tab resumes the interval');
+  // Re-entry reloads at once rather than waiting up to one interval.
+  assert.ok(count() > frozen, 're-entry reloads immediately before the next interval');
+  assert.equal(live(), 1, 're-entering the usage tab resumes exactly one interval');
+  const reentered = count();
   await new Promise(resolve => setTimeout(resolve, 45));
-  assert.ok(count() > frozen, 'polling resumes on re-entry');
+  assert.ok(count() > reentered, 'polling resumes on re-entry');
+  // Leave the tab so the short test interval cannot fire into later cases.
+  h.id('tab-quota').click(); await flush();
+  assert.equal(live(), 0, 'no timer left running at the end of the test');
+});
+
+test('interaction: auto-refresh rebuild preserves the records horizontal scroll position', async () => {
+  const h = harness();
+  h.win.__CCR_USAGE_REFRESH_MS__ = 10;
+  await openUsage(h);
+  const body = h.id('usage-body');
+  const scroller = () => body.querySelector('.records-scroll');
+  assert.ok(scroller(), 'the records horizontal scroller is rendered');
+  scroller().scrollLeft = 320;
+  // A refresh tick rebuilds the usage body and the records card; the user's
+  // horizontal position must survive the rebuild rather than snapping to 0.
+  const before = h.calls.filter(c => c.cmd === 'usage_snapshot').length;
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.ok(h.calls.filter(c => c.cmd === 'usage_snapshot').length > before, 'a refresh tick ran');
+  assert.equal(scroller().scrollLeft, 320, 'horizontal scroll position is preserved across the rebuild');
+  h.id('tab-quota').click(); await flush();
 });
 
 test('interaction: records pager walks pages, resets on period switch, shows page/total info', async () => {

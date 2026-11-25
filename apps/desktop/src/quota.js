@@ -2336,11 +2336,17 @@
     function renderRecords(rs) {
       // renderUsage rebuilds usage-body on every emit, so the records card is
       // re-appended after it; records-only updates sync the existing card.
+      // Either path can rebuild the horizontal scroller's content, which would
+      // snap scrollLeft back to 0 under the 30s auto-refresh. Preserve the
+      // user's horizontal position across the (re)build; the browser clamps it
+      // if the new content is narrower.
+      var preservedScroll = recordsRefs ? recordsRefs.scroll.scrollLeft : 0;
       if (!recordsRefs || !recordsRefs.root.parentNode) {
         recordsRefs = buildRecordsCard();
         els.usageBody.appendChild(recordsRefs.root);
       }
       syncRecordsCard(recordsRefs, rs);
+      if (preservedScroll > 0) recordsRefs.scroll.scrollLeft = preservedScroll;
     }
 
     // ---- clients tab ------------------------------------------------------
@@ -2521,7 +2527,6 @@
       if (mode === 'missing' || loadedTabs[name]) return;
       loadedTabs[name] = true;
       if (name === 'routing') routingCtrl.refresh();
-      if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); startUsageAutoRefresh(); }
       if (name === 'clients') clientsCtrl.refresh();
       if (name === 'projects') projectsCtrl.refresh();
     }
@@ -2529,10 +2534,15 @@
     function selectTab(name) {
       if (TAB_IDS.indexOf(name) === -1) return;
       activeTab = name;
-      // Polling lifecycle lives here (maybeLoadTab early-returns once a tab
-      // has loaded, so a re-entry must still resume the timer).
-      if (name === 'usage') startUsageAutoRefresh();
-      else stopUsageAutoRefresh();
+      // Polling lifecycle lives here, not in maybeLoadTab (which early-returns
+      // once a tab has loaded): re-entering the tab must both resume the
+      // timer and reload immediately, so the panel never shows stale data
+      // for up to one interval.
+      if (name === 'usage' && usageCtrl && recordsCtrl) {
+        usageCtrl.refresh();
+        recordsCtrl.refresh();
+        startUsageAutoRefresh();
+      } else stopUsageAutoRefresh();
       TAB_IDS.forEach(function (id) {
         var on = id === name;
         tabButtons[id].setAttribute('aria-selected', String(on));
