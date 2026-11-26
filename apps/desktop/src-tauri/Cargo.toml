@@ -25,6 +25,13 @@ semver = "1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread"] }
 
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+tempfile = "3"
+
 # Graceful SIGTERM delivery to the desktop-owned gateway child (unix only).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

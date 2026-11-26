@@ -99,7 +99,19 @@ cargo clippy --all-targets -- -D warnings
 cd ../.. && node apps/desktop/scripts/build-standalone.mjs
 ```
 
-macOS 输出：`apps/desktop/src-tauri/target/release/bundle/macos/CCR Desktop.app`。正式分发仍需独立签名/公证；无 auto-updater。Windows/Linux 未验证。
+macOS 输出：`apps/desktop/src-tauri/target/release/bundle/macos/CCR Desktop.app`。正式分发仍需独立签名/公证；无 auto-updater。
+
+**Windows（x64，实验支持）**：在 Windows 10 1809+ 主机上构建（staging 校验会执行 node.exe，不支持交叉构建）。
+
+```sh
+# 仓库根：先构建 shared/core
+pnpm build:shared && pnpm build:core
+cd apps/desktop
+node scripts/prepare-runtime.mjs --arch x64   # nodejs.org win-x64.zip + SHA256 校验 + tar.exe 解压
+node scripts/build-standalone-windows.mjs     # cargo tauri build --bundles nsis
+```
+
+前置：rustup stable-msvc、VS Build Tools 2022（C++ workload）、cargo-tauri；Windows zip 的 better-sqlite3 需要 win32-x64 对应 Node ABI 的 prebuilt（npmmirror 镜像可取）。runtime 通过 `tauri.windows.conf.json` 的 resources 映射随 NSIS 安装包分发，构建脚本在每次构建前清空旧暂存树，并以 `target/release/runtime` 暂存树的存在性为结构化校验（安装包体积只是弱信号，防止映射失效打出空壳）。产物：`apps/desktop/src-tauri/target/release/bundle/nsis/*.exe`。已知限制：未签名；runtime 解压依赖系统 tar.exe（1809+ 内置）；`better-sqlite3` ABI 必须与 Node 大版本匹配，staging 末尾的 require 往返是权威校验。
 
 ### 本次实际验证（2026-11-17）
 

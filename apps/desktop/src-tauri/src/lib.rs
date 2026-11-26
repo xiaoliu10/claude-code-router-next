@@ -1,4 +1,5 @@
 mod api;
+mod autostart;
 mod control;
 mod credentials;
 mod general;
@@ -26,6 +27,8 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     let app = builder
         .invoke_handler(tauri::generate_handler![
+            autostart::login_start_status,
+            autostart::login_start_set,
             popup::quota_snapshot,
             popup::quota_hide,
             popup::quota_open_ui,

@@ -46,6 +46,43 @@ const SERVICE_KEYS = ["mode", "running", "message"]
 const SERVICE_MODES = ["owned", "external", "stopped", "starting", "error"]
 const FIVE_IDS = CLIENT_IDS
 
+test('login startup reads the OS setting, confirms writes and recovers after failure', async () => {
+  const preview = Q.createPreviewInvoke()
+  const calls = []
+  let fail = ''
+  const invoke = async (command, args) => {
+    calls.push(command)
+    if (command === fail) throw Error('unavailable')
+    return preview(command, args)
+  }
+  const toggle = { disabled: true, addEventListener(event, handler) { assert.equal(event, 'change'); this.change = handler } }
+  const message = {}
+  const refresh = Q.bindAutostart(invoke, toggle, message)
+  await refresh()
+  assert.deepEqual(calls, ['login_start_status'])
+  assert.equal(toggle.checked, false)
+  toggle.checked = true
+  await toggle.change()
+  assert.equal(toggle.checked, true)
+  assert.equal(message.textContent, '')
+  fail = 'login_start_set'
+  toggle.checked = false
+  await toggle.change()
+  assert.equal(toggle.checked, true)
+  assert.match(message.textContent, /未能更改/)
+  fail = 'login_start_status'
+  await refresh()
+  assert.equal(toggle.disabled, true)
+  assert.equal(toggle.indeterminate, true)
+  fail = ''
+  await refresh()
+  assert.equal(toggle.disabled, false)
+  toggle.checked = false
+  await toggle.change()
+  assert.equal(toggle.checked, false)
+  assert.equal(toggle.indeterminate, false)
+})
+
 async function previewCall(invoke, cmd, args) {
   const r = invoke(cmd, args)
   assert.ok(r && typeof r.then === "function", `${cmd} must return a promise`)

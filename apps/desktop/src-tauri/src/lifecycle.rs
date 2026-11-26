@@ -107,8 +107,15 @@ pub fn endpoint(base: &str) -> Result<SocketAddr, String> {
     ))
 }
 
+// On Windows, a refused loopback connection can take about two seconds to
+// report WSAECONNREFUSED. Keep the two startup probes below the shutdown wait.
+#[cfg(windows)]
+const PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(windows))]
+const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 pub fn probe_port(addr: SocketAddr) -> PortState {
-    match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+    match TcpStream::connect_timeout(&addr, PORT_PROBE_TIMEOUT) {
         Ok(_) => PortState::Occupied,
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => PortState::Refused,
         Err(_) => PortState::Unknown,
@@ -161,9 +168,10 @@ impl RuntimeBundle {
             None
         }
     }
-    /// Fixed resource launch path: `<resources>/runtime/node` (portable node).
+    /// Fixed resource launch path: `<resources>/runtime/node` (portable node;
+    /// `node.exe` on Windows, where an extension is required to execute).
     pub fn node(&self) -> PathBuf {
-        self.root.join("node")
+        self.root.join(if cfg!(windows) { "node.exe" } else { "node" })
     }
     /// Fixed resource entry: `<resources>/runtime/service/entry.cjs` (the
     /// bundled desktop service entry reusing the core runtime directly).

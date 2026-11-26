@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "resources": {
+      "../runtime/node.exe": "runtime/node.exe",
+      "../runtime/MANIFEST.json": "runtime/MANIFEST.json",
+      "../runtime/LICENSE-node": "runtime/LICENSE-node",
+      "../runtime/bin": "runtime/bin",
+      "../runtime/lib": "runtime/lib",
+      "../runtime/service": "runtime/service"
+    }
+  }
+}

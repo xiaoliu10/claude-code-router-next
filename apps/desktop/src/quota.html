@@ -146,6 +146,10 @@
         <span class="spacer"></span>
         <button id="clients-refresh" class="btn" type="button" title="重新读取客户端接入状态">刷新</button>
       </div>
+      <div class="flags" role="group" aria-label="桌面客户端配置">
+        <label class="flag"><input id="desktop-autostart" class="switch" type="checkbox" role="switch" disabled><span>开机启动（登录后）</span></label>
+        <span id="desktop-autostart-msg" class="inline-msg" role="status"></span>
+      </div>
       <p class="hint">将 Claude Code、Codex、Pi 等接入 CCR。各客户端单独操作，恢复前会先确认。</p>
       <div id="clients-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <ul id="clients-list" class="list" aria-label="客户端列表" aria-busy="false"></ul>
