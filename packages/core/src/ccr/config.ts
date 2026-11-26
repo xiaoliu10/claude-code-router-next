@@ -112,6 +112,20 @@ export const readConfigFile = async () => {
   }
 };
 
+// Non-exiting, non-writing, non-logging reader for the hot-reload route.
+// The bootstrap reader (readConfigFile) exits the process on parse/read
+// failure and auto-creates a default file on ENOENT — right for CLI startup,
+// fatal for a live gateway. This variant throws on any failure so the caller
+// can answer a fixed 500 with the runtime and the file untouched.
+export const readConfigFileSafe = async (jsonPath: string = CONFIG_FILE) => {
+  const raw = await fs.readFile(jsonPath, "utf-8");
+  const parsed = JSON5.parse(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("config root is not an object");
+  }
+  return interpolateEnvVars(parsed);
+};
+
 function assertNotTestEnv() {
   if (process.env.VITEST || process.env.CI) {
     throw new Error(

@@ -62,6 +62,7 @@ const ERR_CLIENTS_LIST: &str = "Client statuses are unavailable";
 const ERR_CLIENT_FAILED: &str = "Client update failed";
 const ERR_CLIENT_SYNC: &str = "Client updated, but project takeover sync failed";
 const ERR_CLIENT_REFRESH: &str = "Client updated, but live statuses could not be refreshed";
+const ERR_CONFIG_RELOAD: &str = "Config reload failed";
 
 // ============================== IPC projections ==============================
 
@@ -413,6 +414,34 @@ impl ControlService {
             message,
         })
     }
+
+    /// Hot-reload config.json in the running gateway. The response is the
+    /// fixed {success, restartRequired} contract; transport and non-200
+    /// failures collapse to one safe message, never an upstream body.
+    pub(crate) async fn config_reload(&self) -> Result<Value, String> {
+        let body = self
+            .client()?
+            .post_json_and_parse("/api/config/reload")
+            .await
+            .map_err(|_| ERR_CONFIG_RELOAD.to_string())?;
+        // Project the declared contract only: in external mode the gateway can
+        // be any local process, so extra 200-body fields must never cross IPC.
+        if body.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(ERR_CONFIG_RELOAD.to_string());
+        }
+        let restart_required: Vec<String> = body
+            .get("restartRequired")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(json!({ "success": true, "restartRequired": restart_required }))
+    }
 }
 
 // ============================== Tauri commands ==============================
@@ -444,6 +473,15 @@ pub async fn routing_save_groups(
 ) -> Result<RoutingSnapshot, String> {
     crate::popup::guard(&window)?;
     service.routing_save_groups(changes).await
+}
+
+#[tauri::command]
+pub async fn config_reload(
+    window: WebviewWindow,
+    service: tauri::State<'_, ControlService>,
+) -> Result<Value, String> {
+    crate::popup::guard(&window)?;
+    service.config_reload().await
 }
 
 #[tauri::command]
@@ -2090,9 +2128,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_reload_returns_the_gateway_contract_json() {
+        let payload = json!({"success": true, "restartRequired": ["PORT"], "extra": "LEAK_SECRET"});
+        let mock = Mock::new(vec![response(payload)]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service.config_reload().await.unwrap(),
+            json!({"success": true, "restartRequired": ["PORT"]})
+        );
+        let requests = mock.finish().await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/config/reload "));
+    }
+
+    #[tokio::test]
+    async fn config_reload_rejects_non_contract_bodies() {
+        for body in [
+            json!(["array"]),
+            json!({"success": false}),
+            json!({"success": "yes"}),
+        ] {
+            let mock = Mock::new(vec![response(body)]);
+            let service = ControlService::new(Some(mock.client()));
+            assert_eq!(
+                service.config_reload().await.unwrap_err(),
+                ERR_CONFIG_RELOAD
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_reload_failures_use_fixed_safe_messages() {
+        // Non-200: the upstream error body must never surface.
+        let mock = Mock::new(vec![(500, "LEAK_SECRET".into())]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service.config_reload().await.unwrap_err(),
+            ERR_CONFIG_RELOAD
+        );
+        assert_eq!(mock.finish().await.len(), 1);
+
+        // Connection refused: release a bound loopback port before calling.
+        let address = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let client = AdminClient::new(crate::settings::ConnectionSettings {
+            base_url: format!("http://{address}"),
+            api_key: Some("test-key".into()),
+        })
+        .unwrap();
+        let service = ControlService::new(Some(client));
+        assert_eq!(
+            service.config_reload().await.unwrap_err(),
+            ERR_CONFIG_RELOAD
+        );
+    }
+
+    #[tokio::test]
     async fn offline_service_reports_fixed_safe_errors() {
         let service = ControlService::new(None);
         assert_eq!(service.routing_snapshot().await.unwrap_err(), ERR_OFFLINE);
+        assert_eq!(service.config_reload().await.unwrap_err(), ERR_OFFLINE);
         assert_eq!(
             service.usage_snapshot("today").await.unwrap_err(),
             ERR_OFFLINE

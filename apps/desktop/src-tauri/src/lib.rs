@@ -38,6 +38,7 @@ pub fn run() {
             control::routing_snapshot,
             control::routing_save,
             control::routing_save_groups,
+            control::config_reload,
             control::routing_flags,
             control::usage_snapshot,
             control::usage_records,

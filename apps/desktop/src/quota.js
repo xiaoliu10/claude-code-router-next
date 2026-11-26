@@ -1640,6 +1640,7 @@
         }
         return Promise.reject(new Error('服务操作无效'));
       }
+      if (cmd === 'config_reload') return delay({ success: true, restartRequired: [] });
       return Promise.resolve(null);
     };
   }
@@ -2168,6 +2169,8 @@
       serviceText: document.getElementById('service-text'),
       serviceStart: document.getElementById('service-start'),
       serviceStop: document.getElementById('service-stop'),
+      serviceReload: document.getElementById('service-reload'),
+      serviceReloadMsg: document.getElementById('service-reload-msg'),
       serviceRefresh: document.getElementById('service-refresh'),
       routingRevision: document.getElementById('routing-revision'),
       routingRefresh: document.getElementById('routing-refresh'),
@@ -2333,6 +2336,24 @@
 
     // ---- service bar ------------------------------------------------------
 
+    // Reload-config feedback lives in its own toast node; renderService keeps
+    // exclusive ownership of the chip. An epoch guard retires stale auto-hide
+    // timers so a newer message is never hidden by an older timer.
+    var reloadPending = false;
+    var reloadMsgEpoch = 0;
+    var RELOAD_MSG_TIMEOUT_MS = 5000;
+    function showReloadMsg(text, tone) {
+      var my = ++reloadMsgEpoch;
+      setBanner(els.serviceReloadMsg, text, tone);
+      if (text) setTimeout(function () {
+        if (my === reloadMsgEpoch) setBanner(els.serviceReloadMsg, null, null);
+      }, RELOAD_MSG_TIMEOUT_MS);
+    }
+
+    function reloadableService(service) {
+      return !!service && service.running === true && (service.mode === 'owned' || service.mode === 'external');
+    }
+
     function renderService(sState) {
       pluginsPanel.serviceChanged(sState);
       var view = serviceView(sState.service);
@@ -2351,6 +2372,7 @@
       els.serviceStart.title = view.startTitle;
       els.serviceStop.disabled = mode === 'missing' || !view.canStop || busy;
       els.serviceStop.title = view.stopTitle;
+      els.serviceReload.disabled = mode === 'missing' || !reloadableService(sState.service) || busy || reloadPending;
       els.serviceRefresh.disabled = mode === 'missing' || sState.loading || !!sState.pending;
       els.quit.title = quitTitleFor(sState.service);
       els.quit.querySelector('span').textContent = sState.service && sState.service.mode === 'owned'
@@ -3255,6 +3277,28 @@
     els.serviceStart.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('start'); });
     els.serviceStop.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('stop'); });
     els.serviceRefresh.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.refresh(); });
+    els.serviceReload.addEventListener('click', function () {
+      if (!invoke || reloadPending || !serviceCtrl) return;
+      var s = serviceCtrl.state();
+      if (!reloadableService(s.service) || s.loading || s.pending) return;
+      reloadPending = true;
+      showReloadMsg(null, null);
+      renderService(s);
+      invoke('config_reload').then(function (r) {
+        var keys = r && Array.isArray(r.restartRequired)
+          ? r.restartRequired.filter(function (k) { return typeof k === 'string' && k; })
+          : [];
+        reloadPending = false;
+        showReloadMsg(keys.length
+          ? '配置已重载；' + keys.join('/') + ' 变更需停止后重新启动服务才能生效'
+          : '配置已重载', keys.length ? 'warn' : null);
+        renderService(serviceCtrl.state());
+      }, function (err) {
+        reloadPending = false;
+        showReloadMsg('重载配置失败：' + errorMessage(err), 'error');
+        renderService(serviceCtrl.state());
+      });
+    });
 
     if (controller) {
       controller.subscribe(render);

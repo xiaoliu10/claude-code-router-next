@@ -34,10 +34,13 @@
       <span class="spacer"></span>
       <button id="service-start" class="btn" type="button" title="启动桌面托管的网关服务">启动</button>
       <button id="service-stop" class="btn" type="button" title="停止由桌面启动的网关服务">停止</button>
+      <button id="service-reload" class="btn" type="button" title="重新读取 config.json 并热应用，不重启服务">重载配置</button>
       <button id="service-refresh" class="btn btn-icon" type="button" aria-label="刷新服务状态" title="刷新服务状态">
         <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/><path d="M13.4 1.6v3h-3"/></svg>
       </button>
     </div>
+
+    <div id="service-reload-msg" class="banner" role="status" aria-live="polite" hidden></div>
 
     <nav id="tabs" class="tabs" role="tablist" aria-label="控制中心页签">
       <button id="tab-quota" class="tab" type="button" role="tab" aria-selected="true" aria-controls="panel-quota">额度</button>
