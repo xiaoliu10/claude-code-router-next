@@ -422,7 +422,15 @@ export function parseAliyunTokenPlanUsage(payload: any): ProviderQuotaResult | n
 
   // Reject gateway-level errors early (e.g. BailianGateway.Login.NotLogined).
   const gatewayError = readGatewayError(payload);
-  if (gatewayError) return null;
+  if (gatewayError) {
+    // Fixed, credential-free hint: a NotLogined answer means the saved console
+    // cookie no longer authenticates (stale capture or console session
+    // rotation) and must be re-copied from a live bailian-cs request.
+    if (gatewayError.includes("NotLogined")) {
+      console.debug("aliyun-token-plan: gateway rejected the saved cookie as not-logined; re-copy a fresh Cookie and sec_token from a live bailian-cs.console.aliyun.com usage request");
+    }
+    return null;
+  }
 
   // The usage object lives at payload.data.DataV2.data.data. Walk every nested
   // object candidate so shallower wraps are still tolerated.
