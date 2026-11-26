@@ -1,3 +1,9 @@
+// The Windows lib-test executable needs the same Common Controls v6 manifest as
+// the app for muda's TaskDialogIndirect import to resolve before tests start.
+#[cfg(all(test, windows, target_env = "msvc"))]
+#[link(name = "resource", kind = "static", modifiers = "-bundle")]
+extern "C" {}
+
 mod api;
 mod autostart;
 mod control;

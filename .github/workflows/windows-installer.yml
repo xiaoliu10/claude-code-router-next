@@ -56,12 +56,32 @@ jobs:
         run: node scripts/prepare-runtime.mjs --arch x64
 
       - name: Verify per-user login registration in a temporary registry key
+        id: registry_test
         working-directory: apps/desktop/src-tauri
         run: cargo test --locked --lib autostart::platform::isolated_registry_round_trip -- --exact --test-threads=1
 
       - name: Test updater with loopback manifests and a signed test payload
+        id: updater_tests
         working-directory: apps/desktop/src-tauri
         run: cargo test --locked --lib update::tests
+
+      - name: Inspect failed Windows test executable
+        if: failure() && (steps.registry_test.outcome == 'failure' || steps.updater_tests.outcome == 'failure')
+        working-directory: apps/desktop/src-tauri
+        shell: pwsh
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Application Popup'; StartTime=(Get-Date).AddMinutes(-15) } -ErrorAction SilentlyContinue |
+            Select-Object TimeCreated, Message | Format-List
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          Get-ChildItem target/debug -Recurse -Filter 'ccr_desktop_lib-*.exe' | ForEach-Object {
+            Write-Host "Inspecting $($_.FullName) on $env:ImageOS $env:ImageVersion"
+            llvm-readobj --coff-imports $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to read PE imports' }
+            $manifest = Join-Path $env:RUNNER_TEMP 'ccr-test.manifest'
+            & $mt.FullName "-inputresource:$($_.FullName);#1" "-out:$manifest" -nologo
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to read embedded application manifest' }
+            Get-Content $manifest
+          }
 
       - name: Test release manifest staging
         run: node --test apps/desktop/tests/desktop-update-release.test.mjs
