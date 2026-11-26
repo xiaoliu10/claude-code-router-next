@@ -86,6 +86,7 @@
       }) : [],
     };
   }
+  var CODEX_PROVIDER_NAME = 'codex-subscription';
   function normalizeProvider(p) {
     var s = p && typeof p === 'object' ? p : {};
     return {
@@ -94,6 +95,7 @@
       plan: toStr(s.plan),
       status: typeof s.status === 'string' ? s.status : null,
       message: toStr(s.message),
+      ...(s.codexResetEligible === true && s.enabled === true && s.name === CODEX_PROVIDER_NAME ? { codexResetEligible: true } : {}),
       ...(s.stepPlan ? { stepPlan: normalizeStepPlan(s.stepPlan) } : {}),
       windows: Array.isArray(s.windows) ? s.windows.map(normalizeWindow) : [],
       updatedAt: toNum(s.updatedAt),
@@ -219,14 +221,14 @@
       var prev = snapshot;
       // Rust serializes refreshes, but IPC responses can land in a different order.
       if (prev && next.updatedAt !== null && prev.updatedAt !== null && next.updatedAt < prev.updatedAt &&
-          next.providers.some(function (p) { return p.stepPlan; })) return;
+          next.providers.some(function (p) { return p.stepPlan || p.codexResetEligible; })) return;
       if (prev) {
         next.providers = next.providers.map(function (p) {
           var f = flags.get(p.name);
 
           if (!f || !f.loading) return p;
           var old = findProvider(prev.providers, p.name);
-          return old && !old.stepPlan && !p.stepPlan ? old : p;
+          return old && !old.stepPlan && !p.stepPlan && old.codexResetEligible === p.codexResetEligible ? old : p;
         });
       }
       snapshot = next;
@@ -1492,9 +1494,14 @@
       ];
     }
     var quotaProviders = previewQuotaProviders(Date.now());
+    var codexQuota = { name: CODEX_PROVIDER_NAME, enabled: true, codexResetEligible: true, plan: 'Plus', status: 'ready',
+      windows: [{ label: '5 小时', used: 80, limit: 100, remaining: 20, unit: '%' }], updatedAt: Date.now() };
+    quotaProviders.push(codexQuota);
+    var resetCredit = { id: 'preview-credit', status: 'available', expiresAt: Date.now() + 7 * 86400e3 };
+
     var providerDetails = new Map(quotaProviders.map(function (row) {
       var route = routing.providers.find(function (p) { return p.name === row.name; });
-      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false, transformer: null, transformerProtected: false }];
+      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: row === codexQuota, transformer: null, transformerProtected: false }];
     }));
 
     var previewCatalog = { names: ['OpenAI', 'customparams'], parameterizedNames: ['customparams'] };
@@ -1527,6 +1534,15 @@
       }
       if (cmd === 'quota_snapshot') {
         return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
+      }
+      if (cmd === 'codex_reset_credits') return delay({ availableCount: resetCredit.status === 'available' ? 1 : 0, credits: [copy(resetCredit)] });
+      if (cmd === 'codex_reset_consume') {
+        if (a.creditId !== resetCredit.id || resetCredit.status !== 'available') return delay({ outcome: 'no_credit', windowsReset: 0 });
+        resetCredit.status = 'redeemed';
+        codexQuota.windows[0].used = 0;
+        codexQuota.windows[0].remaining = 100;
+        codexQuota.updatedAt = Date.now();
+        return delay({ outcome: 'reset', windowsReset: 1, availableCount: 0 });
       }
       if (cmd === 'provider_transformers') return delay(copy(previewCatalog));
       if (cmd === 'provider_get') {
@@ -1816,6 +1832,131 @@
     actions.appendChild(saveBtn); actions.appendChild(clearBtn); actions.appendChild(cancelBtn);
     root.appendChild(actions);
     return { root: root, ak: ak, sk: sk, msg: msg, saveBtn: saveBtn, clearBtn: clearBtn, cancelBtn: cancelBtn };
+  }
+
+  function createCodexResetPanel(invoke, refreshQuota) {
+    var root = el('div', 'codex-reset');
+    var summary = el('p', 'card-message');
+    summary.setAttribute('role', 'status');
+    var actions = el('div', 'codex-reset-actions');
+    var recheck = mkBtn('重查张数', null, function () { readCredits(); });
+    var open = mkBtn('重置用量', null, function () {
+      if (!card || !target || reading || consuming || confirming) return;
+      confirming = true;
+      feedback.textContent = '';
+      render();
+      cancel.focus();
+    });
+    var prompt = el('div', 'client-confirm');
+    prompt.setAttribute('role', 'group');
+    prompt.setAttribute('aria-label', '确认使用重置卡');
+    prompt.appendChild(el('span', null, '使用 1 张重置卡恢复 Codex 订阅额度？'));
+    var promptActions = el('div', 'client-confirm-actions');
+    var cancel = mkBtn('取消', null, function () { cancelConfirm(true); });
+    var confirm = mkBtn('确认使用 1 张', null, consume);
+    confirm.className = 'btn btn-primary';
+    var feedback = el('p', 'card-message');
+    feedback.setAttribute('role', 'status');
+    actions.appendChild(recheck);
+    actions.appendChild(open);
+    promptActions.appendChild(cancel);
+    promptActions.appendChild(confirm);
+    prompt.appendChild(promptActions);
+    root.appendChild(summary);
+    root.appendChild(actions);
+    root.appendChild(prompt);
+    root.appendChild(feedback);
+
+    var card = null, generation = 0, count = null, target = null;
+    var reading = false, consuming = false, confirming = false;
+    function render() {
+      var text = '无法读取重置卡张数。';
+      if (reading) text = '正在查询重置卡…';
+      else if (consuming) text = '正在提交重置请求…';
+      else if (count !== null) {
+        text = '可用重置卡：' + count + ' 张';
+        if (target && target.expiresAt) text += ' · 优先使用的卡将于 ' + formatTimestamp(target.expiresAt) + ' 到期';
+        if (count > 0 && !target) text += ' · 暂无可选择的卡，请重查';
+      }
+      summary.textContent = text;
+      recheck.disabled = reading || consuming || confirming;
+      open.disabled = !target || reading || consuming || confirming;
+      prompt.hidden = !confirming;
+      confirm.disabled = !confirming;
+      feedback.hidden = !feedback.textContent;
+    }
+    function cancelConfirm(restoreFocus) {
+      if (!confirming) return false;
+      confirming = false;
+      render();
+      if (restoreFocus) open.focus();
+      return true;
+    }
+    async function readCredits() {
+      if (!card || reading || consuming || confirming) return;
+      var current = generation;
+      reading = true;
+      target = null;
+      count = null;
+      render();
+      try {
+        var list = await invoke('codex_reset_credits');
+        if (current !== generation) return;
+        if (!list || !Number.isSafeInteger(list.availableCount) || list.availableCount < 0 || !Array.isArray(list.credits)) return;
+        count = list.availableCount;
+        // Same ordering as the Web card: first expiring available credit, undated last.
+        if (count > 0) list.credits.forEach(function (credit) {
+          if (!credit || credit.status !== 'available' || !toStr(credit.id) || !credit.id.trim()) return;
+          var expiry = toNum(credit.expiresAt);
+          if (!(expiry > 0 && Number.isFinite(new Date(expiry).getTime()))) expiry = null;
+          if (!target || (expiry !== null && (target.expiresAt === null || expiry < target.expiresAt))) {
+            target = { id: credit.id, expiresAt: expiry };
+          }
+        });
+      } catch { /* Keep the count unknown until an explicit recheck succeeds. */ }
+      finally {
+        if (current === generation) { reading = false; render(); }
+      }
+    }
+    async function consume() {
+      if (!card || !confirming || !target || consuming) return;
+      var current = generation, creditId = target.id;
+      consuming = true;
+      confirming = false;
+      target = null;
+      count = null;
+      render();
+      var relist = false;
+      try {
+        var result = await invoke('codex_reset_consume', { creditId: creditId });
+        if (result?.outcome === 'reset' || result?.outcome === 'already_redeemed') refreshQuota();
+        if (generation !== current) return;
+        switch (result?.outcome) {
+          case 'reset': feedback.textContent = 'Codex 订阅额度已重置。'; relist = true; break;
+          case 'already_redeemed': feedback.textContent = '这张重置卡此前已使用。'; relist = true; break;
+          case 'nothing_to_reset': feedback.textContent = '当前订阅额度无需重置。'; relist = true; break;
+          case 'no_credit': feedback.textContent = '没有可用的重置卡。'; count = 0; break;
+          default: throw new Error();
+        }
+      } catch {
+        if (generation === current) feedback.textContent = '无法确认是否已使用重置卡。请先重查张数并核对额度。';
+      } finally {
+        consuming = false;
+        render();
+        if (relist || generation !== current) readCredits();
+      }
+    }
+    function attach(next) {
+      if (card === next) return;
+      generation++;
+      card = next;
+      root.remove();
+      confirming = reading = false;
+      count = target = null;
+      feedback.textContent = '';
+      if (card) { card.appendChild(root); render(); readCredits(); }
+    }
+    return { attach: attach, cancel: cancelConfirm };
   }
 
   function buildWindow(win) {
@@ -2248,6 +2389,22 @@
     var pluginsPanel = PluginsUI.mount(document, invoke);
     var settings = GeneralSettingsUI.mount(document, invoke);
     var cards = new Map();
+    var mainWindow = mode === 'preview';
+    if (tauri) {
+      try { mainWindow = tauri.window?.getCurrentWindow?.()?.label === 'main'; }
+      catch { mainWindow = false; }
+    }
+    var codexReset = mainWindow ? createCodexResetPanel(invoke, function refreshCodexQuota() {
+      // An in-flight snapshot may predate the redemption. Queue a targeted read behind it.
+      function busy(state) { return state.loadingAll || state.rows.some(function (r) { return r.provider.name === CODEX_PROVIDER_NAME && r.loading; }); }
+      if (!busy(controller.state())) return controller.refreshProvider(CODEX_PROVIDER_NAME);
+      var unsubscribe = controller.subscribe(function (state) {
+        if (!busy(state)) {
+          unsubscribe();
+          controller.refreshProvider(CODEX_PROVIDER_NAME);
+        }
+      });
+    }) : null;
 
     function safeCommand(cmd) {
       if (!invoke) return;
@@ -2386,6 +2543,10 @@
       cards.forEach(function (refs, name) {
         if (!seen.has(name)) { refs.li.remove(); cards.delete(name); }
       });
+      if (codexReset) {
+        var eligible = state.rows.find(function (row) { return row.provider.codexResetEligible === true && !row.stale; });
+        codexReset.attach(eligible ? cards.get(eligible.provider.name).li : null);
+      }
       state.rows.forEach(function (row) { els.list.insertBefore(cards.get(row.provider.name).li, els.empty); });
       // A missing snapshot or an offline gateway is NOT an empty state; keep
       // the loading/offline banner instead of claiming no providers exist.
@@ -3302,7 +3463,7 @@
 
     function selectTab(name) {
       if (TAB_IDS.indexOf(name) === -1) return;
-      if (name !== 'quota') providerForm.close(false);
+      if (name !== 'quota') { providerForm.close(false); if (codexReset) codexReset.cancel(false); }
       if (name !== 'plugins') pluginsPanel.cancel(false);
       // Before hiding the current panel, capture the usage scroller while it
       // is still visible: once display:none applies, the browser reports
@@ -3493,7 +3654,7 @@
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
       if (event.key === 'Escape' && !event.isComposing && !event.defaultPrevented) {
-        if (providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
+        if ((codexReset && codexReset.cancel(true)) || providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
         else safeCommand('quota_hide');
       }
     });
