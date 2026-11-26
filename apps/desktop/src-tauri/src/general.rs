@@ -499,7 +499,7 @@ mod tests {
             assert_eq!(snapshot_from(&original).host_is_empty, host.is_empty());
             let cleared = json!({"APIKEY":"prefix-${UNCHANGED}"});
             for readback in [cleared.clone(), json!({"HOST":""}), json!({"HOST":null})] {
-                let mock = Mock::new(vec![
+                let mock = conditional_mock(vec![
                     response(original.clone()),
                     response(json!({"success":true})),
                     response(readback.clone()),
@@ -517,7 +517,11 @@ mod tests {
                 let requests = mock.finish().await;
                 assert_eq!(requests.len(), 3);
                 let body = requests[1].split_once("\r\n\r\n").unwrap().1;
-                assert_eq!(serde_json::from_str::<Value>(body).unwrap(), cleared);
+                assert!(requests[1].starts_with("PUT /api/config "));
+                assert_eq!(
+                    serde_json::from_str::<Value>(body).unwrap(),
+                    json!({"config":cleared, "revision":GATEWAY_REVISION})
+                );
             }
         }
         assert!(confirmed(&json!({}), "HOST", &json!("")));
