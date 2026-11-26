@@ -83,6 +83,14 @@ jobs:
             Get-Content $manifest
           }
 
+      - name: Verify installer failure recovery for live and exited gateways
+        working-directory: apps/desktop/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib tray::tests::failed_install_ -- --test-threads=1
+          cargo test --locked --lib lifecycle::force_stop_after_grace_period_preserves_independent_exit -- --exact
+
       - name: Test release manifest staging
         run: node --test apps/desktop/tests/desktop-update-release.test.mjs
 

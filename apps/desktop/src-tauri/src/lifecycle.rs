@@ -382,12 +382,50 @@ pub fn stop_owned_gateway(child: &mut Child) -> GatewayStop {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    let killed = child.kill().is_ok();
+    #[cfg(windows)]
+    {
+        force_stop_windows(child)
+    }
+    #[cfg(not(windows))]
+    {
+        let killed = child.kill().is_ok();
+        match child.wait() {
+            Ok(_) if killed || termination_requested => GatewayStop::Stopped,
+            Ok(_) => GatewayStop::AlreadyExited,
+            Err(_) => GatewayStop::Failed,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn force_stop_windows(child: &mut Child) -> GatewayStop {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    const UPDATE_STOP_CODE: u32 = 0x434352;
+    // SAFETY: Child owns this process handle for the duration of the call.
+    let requested = unsafe { TerminateProcess(child.as_raw_handle(), UPDATE_STOP_CODE) } != 0;
+    if !requested {
+        return match child.try_wait() {
+            Ok(Some(_)) => GatewayStop::AlreadyExited,
+            _ => GatewayStop::Failed,
+        };
+    }
     match child.wait() {
-        Ok(_) if killed || termination_requested => GatewayStop::Stopped,
+        Ok(status) if status.code() == Some(UPDATE_STOP_CODE as i32) => GatewayStop::Stopped,
         Ok(_) => GatewayStop::AlreadyExited,
         Err(_) => GatewayStop::Failed,
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn force_stop_after_grace_period_preserves_independent_exit() {
+    let mut child = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "exit 7"])
+        .spawn()
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+    assert_eq!(force_stop_windows(&mut child), GatewayStop::AlreadyExited);
 }
 
 pub struct Startup {
