@@ -8,6 +8,7 @@ import { Switch } from "@/components/ui/switch";
 import { Combobox } from "@/components/ui/combobox";
 import { MultiCombobox } from "@/components/ui/multi-combobox";
 import { useConfig } from "./ConfigProvider";
+import { mergeClientConfig } from "@/utils/config-draft";
 import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
 import { PluginCardArea } from "./PluginCardArea";
@@ -51,7 +52,7 @@ export function SettingsPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
-  const { config, saveDraft, setConfig, error } = useConfig();
+  const { config, saveDraft, setConfig, refreshConfig, error } = useConfig();
   const [isStatusLineConfigOpen, setIsStatusLineConfigOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -127,26 +128,11 @@ export function SettingsPage() {
     [providers]
   );
 
-  const syncClientResponse = useCallback((response: ClientApplyResponse) => {
+  const syncClientResponse = useCallback(async (response: ClientApplyResponse) => {
     setClients(response.clients || []);
     setSelectedClientIds((response.clients || []).filter((client) => client.enabled || client.managed).map((client) => client.id));
-    if (response.config) {
-      setConfig((current) => {
-        if (!current) return response.config;
-        return {
-          ...current,
-          Clients: response.config.Clients,
-          Router: {
-            ...(current.Router || {}),
-            models: {
-              ...(current.Router?.models || {}),
-              ...(response.config.Router?.models || {}),
-            },
-          },
-        };
-      });
-    }
-  }, [setConfig]);
+    await refreshConfig(mergeClientConfig);
+  }, [refreshConfig]);
 
   // Keep a ref to the latest translator so loadClients itself can have a
   // stable identity. Depending on `t` directly would recreate the callback on
@@ -302,7 +288,7 @@ export function SettingsPage() {
     setIsApplyingClients(true);
     try {
       const response = await api.applyClients(selectedClientIds);
-      syncClientResponse(response);
+      await syncClientResponse(response);
       if (response.success) {
         setToast({ message: t("clients.apply_success"), type: 'success' });
       } else {
@@ -323,7 +309,7 @@ export function SettingsPage() {
     setRestoringClientId(id);
     try {
       const response = await api.restoreClient(id);
-      syncClientResponse(response);
+      await syncClientResponse(response);
       if (response.success) {
         setToast({ message: t("clients.restore_success"), type: 'success' });
       } else {

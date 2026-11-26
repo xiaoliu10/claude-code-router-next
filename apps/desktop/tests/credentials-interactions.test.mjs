@@ -256,6 +256,21 @@ test('credentials interaction: failed save keeps the panel open with typed value
   assert.equal(card.querySelector('.card-creds-note').hidden, false, 'still unconfigured after the failure');
 });
 
+test('credentials interaction: an older gateway shows the upgrade hint and preserves the draft', async () => {
+  const { h, card } = await start(false, VOLC, {
+    quota_credentials_save: () => Promise.reject('网关未提供有效的配置修订号。请升级网关并刷新额度面板后再保存凭证。'),
+  });
+  buttonOf(card, 'data-creds-open').click(); await flush();
+  const [, sk] = inputsOf(card);
+  sk.value = 'FIXTURE_SK';
+  buttonOf(card, 'data-creds-save').click(); await flush();
+  assert.equal(saveCalls(h).length, 1);
+  assert.equal(panelOf(card).hidden, false);
+  assert.equal(sk.value, 'FIXTURE_SK');
+  assert.match(panelOf(card).querySelector('.creds-msg').textContent, /升级网关并刷新/);
+  assert.equal(panelOf(card).textContent.includes('FIXTURE_SK'), false);
+});
+
 test('credentials interaction: XSS provider names stay text and round-trip through save args', async () => {
   const name = '<img src=x onerror=alert(1)>';
   const { h, card } = await start(false, name);

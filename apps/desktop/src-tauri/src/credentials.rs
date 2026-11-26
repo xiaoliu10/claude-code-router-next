@@ -11,7 +11,7 @@
 //! the post-save readback. Omitted input keeps the saved field; an empty
 //! string clears it.
 
-use crate::api::AdminClient;
+use crate::api::{AdminClient, ConditionalSaveError};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -30,6 +30,9 @@ const MAX_VALUE_LENGTH: usize = 256;
 const ERR_OFFLINE: &str = "Gateway connection is unavailable";
 const ERR_NOT_FOUND: &str = "Coding Plan provider is no longer configured; refresh the panel";
 const ERR_INPUT: &str = "Invalid credentials input";
+const ERR_STALE: &str = "配置已更改，凭证未保存。请刷新额度面板后重试。";
+const ERR_REVISION_MISSING: &str =
+    "网关未提供有效的配置修订号。请升级网关并刷新额度面板后再保存凭证。";
 const ERR_SAVE_NOT_CONFIRMED: &str = "Credentials update was not confirmed by the gateway";
 
 // ============================== IPC projection ==============================
@@ -198,8 +201,7 @@ impl CredentialsService {
         let secret = field_change(secret_key)?;
         let client = self.client()?;
         let _write = client.write_guard().await;
-        // Always mutate the freshest config; never a cached snapshot.
-        let mut config = client.config().await?;
+        let (mut config, revision) = client.config_with_revision().await?;
         let key = crate::api::provider_list_key(&config);
         let index = config[key]
             .as_array()
@@ -215,11 +217,18 @@ impl CredentialsService {
         secret.apply(&mut updated, SECRET_KEY_FIELD);
         if updated == *entry {
             // Nothing to write (both fields kept or identical values): skip
-            // the full-config POST so an unchanged save never churns backups.
+            // the conditional PUT so an unchanged save never churns backups.
             return Ok(status_from(&config));
         }
         config[key][index] = updated;
-        let verified = client.post_config_and_readback(&config).await?;
+        let revision = revision.ok_or(ERR_REVISION_MISSING)?;
+        let verified = client
+            .put_config_and_readback(&config, &revision)
+            .await
+            .map_err(|error| match error {
+                ConditionalSaveError::Stale => ERR_STALE,
+                ConditionalSaveError::Unconfirmed => ERR_SAVE_NOT_CONFIRMED,
+            })?;
         let readback =
             find_entry(&verified, name).ok_or_else(|| ERR_SAVE_NOT_CONFIRMED.to_string())?;
         if !access.confirmed(readback, ACCESS_KEY_FIELD)
@@ -276,7 +285,14 @@ mod tests {
         json!({"APIKEY": "ADMIN_SECRET", "Providers": entries, "Router": {"default": "other,model"}})
     }
 
-    fn posted_config(request: &str) -> Value {
+    const REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn conditional_mock(replies: Vec<(u16, String)>) -> Mock {
+        Mock::with_config_revision(replies, Some(REVISION))
+    }
+
+    fn put_body(request: &str) -> Value {
+        assert!(request.starts_with("PUT /api/config "));
         serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
 
@@ -371,7 +387,7 @@ mod tests {
         let mut expected = original.clone();
         expected["Providers"][0][ACCESS_KEY_FIELD] = json!("NEW_AK");
         expected["Providers"][0][SECRET_KEY_FIELD] = json!("NEW_SK");
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success": true})),
             response(expected.clone()),
@@ -391,10 +407,12 @@ mod tests {
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 3);
         assert!(requests[0].starts_with("GET /api/config "));
-        assert!(requests[1].starts_with("POST /api/config "));
         assert!(requests[2].starts_with("GET /api/config "));
         // Only the two credential fields change; everything else roundtrips.
-        assert_eq!(posted_config(&requests[1]), expected);
+        assert_eq!(
+            put_body(&requests[1]),
+            json!({"config": expected, "revision": REVISION})
+        );
         assert!(!serde_json::to_string(&status).unwrap().contains("NEW_SK"));
     }
 
@@ -409,7 +427,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove(ACCESS_KEY_FIELD);
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success": true})),
             response(expected.clone()),
@@ -425,14 +443,54 @@ mod tests {
         );
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 3);
-        let posted = posted_config(&requests[1]);
+        let posted = put_body(&requests[1])["config"].clone();
         assert_eq!(posted, expected);
         assert_eq!(posted["Providers"][0][SECRET_KEY_FIELD], json!("OLD_SK"));
         assert!(posted["Providers"][0].get(ACCESS_KEY_FIELD).is_none());
     }
 
     #[tokio::test]
-    async fn unchanged_save_never_posts() {
+    async fn web_write_after_credential_read_reports_conflict_without_retry() {
+        let original = config_with(vec![coding_entry("volc")]);
+        let mock = conditional_mock(vec![
+            response(original.clone()),
+            (409, "PRIVATE_BODY".into()),
+        ]);
+        let service = CredentialsService::new(Some(mock.client()));
+        let error = service
+            .save("volc", None, Some("NEW_SK".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, ERR_STALE);
+        let requests = mock.finish().await;
+        assert_eq!(requests.len(), 2);
+        let mut expected = original;
+        expected["Providers"][0][SECRET_KEY_FIELD] = json!("NEW_SK");
+        assert_eq!(
+            put_body(&requests[1]),
+            json!({"config": expected, "revision": REVISION})
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_revision_requires_upgrade_before_mutation() {
+        let original = config_with(vec![coding_entry("volc")]);
+        for revision in [None, Some("invalid")] {
+            let mock = Mock::with_config_revision(vec![response(original.clone())], revision);
+            let error = CredentialsService::new(Some(mock.client()))
+                .save("volc", Some("NEW_AK".into()), None)
+                .await
+                .unwrap_err();
+            assert!(error.contains("升级网关"));
+            assert!(!error.contains("NEW_AK"));
+            let requests = mock.finish().await;
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET /api/config "));
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_save_never_writes() {
         let mut entry = coding_entry("volc");
         entry[ACCESS_KEY_FIELD] = json!("AK");
         entry[SECRET_KEY_FIELD] = json!("SK");
@@ -446,12 +504,12 @@ mod tests {
             let status = service.save("volc", access, secret).await.unwrap();
             assert!(status.providers[0].configured);
             let requests = mock.finish().await;
-            assert_eq!(requests.len(), 1, "an unchanged save must not POST");
+            assert_eq!(requests.len(), 1, "an unchanged save must not write");
         }
     }
 
     #[tokio::test]
-    async fn unknown_non_coding_and_invalid_targets_never_post() {
+    async fn unknown_non_coding_and_invalid_targets_never_write() {
         let config = config_with(vec![
             coding_entry("volc"),
             json!({"name": "plain", "api_base_url": "https://example.com/api/coding/v3"}),
@@ -490,7 +548,7 @@ mod tests {
     async fn readback_mismatch_and_transport_errors_are_not_confirmed_or_leaked() {
         let original = config_with(vec![coding_entry("volc")]);
         // The gateway reports success but the readback lacks the new values.
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success": true})),
             response(original.clone()),
@@ -504,8 +562,8 @@ mod tests {
         assert!(!error.contains("NEW_AK") && !error.contains("NEW_SK"));
         assert_eq!(mock.finish().await.len(), 3);
 
-        // A failed POST never echoes the upstream body or the submitted keys.
-        let mock = Mock::new(vec![
+        // A failed PUT never echoes the upstream body or the submitted keys.
+        let mock = conditional_mock(vec![
             response(original.clone()),
             (500, "LEAK_SECRET NEW_SK".into()),
         ]);
@@ -522,7 +580,7 @@ mod tests {
         assert_eq!(mock.finish().await.len(), 2);
 
         // A readback where the provider vanished is also unconfirmed.
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success": true})),
             response(config_with(vec![])),
@@ -546,7 +604,7 @@ mod tests {
         // The gateway may persist cleared fields as empty strings.
         readback["Providers"][0][ACCESS_KEY_FIELD] = json!("");
         readback["Providers"][0][SECRET_KEY_FIELD] = json!("");
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success": true})),
             response(readback),
