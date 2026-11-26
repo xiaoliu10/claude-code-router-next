@@ -79,7 +79,7 @@ export const CODEX_WHAM_USAGE_PATH = "/backend-api/wham/usage";
  * pinned default must stay reasonably new; env override exists for
  * maintenance without a code change.
  */
-export const CODEX_DEFAULT_CLIENT_VERSION = "0.160.1";
+export const CODEX_DEFAULT_CLIENT_VERSION = "0.170.0";
 
 /** Full Codex turn endpoint: backend base + /responses (pinned wire fact). */
 export const CODEX_UPSTREAM_URL = `${CODEX_BACKEND_BASE}/responses`;
@@ -131,14 +131,14 @@ export function codexUserAgent(
 }
 
 /** Fixed management-plane headers (codex_request.go codexSign, management calls). */
-export function codexManagementHeaders(accessToken: string, accountId: string | undefined): Record<string, string> {
+export function codexManagementHeaders(accessToken: string, accountId: string | undefined, version = codexClientVersion()): Record<string, string> {
   return {
     Authorization: `Bearer ${accessToken}`,
     ...(accountId ? { "chatgpt-account-id": accountId } : {}),
     "OpenAI-Beta": "responses=experimental",
     originator: "codex_cli_rs",
-    version: codexClientVersion(),
-    "User-Agent": codexUserAgent(),
+    version,
+    "User-Agent": codexUserAgent(version),
     Accept: "application/json",
     // Same rationale as the token exchange: a compressed body without
     // content-encoding hands undecodable bytes to text(); identity is plain.
@@ -560,7 +560,7 @@ export async function fetchCodexModels(params: {
   const url = `${params.base ?? CODEX_BACKEND_BASE}/models?client_version=${encodeURIComponent(version)}`;
   const res = await params.fetchImpl(url, boundedFetchInit({
     method: "GET",
-    headers: codexManagementHeaders(params.accessToken, params.accountId),
+    headers: codexManagementHeaders(params.accessToken, params.accountId, version),
   }));
   const text = await res.text().catch(() => "");
   let json: any = null;

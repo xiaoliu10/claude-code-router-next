@@ -27,15 +27,15 @@ const ROUTE_KEYS = ["providers", "routes", "familyRouting", "fallbackEnabled", "
 const ROUTE_ENTRY_KEYS = ["scope", "field", "target", "fallback"]
 const USAGE_KEYS = [
   "period", "totalRequests", "successCount", "errorCount",
-  "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "estimatedCount",
+  "inputTokens", "effectiveInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "estimatedCount",
   "avgTtftMs", "avgTokensPerSecond",
   "byModel", "byProvider", "byDay", "updatedAt",
 ]
-const USAGE_ROW_KEYS = ["name", "requests", "inputTokens", "outputTokens"]
+const USAGE_ROW_KEYS = ["name", "requests", "inputTokens", "effectiveInputTokens", "outputTokens"]
 const RECORDS_PAGE_KEYS = ["period", "page", "pageSize", "total", "records"]
 const RECORD_KEYS = [
   "timestamp", "provider", "model", "originalModel", "upstreamModel",
-  "clientType", "scenarioType", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
+  "clientType", "scenarioType", "inputTokens", "effectiveInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
   "ttftMs", "tokensPerSecond", "durationMs", "status", "usageEstimated", "errorMessage",
 ]
 const RECORDS_BANNED = ["responseBody", "sessionId", "apiKey", "secret"]
@@ -116,7 +116,7 @@ function assertRoutingSnapshot(s, label) {
 function assertUsageSnapshot(u, period, label) {
   for (const k of USAGE_KEYS) assert.ok(k in u, `${label}: missing ${k}`)
   assert.equal(u.period, period)
-  for (const k of ["totalRequests", "successCount", "errorCount", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "estimatedCount"]) {
+  for (const k of ["totalRequests", "successCount", "errorCount", "inputTokens", "effectiveInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "estimatedCount"]) {
     assert.equal(typeof u[k], "number", `${label}: ${k} numeric`)
   }
   assert.ok(Array.isArray(u.byProvider), `${label}: byProvider array`)

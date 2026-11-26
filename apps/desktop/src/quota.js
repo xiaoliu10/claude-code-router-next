@@ -67,6 +67,25 @@
     var s = w && typeof w === 'object' ? w : {};
     return { label: toStr(s.label), used: toNum(s.used), limit: toNum(s.limit), remaining: toNum(s.remaining), unit: toStr(s.unit), resetAt: toStr(s.resetAt) };
   }
+  function normalizeStepPlan(s) {
+    var state = ['known', 'partial', 'stale'].includes(s.state) ? s.state : 'unavailable';
+    if (state === 'unavailable') s = {};
+    var family = ['coding', 'token'].includes(s.family) ? s.family : 'none';
+    return {
+      state: state, family: family, name: toStr(s.name), observedAt: toNum(s.observedAt),
+      allowed: typeof s.allowed === 'boolean' ? s.allowed : null,
+      windows: family === 'coding' && Array.isArray(s.windows) ? s.windows.filter(function (w) {
+        return w && ['five_hour', 'weekly'].includes(w.id) && typeof w.limited === 'boolean';
+      }).map(function (w) {
+        return { id: w.id, limited: w.limited, usedPercent: toNum(w.usedPercent), resetsAt: toNum(w.resetsAt) };
+      }) : [],
+      creditBuckets: family === 'token' && Array.isArray(s.creditBuckets) ? s.creditBuckets.filter(function (b) {
+        return b && ['subscription', 'topup'].includes(b.type);
+      }).map(function (b) {
+        return { type: b.type, total: toStr(b.total), remaining: toStr(b.remaining), usedPercent: toNum(b.usedPercent), resetsAt: toNum(b.resetsAt), expiresAt: toNum(b.expiresAt) };
+      }) : [],
+    };
+  }
   function normalizeProvider(p) {
     var s = p && typeof p === 'object' ? p : {};
     return {
@@ -75,6 +94,7 @@
       plan: toStr(s.plan),
       status: typeof s.status === 'string' ? s.status : null,
       message: toStr(s.message),
+      ...(s.stepPlan ? { stepPlan: normalizeStepPlan(s.stepPlan) } : {}),
       windows: Array.isArray(s.windows) ? s.windows.map(normalizeWindow) : [],
       updatedAt: toNum(s.updatedAt),
     };
@@ -195,15 +215,18 @@
     }
 
     function applyMerged(result) {
-
-
       var next = normalizeSnapshot(result);
       var prev = snapshot;
+      // Rust serializes refreshes, but IPC responses can land in a different order.
+      if (prev && next.updatedAt !== null && prev.updatedAt !== null && next.updatedAt < prev.updatedAt &&
+          next.providers.some(function (p) { return p.stepPlan; })) return;
       if (prev) {
         next.providers = next.providers.map(function (p) {
           var f = flags.get(p.name);
 
-          return f && f.loading ? (findProvider(prev.providers, p.name) || p) : p;
+          if (!f || !f.loading) return p;
+          var old = findProvider(prev.providers, p.name);
+          return old && !old.stepPlan && !p.stepPlan ? old : p;
         });
       }
       snapshot = next;
@@ -807,6 +830,7 @@
       name: toStr(o.name) || '—',
       requests: toNum(o.requests),
       inputTokens: toNum(o.inputTokens),
+      effectiveInputTokens: toNum(o.effectiveInputTokens),
       outputTokens: toNum(o.outputTokens),
       cacheReadTokens: toNum(o.cacheReadTokens),
       cacheWriteTokens: toNum(o.cacheWriteTokens),
@@ -820,6 +844,7 @@
       successCount: toNum(s.successCount),
       errorCount: toNum(s.errorCount),
       inputTokens: toNum(s.inputTokens),
+      effectiveInputTokens: toNum(s.effectiveInputTokens),
       outputTokens: toNum(s.outputTokens),
       cacheReadTokens: toNum(s.cacheReadTokens),
       cacheWriteTokens: toNum(s.cacheWriteTokens),
@@ -929,6 +954,7 @@
       clientType: toStr(o.clientType),
       scenarioType: toStr(o.scenarioType) || 'default',
       inputTokens: toNum(o.inputTokens),
+      effectiveInputTokens: toNum(o.effectiveInputTokens),
       outputTokens: toNum(o.outputTokens),
       cacheReadTokens: toNum(o.cacheReadTokens),
       cacheWriteTokens: toNum(o.cacheWriteTokens),
@@ -967,18 +993,17 @@
     return out.join(' → ');
   }
   // byModel arrives sorted by request count; charts rank by total tokens.
-  // Effective input mirrors the Web UsageStats heuristic (computeEffectiveInputTokens):
-  // some upstreams report inputTokens inclusive of cache read/write (then input
-  // ~= cache sum within a tolerance), others report net input. Never double-count.
-  function effectiveInputTokens(input, cacheRead, cacheWrite) {
-    if (input === null) return null;
-    var cacheTotal = (toNum(cacheRead) || 0) + (toNum(cacheWrite) || 0);
-    if (cacheTotal <= 0) return input;
-    var tolerance = Math.max(500, input * 0.02);
-    return Math.abs(input - cacheTotal) <= tolerance ? input : input + cacheTotal;
+  function inclusiveInputTokens(row) {
+    if (row.effectiveInputTokens != null) return row.effectiveInputTokens;
+    // Legacy raw input is unambiguous only with no recorded cache activity.
+    return row.cacheReadTokens || row.cacheWriteTokens ? null : row.inputTokens;
+  }
+  function cacheMissInputTokens(row) {
+    var input = inclusiveInputTokens(row);
+    return input == null ? null : input - (row.cacheReadTokens || 0);
   }
   function rowTotalTokens(row) {
-    var input = effectiveInputTokens(row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens);
+    var input = inclusiveInputTokens(row);
     if (input === null || row.outputTokens === null) return null;
     return input + row.outputTokens;
   }
@@ -986,8 +1011,8 @@
   function topModelsByTotal(rows, limit) {
     var list = (Array.isArray(rows) ? rows : []).slice();
     list.sort(function (a, b) {
-      var ta = rowTotalTokens(a) || 0;
-      var tb = rowTotalTokens(b) || 0;
+      var ta = rowTotalTokens(a) ?? -1;
+      var tb = rowTotalTokens(b) ?? -1;
       return tb - ta;
     });
     return typeof limit === 'number' ? list.slice(0, limit) : list;
@@ -1328,55 +1353,55 @@
     var usage = {
       today: {
         period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
-        inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
+        inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
         avgTtftMs: 842, avgTokensPerSecond: 36.2,
         byProvider: [
-          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
-          { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
+          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, effectiveInputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
+          { name: 'beta.example.com', requests: 32, inputTokens: 202100, effectiveInputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
         ],
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
-        byDay: [{ name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byDay: [{ name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
         updatedAt: Date.now() - 3000,
       },
       '7d': {
         period: '7d', totalRequests: 902, successCount: 890, errorCount: 12,
-        inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
+        inputTokens: 6210000, effectiveInputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
         avgTtftMs: 905, avgTokensPerSecond: 33.8,
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, effectiveInputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
-          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
+          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, effectiveInputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
+          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, effectiveInputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
         ],
         byDay: [
-          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
-          { name: usageDayKey(previewDay, 2), requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
-          { name: usageDayKey(previewDay, 3), requests: 132, inputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
-          { name: usageDayKey(previewDay, 4), requests: 147, inputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
-          { name: usageDayKey(previewDay, 5), requests: 101, inputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
-          { name: usageDayKey(previewDay, 6), requests: 99, inputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
+          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, effectiveInputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: usageDayKey(previewDay, 2), requests: 155, inputTokens: 950000, effectiveInputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
+          { name: usageDayKey(previewDay, 3), requests: 132, inputTokens: 720000, effectiveInputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
+          { name: usageDayKey(previewDay, 4), requests: 147, inputTokens: 880000, effectiveInputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
+          { name: usageDayKey(previewDay, 5), requests: 101, inputTokens: 520000, effectiveInputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
+          { name: usageDayKey(previewDay, 6), requests: 99, inputTokens: 498000, effectiveInputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
         ],
         updatedAt: Date.now() - 3000,
       },
       '30d': {
         period: '30d', totalRequests: 4120, successCount: 4044, errorCount: 76,
-        inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
+        inputTokens: 28600000, effectiveInputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
         avgTtftMs: 878, avgTokensPerSecond: 34.9,
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, effectiveInputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
-          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
+          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, effectiveInputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
+          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, effectiveInputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
         ],
         byDay: [
-          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, effectiveInputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
         ],
         updatedAt: Date.now() - 3000,
       },
     };
-    var olderDay = { name: '2026-09-01', requests: 1, inputTokens: 1000, outputTokens: 250, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    var olderDay = { name: '2026-09-01', requests: 1, inputTokens: 1000, effectiveInputTokens: 1000, outputTokens: 250, cacheReadTokens: 0, cacheWriteTokens: 0 };
     usage.all = Object.assign({}, usage['30d'], {
-      period: 'all', totalRequests: 4121, successCount: 4045, inputTokens: 28601000, outputTokens: 7100250,
+      period: 'all', totalRequests: 4121, successCount: 4045, inputTokens: 28601000, effectiveInputTokens: 28601000, outputTokens: 7100250,
       byDay: [olderDay].concat(usage['30d'].byDay),
     });
     var clients = {
@@ -1421,6 +1446,7 @@
           clientType: RECORD_CLIENTS[i % RECORD_CLIENTS.length],
           scenarioType: i % 4 === 0 ? 'background' : 'default',
           inputTokens: 1200 + (i % 7) * 350,
+          effectiveInputTokens: 1200 + (i % 7) * 350 + (i % 3) * 900 + (i % 2) * 400,
           outputTokens: 300 + (i % 5) * 120,
           cacheReadTokens: (i % 3) * 900,
           cacheWriteTokens: (i % 2) * 400,
@@ -1793,10 +1819,13 @@
   }
 
   function buildWindow(win) {
-    var li = el('li', 'window');
     var label = toStr(win.label) || '用量';
     var pct = computePercent(win);
-    var pctText = formatPercent(pct);
+    return buildQuotaMeter(label, pct, formatPercent(pct) || '', describeWindow(win));
+  }
+
+  function buildQuotaMeter(label, pct, pctText, meta) {
+    var li = el('li', 'window');
     var top = el('div', 'window-top');
     top.appendChild(el('span', 'window-label', label));
     top.appendChild(el('span', 'window-pct', pctText || ''));
@@ -1805,12 +1834,11 @@
       var meter = document.createElement('progress');
       meter.className = 'meter';
       meter.setAttribute('max', '100');
-      meter.setAttribute('value', String(Math.round(pct * 100) / 100));
+      meter.setAttribute('value', String(pct));
       meter.setAttribute('data-level', pct >= 90 ? 'high' : 'normal');
-      meter.setAttribute('aria-label', label + ' 已用 ' + pctText);
+      meter.setAttribute('aria-label', label + ' 已用');
       li.appendChild(meter);
     }
-    var meta = describeWindow(win);
     if (meta) li.appendChild(el('div', 'window-meta', meta));
     return li;
   }
@@ -2124,6 +2152,25 @@
     };
   }
 
+  function renderStepPlanWindows(list, plan) {
+    function append(label, pct, unlimited, details, resetsAt, expiresAt) {
+      var resets = formatTimestamp(resetsAt), expires = formatTimestamp(expiresAt);
+      if (resets) details.push('重置 ' + resets);
+      if (expires) details.push('到期 ' + expires);
+      var usage = unlimited ? '无限额' : pct === null ? '—' : '已用 ' + pct + '%';
+      list.appendChild(buildQuotaMeter(label, unlimited ? null : pct, usage, details.join(' · ')));
+    }
+    plan.windows.forEach(function (w) {
+      append(w.id === 'five_hour' ? '5 小时' : '7 天', w.usedPercent, !w.limited, [], w.resetsAt, null);
+    });
+    var topups = 0;
+    plan.creditBuckets.forEach(function (b) {
+      var label = b.type === 'subscription' ? '月度订阅 Credit' : '加油包 ' + (++topups) + ' Credit';
+      var details = ['剩余 ' + (b.remaining || '—') + ' / 总量 ' + (b.total || '—') + ' Credit'];
+      append(label, b.usedPercent, false, details, b.resetsAt, b.expiresAt);
+    });
+  }
+
   function detectTauri() {
     var t = typeof window !== 'undefined' && window.__TAURI__;
     return t && t.core && typeof t.core.invoke === 'function' ? t : null;
@@ -2222,7 +2269,7 @@
       var tone = null, text = null;
       if (mode === 'missing') { tone = 'error'; text = '无法访问桌面 IPC（window.__TAURI__ 不可用），额度数据不可用。'; }
       else if (state.fullError) { tone = 'error'; text = '刷新失败，正在显示最后已知数据：' + state.fullError; }
-      else if (state.snapshot && !state.snapshot.online) { tone = 'warn'; text = '网关离线 · 显示最后已知数据'; }
+      else if (state.snapshot && !state.snapshot.online) { tone = 'warn'; text = state.snapshot.error || '网关离线 · 显示最后已知数据'; }
       else if (state.snapshot && state.snapshot.error) { tone = 'warn'; text = '部分数据获取失败：' + state.snapshot.error; }
       setBanner(els.banner, text, tone);
     }
@@ -2235,18 +2282,30 @@
       refs.li.setAttribute('aria-busy', String(row.loading));
       if (refs.name.textContent !== p.name) refs.name.textContent = p.name;
       refs.badges.textContent = '';
-      if (p.plan) refs.badges.appendChild(el('span', 'badge badge-plan', p.plan));
+      var plan = p.stepPlan;
+      var planName = plan ? plan.name || 'Step Plan' : p.plan;
+      if (planName) refs.badges.appendChild(el('span', 'badge badge-plan', planName));
       if (!p.enabled) refs.badges.appendChild(el('span', 'badge badge-off', '已停用'));
       if (row.stale) refs.badges.appendChild(el('span', 'badge badge-stale', '可能过期'));
       var meta = statusMeta(p.status);
+      if (plan && plan.state === 'partial') meta = { label: '部分数据', tone: 'warn' };
+      if (plan && plan.state === 'stale') meta = { label: '数据已陈旧', tone: 'warn' };
       refs.status.className = 'status tone-' + meta.tone;
       refs.status.textContent = meta.label;
-      refs.message.hidden = !p.message;
-      refs.message.textContent = p.message || '';
+      var message = p.message;
+      if (plan) {
+        var details = [];
+        if (plan.allowed !== null) details.push(plan.allowed ? '账户可用' : '账户不可用');
+        if (plan.observedAt !== null) details.push('观测于 ' + formatTimestamp(plan.observedAt));
+        message = details.join(' · ');
+      }
+      refs.message.hidden = !message;
+      refs.message.textContent = message || '';
       refs.error.hidden = !row.cardError;
       refs.error.textContent = row.cardError ? '刷新失败：' + row.cardError : '';
       refs.windows.textContent = '';
-      p.windows.forEach(function (w) { refs.windows.appendChild(buildWindow(w)); });
+      if (plan) renderStepPlanWindows(refs.windows, plan);
+      else p.windows.forEach(function (w) { refs.windows.appendChild(buildWindow(w)); });
       refs.loading.hidden = !row.loading;
       refs.loading.textContent = row.loading ? '读取中…' : '';
       refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';
@@ -2719,18 +2778,21 @@
       grid.appendChild(usageNumCell('success', '成功', formatInt(u.successCount)));
       grid.appendChild(usageNumCell('errors', '失败', formatInt(u.errorCount)));
       grid.appendChild(usageNumCell('rate', '成功率', formatSuccessRate(u.successCount, u.totalRequests)));
+      var input = cacheMissInputTokens(u);
+      var inclusive = inclusiveInputTokens(u);
       var totalTokens = rowTotalTokens(u);
-      var totalCell = usageNumCell('total', '总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
-      totalCell.title = '有效输入 + 输出；上游 inputTokens 已含缓存时直接采用，否则加计缓存读/写';
-      grid.appendChild(totalCell);
-      grid.appendChild(usageNumCell('input', '输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
-      grid.appendChild(usageNumCell('output', '输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
+      var estimated = u.estimatedCount > 0;
+      function summaryTokenCell(metric, label, count) {
+        var cell = recordsTokenCell(count, estimated);
+        return usageNumCell(metric, label, cell.text, cell.title);
+      }
+      grid.appendChild(summaryTokenCell('total', '总 tokens', totalTokens));
+      grid.appendChild(summaryTokenCell('input', '输入（未命中）', input));
+      grid.appendChild(summaryTokenCell('output', '输出 tokens', u.outputTokens));
       grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
       grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
-      var effectiveInput = effectiveInputTokens(u.inputTokens, u.cacheReadTokens, u.cacheWriteTokens);
-      var hitRate = effectiveInput > 0 && u.cacheReadTokens !== null
-        ? ((u.cacheReadTokens / effectiveInput) * 100).toFixed(1) + '%'
-        : null;
+      var hitRate = inclusive > 0 && u.cacheReadTokens !== null
+        ? (estimated ? '≈' : '') + (u.cacheReadTokens / inclusive * 100).toFixed(1) + '%' : null;
       var cacheHitCell = usageNumCell('cache-hit', '缓存命中率', hitRate);
       cacheHitCell.title = '缓存读取 tokens ÷ 有效输入 tokens';
       grid.appendChild(cacheHitCell);
@@ -2738,7 +2800,7 @@
       grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
       body.appendChild(totals);
-      totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
+      totals.appendChild(noteEl('总 tokens = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。'));
       if (s.trend) {
         body.appendChild(buildUsageTrend(s.trend));
       } else {
@@ -2747,14 +2809,15 @@
       body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
         var rowTotal = rowTotalTokens(m);
+        var input = cacheMissInputTokens(m);
         return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
-          { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
+          { text: formatCompact(input) || '—', title: formatInt(input) },
           { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
-          { text: (formatCompact(m.cacheReadTokens) || '—') + ' / ' + (formatCompact(m.cacheWriteTokens) || '—'),
-            title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') },
+          { text: formatCompact(m.cacheReadTokens) || '—', title: formatInt(m.cacheReadTokens) },
+          { text: formatCompact(m.cacheWriteTokens) || '—', title: formatInt(m.cacheWriteTokens) },
           { text: formatCompact(rowTotal) || '—', title: formatInt(rowTotal) }];
       }
-      var tokenHeaders = ['请求', '输入', '输出', '缓存（读 / 写）', '总 tokens'];
+      var tokenHeaders = ['请求', '输入（未命中）', '输出', '缓存读', '缓存写', '总 tokens'];
       body.appendChild(usageTable('按模型', ['模型'].concat(tokenHeaders), u.byModel.map(tokenRow), 1));
       body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
       body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
@@ -2815,13 +2878,16 @@
         var track = el('div', 'usage-day-track');
         var bar = el('div', 'usage-bar');
         bar.style.height = pct + '%';
-        bar.title = d.name + ' · 输入 ' + (formatCompact(d.inputTokens) || '—') + '（' + (formatInt(d.inputTokens) || '—') + '）'
+        bar.hidden = v === null;
+        var input = cacheMissInputTokens(d);
+        bar.title = d.name + ' · 输入（未命中） ' + (formatCompact(input) || '—') + '（' + (formatInt(input) || '—') + '）'
+          + ' · 缓存读 ' + (formatInt(d.cacheReadTokens) || '—')
           + ' · 输出 ' + (formatCompact(d.outputTokens) || '—') + '（' + (formatInt(d.outputTokens) || '—') + '）'
           + ' · 总量 ' + (formatCompact(v) || '—') + '（' + (formatInt(v) || '—') + '）';
         track.appendChild(bar);
         col.appendChild(track);
-        if (compact) col.title = bar.title;
-        else col.appendChild(el('div', 'usage-day-date', String(d.name)));
+        col.title = bar.title;
+        if (!compact) col.appendChild(el('div', 'usage-day-date', String(d.name)));
         bars.appendChild(col);
       });
       scroll.appendChild(bars);
@@ -2849,13 +2915,13 @@
       });
       var list = el('div', 'usage-hbar');
       models.forEach(function (m) {
-        var total = rowTotalTokens(m) || 0;
+        var total = rowTotalTokens(m);
         // Visible bars floor at 1% so a tiny-but-nonzero total still renders.
         var pct = total > 0 && max > 0 ? Math.max(1, Math.round((total / max) * 1000) / 10) : 0;
         var row = el('div', 'usage-hbar-row');
         var name = el('span', 'usage-hbar-name', m.name);
         name.title = m.name + ' · 请求 ' + (formatInt(m.requests) || '—')
-          + ' · 输入 ' + (formatInt(m.inputTokens) || '—') + ' · 输出 ' + (formatInt(m.outputTokens) || '—')
+          + ' · 输入（未命中） ' + (formatInt(cacheMissInputTokens(m)) || '—') + ' · 输出 ' + (formatInt(m.outputTokens) || '—')
           + ' · 缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—');
         var track = el('div', 'usage-hbar-track');
         var fill = el('div', 'usage-hbar-fill');
@@ -2878,11 +2944,11 @@
       var t = new Date(s);
       return Number.isNaN(t.getTime()) ? s : formatClock(t.getTime());
     }
-    var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
+    var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入（未命中）', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
     function recordsTokenCell(value, estimated) {
       return {
-        text: (estimated ? '≈' : '') + (formatCompact(value) || '—'),
-        title: formatInt(value) == null ? null : formatInt(value),
+        text: value == null ? '—' : (estimated ? '≈' : '') + formatCompact(value),
+        title: value == null ? null : (estimated ? '≈' : '') + formatInt(value),
       };
     }
     function recordsNumCell(cell) {
@@ -2914,7 +2980,7 @@
         modelTd.title = chain;
         tr.appendChild(modelTd);
         tr.appendChild(el('td', null, clientLabel(r.clientType)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.inputTokens, r.usageEstimated)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(cacheMissInputTokens(r), r.usageEstimated)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.outputTokens, r.usageEstimated)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheReadTokens, false)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheWriteTokens, false)));

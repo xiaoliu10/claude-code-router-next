@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -18,7 +18,7 @@ type AppendInput = Parameters<typeof append>[0];
 function makeRecord(overrides: Partial<AppendInput>): AppendInput {
   return {
     id: `rec-${Math.random().toString(36).slice(2)}`,
-    timestamp: new Date().toISOString(),
+    timestamp: "2026-08-01T10:00:00.000Z",
     sessionId: "session-est",
     provider: "kiro-subscription",
     originalModel: "claude-routed",
@@ -72,6 +72,8 @@ describe("usage store estimated flag", () => {
     close();
     // Recreate a genuine v2 table: no provenance column, user_version=2.
     const legacy = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
+    legacy.exec("ALTER TABLE usage_records DROP COLUMN effective_input_tokens");
+    legacy.exec("ALTER TABLE usage_records DROP COLUMN effective_input_estimated");
     legacy.exec("ALTER TABLE usage_records DROP COLUMN usage_estimated");
     legacy.pragma("user_version = 2");
     legacy.close();
@@ -88,6 +90,36 @@ describe("usage store estimated flag", () => {
     close();
     expect(query({ sessionId: "session-est" }).records).toEqual(rows);
     expect(querySummary().estimatedCount).toBe(0);
+  });
+
+  it("migrates v3 cached rows to a null inclusive count, never an approximation", () => {
+    clear();
+    append(makeRecord({ id: "v3", inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7, effectiveInputTokens: 70 }));
+    close();
+    const db = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
+    db.exec("ALTER TABLE usage_records DROP COLUMN effective_input_tokens");
+    db.exec("ALTER TABLE usage_records DROP COLUMN effective_input_estimated");
+    db.pragma("user_version = 3");
+    db.close();
+    const row = query({ sessionId: "session-est" }).records[0];
+    expect(row.effectiveInputTokens).toBeNull();
+    expect(row.effectiveInputTokensSource).toBeUndefined();
+    expect(querySummary().totalEffectiveInputTokens).toBeNull();
+    close();
+    const reopened = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
+    expect(reopened.pragma("user_version", { simple: true })).toBe(4);
+    reopened.close();
+  });
+
+  it("imports legacy cached JSONL rows as null inclusive counts", () => {
+    clear(); close();
+    mkdirSync(join(tempHome, "data"), { recursive: true });
+    writeFileSync(join(tempHome, "data", "usage.jsonl"), JSON.stringify(makeRecord({
+      id: "jsonl-legacy", inputTokens: 2, cacheReadInputTokens: 60, cacheCreationInputTokens: 7,
+    })) + "\n");
+    const row = query({ sessionId: "session-est" }).records[0];
+    expect(row.effectiveInputTokens).toBeNull();
+    expect(querySummary().totalEffectiveInputTokens).toBeNull();
   });
 
   afterAll(() => {

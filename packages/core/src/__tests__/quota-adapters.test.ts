@@ -161,6 +161,31 @@ describe("parseAliyunTokenPlanUsage", () => {
     expect(result).toBeNull();
   });
 
+  it("hints at a stale cookie when the gateway answers NotLogined", () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    try {
+      const payload = {
+        code: "200",
+        data: {
+          success: false,
+          errorCode: "BailianGateway.Login.NotLogined",
+          errorMsg: "BailianGateway.Login.NotLogined",
+        },
+        successResponse: true,
+      };
+      expect(parseAliyunTokenPlanUsage(payload)).toBeNull();
+      expect(debug).toHaveBeenCalledTimes(1);
+      expect(String(debug.mock.calls[0]?.[0])).toContain("not-logined");
+      expect(String(debug.mock.calls[0]?.[0])).not.toMatch(/cookie=/i);
+
+      debug.mockClear();
+      parseAliyunTokenPlanUsage({ code: "200", data: {}, successResponse: true });
+      expect(debug).not.toHaveBeenCalled();
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
   it("returns null when no recognised quota fields are present", () => {
     expect(parseAliyunTokenPlanUsage({ foo: "bar", baz: 42 })).toBeNull();
   });

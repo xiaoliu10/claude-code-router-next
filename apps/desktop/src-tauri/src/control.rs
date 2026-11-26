@@ -100,6 +100,7 @@ pub struct UsageBucket {
     pub name: String,
     pub requests: u64,
     pub input_tokens: u64,
+    pub effective_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
@@ -113,6 +114,7 @@ pub struct UsageSnapshot {
     pub success_count: u64,
     pub error_count: u64,
     pub input_tokens: u64,
+    pub effective_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
@@ -153,6 +155,7 @@ pub struct UsageRecordView {
     pub client_type: Option<String>,
     pub scenario_type: String,
     pub input_tokens: u64,
+    pub effective_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
@@ -990,6 +993,7 @@ fn buckets(summary: &Value, key: &str, cap: usize, sort_desc: bool) -> Vec<Usage
             name: name.clone(),
             requests: counter(value, "count"),
             input_tokens: counter(value, "inputTokens"),
+            effective_input_tokens: optional_counter(value, "effectiveInputTokens"),
             output_tokens: counter(value, "outputTokens"),
             cache_read_tokens: counter(value, "cacheReadInputTokens"),
             cache_write_tokens: counter(value, "cacheCreationInputTokens"),
@@ -1018,6 +1022,7 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
         success_count: counter(summary, "successCount"),
         error_count: counter(summary, "errorCount"),
         input_tokens: counter(summary, "totalInputTokens"),
+        effective_input_tokens: optional_counter(summary, "totalEffectiveInputTokens"),
         output_tokens: counter(summary, "totalOutputTokens"),
         cache_read_tokens: counter(summary, "totalCacheReadInputTokens"),
         cache_write_tokens: counter(summary, "totalCacheCreationInputTokens"),
@@ -1064,6 +1069,7 @@ fn usage_record_view(entry: &Value) -> Option<UsageRecordView> {
         client_type: projected_text(entry.get("clientType")),
         scenario_type: projected_text(entry.get("scenarioType")).unwrap_or_default(),
         input_tokens: counter(entry, "inputTokens"),
+        effective_input_tokens: optional_counter(entry, "effectiveInputTokens"),
         output_tokens: counter(entry, "outputTokens"),
         cache_read_tokens: counter(entry, "cacheReadInputTokens"),
         cache_write_tokens: counter(entry, "cacheCreationInputTokens"),
@@ -1646,7 +1652,7 @@ mod tests {
     fn usage_whitelisted_counters_and_sorted_buckets_only() {
         let summary = json!({
             "totalRequests": 12, "successCount": 10, "errorCount": 2,
-            "totalInputTokens": 100.0, "totalOutputTokens": 200,
+            "totalInputTokens": 100.0, "totalEffectiveInputTokens": 170, "totalOutputTokens": 200,
             "totalCacheReadInputTokens": 30, "totalCacheCreationInputTokens": 40,
             "estimatedCount": 3, "avgTtft": 999, "avgTokensPerSecond": 42,
             "byProvider": {
@@ -1655,7 +1661,7 @@ mod tests {
                 "$SECRET": {"count": 1}
             },
             "byDay": {"2026-11-17": {"count": 9}, "2026-11-16": {"count": 3}},
-            "byModel": {"model-a": {"count": 4, "inputTokens": 12, "outputTokens": 3, "cacheReadInputTokens": 9, "cacheCreationInputTokens": 2, "secret": "sekret"}},
+            "byModel": {"model-a": {"count": 4, "inputTokens": 12, "effectiveInputTokens": 12, "outputTokens": 3, "cacheReadInputTokens": 9, "cacheCreationInputTokens": 2, "secret": "sekret"}},
             "byClient": {"secret-client": {"count": 4}}
         });
         let snapshot = usage_snapshot_from(&summary, "7d").unwrap();
@@ -1663,6 +1669,9 @@ mod tests {
         assert_eq!(snapshot.total_requests, 12);
         assert_eq!(snapshot.error_count, 2);
         assert_eq!(snapshot.input_tokens, 100);
+        assert_eq!(snapshot.effective_input_tokens, Some(170));
+        assert_eq!(snapshot.by_model[0].effective_input_tokens, Some(12));
+        assert_eq!(snapshot.by_provider[0].effective_input_tokens, None);
         assert_eq!(snapshot.cache_read_tokens, 30);
         assert_eq!(snapshot.cache_write_tokens, 40);
         assert_eq!(snapshot.estimated_count, 3);
@@ -1768,7 +1777,7 @@ mod tests {
                     "model": "claude-opus-4", "upstreamModel": "claude-opus-4-5",
                     "modelFamily": "opus", "scenarioType": "think",
                     "clientType": "claude-code", "usageEstimated": true,
-                    "inputTokens": 100, "outputTokens": 200.7,
+                    "inputTokens": 100, "effectiveInputTokens": 170, "outputTokens": 200.7,
                     "cacheReadInputTokens": 30, "cacheCreationInputTokens": 40,
                     "ttft": 820, "tokensPerSecond": 55.5, "durationMs": 3600,
                     "status": "success", "responseBody": "LEAK_SECRET_BODY"
@@ -1808,6 +1817,7 @@ mod tests {
         assert_eq!(full.client_type.as_deref(), Some("claude-code"));
         assert_eq!(full.scenario_type, "think");
         assert_eq!(full.input_tokens, 100);
+        assert_eq!(full.effective_input_tokens, Some(170));
         assert_eq!(full.output_tokens, 200);
         assert_eq!(full.cache_read_tokens, 30);
         assert_eq!(full.cache_write_tokens, 40);
@@ -1821,6 +1831,7 @@ mod tests {
         // Null, missing, and non-numeric fields default to None/0.
         let errored = &page.records[1];
         assert_eq!(errored.input_tokens, 0);
+        assert_eq!(errored.effective_input_tokens, None);
         assert_eq!(errored.output_tokens, 0);
         assert_eq!(errored.ttft_ms, None);
         assert_eq!(errored.tokens_per_second, None);

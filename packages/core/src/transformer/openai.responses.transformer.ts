@@ -1,3 +1,4 @@
+import { captureInputUsage, startInputUsageCapture } from "../ccr/effective-input-usage";
 import { UnifiedChatRequest, MessageContent } from "@/types/llm";
 import { Transformer } from "@/types/transformer";
 import {
@@ -1083,6 +1084,9 @@ export class OpenAIResponsesTransformer implements Transformer {
     // Non-stream: assume OpenAI Chat JSON → wrap in Responses API shape
     try {
       const json = await parseResponseJson(response);
+      const format = json.type === "message" ? (context?.provider?.cacheMode === "inclusive" ? "anthropic-inclusive" : "anthropic") :
+        json.object === "response" ? "responses" : "chat";
+      captureInputUsage(startInputUsageCapture(context?.req, format), json.usage);
       return new Response(JSON.stringify(this.wrapChatInResponses(json)), {
         headers: { "Content-Type": "application/json" },
       });
@@ -1099,6 +1103,7 @@ export class OpenAIResponsesTransformer implements Transformer {
     stream: ReadableStream,
     context?: any
   ): ReadableStream {
+    const inputUsage = startInputUsageCapture(context?.req, "chat");
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     const model = (context?.provider?.models?.[0]) || "gpt-5.4";
@@ -1122,9 +1127,10 @@ export class OpenAIResponsesTransformer implements Transformer {
       status,
       model,
       output,
-      usage: this.buildResponsesUsage(),
+      usage: transformer.buildResponsesUsage(),
     });
 
+    const transformer = this;
     return new ReadableStream({
       async start(controller) {
         try {
@@ -1180,8 +1186,8 @@ export class OpenAIResponsesTransformer implements Transformer {
                 model: data?.model || model,
                 output: outputItems.slice(),
                 usage: data?.usage ? {
-                  ...this.buildResponsesUsage(data.usage),
-                } : this.buildResponsesUsage(),
+                  ...transformer.buildResponsesUsage(data.usage),
+                } : transformer.buildResponsesUsage(),
               },
             }));
           };
@@ -1210,6 +1216,7 @@ export class OpenAIResponsesTransformer implements Transformer {
               let data: any;
               try { data = JSON.parse(raw); } catch { continue; }
 
+              captureInputUsage(inputUsage, data.usage);
               // Emit response.created on first chunk
               if (!sentCreated) {
                 sentCreated = true;
@@ -1275,6 +1282,7 @@ export class OpenAIResponsesTransformer implements Transformer {
     stream: ReadableStream,
     context?: any
   ): ReadableStream {
+    const inputUsage = startInputUsageCapture(context?.req, context?.provider?.cacheMode === "inclusive" ? "anthropic-inclusive" : "anthropic");
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     const model = (context?.provider?.models?.[0]) || "gpt-5.4";
@@ -1396,6 +1404,7 @@ export class OpenAIResponsesTransformer implements Transformer {
               let data: any;
               try { data = JSON.parse(raw); } catch { continue; }
 
+              captureInputUsage(inputUsage, data.message?.usage ?? data.usage);
               if (data.type === "message_start") {
                 responseId = data.message?.id || responseId;
                 ensureCreated();

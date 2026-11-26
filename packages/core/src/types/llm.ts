@@ -60,8 +60,12 @@ export interface UnifiedMessage {
   };
 }
 
+// Kept off the JSON wire when forwarding unified tools to other providers.
+export const builtinWebSearch = Symbol("builtinWebSearch");
+
 // 统一的工具定义接口
 export interface UnifiedTool {
+  [builtinWebSearch]?: true;
   type: "function";
   function: {
     name: string;
@@ -277,6 +281,9 @@ export interface ConfigProvider {
   quota_litellm_token?: string;
   /** Optional quota backend framework selector (litellm | newapi | oneapi) */
   quota_framework?: string;
+  /** Control-plane credentials for Volcengine Coding Plan quota probes. */
+  quotaAccessKey?: string;
+  quotaSecretKey?: string;
   transformer: {
     use?: string[] | Array<any>[];
   } & {

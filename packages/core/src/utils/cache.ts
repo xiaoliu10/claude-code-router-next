@@ -5,6 +5,7 @@ export interface Usage {
   output_tokens: number;
   cache_read_input_tokens: number;
   cache_creation_input_tokens: number;
+  usage_estimated?: boolean;
 }
 
 class LRUCache<K, V> {

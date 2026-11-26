@@ -1,16 +1,15 @@
 import {
   FastifyInstance,
-  FastifyPluginAsync,
   FastifyRequest,
   FastifyReply,
 } from "fastify";
 import { CCR_SELF_PROVIDER_NAME } from "@wengine-ai/claude-code-router-shared";
-import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
+import { builtinWebSearch, RegisterProviderRequest, LLMProvider, type UnifiedTool } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import type { ChatCompletionCapture } from "../ccr/chat-completion-capture";
 import { probeAnswer, rebuildAnswerStream } from "./empty-answer-guard";
-import { type PluginRegistry, isPluginClassifiedError, pluginErrorFrom } from "../provider-plugins/registry";
+import { type PluginRegistry, isPluginClassifiedError } from "../provider-plugins/registry";
 import { ensurePluginRequestState, pluginAttemptBudget, pluginTerminalFailure, rememberPluginFailure } from "./plugin-request-state";
 import { pluginResponseError, describeTransportFailure } from "./plugin-response-error";
 import {
@@ -38,7 +37,7 @@ import {
   readBodyForSSE,
 } from "../transformer/response-body";
 import { router, findProviderModel, ProjectRoutingError } from "@/utils/router";
-import { resolveProviderProxyUrl, getDirectDispatcher } from "@/services/proxy";
+import { resolveProviderProxyUrl } from "@/services/proxy";
 
 // Matches the CCR model-family aliases that CCR injects into managed clients
 // (e.g. "ccr-opus", "ccr-sonnet[1m]"). Codex sends one of these as a bare model
@@ -132,6 +131,7 @@ export function normalizeResponsesBody(body: any): void {
         // Codex web_search tool
         if (tool.type === "web_search") {
           return {
+            [builtinWebSearch]: true,
             type: "function",
             function: {
               name: "web_search",
@@ -174,6 +174,7 @@ declare module "fastify" {
   interface FastifyRequest {
     provider?: string;
     chatCompletionCapture?: ChatCompletionCapture;
+    sourceInputUsage?: import("../ccr/effective-input-usage").InputUsageCapture;
   }
 }
 
@@ -320,12 +321,19 @@ async function handleTransformerEndpoint(
   // Store codex flags on the request so handleFallback can propagate them
   (req as any).isCodexOnMessagesEndpoint = isCodexOnMessagesEndpoint;
 
-  const familyChatUsesTools = isChat && CCR_FAMILY_ALIAS.test((req as any).originalModel) && chatUsesTools(body);
-  if (familyChatUsesTools && isAgyRoute(provider, body.model, fastify.pluginRegistry)) {
+  // Both family routes skip Agy before dispatch because its plugin disables
+  // fallback. An explicit Agy route may use its caller-tool bridge.
+  const familyUsesTools = CCR_FAMILY_ALIAS.test((req as any).originalModel) &&
+    (isChat
+      ? chatUsesTools(body)
+      : transformer.endPoint === "/v1/messages"
+        ? anthropicUsesTools(body) || chatUsesTools(body)
+        : false);
+  if (familyUsesTools && isAgyRoute(provider, body.model, fastify.pluginRegistry)) {
     // The plugin disables fallback when entered. Skip it before an attempt exists.
-    const result = await handleFallback(req, reply, fastify, transformer, undefined, familyChatUsesTools);
+    const result = await handleFallback(req, reply, fastify, transformer, undefined, familyUsesTools);
     if (result) return result;
-    throw createApiError("No configured Chat route supports this tool request", 400, "agy_unsupported_request");
+    throw createApiError("No configured route supports this tool request", 400, "agy_unsupported_request");
   }
 
   try {
@@ -404,7 +412,7 @@ async function handleTransformerEndpoint(
       if (provider?.baseUrl && response?.headers) {
         captureRateLimitHeaders(providerName, provider.baseUrl, response.headers);
       }
-    } catch {}
+    } catch { /* Header accounting is best effort. */ }
 
     // Process response transformer chain
     let finalResponse = await processResponseTransformers(
@@ -425,13 +433,12 @@ async function handleTransformerEndpoint(
       if (!req.chatCompletionCapture && providerName && model) {
         getHealthStore().recordSuccess(providerName, model);
       }
-    } catch {}
+    } catch { /* Preserve the successful response if accounting fails. */ }
 
     return result;
   } catch (error: any) {
-    // ProjectRoutingError must propagate directly — it is a configuration
-    // error, not a transient upstream failure. No retry, no fallback.
-    if (error instanceof ProjectRoutingError || (isChat && isTerminalChatError(error))) {
+    // Routing, tool-choice, and terminal chat errors cannot be recovered by replay.
+    if (error instanceof ProjectRoutingError || error?.code === "invalid_gemini_tool_choice" || (isChat && isTerminalChatError(error))) {
       throw error;
     }
     // Double-check: retry the same model once before falling back.
@@ -463,7 +470,7 @@ async function handleTransformerEndpoint(
       }
     }
     // Handle fallback for any request error (timeout, network, API errors)
-    const fallbackResult = await handleFallback(req, reply, fastify, transformer, error, familyChatUsesTools);
+    const fallbackResult = await handleFallback(req, reply, fastify, transformer, error, familyUsesTools);
     if (fallbackResult) {
       return fallbackResult;
     }
@@ -614,7 +621,7 @@ async function handleFallback(
   fastify: FastifyInstance,
   transformer: any,
   error: any,
-  familyChatUsesTools: boolean
+  familyUsesTools: boolean
 ): Promise<any> {
   const scenarioType = (req as any).scenarioType || 'default';
   const familyFallback = (req as any).familyFallback;
@@ -802,7 +809,7 @@ async function handleFallback(
       const fbProviderName = configuredFallback.provider.name;
       const fbModel = configuredFallback.model;
 
-      if (familyChatUsesTools && isAgyRoute(configuredFallback.provider, fbModel, fastify.pluginRegistry)) continue;
+      if (familyUsesTools && isAgyRoute(configuredFallback.provider, fbModel, fastify.pluginRegistry)) continue;
 
       // Skip if model is in fail pool (open state)
       if (!healthStore.isAvailable(fbProviderName, fbModel, configuredFallback.provider.apiKey?.startsWith("ccr-managed-") === true)) {
@@ -873,7 +880,7 @@ async function handleFallback(
             if (provider?.baseUrl && response?.headers) {
               captureRateLimitHeaders(fbProviderName, provider.baseUrl, response.headers);
             }
-          } catch {}
+          } catch { /* Header accounting is best effort. */ }
 
           // Process response transformer chain — propagate codex flags so the
           // fallback response also gets Responses API conversion when needed.
@@ -920,6 +927,7 @@ async function handleFallback(
           }
 
           // Write back to original req so onResponse hook records correct provider/model
+          req.sourceInputUsage = newReq.sourceInputUsage;
           req.provider = fbProviderName;
           req.body = newBody;
 
@@ -932,7 +940,7 @@ async function handleFallback(
           // Format and return response
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
-          if (transformer.endPoint === "/v1/chat/completions" && isTerminalChatError(error)) {
+          if (error?.code === "invalid_gemini_tool_choice" || (transformer.endPoint === "/v1/chat/completions" && isTerminalChatError(error))) {
             throw error;
           }
           fallbackError = error;
@@ -1007,6 +1015,13 @@ async function processRequestTransformers(
   // Deep clone the request body to preserve original messages for caching
   // and to ensure thinking blocks are not lost when switching between models
   let requestBody = JSON.parse(JSON.stringify(body));
+  // The JSON clone deliberately omits internal symbols. Restore tool ownership
+  // for this attempt without exposing it in any provider’s JSON payload.
+  if (Array.isArray(body.tools)) {
+    body.tools.forEach((tool: UnifiedTool, index: number) => {
+      if (tool?.[builtinWebSearch]) requestBody.tools[index][builtinWebSearch] = true;
+    });
+  }
 
   // Normalize per-request "cch=xxx;" hash in billing header system messages.
   // Claude Code injects a rotating hash (cch=...) that changes every request,
@@ -1347,6 +1362,7 @@ async function sendProviderAttempt(
   }
 
   const managedRequest = config.__ccrManagedRequest;
+  const dispatchedModel = managedRequest?.model ?? requestBody.model;
   let response: Response;
   const dispatchUpstream = () => sendUnifiedRequest(
     url,
@@ -1405,12 +1421,12 @@ async function sendProviderAttempt(
       throw error;
     }
     fastify.log.error(
-      `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
+      `[provider_response_error] Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${errorText}`,
     );
     const errorDetail = context.req.chatCompletionCapture && (isEventStreamResponse(response) || looksLikeSSE(errorText))
       ? "Upstream SSE error" : errorText;
     const error = createApiError(
-      `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorDetail}`,
+      `Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${errorDetail}`,
       response.status,
       "provider_response_error"
     );
@@ -1425,7 +1441,7 @@ async function sendProviderAttempt(
     const isStreamRequest = requestBody.stream === true;
     // DEBUG: log response metadata to diagnose why empty responses bypass checks
     fastify.log.info(
-      `[hidden-error-check] provider=${provider.name} model=${requestBody.model} stream=${requestBody.stream} isStreamRequest=${isStreamRequest} contentType=${contentType} ok=${response.ok} status=${response.status} hasBody=${!!response.body}`
+      `[hidden-error-check] provider=${provider.name} model=${dispatchedModel} stream=${requestBody.stream} isStreamRequest=${isStreamRequest} contentType=${contentType} ok=${response.ok} status=${response.status} hasBody=${!!response.body}`
     );
     // For non-streaming requests, always validate the response body regardless
     // of content-type. Some providers return 200 with empty body or non-JSON
@@ -1473,12 +1489,12 @@ async function sendProviderAttempt(
               throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody), undefined, managedRequest);
             }
             fastify.log.error(
-              `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
+              `[provider_response_error] Hidden error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${bodyText}`,
             );
             // Classify as rate-limit when error text contains relevant keywords
             const isRateLimit = isRateLimitError(bodyText);
             const error = createApiError(
-              `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
+              `Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${bodyText}`,
               // Promote to 400 to trigger fallback and correct usage logging
               400,
               "provider_response_error"
@@ -1500,7 +1516,7 @@ async function sendProviderAttempt(
         // the empty response to the client, which would cause a different error.
         if (e instanceof SyntaxError) {
           fastify.log.warn(
-            `[provider_response_error] Empty or malformed JSON response from provider(${provider.name},${requestBody.model}: 200): "${bodyText}"`
+            `[provider_response_error] Empty or malformed JSON response from provider(${provider.name},${dispatchedModel}: 200): "${bodyText}"`
           );
           const error = createApiError(
             `API returned an empty or malformed response (HTTP 200) from ${provider.name} — check for a proxy or gateway intercepting the request`,
@@ -1543,6 +1559,7 @@ async function processResponseTransformers(
   bypass: boolean,
   context: any
 ) {
+  delete context.req.sourceInputUsage; // Each retry/fallback has its own source counters.
   let finalResponse = response;
 
   // Execute provider-level response transformers
@@ -1750,7 +1767,7 @@ export const registerApiRoutes = async (
     },
     async (
       request: FastifyRequest<{ Body: RegisterProviderRequest }>,
-      reply: FastifyReply
+      _reply: FastifyReply
     ) => {
       // Validation
       const { name, baseUrl, apiKey, models } = request.body;
@@ -1850,7 +1867,7 @@ export const registerApiRoutes = async (
         Params: { id: string };
         Body: Partial<LLMProvider>;
       }>,
-      reply
+      _reply
     ) => {
       const provider = fastify.providerService.updateProvider(
         request.params.id,
@@ -1906,7 +1923,7 @@ export const registerApiRoutes = async (
         Params: { id: string };
         Body: { enabled: boolean };
       }>,
-      reply
+      _reply
     ) => {
       const success = fastify.providerService.toggleProvider(
         request.params.id,
@@ -1994,6 +2011,27 @@ function chatUsesTools(body: any): boolean {
       namedTool(call) && named(call.id) &&
       (call.type === "function" ? typeof call.function.arguments === "string" : typeof call.custom.input === "string"));
   });
+}
+
+/**
+ * Detect tool use in an Anthropic /v1/messages body. Only well-formed signals
+ * count (named tools, a usable tool_choice, or tool_use/tool_result history),
+ * so a purely malformed payload keeps its existing non-skipped behavior. Each
+ * signal is evaluated independently rather than short-circuiting on a malformed
+ * tools array like chatUsesTools does; this also detects a tool signal alongside a
+ * malformed array. Anthropic clients send tools as {name, input_schema}.
+ */
+function anthropicUsesTools(body: any): boolean {
+  const named = (name: unknown) => typeof name === "string" && name.trim().length > 0;
+  const tools = body?.tools;
+  if (Array.isArray(tools) && tools.length > 0 && tools.every((tool: any) => named(tool?.name))) return true;
+  const choice = body?.tool_choice;
+  if (choice?.type === "auto" || choice?.type === "any") return true;
+  if (choice?.type === "tool" && named(choice.name)) return true;
+  return Array.isArray(body?.messages) && body.messages.some((message: any) =>
+    Array.isArray(message?.content) && message.content.some((block: any) =>
+      (block?.type === "tool_use" && named(block.name) && named(block.id)) ||
+      (block?.type === "tool_result" && named(block.tool_use_id))));
 }
 
 function isLoopbackPreset(provider: LLMProvider): boolean {

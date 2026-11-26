@@ -11,7 +11,9 @@ import { TokenizerService } from "../services/tokenizer";
 import { getAllRateLimitInfo, initRateLimitPersistence } from "../services/rate-limit";
 import { getAllQuotaResults, initQuotaStorePersistence } from "../services/quota-store";
 import { pollPluginQuota, PLUGIN_QUOTA_INLINE_BUDGET_MS } from "../services/plugin-quota";
+import { StepPlanQuotaCache, type StepPlanQuota } from "../services/step-plan-quota";
 import { isQuotaWindowExpired } from "../services/rate-limit";
+import { getQuotaAdapter } from "../services/quota-adapters";
 import { findInvalidProxyUrls } from "../services/proxy";
 import { setRuntimeDebugLog, getRuntimeDebugLog } from "../utils/debug-log";
 import { getHealthStore } from "../services/provider-health";
@@ -99,6 +101,7 @@ function listAvailableModels(config: any) {
 
 interface ProviderQuotaUsage {
   provider: string;
+  stepPlan?: StepPlanQuota;
   used5h: number;
   used7d: number;
   limit5h?: number;
@@ -339,6 +342,24 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     // an omitted entry. A protector throws to veto.
     server.pluginRegistry.applyConfigProtectors(newConfig, previousConfig);
 
+    // Web forms do not edit quota keys. Their cached draft may predate a desktop
+    // credential save, rotation or clear. Use the raw fields, including env refs.
+    if (req.headers["x-ccr-preserve-quota-credentials"] === "1") {
+      const latest = await readConfigFileRaw();
+      const saved = latest.Providers ?? latest.providers;
+      const incoming = newConfig.Providers ?? newConfig.providers;
+      if (Array.isArray(saved) && Array.isArray(incoming)) {
+        for (const entry of incoming) {
+          if (typeof entry?.api_base_url !== "string" || !getQuotaAdapter(entry.api_base_url)?.usesVolcengineCredentials) continue;
+          const matches = saved.filter(p => p?.name === entry.name && p.api_base_url === entry.api_base_url);
+          if (matches.length !== 1) continue;
+          for (const field of ["quotaAccessKey", "quotaSecretKey"]) {
+            if (Object.hasOwn(matches[0], field)) entry[field] = matches[0][field];
+            else delete entry[field];
+          }
+        }
+      }
+    }
     await writeConfigFile(newConfig);
     let projectTakeoverSync: Awaited<ReturnType<typeof syncGlobalProjectTakeovers>> | undefined;
     try {
@@ -973,11 +994,14 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     }
   });
 
+  const stepPlanCache = new StepPlanQuotaCache();
   // Get provider quota usage (5h and 7d windows)
   _app.get("/api/providers/quota", async (req: any, reply: any) => {
     try {
       const config = await readConfigFile();
       const providers = config.Providers || [];
+      // Start this alongside managed plugin polling so their deadlines do not add up.
+      const stepPlansPending = stepPlanCache.poll(providers, { get: key => config[key] });
 
       // Managed plugin runtimes that expose the fetchQuota seam: poll on
       // demand here as well as from the periodic active-probe loop. The
@@ -1126,6 +1150,12 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
         if (typeof stored.resetTime7d === 'string' && !storeReset7dExpired) {
           quota.reset7d = stored.resetTime7d;
         }
+      }
+
+      const stepPlans = await stepPlansPending;
+      for (const row of quotas) {
+        const snapshot = stepPlans.get(row.provider);
+        if (snapshot) row.stepPlan = snapshot;
       }
 
       return {

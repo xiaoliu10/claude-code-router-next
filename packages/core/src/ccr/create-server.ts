@@ -217,6 +217,8 @@ export async function createCcrServer(options: CcrRunOptions = {}) {
           clientType,
           stream: data.stream ?? false,
           inputTokens: data.inputTokens || 0,
+          // A failed attempt never produced confirmable usage; leave inclusive null.
+          effectiveInputTokens: null,
           outputTokens: 0,
           cacheReadInputTokens: data.cacheReadInputTokens || 0,
           cacheCreationInputTokens: data.cacheCreationInputTokens || 0,
