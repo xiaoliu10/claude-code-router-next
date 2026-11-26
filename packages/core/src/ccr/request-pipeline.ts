@@ -734,6 +734,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         });
       }
 
+      const inputCapture = hardFailed ? undefined : req.sourceInputUsage ?? chat?.inputUsage ?? req.wireInputUsage;
       appendUsage({
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         timestamp: new Date().toISOString(),
@@ -746,13 +747,13 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         // matches what the client was told. `unknown` in the UI looked like a
         // routing bug rather than a missing upstream echo.
         upstreamModel: chat?.model || req.upstreamModel || model || undefined,
-        ...(usage?.usage_estimated === true ? { usageEstimated: true } : {}),
+        ...(usage?.usage_estimated === true || inputCapture?.usage.estimated ? { usageEstimated: true } : {}),
         modelFamily: req.modelFamily || "",
         scenarioType: req.scenarioType || "default",
         clientType: req.clientType || detectClientType(req),
         stream: req.body?.stream ?? false,
         inputTokens: rawInputTokens,
-        ...effectiveInputUsage(hardFailed ? undefined : req.sourceInputUsage ?? chat?.inputUsage ?? req.wireInputUsage),
+        ...effectiveInputUsage(inputCapture),
         outputTokens,
         cacheReadInputTokens,
         cacheCreationInputTokens: usage?.cache_creation_input_tokens || 0,

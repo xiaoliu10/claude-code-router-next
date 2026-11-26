@@ -975,6 +975,21 @@ fn optional_counter(value: &Value, key: &str) -> Option<u64> {
         .map(|value| value as u64)
 }
 
+// Gateways predating the inclusive count omit its key. A present null is authoritative.
+fn effective_input_counter(
+    value: &Value,
+    effective: &str,
+    input: &str,
+    read: &str,
+    write: &str,
+) -> Option<u64> {
+    if value.get(effective).is_none() && counter(value, read) == 0 && counter(value, write) == 0 {
+        optional_counter(value, input)
+    } else {
+        optional_counter(value, effective)
+    }
+}
+
 /// Finite-only float metric: missing, non-numeric, or non-finite → None.
 fn optional_metric(value: &Value, key: &str) -> Option<f64> {
     value
@@ -993,7 +1008,13 @@ fn buckets(summary: &Value, key: &str, cap: usize, sort_desc: bool) -> Vec<Usage
             name: name.clone(),
             requests: counter(value, "count"),
             input_tokens: counter(value, "inputTokens"),
-            effective_input_tokens: optional_counter(value, "effectiveInputTokens"),
+            effective_input_tokens: effective_input_counter(
+                value,
+                "effectiveInputTokens",
+                "inputTokens",
+                "cacheReadInputTokens",
+                "cacheCreationInputTokens",
+            ),
             output_tokens: counter(value, "outputTokens"),
             cache_read_tokens: counter(value, "cacheReadInputTokens"),
             cache_write_tokens: counter(value, "cacheCreationInputTokens"),
@@ -1022,7 +1043,13 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
         success_count: counter(summary, "successCount"),
         error_count: counter(summary, "errorCount"),
         input_tokens: counter(summary, "totalInputTokens"),
-        effective_input_tokens: optional_counter(summary, "totalEffectiveInputTokens"),
+        effective_input_tokens: effective_input_counter(
+            summary,
+            "totalEffectiveInputTokens",
+            "totalInputTokens",
+            "totalCacheReadInputTokens",
+            "totalCacheCreationInputTokens",
+        ),
         output_tokens: counter(summary, "totalOutputTokens"),
         cache_read_tokens: counter(summary, "totalCacheReadInputTokens"),
         cache_write_tokens: counter(summary, "totalCacheCreationInputTokens"),
@@ -1069,7 +1096,13 @@ fn usage_record_view(entry: &Value) -> Option<UsageRecordView> {
         client_type: projected_text(entry.get("clientType")),
         scenario_type: projected_text(entry.get("scenarioType")).unwrap_or_default(),
         input_tokens: counter(entry, "inputTokens"),
-        effective_input_tokens: optional_counter(entry, "effectiveInputTokens"),
+        effective_input_tokens: effective_input_counter(
+            entry,
+            "effectiveInputTokens",
+            "inputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
+        ),
         output_tokens: counter(entry, "outputTokens"),
         cache_read_tokens: counter(entry, "cacheReadInputTokens"),
         cache_write_tokens: counter(entry, "cacheCreationInputTokens"),
@@ -1733,6 +1766,30 @@ mod tests {
         assert_eq!(snapshot.error_count, 0);
         assert_eq!(snapshot.avg_ttft_ms, None);
         assert_eq!(snapshot.avg_tokens_per_second, None);
+    }
+
+    #[test]
+    fn usage_projection_distinguishes_missing_and_null_inclusive_input() {
+        let mut summary = json!({"totalInputTokens":100,"byModel":{"old":{"inputTokens":100},"unknown":{"inputTokens":100,"effectiveInputTokens":null}}});
+        let legacy = usage_snapshot_from(&summary, "7d").unwrap();
+        assert_eq!(legacy.effective_input_tokens, Some(100));
+        assert_eq!(legacy.by_model[0].effective_input_tokens, Some(100));
+        assert_eq!(legacy.by_model[1].effective_input_tokens, None);
+        summary["totalEffectiveInputTokens"] = Value::Null;
+        assert_eq!(
+            usage_snapshot_from(&summary, "7d")
+                .unwrap()
+                .effective_input_tokens,
+            None
+        );
+        for (name, expected) in [("old", Some(100)), ("unknown", None)] {
+            assert_eq!(
+                usage_record_view(&summary["byModel"][name])
+                    .unwrap()
+                    .effective_input_tokens,
+                expected
+            );
+        }
     }
 
     #[test]

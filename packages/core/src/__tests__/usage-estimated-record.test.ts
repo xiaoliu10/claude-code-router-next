@@ -18,7 +18,7 @@ type AppendInput = Parameters<typeof append>[0];
 function makeRecord(overrides: Partial<AppendInput>): AppendInput {
   return {
     id: `rec-${Math.random().toString(36).slice(2)}`,
-    timestamp: "2026-08-01T10:00:00.000Z",
+    timestamp: new Date().toISOString(),
     sessionId: "session-est",
     provider: "kiro-subscription",
     originalModel: "claude-routed",
@@ -95,15 +95,18 @@ describe("usage store estimated flag", () => {
   it("migrates v3 cached rows to a null inclusive count, never an approximation", () => {
     clear();
     append(makeRecord({ id: "v3", inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7, effectiveInputTokens: 70 }));
+    append(makeRecord({ id: "v3-no-cache", inputTokens: 7 }));
     close();
     const db = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
     db.exec("ALTER TABLE usage_records DROP COLUMN effective_input_tokens");
     db.exec("ALTER TABLE usage_records DROP COLUMN effective_input_estimated");
     db.pragma("user_version = 3");
     db.close();
-    const row = query({ sessionId: "session-est" }).records[0];
-    expect(row.effectiveInputTokens).toBeNull();
-    expect(row.effectiveInputTokensSource).toBeUndefined();
+    const { records } = query({ sessionId: "session-est" });
+    expect(records.find(row => row.id === "v3-no-cache")?.effectiveInputTokens).toBe(7);
+    const cached = records.find(row => row.id === "v3")!;
+    expect(cached.effectiveInputTokens).toBeNull();
+    expect(cached.effectiveInputTokensSource).toBeUndefined();
     expect(querySummary().totalEffectiveInputTokens).toBeNull();
     close();
     const reopened = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
@@ -114,11 +117,16 @@ describe("usage store estimated flag", () => {
   it("imports legacy cached JSONL rows as null inclusive counts", () => {
     clear(); close();
     mkdirSync(join(tempHome, "data"), { recursive: true });
-    writeFileSync(join(tempHome, "data", "usage.jsonl"), JSON.stringify(makeRecord({
-      id: "jsonl-legacy", inputTokens: 2, cacheReadInputTokens: 60, cacheCreationInputTokens: 7,
-    })) + "\n");
-    const row = query({ sessionId: "session-est" }).records[0];
-    expect(row.effectiveInputTokens).toBeNull();
+    const fixtures = [
+      makeRecord({ id: "jsonl-cached", inputTokens: 2, cacheReadInputTokens: 60, cacheCreationInputTokens: 7 }),
+      makeRecord({ id: "jsonl-no-cache", inputTokens: 7 }),
+      makeRecord({ id: "jsonl-unknown", inputTokens: 7, effectiveInputTokens: null }),
+    ];
+    writeFileSync(join(tempHome, "data", "usage.jsonl"), fixtures.map(row => JSON.stringify(row)).join("\n"));
+    const { records } = query({ sessionId: "session-est" });
+    expect(Object.fromEntries(records.map(row => [row.id, row.effectiveInputTokens]))).toEqual({
+      "jsonl-cached": null, "jsonl-no-cache": 7, "jsonl-unknown": null,
+    });
     expect(querySummary().totalEffectiveInputTokens).toBeNull();
   });
 

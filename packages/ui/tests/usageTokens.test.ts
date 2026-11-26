@@ -12,6 +12,7 @@ test("identical raw counters use the gateway's inclusive count and retain cache 
 test("ambiguous legacy cache leaves derived metrics unavailable", () => {
   const unknown = { cacheMissInput: null, total: null, hitRate: null };
   assert.deepEqual(usageTokens(row), unknown);
+  assert.deepEqual(usageTokens({ inputTokens: 1000, outputTokens: 5, effectiveInputTokens: null }), unknown);
   assert.deepEqual(usageTokens({ ...row, effectiveInputTokens: null }), unknown);
 });
 

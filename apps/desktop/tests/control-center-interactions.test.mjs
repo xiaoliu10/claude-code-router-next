@@ -336,6 +336,25 @@ test('interaction: 77k inclusive input with 76k cache reads shows 1k misses and 
   assert.equal(value('总 tokens').title, '77,200');
 });
 
+test('interaction: explicit unknown input stays unavailable while an older zero-cache record uses raw input', async () => {
+  const legacy = { inputTokens: 100, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const unknown = { ...legacy, effectiveInputTokens: null };
+  const h = harness({
+    usage_snapshot: () => ({ ...unknown, byModel: [{ ...unknown, name: 'model' }] }),
+    usage_records: () => ({ records: [unknown, legacy] }),
+  });
+  await openUsage(h);
+  const body = h.id('usage-body');
+  const cell = label => body.querySelectorAll('.usage-cell').find(n => n.textContent.includes(label)).querySelector('.usage-num');
+  assert.equal(cell('输入（未命中）').textContent, '—');
+  assert.equal(cell('总 tokens').textContent, '—');
+  assert.equal(cell('缓存命中率').textContent, '—');
+  assert.equal(body.querySelector('.usage-hbar-total').textContent, '—');
+  const rows = recordsCard(body).querySelector('tbody').children;
+  assert.equal(rows[0].children[4].textContent, '—');
+  assert.equal(rows[1].children[4].textContent, '100');
+});
+
 test('interaction: ambiguous legacy cache leaves derived totals, inputs and hit rates unavailable', async () => {
   const row = { inputTokens: 100, outputTokens: 5, cacheReadTokens: 50, cacheWriteTokens: 30 };
   const h = harness({
