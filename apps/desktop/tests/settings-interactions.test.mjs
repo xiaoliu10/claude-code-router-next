@@ -174,6 +174,15 @@ test('settings: an existing empty HOST can be kept or explicitly repaired', asyn
   assert.equal(save.disabled, true);
 });
 
+test('settings: an older gateway keeps the draft and asks for an upgrade', async () => {
+  const { h } = setup({ general_settings_save: () => { throw Error('Gateway does not support conditional settings saves'); } });
+  await open(h);
+  write(h, 'set-timeout', '720000'); h.id('settings-save').click(); await flush();
+  assert.match(h.id('settings-msg').textContent, /升级网关后刷新/);
+  assert.equal(h.id('set-timeout').value, '720000');
+  assert.equal(h.id('settings-save').disabled, true);
+});
+
 test('settings: failed load has a retry and unconfirmed saves require an explicit reload', async () => {
   let failLoad = true;
   const { h, fixture } = setup({

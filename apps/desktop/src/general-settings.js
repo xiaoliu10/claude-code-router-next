@@ -179,6 +179,9 @@
         if (/stale|conflict/i.test(detail)) {
           needsReload = true;
           feedback('配置已在其他位置修改。请刷新并核对保留的草稿，再次保存。', 'warn');
+        } else if (/does not support conditional settings saves/i.test(detail)) {
+          needsReload = true;
+          feedback('请升级网关后刷新设置，再保存当前草稿。', 'warn');
         } else if (/could not be confirmed/i.test(detail)) {
           needsReload = true;
           feedback('尚未确认写入结果。请检查网关连接并刷新，核对草稿后再保存。', 'warn');
