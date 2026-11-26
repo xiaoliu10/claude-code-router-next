@@ -179,6 +179,9 @@ function getDb(): SqliteDatabase {
       const columns = db.prepare("PRAGMA table_info(usage_records)").all() as { name: string }[];
       if (!columns.some(column => column.name === "effective_input_tokens")) {
         db.exec("ALTER TABLE usage_records ADD COLUMN effective_input_tokens INTEGER");
+        // Only pre-column rows are known to be legacy. Later NULLs mean unknown.
+        db.exec(`UPDATE usage_records SET effective_input_tokens = input_tokens
+                 WHERE cache_read_input_tokens = 0 AND cache_creation_input_tokens = 0`);
       }
       if (!columns.some(column => column.name === "effective_input_estimated")) {
         db.exec("ALTER TABLE usage_records ADD COLUMN effective_input_estimated INTEGER NOT NULL DEFAULT 0");
@@ -372,6 +375,11 @@ function normalizeStatus(value: unknown): UsageStatus {
 
 function toDbRow(record: UsageRecordInput): UsageRecordRow {
   const normalized = normalizeUsageRecord(record);
+  const cacheRead = Math.trunc(normalizeNumber(normalized.cacheReadInputTokens));
+  const cacheWrite = Math.trunc(normalizeNumber(normalized.cacheCreationInputTokens));
+  const input = Math.trunc(normalizeNumber(normalized.inputTokens));
+  const effectiveInput = normalized.effectiveInputTokens === undefined && cacheRead === 0 && cacheWrite === 0
+    ? input : normalized.effectiveInputTokens;
   return {
     id: normalizeString(normalized.id),
     timestamp: normalizeString(normalized.timestamp),
@@ -385,12 +393,12 @@ function toDbRow(record: UsageRecordInput): UsageRecordRow {
     client_type: normalizeOptionalString(normalized.clientType) ?? null,
     stream: normalized.stream ? 1 : 0,
     usage_estimated: normalized.usageEstimated === true ? 1 : 0,
-    effective_input_tokens: normalized.effectiveInputTokens == null ? null : Math.trunc(normalizeNumber(normalized.effectiveInputTokens)),
+    effective_input_tokens: effectiveInput == null ? null : Math.trunc(normalizeNumber(effectiveInput)),
     effective_input_estimated: normalized.effectiveInputTokensSource === "estimated" ? 1 : 0,
-    input_tokens: Math.trunc(normalizeNumber(normalized.inputTokens)),
+    input_tokens: input,
     output_tokens: Math.trunc(normalizeNumber(normalized.outputTokens)),
-    cache_read_input_tokens: Math.trunc(normalizeNumber(normalized.cacheReadInputTokens)),
-    cache_creation_input_tokens: Math.trunc(normalizeNumber(normalized.cacheCreationInputTokens)),
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheWrite,
     ttft: parseNumericTokenSpeedValue(normalized.ttft),
     tokens_per_second: parseNumericTokenSpeedValue(normalized.tokensPerSecond),
     duration_ms: Math.trunc(normalizeNumber(normalized.durationMs)),
@@ -400,7 +408,7 @@ function toDbRow(record: UsageRecordInput): UsageRecordRow {
   };
 }
 
-function toUsageRecord(row: UsageRecordRow & { effectiveInputTokens: number | null }): UsageRecord {
+function toUsageRecord(row: UsageRecordRow): UsageRecord {
   return normalizeUsageRecord<UsageRecord>({
     id: row.id,
     timestamp: row.timestamp,
@@ -414,7 +422,7 @@ function toUsageRecord(row: UsageRecordRow & { effectiveInputTokens: number | nu
     clientType: row.client_type ?? undefined,
     stream: row.stream === 1,
     ...(row.usage_estimated === 1 ? { usageEstimated: true } : {}),
-    effectiveInputTokens: row.effectiveInputTokens,
+    effectiveInputTokens: row.effective_input_tokens,
     ...(row.effective_input_estimated === 1 || row.usage_estimated === 1 ? { effectiveInputTokensSource: "estimated" } : {}),
     inputTokens: row.input_tokens,
     outputTokens: row.output_tokens,
@@ -495,23 +503,12 @@ function buildWhereClause(filters: UsageQueryFilters): QueryWhereClause {
 // synchronous. COUNT/SUM/AVG/GROUP BY keep this work inside SQLite and return
 // only tiny result sets. Semantics intentionally mirror the old JS version:
 // tokens are counted for successful requests only.
-// Per-row cache-inclusive input. A recorded count is authoritative. A NULL
-// recorded count means the source protocol was never captured (legacy row):
-// with zero cache buckets the raw input is unambiguous, but with nonzero cache
-// the inclusive total cannot be confirmed, so it stays NULL — never approximated.
-const EFFECTIVE_INPUT_ROW_SQL = `
-  CASE
-    WHEN effective_input_tokens IS NOT NULL THEN effective_input_tokens
-    WHEN cache_read_input_tokens + cache_creation_input_tokens = 0 THEN input_tokens
-    ELSE NULL
-  END
-`;
 // Aggregates propagate NULL: if any successful row in scope has an unconfirmable
 // inclusive input, the whole bucket/total is NULL rather than a partial sum.
 const EFFECTIVE_INPUT_SUM_SQL = `
   CASE
-    WHEN SUM(CASE WHEN status = 'success' AND (${EFFECTIVE_INPUT_ROW_SQL}) IS NULL THEN 1 ELSE 0 END) > 0 THEN NULL
-    ELSE COALESCE(SUM(CASE WHEN status = 'success' THEN ${EFFECTIVE_INPUT_ROW_SQL} ELSE 0 END), 0)
+    WHEN SUM(CASE WHEN status = 'success' AND effective_input_tokens IS NULL THEN 1 ELSE 0 END) > 0 THEN NULL
+    ELSE COALESCE(SUM(CASE WHEN status = 'success' THEN effective_input_tokens ELSE 0 END), 0)
   END
 `;
 const SUMMARY_BUCKET_AGGREGATES = `
@@ -667,8 +664,8 @@ export function query(filters: UsageQueryFilters): UsageQueryResult {
     .prepare(`SELECT COUNT(*) AS count FROM usage_records ${where.sql}`)
     .get(...where.params) as { count: number };
   const rows = db
-    .prepare(`SELECT *, ${EFFECTIVE_INPUT_ROW_SQL} AS effectiveInputTokens FROM usage_records ${where.sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`)
-    .all(...where.params, pageSize, offset) as Array<UsageRecordRow & { effectiveInputTokens: number | null }>;
+    .prepare(`SELECT * FROM usage_records ${where.sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`)
+    .all(...where.params, pageSize, offset) as UsageRecordRow[];
 
   const summary = computeSummarySQL(db, filters);
 

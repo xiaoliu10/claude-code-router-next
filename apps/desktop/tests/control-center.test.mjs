@@ -390,8 +390,8 @@ test("usage: normalizeUsageSnapshot whitelists contract fields only", () => {
     inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
     avgTtftMs: 812, avgTokensPerSecond: 33.4,
     byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6 }],
-    byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: null, cacheReadTokens: null, cacheWriteTokens: null }],
-    byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: null, cacheReadTokens: null, cacheWriteTokens: null }],
+    byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 100, cacheReadTokens: null, cacheWriteTokens: null }],
+    byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 100, cacheReadTokens: null, cacheWriteTokens: null }],
     updatedAt: 123,
   })
   assert.equal(JSON.stringify(u).includes("cost"), false, "no fabricated cost fields")

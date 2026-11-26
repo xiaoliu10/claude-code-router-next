@@ -456,7 +456,7 @@ fn quota_lines(response: &Value, current_default: Option<&str>) -> Result<Vec<St
             .filter(|n| n.is_finite() && *n >= 0.0)
     };
     let mut lines = Vec::new();
-    for window in ["5h", "7d"] {
+    for window in ["5h", "7d", "30d"] {
         let (Some(used), Some(limit)) = (
             number(&format!("used{window}")),
             number(&format!("limit{window}")),
@@ -943,6 +943,15 @@ mod tests {
         );
         assert_eq!(lines(json!({"state":"partial","family":"token","creditBuckets":[{"type":"topup","total":"12345678901234567890","remaining":"1.2300","expiresAt":1000}]})), ["Step Plan · partial", "topup Credit · 1.2300 / 12345678901234567890 remaining · used — · expires 1970-01-01T00:00:01Z"]);
     }
+    #[test]
+    fn monthly_only_quota_is_shown_in_tray() {
+        let response = json!({"quotas":[{"provider":"volcengine","used30d":75,"limit30d":300}]});
+        assert_eq!(
+            quota_lines(&response, Some("volcengine,model")).unwrap(),
+            ["30d 75/300 (25.0%)"]
+        );
+    }
+
     #[test]
     fn quota_unknown_zero_invalid_and_other_provider_values_are_not_fabricated() {
         let lines = |quota| quota_lines(&json!({"quotas":[quota]}), Some("alpha,one")).unwrap();

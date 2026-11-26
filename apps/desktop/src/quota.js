@@ -830,7 +830,7 @@
       name: toStr(o.name) || '—',
       requests: toNum(o.requests),
       inputTokens: toNum(o.inputTokens),
-      effectiveInputTokens: toNum(o.effectiveInputTokens),
+      effectiveInputTokens: inclusiveInputTokens(o),
       outputTokens: toNum(o.outputTokens),
       cacheReadTokens: toNum(o.cacheReadTokens),
       cacheWriteTokens: toNum(o.cacheWriteTokens),
@@ -844,7 +844,7 @@
       successCount: toNum(s.successCount),
       errorCount: toNum(s.errorCount),
       inputTokens: toNum(s.inputTokens),
-      effectiveInputTokens: toNum(s.effectiveInputTokens),
+      effectiveInputTokens: inclusiveInputTokens(s),
       outputTokens: toNum(s.outputTokens),
       cacheReadTokens: toNum(s.cacheReadTokens),
       cacheWriteTokens: toNum(s.cacheWriteTokens),
@@ -954,7 +954,7 @@
       clientType: toStr(o.clientType),
       scenarioType: toStr(o.scenarioType) || 'default',
       inputTokens: toNum(o.inputTokens),
-      effectiveInputTokens: toNum(o.effectiveInputTokens),
+      effectiveInputTokens: inclusiveInputTokens(o),
       outputTokens: toNum(o.outputTokens),
       cacheReadTokens: toNum(o.cacheReadTokens),
       cacheWriteTokens: toNum(o.cacheWriteTokens),
@@ -994,9 +994,9 @@
   }
   // byModel arrives sorted by request count; charts rank by total tokens.
   function inclusiveInputTokens(row) {
-    if (row.effectiveInputTokens != null) return row.effectiveInputTokens;
+    if (row.effectiveInputTokens !== undefined) return toNum(row.effectiveInputTokens);
     // Legacy raw input is unambiguous only with no recorded cache activity.
-    return row.cacheReadTokens || row.cacheWriteTokens ? null : row.inputTokens;
+    return row.cacheReadTokens || row.cacheWriteTokens ? null : toNum(row.inputTokens);
   }
   function cacheMissInputTokens(row) {
     var input = inclusiveInputTokens(row);
