@@ -19,7 +19,8 @@ interface MappingRow {
 export function AdvancedRouter() {
   const navigate = useNavigate();
   const { t } = useTranslation();
-  const { config, setConfig, error } = useConfig();
+  const { config, saveDraft, revision, error } = useConfig();
+  const [editorRevision, setEditorRevision] = useState<string | null | undefined>(undefined);
   const [rows, setRows] = useState<MappingRow[]>([{ source: "", target: "" }]);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'warning' } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -44,10 +45,12 @@ export function AdvancedRouter() {
   );
 
   useEffect(() => {
-    const models = config?.Router?.models || {};
+    if (!config || editorRevision !== undefined) return;
+    setEditorRevision(revision);
+    const models = config.Router?.models || {};
     const entries = Object.entries(models).map(([source, target]) => ({ source, target }));
     setRows(entries.length > 0 ? entries : [{ source: "", target: "" }]);
-  }, [config?.Router?.models]);
+  }, [config, revision, editorRevision]);
 
   const buildModels = (entries: MappingRow[]) => {
     return entries.reduce<Record<string, string>>((acc, item) => {
@@ -69,7 +72,6 @@ export function AdvancedRouter() {
         models: buildModels(rows),
       },
     };
-    setConfig(nextConfig);
     return nextConfig;
   };
 
@@ -94,8 +96,9 @@ export function AdvancedRouter() {
     try {
       const nextConfig = syncConfig();
       if (!nextConfig) return;
-      const response = await api.updateConfig(nextConfig);
+      const response = await saveDraft(nextConfig, editorRevision ?? null);
       if (response.success) {
+        setEditorRevision(undefined);
         setToast({ message: response.message || t("app.config_saved_success"), type: "success" });
       } else {
         setToast({ message: response.message || t("app.config_saved_failed"), type: "error" });
@@ -113,12 +116,13 @@ export function AdvancedRouter() {
     try {
       const nextConfig = syncConfig();
       if (!nextConfig) return;
-      const response = await api.updateConfig(nextConfig);
+      const response = await saveDraft(nextConfig, editorRevision ?? null);
       if (!response.success) {
         setToast({ message: response.message || t("app.config_saved_failed"), type: "error" });
         return;
       }
 
+      setEditorRevision(undefined);
       const restartResponse = await api.restartService();
       if (restartResponse && typeof restartResponse === "object" && "success" in restartResponse) {
         const apiResponse = restartResponse as { success: boolean; message?: string };

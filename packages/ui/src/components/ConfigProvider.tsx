@@ -1,11 +1,16 @@
-import { createContext, useContext, useState, useEffect } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import type { ReactNode, Dispatch, SetStateAction } from 'react';
+import { useTranslation } from 'react-i18next';
+import { openConfigDraft, refreshConfigDraft } from '@/utils/config-draft';
+import type { ConfigDraft } from '@/utils/config-draft';
 import { api } from '@/lib/api';
 import type { Config } from '@/types';
 
 interface ConfigContextType {
   config: Config | null;
   setConfig: Dispatch<SetStateAction<Config | null>>;
+  revision: string | null;
+  saveDraft: (config: Config, revision?: string | null) => ReturnType<typeof api.updateConfig>;
   error: Error | null;
   refreshConfig: (merge?: (current: Config, server: Config) => Config) => Promise<void>;
 }
@@ -26,9 +31,11 @@ interface ConfigProviderProps {
 }
 
 export function ConfigProvider({ children }: ConfigProviderProps) {
-  const [config, setConfig] = useState<Config | null>(null);
+  const { t } = useTranslation();
+  const [draft, setDraft] = useState<ConfigDraft | null>(null);
+  const base = draft?.base;
+  const revision = base?.revision ?? null;
   const [error, setError] = useState<Error | null>(null);
-  const [hasFetched, setHasFetched] = useState<boolean>(false);
   const [apiKey, setApiKey] = useState<string | null>(localStorage.getItem('apiKey'));
 
   // Listen for localStorage changes
@@ -44,105 +51,50 @@ export function ConfigProvider({ children }: ConfigProviderProps) {
   }, []);
 
   useEffect(() => {
-    const fetchConfig = async () => {
-      // Reset fetch state when API key changes
-      setHasFetched(false);
-      setConfig(null);
-      setError(null);
-    };
-
-    fetchConfig();
+    let active = true;
+    setDraft(null);
+    setError(null);
+    api.getConfigSnapshot().then(snapshot => {
+      if (active) setDraft(openConfigDraft(snapshot));
+    }).catch(err => {
+      if (active) setError(err as Error);
+    });
+    return () => { active = false; };
   }, [apiKey]);
 
-  const loadConfigFromServer = async () => {
-    const data = await api.getConfig();
+  const setConfig: ConfigContextType['setConfig'] = useCallback(action => {
+    setDraft(current => {
+      if (!current || !base) return current;
+      if (typeof action !== 'function') return action ? { base, config: action } : null;
+      const config = action(current.config);
+      return config ? { ...current, config } : null;
+    });
+  }, [base]);
 
-    // Pass through the raw server data as-is so we never write back
-    // fields that the user didn't configure. Components handle missing
-    // fields with defensive defaults at render time.
-    const validConfig = { ...data } as Config;
-
-    // Only normalise nested structures that the UI mutates directly
-    if (data.Providers && !Array.isArray(data.Providers)) {
-      validConfig.Providers = [];
+  const saveDraft: ConfigContextType['saveDraft'] = async (config, expected = revision) => {
+    if (!expected || !/^[a-f0-9]{64}$/.test(expected)) throw new Error(t('app.config_revision_missing'));
+    if (expected !== revision) throw new Error(t('app.config_conflict'));
+    try {
+      const result = await api.updateConfig(config, expected);
+      if (result.success) {
+        // The server may add managed providers. Adopt the complete raw GET and
+        // its revision together, only if no new edits arrived during the save.
+        const snapshot = await api.getConfigSnapshot().catch(() => {
+          throw new Error(t('app.config_saved_refresh_failed'));
+        });
+        setDraft(current => current === draft ? openConfigDraft(snapshot) : current);
+      }
+      return result;
+    } catch (error) {
+      if ((error as { status?: number }).status === 409) throw new Error(t('app.config_conflict'));
+      throw error;
     }
-    if (data.transformers && !Array.isArray(data.transformers)) {
-      validConfig.transformers = [];
-    }
-
-    return validConfig;
   };
 
-  useEffect(() => {
-    const fetchConfig = async () => {
-      // Prevent duplicate API calls in React StrictMode
-      // Skip if we've already fetched
-      if (hasFetched) {
-        return;
-      }
-      setHasFetched(true);
-
-      try {
-        const validConfig = await loadConfigFromServer();
-        setConfig(validConfig);
-      } catch (err) {
-        console.error('Failed to fetch config:', err);
-        // If we get a 401, the API client will redirect to login
-        // Otherwise, set an empty config or error
-        if ((err as Error).message !== 'Unauthorized') {
-          // Set default empty config when fetch fails
-          setConfig({
-            LOG: false,
-            LOG_LEVEL: 'error',
-            CLAUDE_PATH: '',
-            HOST: '127.0.0.1',
-            PORT: 3456,
-            APIKEY: '',
-            API_TIMEOUT_MS: '600000',
-            PROXY_URL: '',
-            PROXY_GLOBAL_ENABLED: true,
-            transformers: [],
-            Providers: [],
-            StatusLine: undefined,
-            Clients: {
-              claudeCode: {
-                enabled: false,
-                managed: false,
-                configPath: '~/.claude/settings.json',
-              },
-              codex: {
-                enabled: false,
-                managed: false,
-                configPath: '~/.codex/config.toml',
-                modelAlias: 'ccr-opus',
-              },
-            },
-            Router: {
-              default: '',
-              background: '',
-              think: '',
-              longContext: '',
-              longContextThreshold: 60000,
-              webSearch: '',
-              image: '',
-              models: {}
-            },
-            CUSTOM_ROUTER_PATH: ''
-          });
-          setError(err as Error);
-        }
-      }
-    };
-
-    fetchConfig();
-  }, [hasFetched, apiKey]);
-
-  const refreshConfig = async (merge?: (current: Config, server: Config) => Config) => {
+  const refreshConfig: ConfigContextType['refreshConfig'] = async merge => {
     try {
-      const validConfig = await loadConfigFromServer();
-      // Optional narrow refresh for server-managed providers: preserve Router
-      // drafts and unrelated local edits, including edits made during the read.
-      setConfig(current => merge && current ? merge(current, validConfig) : validConfig);
+      const snapshot = await api.getConfigSnapshot();
+      setDraft(current => current && current.base === draft?.base ? refreshConfigDraft(current, snapshot, merge) : current);
       setError(null);
     } catch (err) {
       console.error('Failed to refresh config:', err);
@@ -156,7 +108,7 @@ export function ConfigProvider({ children }: ConfigProviderProps) {
   };
 
   return (
-    <ConfigContext.Provider value={{ config, setConfig, error, refreshConfig }}>
+    <ConfigContext.Provider value={{ config: draft?.config ?? null, revision, setConfig, saveDraft, error, refreshConfig }}>
       {children}
     </ConfigContext.Provider>
   );

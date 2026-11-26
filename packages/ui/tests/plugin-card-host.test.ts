@@ -423,9 +423,9 @@ test("provider management lease excludes full-config writes in both directions",
   try {
     const release = client.acquireProviderManagement(); assert.ok(release);
     assert.equal(client.acquireProviderManagement(), null);
-    assert.deepEqual(await client.updateConfig({} as never), { success: false });
+    assert.deepEqual(await client.updateConfig({} as never, "a".repeat(64)), { success: false });
     release();
-    const pending = client.updateConfig({} as never);
+    const pending = client.updateConfig({} as never, "a".repeat(64));
     assert.equal(client.acquireProviderManagement(), null);
     finish(new Response('{"success":true}')); await pending;
     const next = client.acquireProviderManagement(); assert.ok(next); next();

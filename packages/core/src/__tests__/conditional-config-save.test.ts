@@ -65,7 +65,7 @@ describe("conditional /api/config save", () => {
     expect(revision).toMatch(/^[a-f0-9]{64}$/);
     const webConfig = { ...initial, extra: { flags: ["web edit"] } };
     const desktopConfig = { ...initial, LOG: true };
-    const web = () => server.app.inject({ method: "POST", url, payload: webConfig });
+    const web = () => server.app.inject({ method: "PUT", url, payload: { revision, config: webConfig } });
     const desktop = () => server.app.inject({ method: "PUT", url, payload: { revision, config: desktopConfig } });
 
     // Pause the first write before disk changes. Deliver the second request
@@ -85,22 +85,29 @@ describe("conditional /api/config save", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     proceed.release();
     expect((await first).statusCode).toBe(200);
-    expect((await second).statusCode).toBe(webFirst ? 409 : 200);
-    expect(configIO.backupConfigFile).toHaveBeenCalledTimes(webFirst ? 1 : 2);
-    expect(configIO.writeConfigFile).toHaveBeenCalledTimes(webFirst ? 1 : 2);
-    expect(reload.mock.calls.map(([config]) => config.LOG)).toEqual(webFirst ? [false] : [true, false]);
+    expect((await second).statusCode).toBe(409);
+    expect(configIO.backupConfigFile).toHaveBeenCalledTimes(1);
+    expect(configIO.writeConfigFile).toHaveBeenCalledTimes(1);
+    expect(reload.mock.calls.map(([config]) => config.LOG)).toEqual(webFirst ? [false] : [true]);
     for (const [config] of reload.mock.calls) {
       expect(config.Providers[0]).toMatchObject({ api_key: "synthetic-key", api_base_url: "https://fixture.invalid/api" });
     }
-    expect(vi.mocked(configIO.writeConfigFile).mock.calls.map(([raw]) => raw)).toEqual(
-      webFirst ? [webConfig] : [desktopConfig, webConfig],
-    );
-    expect(readRaw()).toEqual(webConfig);
+    const winner = webFirst ? webConfig : desktopConfig;
+    expect(configIO.writeConfigFile).toHaveBeenCalledWith(winner);
+    expect(readRaw()).toEqual(winner);
     const final = await server.app.inject({ method: "GET", url });
-    expect(final.json()).toEqual(webConfig);
+    expect(final.json()).toEqual(winner);
     expect(final.headers["x-ccr-config-revision"]).not.toBe(revision);
     expect(server.providerService.getProvider("sample")).toMatchObject({ apiKey: "synthetic-key", baseUrl: "https://fixture.invalid/api" });
     expect(configIO.readConfigFile).not.toHaveBeenCalled();
+  });
+
+  it("accepts an unconditional raw POST from a legacy client", async () => {
+    const legacy = { ...initial, LOG: true };
+    const save = await server.app.inject({ method: "POST", url, payload: legacy });
+    expect(save.statusCode).toBe(200);
+    expect(save.json().success).toBe(true);
+    expect(readRaw()).toEqual(legacy);
   });
 
   it("requires a valid precondition and recovers after an unreadable current config", async () => {

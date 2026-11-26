@@ -24,7 +24,8 @@ interface JsonEditorProps {
 
 export function JsonEditor({ open, onOpenChange, showToast }: JsonEditorProps) {
   const { t } = useTranslation();
-  const { config } = useConfig();
+  const { config, saveDraft, revision } = useConfig();
+  const [editorRevision, setEditorRevision] = useState<string | null | undefined>(undefined);
   const [jsonValue, setJsonValue] = useState<string>('');
   const [isSaving, setIsSaving] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
@@ -50,10 +51,12 @@ export function JsonEditor({ open, onOpenChange, showToast }: JsonEditorProps) {
   };
 
   useEffect(() => {
-    if (config && open) {
+    if (!open) { setEditorRevision(undefined); return; }
+    if (config && editorRevision === undefined) {
+      setEditorRevision(revision);
       setJsonValue(JSON.stringify(config, null, 2));
     }
-  }, [config, open]);
+  }, [config, open, revision, editorRevision]);
 
   // Handle open/close animations
   useEffect(() => {
@@ -100,7 +103,7 @@ export function JsonEditor({ open, onOpenChange, showToast }: JsonEditorProps) {
   const performSave = async (parsedConfig: Config) => {
     try {
       setIsSaving(true);
-      const response = await api.updateConfig(parsedConfig);
+      const response = await saveDraft(parsedConfig, editorRevision ?? null);
 
       const success = handleSaveResponse(
         response,
@@ -125,7 +128,7 @@ export function JsonEditor({ open, onOpenChange, showToast }: JsonEditorProps) {
     try {
       setIsSaving(true);
       // Save config first
-      const saveResponse = await api.updateConfig(parsedConfig);
+      const saveResponse = await saveDraft(parsedConfig, editorRevision ?? null);
       const saveSuccessful = handleSaveResponse(
         saveResponse,
         t('app.config_saved_success'),
