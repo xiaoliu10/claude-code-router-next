@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "codex-service-tier",
+  "description": "Allow the local main window to read and save the Codex subscription service tier",
+  "windows": ["main"],
+  "permissions": ["allow-codex-service-tier-get", "allow-codex-service-tier-set"]
+}

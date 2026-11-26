@@ -1,4 +1,5 @@
 //! Read-only quota projection. Config and upstream payloads never cross the IPC boundary.
+pub(crate) mod codex_service_tier;
 mod step_plan;
 use crate::api::{admin_auth_failed, AdminClient};
 use reqwest::Method;
@@ -131,6 +132,18 @@ fn live(value: &Value) -> bool {
         .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
         .is_some_and(|date| date.unix_timestamp_nanos() > now() as i128 * 1_000_000)
 }
+fn codex_managed(entry: &Value, credential: Option<&str>) -> bool {
+    entry["codex_managed"] == true
+        || entry["codexManaged"] == true
+        || credential == Some("ccr-managed-codex")
+}
+
+fn provider_credential(entry: &Value) -> Option<&str> {
+    entry["api_key"]
+        .as_str()
+        .or_else(|| entry["apiKey"].as_str())
+}
+
 fn configured(config: &Value, step_plan_hasher: &RandomState) -> Vec<ConfiguredProvider> {
     let mut seen = HashSet::new();
     config[crate::api::provider_list_key(config)]
@@ -142,19 +155,13 @@ fn configured(config: &Value, step_plan_hasher: &RandomState) -> Vec<ConfiguredP
             if name.contains(',') || name.trim() != name || !seen.insert(name.clone()) {
                 return None;
             }
-            let credential = entry["api_key"]
-                .as_str()
-                .or_else(|| entry["apiKey"].as_str());
+            let credential = provider_credential(entry);
             let endpoint = entry["api_base_url"].as_str();
             let enabled = entry["enabled"] != false;
             let key = credential.unwrap_or("");
             let flag = |a: &str, b: &str| entry[a] == true || entry[b] == true;
             let adapter = match name.as_str() {
-                "codex-subscription"
-                    if flag("codex_managed", "codexManaged") || key == "ccr-managed-codex" =>
-                {
-                    Adapter::Codex
-                }
+                "codex-subscription" if codex_managed(entry, credential) => Adapter::Codex,
                 "kiro-subscription"
                     if flag("kiro_managed", "kiroManaged") || key == "ccr-managed-kiro" =>
                 {

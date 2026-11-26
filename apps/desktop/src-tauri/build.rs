@@ -7,6 +7,8 @@ fn main() {
             "quota_hide",
             "quota_open_ui",
             "quota_quit",
+            "codex_service_tier_get",
+            "codex_service_tier_set",
             "general_settings_snapshot",
             "general_settings_save",
             "routing_snapshot",

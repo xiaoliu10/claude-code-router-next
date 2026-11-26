@@ -34,6 +34,8 @@ pub fn run() {
             popup::quota_hide,
             popup::quota_open_ui,
             popup::quota_quit,
+            quota::codex_service_tier::codex_service_tier_get,
+            quota::codex_service_tier::codex_service_tier_set,
             general::general_settings_snapshot,
             general::general_settings_save,
             control::routing_snapshot,
