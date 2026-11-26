@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.3.2438] - 2026-11-26
+
+### English
+
+CCR Desktop 0.1.2 and the Codex 1.0.16 plugin add a service tier selector to the Codex subscription card. Follow Request is the default. Select Fast to send `priority` on subsequent subscription requests, or Standard to use the upstream default.
+
+### 中文
+
+CCR Desktop 0.1.2 和 Codex 插件 1.0.16 在 Codex 订阅卡片新增服务层级选择。默认跟随请求，选择「快速（Fast）」后，后续订阅请求会发送 `priority`。选择「标准」可使用上游默认层级。
+
 ## [2.3.2437] - 2026-11-26
 
 ### English
