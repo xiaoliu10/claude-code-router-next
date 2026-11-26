@@ -73,9 +73,18 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn stop_slot(slot: &Mutex<Option<Child>>) -> Option<GatewayStop> {
+    stop_slot_with(slot, lifecycle::stop_owned_gateway)
+}
+
+fn stop_slot_with(
+    slot: &Mutex<Option<Child>>,
+    stop: impl FnOnce(&mut Child) -> GatewayStop,
+) -> Option<GatewayStop> {
     let mut guard = lock(slot);
-    let result = lifecycle::stop_owned_gateway(guard.as_mut()?);
-    guard.take();
+    let result = stop(guard.as_mut()?);
+    if result != GatewayStop::Failed {
+        guard.take();
+    }
     Some(result)
 }
 
@@ -956,6 +965,29 @@ mod tests {
         assert!(lock(&slot).take().is_none());
         worker.join().unwrap();
         assert_eq!(stop_slot(&slot), None);
+    }
+
+    #[test]
+    fn failed_install_stop_retains_the_same_live_child_for_retry() {
+        let child = std::process::Command::new("sort")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let id = child.id();
+        let slot = Mutex::new(Some(child));
+        for _ in 0..2 {
+            assert_eq!(
+                stop_slot_with(&slot, |child| {
+                    assert_eq!(child.id(), id);
+                    assert!(child.try_wait().unwrap().is_none());
+                    GatewayStop::Failed
+                }),
+                Some(GatewayStop::Failed)
+            );
+        }
+        assert_eq!(stop_slot(&slot), Some(GatewayStop::Stopped));
+        assert!(lock(&slot).is_none());
     }
 
     async fn failed_install_restores_child(already_exited: bool) -> bool {
