@@ -1343,7 +1343,8 @@ export class CodexAuthService {
   private cacheResetListing(listing: CodexResetCredits | null): CodexResetCreditsListing | null {
     const value = listing && {
       ...listing,
-      credits: listing.credits.filter(c => !this.spentResetCredits.has(c.id)),
+      // Desktop displays positive epoch milliseconds. Historical expiries cannot be redeemed.
+      credits: listing.credits.filter(c => !this.spentResetCredits.has(c.id) && (c.expiresAt === undefined || c.expiresAt > 0)),
       accountRevision: this.accountRevision,
     };
     this.resetCache = { at: this.now, value };

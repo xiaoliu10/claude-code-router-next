@@ -714,7 +714,7 @@ function parseResetCredit(raw: any): CodexResetCredit | null {
   return {
     id: raw.id,
     status: raw.status,
-    ...(Number.isFinite(expires) && expires > 0 ? { expiresAt: expires } : {}),
+    ...(Number.isFinite(expires) ? { expiresAt: expires } : {}),
     ...(title ? { title } : {}),
     ...(description ? { description } : {}),
   };

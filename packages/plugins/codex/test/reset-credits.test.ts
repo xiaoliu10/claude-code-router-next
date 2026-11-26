@@ -489,6 +489,29 @@ describe("consumeConfirmedResetCredit", () => {
     expect(h.consumeCalls()).toHaveLength(0);
   });
 
+  it("keeps a valid card selectable alongside a historical expiry", async () => {
+    const h = await connected({ now: () => beforeExpiry, listing: () => json({ ...LISTING,
+      credits: [{ ...LISTING.credits[0], expires_at: "1970-01-01T00:00:00Z" }, LISTING.credits[1]] }) });
+    const display = (await h.service.getResetCredits())!;
+    expect(display.credits.map(c => c.id)).toEqual(["credit-new"]);
+    expect(display.availableCount).toBe(LISTING.available_count);
+    expect(h.consumeCalls()).toHaveLength(0);
+    expect((await h.service.consumeConfirmedResetCredit("credit-new", display.accountRevision)).outcome).toBe("reset");
+    expect(h.consumeCalls().map(call => call.body.credit_id)).toEqual(["credit-new"]);
+  });
+
+  it.each(["1970-01-01T00:00:00Z", "1969-12-31T23:59:59Z"])("rejects a fresh expiry of %s without sending a consume POST", async expires_at => {
+    let fresh = false;
+    const h = await connected({ now: () => beforeExpiry, listing: () => json(fresh
+      ? { ...LISTING, credits: [{ ...LISTING.credits[0], expires_at }, LISTING.credits[1]] }
+      : LISTING) });
+    const display = (await h.service.getResetCredits())!;
+    fresh = true;
+    await expect(h.service.consumeConfirmedResetCredit("credit-old", display.accountRevision)).rejects.toMatchObject({ code: "codex_reset_no_credit" });
+    expect(h.consumeCalls()).toHaveLength(0);
+    expect((await h.service.getResetCredits())?.credits.map(c => c.id)).toEqual(["credit-new"]);
+  });
+
   it("rereads upstream even within the 60s display TTL and rejects an expired selection", async () => {
     let now = beforeExpiry;
     const h = await connected({ now: () => now });
