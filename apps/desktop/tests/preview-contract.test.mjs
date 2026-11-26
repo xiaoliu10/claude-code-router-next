@@ -219,6 +219,17 @@ test("preview: quota_snapshot keeps the existing quota contract", async () => {
   assert.equal(typeof s.online, "boolean")
 })
 
+test('preview: Codex subscription tier defaults to follow and round-trips each choice in memory', async () => {
+  const invoke = Q.createPreviewInvoke()
+  const snapshot = await invoke('quota_snapshot')
+  assert.ok(snapshot.providers.some(p => p.name === 'codex-subscription' && p.enabled))
+  assert.equal((await invoke('codex_service_tier_get')).tier, 'follow')
+  for (const tier of ['priority', 'standard', 'follow']) {
+    assert.equal((await invoke('codex_service_tier_set', { tier })).tier, tier)
+    assert.equal((await invoke('codex_service_tier_get')).tier, tier)
+  }
+})
+
 test("preview: provider_add returns only the name and updates safe quota and routing projections", async () => {
   const invoke = Q.createPreviewInvoke()
   const provider = { name: 'example.com', baseUrl: 'https://example.com/v1', apiKey: 'test-key', models: ['one'] }
