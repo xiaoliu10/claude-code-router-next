@@ -394,6 +394,11 @@ export interface ProviderQuotaUsage {
   type5h?: 'rateLimit' | 'balance';
   /** Display type for the 7d slot */
   type7d?: 'rateLimit' | 'balance';
+  /** Usage/limit for the monthly (30d) slot */
+  used30d?: number;
+  limit30d?: number;
+  reset30d?: string;
+  type30d?: 'rateLimit' | 'balance';
   /** Currency for balance display (e.g. "CNY", "USD") */
   currency?: string;
 }

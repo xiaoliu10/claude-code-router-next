@@ -13,10 +13,12 @@ import vm from "node:vm"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const js = readFileSync(path.join(here, "..", "src", "quota.js"), "utf8")
+const pluginsJs = readFileSync(path.join(here, "..", "src", "plugins.js"), "utf8")
 const html = readFileSync(path.join(here, "..", "src", "quota.html"), "utf8")
 
-const sandbox = { setTimeout }
+const sandbox = { setTimeout, URL, TextEncoder }
 vm.createContext(sandbox)
+new vm.Script(pluginsJs, { filename: "plugins.js" }).runInContext(sandbox)
 new vm.Script(js, { filename: "quota.js" }).runInContext(sandbox)
 const Q = sandbox.QuotaUI
 assert.ok(Q && typeof Q.createPreviewInvoke === "function", "QuotaUI.createPreviewInvoke must exist")
@@ -123,7 +125,7 @@ test("preview: usage_records paginates with cross-page totals, error and estimat
   const empty = await previewCall(invoke, "usage_records", { period: "today", page: 99, pageSize: 20 })
   assert.equal(empty.records.length, 0, "out-of-range page yields no records")
 
-  for (const period of ["7d", "30d"]) {
+  for (const period of ["7d", "30d", "all"]) {
     const page = await previewCall(invoke, "usage_records", { period })
     for (const k of RECORDS_PAGE_KEYS) assert.ok(k in page, `${period}: missing ${k}`)
     assert.equal(page.period, period)
@@ -170,6 +172,71 @@ test("preview: quota_snapshot keeps the existing quota contract", async () => {
   assert.ok(Array.isArray(s.providers) && s.providers.length > 0)
   assert.equal(typeof s.updatedAt, "number")
   assert.equal(typeof s.online, "boolean")
+})
+
+test("preview: provider_add returns only the name and updates safe quota and routing projections", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const provider = { name: 'example.com', baseUrl: 'https://example.com/v1', apiKey: 'test-key', models: ['one'] }
+  const added = await previewCall(invoke, 'provider_add', { provider })
+  assert.deepEqual(Object.keys(added), ['name'])
+  assert.equal(added.name, provider.name)
+  await assert.rejects(previewCall(invoke, 'provider_add', { provider: { ...provider, name: 'EXAMPLE.com' } }), /^(Error: )?PROVIDER_DUPLICATE$/)
+  await assert.rejects(previewCall(invoke, 'provider_add', { provider: { ...provider, models: [] } }), /PROVIDER_INVALID/)
+  const quota = await invoke('quota_snapshot', { provider: provider.name })
+  const routing = await invoke('routing_snapshot')
+  assert.equal(quota.providers.filter(p => p.name === provider.name).length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(routing.providers.at(-1))), { name: provider.name, models: ['one'] })
+  assert.doesNotMatch(JSON.stringify([added, quota, routing]), /test-key|https:\/\/example\.com/)
+})
+
+test('preview: provider_get projects editable fields and provider_update preserves its name', async () => {
+  const invoke = Q.createPreviewInvoke()
+  const provider = { name: 'example.com', baseUrl: 'https://example.com/v1', models: ['one'] }
+  await invoke('provider_add', { provider: { ...provider, apiKey: 'test-key' } })
+  const detail = await invoke('provider_get', { name: provider.name })
+  assert.deepEqual(JSON.parse(JSON.stringify(detail)), { ...provider, managed: false, transformer: null, transformerProtected: false })
+  await assert.rejects(invoke('provider_update', { name: provider.name, provider: { ...provider, name: 'Renamed' } }), /PROVIDER_INVALID/)
+  const change = { ...provider, models: ['two'] }
+  const updated = await invoke('provider_update', { name: provider.name, provider: change })
+  assert.deepEqual({ ...updated }, { name: change.name })
+  assert.deepEqual(JSON.parse(JSON.stringify(await invoke('provider_get', updated))), { ...change, managed: false, transformer: null, transformerProtected: false })
+  const quota = await invoke('quota_snapshot')
+  assert.ok(quota.providers.some(p => p.name === change.name))
+  assert.equal(quota.providers.filter(p => p.name === provider.name).length, 1)
+  const routes = await invoke('routing_snapshot')
+  assert.deepEqual(JSON.parse(JSON.stringify(routes.providers.at(-1))), { name: change.name, models: change.models })
+})
+
+test('preview: provider_get summarizes protected tuples and omitted transformer keeps the chain', async () => {
+  const invoke = Q.createPreviewInvoke()
+  const { parameterizedNames } = await invoke('provider_transformers')
+  assert.ok(parameterizedNames.includes('customparams'))
+  const provider = { name: 'example.com', baseUrl: 'https://example.com', models: ['one'] }
+  const transformer = { use: [[parameterizedNames[0], { value: 'test-key' }]] }
+  const target = await invoke('provider_add', { provider: { ...provider, apiKey: 'test-key', transformer } })
+  await invoke('provider_update', { ...target, provider })
+  const summary = await invoke('provider_get', target)
+  assert.equal(summary.transformerProtected, true)
+  assert.deepEqual(JSON.parse(JSON.stringify(summary.transformer)), { use: [parameterizedNames[0]] })
+  assert.doesNotMatch(JSON.stringify(summary), /test-key/)
+})
+
+test('preview: rejects unsafe URLs, instance-only tuples and managed edits', async () => {
+  const invoke = Q.createPreviewInvoke()
+  const provider = { name: 'safe', baseUrl: 'https://example.com/?version=1', apiKey: 'test-key', models: ['one'] }
+  for (const query of ['api_key=test-secret', 'version=test-secret', 'api-version=2024-02-30', 'version=1&key=test-secret']) {
+    await assert.rejects(invoke('provider_add', { provider: { ...provider, baseUrl: `https://example.com/?${query}` } }), /PROVIDER_INVALID/)
+  }
+  const transformer = { use: [['OpenAI', {}]] }
+  for (const invalid of [transformer, { use: [['unknown', {}]] }, { use: [['customparams', []]] }, { use: [{}] }, { use: [] }, null]) {
+    await assert.rejects(invoke('provider_add', { provider: { ...provider, transformer: invalid } }), /PROVIDER_INVALID/)
+  }
+  await invoke('provider_add', { provider })
+  await assert.rejects(invoke('provider_update', { name: provider.name, provider: { ...provider, transformer } }), /PROVIDER_INVALID/)
+  const managed = { ...provider, name: 'managed', apiKey: 'ccr-managed-test' }
+  await invoke('provider_add', { provider: managed })
+  await assert.rejects(invoke('provider_get', { name: managed.name }), /PROVIDER_MANAGED/)
+  await assert.rejects(invoke('provider_update', { name: managed.name, provider: managed }), /PROVIDER_MANAGED/)
 })
 
 test("preview: routing_snapshot has the complete routing contract", async () => {
@@ -240,7 +307,7 @@ test("preview: routing_flags toggles both flags and returns a fresh snapshot", a
 
 test("preview: usage_snapshot covers today/7d/30d with complete summaries", async () => {
   const invoke = Q.createPreviewInvoke()
-  for (const period of ["today", "7d", "30d"]) {
+  for (const period of ["today", "7d", "30d", "all"]) {
     assertUsageSnapshot(await previewCall(invoke, "usage_snapshot", { period }), period, period)
   }
   const fallback = await previewCall(invoke, "usage_snapshot", { period: "bogus" })
@@ -334,6 +401,51 @@ test("preview: quota_credentials_status/save follow the {name, configured} contr
   )
 })
 
+test("preview: plugin DTOs model partial catalog, install/update, safe actions and manual activation", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const inventory = await previewCall(invoke, "plugin_inventory")
+  assert.deepEqual(Object.keys(inventory), ["plugins"])
+  for (const row of inventory.plugins) {
+    const { connectionState, ...required } = row
+    assert.deepEqual(Object.keys(required), ["id", "name", "version", "loaded", "actions"])
+    assert.ok(Array.isArray(row.actions))
+    assert.ok(connectionState === undefined || ["connected", "disconnected", "unknown"].includes(connectionState))
+  }
+  assert.equal(inventory.plugins.find(row => row.id === "codex").connectionState, "connected")
+  assert.ok(inventory.plugins.some(row => row.loaded && row.actions.includes("usage")))
+  assert.ok(inventory.plugins.some(row => !row.loaded && row.actions.length === 0))
+  const catalog = await previewCall(invoke, "plugin_catalog")
+  assert.equal(catalog.partial, true)
+  for (const row of catalog.plugins) {
+    assert.deepEqual(Object.keys(row), ["name", "description", "version", "installed", "installedVersion", ...(row.installed && !row.localOnly ? ["installedName"] : []), "updateAvailable", "localOnly"])
+  }
+  const offer = catalog.plugins.find(row => !row.installed)
+  const update = catalog.plugins.find(row => row.updateAvailable)
+  await assert.rejects(previewCall(invoke, "plugin_install", { name: catalog.plugins.find(row => row.localOnly).name, version: "0.1.0", installed: { name: "local-example", version: "0.1.0" } }), /PLUGIN_INSTALL_FAILED/)
+  await assert.rejects(previewCall(invoke, "plugin_action", { id: "workbuddy", action: "disconnect" }), /PLUGIN_ACTION_FAILED/)
+  const usage = await previewCall(invoke, "plugin_action", { id: "codex", action: "usage" })
+  assert.deepEqual({ ...usage }, { usage: "fresh" })
+  const disconnected = await previewCall(invoke, "plugin_action", { id: "codex", action: "disconnect" })
+  assert.deepEqual({ ...disconnected }, { success: true })
+  for (const [row, isUpdate] of [[offer, false], [update, true]]) {
+    const result = await previewCall(invoke, "plugin_install", { name: row.name, version: row.version, installed: isUpdate ? { name: row.installedName, version: row.installedVersion } : null })
+    assert.equal(result.restartRequired, true)
+    assert.equal(result.version, row.version)
+    assert.ok(result.id)
+  }
+  const installed = await previewCall(invoke, "plugin_catalog")
+  assert.ok(installed.plugins.every(row => row.installed && !row.updateAvailable))
+  const beforeStart = await previewCall(invoke, "plugin_inventory")
+  assert.equal(beforeStart.plugins.find(row => row.id === "gemini-oauth").loaded, false)
+  assert.equal(beforeStart.plugins.find(row => row.id === "codex").version, update.installedVersion)
+  assert.equal(beforeStart.plugins.find(row => row.id === "codex").connectionState, "disconnected")
+  await previewCall(invoke, "service_action", { action: "stop" })
+  await previewCall(invoke, "service_action", { action: "start" })
+  const afterStart = await previewCall(invoke, "plugin_inventory")
+  assert.equal(afterStart.plugins.find(row => row.id === "gemini-oauth").loaded, true)
+  assert.equal(afterStart.plugins.find(row => row.id === "codex").version, update.version)
+})
+
 test("preview: unknown commands resolve null (never fabricate responses)", async () => {
   const invoke = Q.createPreviewInvoke()
   assert.equal(await previewCall(invoke, "totally_unknown", {}), null)
@@ -342,9 +454,9 @@ test("preview: unknown commands resolve null (never fabricate responses)", async
 // ---------------- HTML / JS wiring ----------------
 
 const htmlIds = () => new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]))
-const jsIds = () => new Set([...js.matchAll(/getElementById\('([^']+)'\)/g)].map((m) => m[1]))
+const jsIds = () => new Set([...(js + pluginsJs).matchAll(/getElementById\('([^']+)'\)/g)].map((m) => m[1]))
 
-test("wiring: every id referenced from quota.js exists in quota.html", () => {
+test("wiring: every id referenced from quota.js and plugins.js exists in quota.html", () => {
   const missing = [...jsIds()].filter((id) => !htmlIds().has(id))
   assert.deepEqual(missing, [], `ids used in JS but missing in HTML: ${missing.join(", ")}`)
 })
@@ -355,13 +467,14 @@ test("wiring: scripts are external only and there are no inline handlers (CSP sc
   }
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i, "no inline on* handlers in HTML")
   assert.match(html, /<script src="quota\.js" defer><\/script>/)
+  assert.ok(html.indexOf('src="plugins.js" defer') > 0 && html.indexOf('src="plugins.js" defer') < html.indexOf('src="quota.js" defer'))
 })
 
 test("wiring: stylesheet and tab structure are present", () => {
   assert.match(html, /<link rel="stylesheet" href="quota\.css">/)
   assert.ok(JSON.stringify(jsIds()).length > 0)
   const ids = htmlIds()
-  for (const tab of ["quota", "routing", "usage", "clients"]) {
+  for (const tab of ["quota", "routing", "usage", "clients", "plugins"]) {
     assert.ok(ids.has(`tab-${tab}`), `tab-${tab} exists`)
     assert.ok(ids.has(`panel-${tab}`), `panel-${tab} exists`)
     assert.ok(new RegExp(`aria-controls="panel-${tab}"`).test(html), `tab-${tab} aria-controls wired`)
@@ -370,7 +483,7 @@ test("wiring: stylesheet and tab structure are present", () => {
 
 test("wiring: product wording matches the approved labels", () => {
   const text = html.replace(/\s+/g, "")
-  for (const label of ["额度", "路由", "用量", "客户端"]) {
+  for (const label of ["额度", "路由", "用量", "客户端", "插件", "已安装", "插件市场"]) {
     assert.ok(text.includes(`>${label}</button>`), `tab label ${label} present`)
   }
   assert.ok(html.includes("将 Claude Code、Codex、Pi 等接入 CCR"), "clients tab description present")

@@ -303,8 +303,8 @@ describe("VolcengineCodingPlanQuotaAdapter window mapping", () => {
     const adapter = getQuotaAdapter(CODING_BASE_URL);
     const result = await adapter!.queryQuota(makeProvider(), 5000);
 
-    // toEqual pins the exact shape: no currency (rateLimit classification),
-    // no remainingBalance, and monthly intentionally unmapped (no UI slot).
+    // toEqual pins the exact shape: no currency (rateLimit classification) and
+    // no remainingBalance; all three windows map onto their UI slots.
     expect(result).toEqual({
       limitDaily: 100,
       usedDailyBalance: 37.5,
@@ -312,6 +312,9 @@ describe("VolcengineCodingPlanQuotaAdapter window mapping", () => {
       totalBalance: 100,
       usedBalance: 62,
       resetTime7d: WEEKLY_RESET_ISO,
+      limitMonthly: 100,
+      usedMonthlyBalance: 80,
+      resetTimeMonthly: new Date(1766000000 * 1000).toISOString(),
     });
   });
 
@@ -374,12 +377,16 @@ describe("VolcengineCodingPlanQuotaAdapter window mapping", () => {
     expect(await adapter!.queryQuota(makeProvider(), 5000)).toBeNull();
   });
 
-  it("returns null when only the unmapped monthly window is present", async () => {
+  it("maps a monthly-only response to the 30d slot alone", async () => {
     mockFetchJson(usagePayload([
       { Level: "monthly", Percent: 80, ResetTimestamp: 1766000000 },
     ]));
     const adapter = getQuotaAdapter(CODING_BASE_URL);
-    expect(await adapter!.queryQuota(makeProvider(), 5000)).toBeNull();
+    expect(await adapter!.queryQuota(makeProvider(), 5000)).toEqual({
+      limitMonthly: 100,
+      usedMonthlyBalance: 80,
+      resetTimeMonthly: new Date(1766000000 * 1000).toISOString(),
+    });
   });
 
   it("ignores entries with a non-numeric Percent", async () => {

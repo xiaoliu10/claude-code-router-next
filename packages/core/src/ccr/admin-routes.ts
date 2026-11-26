@@ -69,6 +69,18 @@ import AdmZip from "adm-zip";
 import { query as queryUsage, querySummary as queryUsageSummary, clear as clearUsage } from "./usage-store";
 import { listAnthropicCompatibleModels } from "./models";
 
+// A tuple calls `new` on the registry value. Probe its constructor capability
+// without executing plugin code or requiring default constructor options.
+function isTransformerConstructor(value: unknown): boolean {
+  if (typeof value !== "function") return false;
+  try {
+    Reflect.construct(Object, [], value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The model list a client should see: models whose circuit is open are hidden.
  *
@@ -97,6 +109,11 @@ interface ProviderQuotaUsage {
   type5h?: 'rateLimit' | 'balance';
   /** Display type for the 7d slot: 'rateLimit' (限额) or 'balance' (余额) */
   type7d?: 'rateLimit' | 'balance';
+  /** Usage/limit for the monthly (30d) slot, when an adapter exposes one. */
+  used30d?: number;
+  limit30d?: number;
+  reset30d?: string;
+  type30d?: 'rateLimit' | 'balance';
   /** Currency for balance display (e.g. "CNY", "USD") */
   currency?: string;
 }
@@ -275,6 +292,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       ([name, transformer]: any) => ({
         name,
         endpoint: transformer.endPoint || null,
+        supportsParameters: isTransformerConstructor(transformer),
       })
     );
     return { transformers: transformerList };
@@ -993,6 +1011,35 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
           }
         } else if (typeof stored.usedBalance === 'number') {
           quota.used7d = stored.usedBalance;
+        }
+
+        const storeReset30dExpired = isQuotaWindowExpired(
+          typeof stored.resetTimeMonthly === 'string'
+            ? Date.parse(stored.resetTimeMonthly) / 1000
+            : undefined
+        );
+        // Monthly window (e.g. Volcengine Coding Plan's 30-day cap): same
+        // percentage-vs-balance semantics as the 7d slot. An expired monthly
+        // sample is dropped entirely — keeping its usage would show an
+        // exhausted window for a period that has already reset.
+        if (!storeReset30dExpired) {
+          if (typeof stored.limitMonthly === 'number') {
+            quota.limit30d = stored.limitMonthly;
+            quota.type30d = stored.currency ? 'balance' : 'rateLimit';
+            quota.used30d = typeof stored.usedMonthlyBalance === 'number'
+              ? stored.usedMonthlyBalance
+              : 0;
+          } else if (typeof stored.usedMonthlyBalance === 'number') {
+            quota.used30d = stored.usedMonthlyBalance;
+          }
+          // A monthly-only balance carries its currency here: the 7d branch
+          // above never runs without totalBalance/usedBalance.
+          if (stored.currency) {
+            quota.currency = stored.currency;
+          }
+          if (typeof stored.resetTimeMonthly === 'string') {
+            quota.reset30d = stored.resetTimeMonthly;
+          }
         }
 
         // Same staleness rule as the header merge above: a window whose reset

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Server from "../server";
 import { listAnthropicCompatibleModels } from "../ccr/models";
+import { registerAdminRoutes } from "../ccr/admin-routes";
 import { apiKeyAuth } from "../ccr/auth";
 
 describe("CCR runtime management API", () => {
@@ -35,6 +36,23 @@ describe("CCR runtime management API", () => {
     expect(health.statusCode).toBe(200);
     expect(health.json().status).toBe("ok");
     await server.app.close();
+  });
+
+  it("reports which registered transformers support tuple parameters", async () => {
+    const config = { Providers: [], Router: {}, ACTIVE_PROBE_ENABLED: false };
+    const server = new Server({ logger: false, useJsonFile: false, initialConfig: config });
+    try {
+      await server.ready();
+      await registerAdminRoutes(server, config);
+      const response = await server.app.inject({ method: "GET", url: "/api/transformers" });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().transformers).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "OpenAI", supportsParameters: false }),
+        expect.objectContaining({ name: "customparams", supportsParameters: true }),
+      ]));
+    } finally {
+      await server.app.close();
+    }
   });
 
   it("loads jsonPath by default when useJsonFile is omitted", async () => {

@@ -176,6 +176,47 @@ describe("managed runtime fetchQuota seam", () => {
     expect(quota.type7d).toBe("balance");
   });
 
+  it("maps monthly figures into the 30d slot and drops expired monthly samples", async () => {
+    ({ server } = await buildAdminRuntime(configDir));
+    const past = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const future = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    // An expired monthly sample is dropped entirely while the live 7d window
+    // stays visible — a stale 100/100 must not read as exhausted.
+    (globalThis as any).__quotaFigures = {
+      limitMonthly: 100,
+      usedMonthlyBalance: 100,
+      resetTimeMonthly: past,
+      usedBalance: 12.5,
+      totalBalance: 50,
+      resetTime7d: FUTURE_ISO_7D,
+    };
+    resetPluginQuotaCache();
+    let res = await server.app.inject({ method: "GET", url: "/api/providers/quota" });
+    let quota = res.json().quotas.find((q: any) => q.provider === "fake-sub");
+    expect(quota.limit30d).toBeUndefined();
+    expect(quota.used30d).toBeUndefined();
+    expect(quota.reset30d).toBeUndefined();
+    expect(quota.used7d).toBe(12.5);
+    expect(quota.limit7d).toBe(50);
+
+    // A live monthly-only balance keeps its currency through the route.
+    (globalThis as any).__quotaFigures = {
+      limitMonthly: 100,
+      usedMonthlyBalance: 20,
+      currency: "USD",
+      resetTimeMonthly: future,
+    };
+    resetPluginQuotaCache();
+    res = await server.app.inject({ method: "GET", url: "/api/providers/quota" });
+    quota = res.json().quotas.find((q: any) => q.provider === "fake-sub");
+    expect(quota.limit30d).toBe(100);
+    expect(quota.used30d).toBe(20);
+    expect(quota.type30d).toBe("balance");
+    expect(quota.currency).toBe("USD");
+    expect(quota.reset30d).toBe(future);
+  });
+
   it("serves the second UI request from the 60s TTL cache without polling again", async () => {
     ({ server } = await buildAdminRuntime(configDir));
 

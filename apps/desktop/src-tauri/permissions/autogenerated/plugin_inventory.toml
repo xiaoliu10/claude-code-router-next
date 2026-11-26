@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-inventory"
+description = "Enables the plugin_inventory command without any pre-configured scope."
+commands.allow = ["plugin_inventory"]
+
+[[permission]]
+identifier = "deny-plugin-inventory"
+description = "Denies the plugin_inventory command without any pre-configured scope."
+commands.deny = ["plugin_inventory"]

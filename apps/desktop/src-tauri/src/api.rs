@@ -307,10 +307,18 @@ fn default_value(config: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+pub(crate) fn provider_list_key(config: &Value) -> &'static str {
+    if config.get("Providers").is_none() && config.get("providers").is_some() {
+        "providers"
+    } else {
+        "Providers"
+    }
+}
+
 pub(crate) fn providers(config: &Value) -> Vec<TrayProvider> {
     let mut result = Vec::new();
     let mut names = HashSet::new();
-    if let Some(entries) = config.get("Providers").and_then(Value::as_array) {
+    if let Some(entries) = config.get(provider_list_key(config)).and_then(Value::as_array) {
         for entry in entries {
             if !entry.is_object() || !matches!(entry.get("enabled"), None | Some(Value::Bool(true)))
             {
@@ -436,6 +444,10 @@ pub(crate) mod mock {
 
     impl Mock {
         pub(crate) fn new(replies: Vec<(u16, String)>) -> Self {
+            Self::delayed(replies, Duration::ZERO)
+        }
+
+        pub(crate) fn delayed(replies: Vec<(u16, String)>, delay: Duration) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -504,6 +516,7 @@ pub(crate) mod mock {
                         .lock()
                         .unwrap()
                         .push(String::from_utf8(bytes).unwrap());
+                    thread::sleep(delay);
                     let redirect = if status == 302 {
                         format!(
                             "Location: http://{}/unexpected\r\n",

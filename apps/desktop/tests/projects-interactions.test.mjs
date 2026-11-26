@@ -84,7 +84,11 @@ test('projects interaction: fallback ordering, family thresholds and deletion co
   let first = h.id('projects-body').querySelector('.route');
   first.querySelectorAll('.fallback-item')[1].querySelector('button').click();
   first = h.id('projects-body').querySelector('.route'); assert.match(first.querySelector('.fallback-item').textContent, /alpha,one/);
-  button(h, 'Opus').click(); button(h, '添加家族配置').click(); type(h, '长上下文阈值', '12345');
+  assert.ok(byLabel(h, '后台 目标'));
+  button(h, 'Opus').click(); button(h, '添加家族配置').click();
+  assert.ok(byLabel(h, '默认 目标'));
+  assert.equal(byLabel(h, '后台 目标'), undefined);
+  type(h, '长上下文阈值', '12345');
   button(h, '项目路由').click(); button(h, 'Opus').click(); assert.equal(byLabel(h, '长上下文阈值').value, '12345');
   button(h, '移除项目配置').click(); assert.match(h.id('projects-body').textContent, /移除 CCR 项目配置，不删除项目文件/);
   assert.equal(h.calls.some(c => c.cmd === 'projects_delete'), false); button(h, '取消').click();

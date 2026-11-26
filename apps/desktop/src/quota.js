@@ -233,8 +233,17 @@
       return allPromise;
     }
 
-    function refreshProvider(name) {
-      if (!snapshot || loadingAll) return Promise.resolve();
+    function refreshProvider(name, newlyAdded) {
+      if (newlyAdded && loadingAll) return allPromise.then(function () { return refreshProvider(name, true); });
+      if ((!snapshot && !newlyAdded) || loadingAll) return Promise.resolve();
+      if (newlyAdded) {
+        // Earlier card snapshots predate the config change and can omit the new row.
+        flags.forEach(function (flag, key) {
+          if (!flag.loading) return;
+          seq.set(key, (seq.get(key) || 0) + 1);
+          flags.set(key, { loading: false, error: null });
+        });
+      }
       var f = flags.get(name);
       if (f && f.loading) return Promise.resolve();
       var my = (seq.get(name) || 0) + 1;
@@ -254,6 +263,37 @@
     return { subscribe: subscribe, state: state, refreshAll: refreshAll, refreshProvider: refreshProvider };
   }
 
+
+  function safeVersionQuery(endpoint) {
+    var start = endpoint.indexOf('?');
+    if (start < 0) return true;
+    var query = endpoint.slice(start + 1);
+    if (/^version=\d{1,3}(?:\.\d{1,3}){0,2}$/.test(query)) return true;
+    var match = /^api-version=(\d{4}-\d{2}-\d{2})(?:-preview)?$/.exec(query);
+    if (!match) return false;
+    var date = new Date(match[1] + 'T00:00:00Z');
+    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === match[1];
+  }
+
+  function providerInputError(provider, editing) {
+    function validText(value, maxBytes) {
+      return typeof value === 'string' && value.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+        && new TextEncoder().encode(value.trim()).length <= maxBytes;
+    }
+    function validId(value) { return validText(value, 256) && !value.includes(','); }
+    if (!provider || !validId(provider.name)) return 'name';
+    if (!validText(provider.baseUrl, 2048)) return 'baseUrl';
+    var endpoint = provider.baseUrl.trim();
+    var authority = /^https?:\/\/([^/?#]+)/i.exec(endpoint);
+    if (!safeVersionQuery(endpoint) || !authority || authority[1].includes('@') || /[\\#\s]/.test(endpoint)) return 'baseUrl';
+    try { if (!new URL(endpoint).hostname) return 'baseUrl'; } catch { return 'baseUrl'; }
+    var keepKey = editing && (provider.apiKey === undefined || provider.apiKey === '');
+    if (!keepKey && !validText(provider.apiKey, 4096)) return 'apiKey';
+    var models = provider.models;
+    if (!Array.isArray(models) || !models.length || models.length > 256 || !models.every(validId)) return 'models';
+    if (new Set(models.map(function (m) { return m.trim(); })).size !== models.length) return 'models';
+    return null;
+  }
 
   // ---- Coding Plan quota credentials (quota tab) -------------------------
   // quota_credentials_status() / quota_credentials_save({name, accessKey?, secretKey?})
@@ -305,8 +345,17 @@
       if (openName !== null && !known(openName)) { openName = null; saveError = null; savedFlash = null; }
     }
 
-    function refresh() {
-      if (loading || saving) return;
+    var refreshQueued = false;
+    function drainRefresh() {
+      if (!refreshQueued || loading || saving) return;
+      refreshQueued = false;
+      refresh();
+    }
+    function refresh(afterConfigChange) {
+      if (loading || saving) {
+        if (afterConfigChange === true) refreshQueued = true;
+        return;
+      }
       loading = true;
       error = null;
       emit();
@@ -321,7 +370,7 @@
         loading = false;
         error = errorMessage(err);
         emit();
-      });
+      }).then(drainRefresh);
     }
 
     function open(name) {
@@ -362,7 +411,7 @@
         saving = false;
         saveError = errorMessage(err);
         emit();
-      });
+      }).then(drainRefresh);
     }
 
     function save(name, values) {
@@ -403,7 +452,9 @@
 
   var ROUTING_SCOPES = ['global', 'opus', 'sonnet', 'haiku', 'models'];
   var ROUTING_SCENARIOS = ['default', 'background', 'think', 'longContext', 'extendedContext', 'webSearch', 'image'];
-  var USAGE_PERIODS = ['today', '7d', '30d'];
+  var USAGE_PERIOD_LABELS = { today: '今天', '7d': '近 7 天', '30d': '近 30 天', all: '全部' };
+  var USAGE_PERIODS = Object.keys(USAGE_PERIOD_LABELS);
+  var DEFAULT_USAGE_PERIOD = '7d';
   var SCOPE_LABELS = { global: '全局', opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', models: '模型别名' };
   var SCENARIO_LABELS = { default: '默认', background: '后台', think: '思考', longContext: '长上下文', extendedContext: '扩展上下文', webSearch: '网页搜索', image: '图像' };
 
@@ -699,7 +750,7 @@
 
 
   // ---- Usage tab ---------------------------------------------------------
-  // usage_snapshot({period:'today'|'7d'|'30d'}) -> totals + byModel/byProvider/byDay.
+  // usage_snapshot({period:'today'|'7d'|'30d'|'all'}) -> totals + byModel/byProvider/byDay.
   // Numbers come from the server summary only; no currency/cost is shown.
 
   function usageRow(x) {
@@ -737,7 +788,7 @@
   function createUsageController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createUsageController: 需要 invoke 函数');
-    var snapshot = null, loading = false, error = null, period = 'today';
+    var snapshot = null, loading = false, error = null, period = DEFAULT_USAGE_PERIOD;
     var epoch = 0;
     var listeners = new Set();
 
@@ -776,7 +827,7 @@
 
 
   // ---- Usage records -----------------------------------------------------
-  // usage_records({period:'today'|'7d'|'30d',page,pageSize}) -> paged,
+  // usage_records({period:'today'|'7d'|'30d'|'all',page,pageSize}) -> paged,
   // whitelisted projections of individual calls. The server never sends
   // responseBody/sessionId/keys; normalizeRecord re-enforces that whitelist
   // on the client before anything renders.
@@ -865,7 +916,7 @@
   function createRecordsController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createRecordsController: 需要 invoke 函数');
-    var period = 'today', page = 1, pageSize = RECORDS_PAGE_SIZE;
+    var period = DEFAULT_USAGE_PERIOD, page = 1, pageSize = RECORDS_PAGE_SIZE;
     var data = null, loading = false, error = null;
     var epoch = 0;
     var listeners = new Set();
@@ -1214,6 +1265,11 @@
         updatedAt: Date.now() - 3000,
       },
     };
+    var olderDay = { name: '2026-09-01', requests: 1, inputTokens: 1000, outputTokens: 250, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    usage.all = Object.assign({}, usage['30d'], {
+      period: 'all', totalRequests: 4121, successCount: 4045, inputTokens: 28601000, outputTokens: 7100250,
+      byDay: [olderDay].concat(usage['30d'].byDay),
+    });
     var clients = {
       clients: [
         { id: 'claudeCode', name: 'Claude Code', enabled: true, managed: true, exists: true, activeModel: 'claude-sonnet-4-5', modelAlias: 'claude-sonnet-4-5' },
@@ -1240,7 +1296,7 @@
       { original: 'claude-opus-4-5', model: 'glm-5', upstream: 'glm-5-air' },
       { original: 'gpt-5-codex', model: 'gpt-5-codex', upstream: null },
     ];
-    var RECORD_COUNTS = { today: 45, '7d': 132, '30d': 260 };
+    var RECORD_COUNTS = { today: 45, '7d': 132, '30d': 260, all: 320 };
     function previewRecords(period) {
       var n = RECORD_COUNTS[period] || 45;
       var records = [];
@@ -1271,17 +1327,18 @@
     }
     var recordsCache = null;
     function recordsFor(period) {
-      if (!recordsCache) recordsCache = { today: previewRecords('today'), '7d': previewRecords('7d'), '30d': previewRecords('30d') };
+      if (!recordsCache) recordsCache = { today: previewRecords('today'), '7d': previewRecords('7d'), '30d': previewRecords('30d'), all: previewRecords('all') };
       return recordsCache[period] || recordsCache.today;
     }
 
     function copy(v) { return JSON.parse(JSON.stringify(v)); }
     function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
+    var pluginsPreview = typeof PluginsUI !== 'undefined' ? PluginsUI.createPreviewPlugins(function (v) { return delay(copy(v)); }) : null;
     function bump() { rev += 1; routing.revision = 'rev-' + rev; }
 
-    function quotaSnapshot(now) {
+    function previewQuotaProviders(now) {
       var h = function (n) { return new Date(now + n * 3600e3).toISOString(); };
-      var all = [
+      return [
         { name: 'alpha.example.com', enabled: true, plan: 'Pro', status: 'ready', message: null, updatedAt: now - 5e3, windows: [
           { label: '五小时', used: 12.3, limit: 45, remaining: 32.7, unit: '次', resetAt: h(3) },
           { label: '每周', used: 210, limit: 1000, remaining: 790, unit: '次', resetAt: h(74) },
@@ -1298,15 +1355,67 @@
           { label: '五小时', used: null, limit: null, remaining: null, unit: null, resetAt: null }] },
         { name: '火山agent plan', enabled: true, plan: null, status: 'unavailable', message: '未提供可用额度数据（来源未声明查询能力）', windows: [], updatedAt: null },
       ];
-      return { providers: all, updatedAt: now - 2e3, online: true, error: null };
     }
+    var quotaProviders = previewQuotaProviders(Date.now());
+    var providerDetails = new Map(quotaProviders.map(function (row) {
+      var route = routing.providers.find(function (p) { return p.name === row.name; });
+      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false, transformer: null, transformerProtected: false }];
+    }));
 
+    var previewCatalog = { names: ['OpenAI', 'customparams'], parameterizedNames: ['customparams'] };
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
       if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
+      if (cmd.indexOf('plugin_') === 0 && pluginsPreview) return pluginsPreview.invoke(cmd, a);
       if (cmd === 'quota_snapshot') {
-        return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
+        return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
+      }
+      if (cmd === 'provider_transformers') return delay(copy(previewCatalog));
+      if (cmd === 'provider_get') {
+        var detail = providerDetails.get(a.name);
+        if (detail && detail.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
+        return detail ? delay(copy(detail)) : Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
+      }
+      if (cmd === 'provider_add' || cmd === 'provider_update') {
+        var editing = cmd === 'provider_update';
+        var provider = a.provider;
+        if (providerInputError(provider, editing)) return Promise.reject(new Error('PROVIDER_INVALID'));
+        var name = provider.name.trim();
+        var previous = editing && providerDetails.get(a.name);
+        if (editing && !previous) return Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
+        if (previous && previous.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
+        if (editing && name !== a.name) return Promise.reject(new Error('PROVIDER_INVALID'));
+        var row = editing && quotaProviders.find(function (p) { return p.name === a.name; });
+        if (quotaProviders.some(function (p) { return p !== row && p.name.toLowerCase() === name.toLowerCase(); })) {
+          return Promise.reject(new Error('PROVIDER_DUPLICATE'));
+        }
+        var models = provider.models.map(function (m) { return m.trim(); });
+        var managed = name === 'ccr' || (provider.apiKey || '').trim().startsWith('ccr-managed-');
+        var transformer = previous ? previous.transformer : null;
+        var transformerProtected = previous ? previous.transformerProtected : false;
+        if (provider.transformer !== undefined) {
+          var chain = provider.transformer === null ? [] : provider.transformer.use;
+          var validName = function (value) {
+            return typeof value === 'string' && value.trim() && Array.from(value.trim()).length <= 64 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+          };
+          if (provider.transformer === null ? !editing :
+              Object.keys(provider.transformer).length !== 1 || !Array.isArray(chain) || !chain.length || chain.length > 8 || chain.some(function (item) {
+                if (!Array.isArray(item)) return !validName(item);
+                return item.length !== 2 || !validName(item[0]) || !previewCatalog.parameterizedNames.includes(item[0].trim()) ||
+                  !item[1] || typeof item[1] !== 'object' || Array.isArray(item[1]) || new TextEncoder().encode(JSON.stringify(item[1])).length > 2048;
+              })) return Promise.reject(new Error('PROVIDER_INVALID'));
+          transformerProtected = chain.some(Array.isArray);
+          transformer = chain.length ? { use: chain.map(function (item) { return (Array.isArray(item) ? item[0] : item).trim(); }) } : null;
+        }
+        providerDetails.set(name, { name: name, baseUrl: provider.baseUrl.trim(), models: models, managed: managed,
+          transformer: transformer, transformerProtected: transformerProtected });
+        if (!row) quotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
+        var route = editing && routing.providers.find(function (p) { return p.name === a.name; });
+        if (route) route.models = models;
+        else if (!row || row.enabled) routing.providers.push({ name: name, models: models });
+        bump();
+        return delay({ name: name });
       }
       if (cmd === 'routing_snapshot') return delay(copy(routing));
       if (cmd === 'routing_save') {
@@ -1381,6 +1490,7 @@
             return Promise.reject(new Error('服务已在运行或启动中'));
           }
           service = { mode: 'owned', running: true, message: '' };
+          if (pluginsPreview) pluginsPreview.start();
           return delay(copy(service));
         }
         if (a.action === 'stop') {
@@ -1482,6 +1592,9 @@
     creds.textContent = '用量凭证';
     creds.title = '配置火山 Coding Plan 用量查询凭证（AK/SK）';
     creds.hidden = true;
+    var edit = el('button', 'btn card-edit', '编辑');
+    edit.type = 'button';
+    edit.setAttribute('aria-controls', 'provider-add-form');
     var refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.className = 'btn btn-icon card-refresh';
@@ -1489,6 +1602,7 @@
     refresh.appendChild(icon(REFRESH_PATHS));
     actions.appendChild(status);
     actions.appendChild(creds);
+    actions.appendChild(edit);
     actions.appendChild(refresh);
     head.appendChild(title);
     head.appendChild(actions);
@@ -1499,7 +1613,7 @@
     var credsPanel = buildCredsPanel();
     var loading = el('p', 'card-loading'); loading.hidden = true;
     li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(credsNote); li.appendChild(windows); li.appendChild(credsPanel.root); li.appendChild(loading);
-    return { li: li, name: name, badges: badges, status: status, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
+    return { li: li, name: name, badges: badges, status: status, edit: edit, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
   }
 
   // Inline AK/SK editor in the client-confirm style; buttons are wired by
@@ -1559,6 +1673,315 @@
     var meta = describeWindow(win);
     if (meta) li.appendChild(el('div', 'window-meta', meta));
     return li;
+  }
+
+  function mountTransformerEditor() {
+    var section = document.getElementById('provider-transformers');
+    var rows = document.getElementById('provider-transformer-rows');
+    var add = document.getElementById('provider-transformer-add');
+    var protectedPanel = document.getElementById('provider-transformer-protected');
+    var summary = document.getElementById('provider-transformer-summary');
+    var replace = document.getElementById('provider-transformer-replace');
+    var confirmPanel = document.getElementById('provider-transformer-confirm');
+    var keep = document.getElementById('provider-transformer-keep');
+    var confirmReplace = document.getElementById('provider-transformer-confirm-replace');
+    var names = [], parameterizedNames = [], originalChain = [], keepProtected = false, confirmedReplacement = false;
+
+    function input(label, cls) {
+      var field = el('input', 'route-input ' + cls);
+      field.setAttribute('aria-label', label);
+      field.placeholder = label;
+      return field;
+    }
+    function select(label, cls, options) {
+      var field = el('select', 'route-input ' + cls);
+      field.setAttribute('aria-label', label);
+      options.forEach(function (value) {
+        var option = el('option', null, value);
+        option.value = value;
+        field.appendChild(option);
+      });
+      return field;
+    }
+    function addParam(params) {
+      var pair = el('div', 'transformer-param');
+      var key = input('参数名', 'param-key');
+      pair.appendChild(key);
+      pair.appendChild(select('参数值类型', 'param-type', ['文本', 'JSON']));
+      var value = input('参数值', 'param-value');
+      value.setAttribute('autocomplete', 'off');
+      value.spellcheck = false;
+      pair.appendChild(value);
+      pair.appendChild(mkBtn('移除', '移除参数', function () { pair.remove(); }));
+      params.appendChild(pair);
+      key.focus();
+    }
+    function addRow(name) {
+      var row = el('div', 'transformer-row');
+      var field = names.length && (!name || names.includes(name))
+        ? select('转换器名称', 'transformer-name', names) : input('转换器名称', 'transformer-name');
+      field.value = name || names[0] || '';
+      row.appendChild(field);
+      row.appendChild(mkBtn('移除', '移除转换器', function () { row.remove(); }));
+      var params = el('div', 'transformer-params');
+      row.appendChild(params);
+      var addParameter = mkBtn('添加参数', null, function () { addParam(params); });
+      function syncParameterButton() { addParameter.disabled = !parameterizedNames.includes(field.value.trim()); }
+      field.addEventListener('input', syncParameterButton);
+      field.addEventListener('change', syncParameterButton);
+      syncParameterButton();
+      row.appendChild(addParameter);
+      rows.appendChild(row);
+      return field;
+    }
+    function reset() {
+      rows.textContent = summary.textContent = '';
+      protectedPanel.hidden = true;
+      confirmPanel.hidden = true;
+      replace.hidden = false;
+      keepProtected = false;
+      add.hidden = false;
+      add.disabled = true;
+      names = [];
+      parameterizedNames = [];
+      originalChain = [];
+      confirmedReplacement = false;
+    }
+    add.addEventListener('click', function () { addRow('').focus(); });
+    replace.addEventListener('click', function () {
+      replace.hidden = true;
+      confirmPanel.hidden = false;
+      keep.focus();
+    });
+    keep.addEventListener('click', function () {
+      confirmPanel.hidden = true;
+      replace.hidden = false;
+      replace.focus();
+    });
+    confirmReplace.addEventListener('click', function () {
+      keepProtected = false;
+      confirmedReplacement = true;
+      protectedPanel.hidden = true;
+      add.hidden = false;
+      add.focus();
+    });
+    function prefill(entry) {
+      var chain = entry.transformer && entry.transformer.use || [];
+      if (!Array.isArray(chain) || !chain.every(function (name) { return typeof name === 'string'; })) throw new Error();
+      originalChain = chain;
+      keepProtected = entry.transformerProtected === true;
+      if (keepProtected) {
+        summary.textContent = '已保留现有转换器和参数。' + chain.join(' → ');
+        protectedPanel.hidden = false;
+        add.hidden = true;
+      } else chain.forEach(addRow);
+    }
+    function writeTo(provider, editing, error) {
+      if (keepProtected) return true;
+      function invalid(field, message) { error.textContent = message; field.focus(); return false; }
+      var use = [];
+      for (var row of rows.children) {
+        var field = row.querySelector('.transformer-name');
+        var name = field.value.trim();
+        if (!name) return invalid(field, '请输入转换器名称。');
+        var params = Object.create(null);
+        var pairs = row.querySelectorAll('.transformer-param');
+        if (pairs.length && !parameterizedNames.includes(name)) return invalid(field, '此转换器不支持参数，请移除参数或选择其他转换器。');
+        for (var pair of pairs) {
+          var key = pair.querySelector('.param-key');
+          var paramName = key.value.trim();
+          if (!paramName || paramName in params) return invalid(key, '请输入唯一的参数名。');
+          var value = pair.querySelector('.param-value');
+          if (pair.querySelector('.param-type').value === 'JSON') {
+            try { params[paramName] = JSON.parse(value.value); }
+            catch { return invalid(value, '请输入有效的 JSON 值。'); }
+          } else params[paramName] = value.value;
+        }
+        use.push(Object.keys(params).length ? [name, params] : name);
+      }
+      if (editing && !confirmedReplacement && use.length === originalChain.length && use.every(function (item, i) { return item === originalChain[i]; })) return true;
+      if (use.length) provider.transformer = { use: use };
+      else if (editing) provider.transformer = null;
+      return true;
+    }
+    return {
+      reset: reset, prefill: prefill, writeTo: writeTo,
+      disable: function (disabled) { section.disabled = disabled; },
+      setNames: function (result) {
+        names = result && Array.isArray(result.names) ? result.names.filter(function (n) { return typeof n === 'string' && n.trim(); }) : [];
+        parameterizedNames = result && Array.isArray(result.parameterizedNames) ? result.parameterizedNames.filter(function (n) { return names.includes(n); }) : [];
+        add.disabled = false;
+      },
+    };
+  }
+
+  function mountProviderForm(invoke, onSaved) {
+    var open = document.getElementById('provider-add-open');
+    var form = document.getElementById('provider-add-form');
+    var title = document.getElementById('provider-form-title');
+    var cancel = document.getElementById('provider-add-cancel');
+    var save = document.getElementById('provider-add-save');
+    var error = document.getElementById('provider-add-error');
+    var status = document.getElementById('provider-add-status');
+    var fields = {
+      name: document.getElementById('provider-name'), baseUrl: document.getElementById('provider-base-url'),
+      apiKey: document.getElementById('provider-api-key'), models: document.getElementById('provider-models'),
+    };
+    var invalidMessages = {
+      name: '请输入供应商名称，不能包含逗号或控制字符。',
+      baseUrl: '请输入完整的 HTTP 或 HTTPS 地址，不能包含账号、密码或片段；查询参数仅支持版本号。',
+      apiKey: '请输入有效的 API 密钥。', models: '请输入 1 至 256 个有效的模型 ID。',
+    };
+    var saving = false, loading = false, managed = false, editName = null;
+    var trigger = open, readId = 0;
+    var transformers = mountTransformerEditor();
+    var managedNote = '系统托管的供应商请在对应插件卡片中管理';
+
+    function close(restoreFocus) {
+      if (form.hidden) return;
+      Object.values(fields).forEach(function (field) { field.value = ''; });
+      error.textContent = '';
+      transformers.reset();
+      form.hidden = true;
+      trigger.setAttribute('aria-expanded', 'false');
+      if (restoreFocus) trigger.focus();
+      trigger = open;
+      editName = null;
+      loading = managed = false;
+      readId++;
+    }
+    function syncControls() {
+      Object.values(fields).forEach(function (field) { field.disabled = saving || loading || managed; });
+      transformers.disable(saving || loading || managed);
+      form.setAttribute('aria-busy', String(saving || loading));
+      open.disabled = !invoke || saving;
+      cancel.disabled = saving;
+      save.disabled = saving || loading || managed;
+      save.textContent = saving ? '正在保存…' : editName !== null ? '保存修改' : '保存';
+    }
+    function show(name, button) {
+      close(false);
+      editName = name;
+      loading = name !== null;
+      trigger = button;
+      title.textContent = loading ? '编辑供应商' : '添加供应商';
+      fields.name.readOnly = loading;
+      fields.name.title = loading ? '名称用于路由，创建后不可修改。' : '';
+      fields.apiKey.required = !loading;
+      fields.apiKey.placeholder = loading ? '已保存，留空则不修改' : '';
+      status.textContent = '';
+      form.hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      transformers.reset();
+      syncControls();
+      var id = ++readId;
+      return invoke('provider_transformers').catch(function () { return null; }).then(function (result) {
+        if (id === readId) transformers.setNames(result);
+      });
+    }
+    async function edit(name, button) {
+      if (!invoke || saving) return;
+      var catalog = show(name, button);
+      var id = readId;
+      try {
+        var results = await Promise.all([invoke('provider_get', { name: name }), catalog]);
+        var entry = results[0];
+        if (id !== readId) return;
+        if (entry && entry.managed === true) throw new Error('PROVIDER_MANAGED');
+        if (!entry || entry.name !== name || typeof entry.baseUrl !== 'string' || !safeVersionQuery(entry.baseUrl) || !Array.isArray(entry.models)
+            || !entry.models.every(function (m) { return typeof m === 'string'; }) || typeof entry.managed !== 'boolean') throw new Error();
+        fields.name.value = entry.name;
+        fields.baseUrl.value = entry.baseUrl;
+        fields.models.value = entry.models.join('\n');
+        transformers.prefill(entry);
+        loading = false;
+        syncControls();
+        fields.baseUrl.focus();
+      } catch (err) {
+        if (id !== readId) return;
+        if ((typeof err === 'string' ? err : err && err.message) === 'PROVIDER_MANAGED') {
+          managed = true;
+          loading = false;
+          syncControls();
+          error.textContent = managedNote;
+          cancel.focus();
+          return;
+        }
+        close(true);
+        status.textContent = '暂时无法读取供应商，请刷新后重试。';
+      }
+    }
+    open.disabled = !invoke;
+    open.addEventListener('click', function () {
+      if (!form.hidden && editName === null) { close(true); return; }
+      show(null, open);
+      fields.name.focus();
+    });
+    cancel.addEventListener('click', function () { close(true); });
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      if (!invoke || saving || loading || managed || form.hidden) return;
+      var editing = editName !== null;
+      var models = fields.models.value.split(/[\r\n,]/).map(function (m) { return m.trim(); }).filter(Boolean);
+      var provider = {
+        name: editing ? editName : fields.name.value.trim(), baseUrl: fields.baseUrl.value.trim(),
+        models: Array.from(new Set(models)),
+      };
+      if (!editing || fields.apiKey.value !== '') provider.apiKey = fields.apiKey.value;
+      var invalid = providerInputError(provider, editing);
+      if (invalid) {
+        error.textContent = invalidMessages[invalid];
+        fields[invalid].focus();
+        return;
+      }
+      if (!transformers.writeTo(provider, editing, error)) return;
+      if (provider.apiKey !== undefined) provider.apiKey = provider.apiKey.trim();
+      error.textContent = '';
+      saving = true;
+      syncControls();
+      var name = provider.name;
+      var saved;
+      try {
+        var request = editing ? invoke('provider_update', { name: editName, provider: provider }) : invoke('provider_add', { provider: provider });
+        provider = null;
+        saved = await request;
+        if (!saved || saved.name !== name) throw new Error('PROVIDER_SAVE_UNCONFIRMED');
+      } catch (err) {
+        saving = false;
+        var code = typeof err === 'string' ? err : err && err.message;
+        var duplicate = code === 'PROVIDER_DUPLICATE';
+        var message = editing ? '更新供应商失败，请检查输入后重试。' : '添加供应商失败，请检查输入后重试。';
+        if (duplicate) message = editing ? '供应商名称已存在，请先解决配置中的重复名称。' : '供应商名称已存在，请使用其他名称。';
+        if (code === 'PROVIDER_INVALID') message = '供应商信息无效，请检查输入后重试。';
+        if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = editing ? '暂时无法确认保存结果，请刷新后再决定是否重试' : '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
+        if (editing && code === 'PROVIDER_MANAGED') { managed = !form.hidden; message = managedNote; fields.apiKey.value = ''; }
+        syncControls();
+        if (form.hidden) status.textContent = message;
+        else {
+          error.textContent = message;
+          if (!editing && (duplicate || code === 'PROVIDER_INVALID')) fields.name.focus();
+          else (managed ? cancel : save).focus();
+        }
+        return;
+      }
+      saving = false;
+      syncControls();
+      close(true);
+      status.textContent = editing ? '已更新供应商' : '供应商已添加。';
+      onSaved(saved.name);
+    });
+    // A tray window can be hidden and reused without unloading its document.
+    window.addEventListener('blur', function () { fields.apiKey.value = ''; });
+    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') close(false); });
+    return {
+      close: close,
+      edit: edit,
+      escape: function () {
+        if (form.hidden) return false;
+        if (!saving) close(true);
+        return true;
+      },
+    };
   }
 
   function detectTauri() {
@@ -1632,6 +2055,7 @@
     };
     var projectsCtrl = mode === 'missing' ? null : ProjectsUI.createProjectsController({ invoke: invoke });
     ProjectsUI.mount(document, projectsCtrl);
+    var pluginsPanel = PluginsUI.mount(document, invoke);
     var cards = new Map();
 
     function safeCommand(cmd) {
@@ -1684,6 +2108,7 @@
       refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';
       refs.refresh.setAttribute('aria-label', '刷新 ' + p.name);
       refs.refresh.title = '刷新 ' + p.name;
+      refs.edit.setAttribute('aria-label', '编辑 ' + p.name);
       syncCardCredentials(refs, p.name, credentialsCtrl ? credentialsCtrl.state() : null);
     }
 
@@ -1768,6 +2193,7 @@
     // ---- service bar ------------------------------------------------------
 
     function renderService(sState) {
+      pluginsPanel.serviceChanged(sState);
       var view = serviceView(sState.service);
       var busy = !!sState.pending || sState.loading;
       if (sState.error) {
@@ -1827,7 +2253,9 @@
           if (p.scope === 'models' && p.field && !seen[p.field]) keys.push(k);
         });
       } else {
-        ROUTING_SCENARIOS.forEach(function (f) { keys.push(routeKey(scope, f)); });
+        ROUTING_SCENARIOS.forEach(function (field) {
+          if (scope === 'global' || field !== 'background') keys.push(routeKey(scope, field));
+        });
       }
       return keys;
     }
@@ -2042,8 +2470,9 @@
 
     // ---- usage tab --------------------------------------------------------
 
-    function usageNumCell(label, value, fullValue) {
+    function usageNumCell(metric, label, value, fullValue) {
       var cell = el('div', 'usage-cell');
+      cell.dataset.metric = metric;
       var num = el('span', 'usage-num', value === null ? '—' : String(value));
       if (fullValue != null) num.title = fullValue;
       cell.appendChild(num);
@@ -2102,27 +2531,33 @@
       }
       var u = s.snapshot;
       var totals = el('div', 'usage-card');
-      totals.appendChild(el('div', 'usage-title', '汇总 · ' + (u.period === 'today' ? '今天' : u.period === '7d' ? '近 7 天' : '近 30 天')));
+      totals.appendChild(el('div', 'usage-title', '汇总 · ' + USAGE_PERIOD_LABELS[u.period]));
       var grid = el('div', 'usage-grid');
-      grid.appendChild(usageNumCell('请求', formatInt(u.totalRequests)));
-      grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
-      grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
-      grid.appendChild(usageNumCell('成功率', formatSuccessRate(u.successCount, u.totalRequests)));
+      grid.appendChild(usageNumCell('requests', '请求', formatInt(u.totalRequests)));
+      grid.appendChild(usageNumCell('success', '成功', formatInt(u.successCount)));
+      grid.appendChild(usageNumCell('errors', '失败', formatInt(u.errorCount)));
+      grid.appendChild(usageNumCell('rate', '成功率', formatSuccessRate(u.successCount, u.totalRequests)));
       var totalTokens = rowTotalTokens(u);
-      var totalCell = usageNumCell('总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
+      var totalCell = usageNumCell('total', '总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
       totalCell.title = '有效输入 + 输出；上游 inputTokens 已含缓存时直接采用，否则加计缓存读/写';
       grid.appendChild(totalCell);
-      grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
-      grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
-      grid.appendChild(usageNumCell('缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
-      grid.appendChild(usageNumCell('缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
-      grid.appendChild(usageNumCell('估算条目', formatInt(u.estimatedCount)));
-      grid.appendChild(usageNumCell('平均 TTFT', formatMs(u.avgTtftMs)));
-      grid.appendChild(usageNumCell('生成速度', formatSpeed(u.avgTokensPerSecond)));
+      grid.appendChild(usageNumCell('input', '输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
+      grid.appendChild(usageNumCell('output', '输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
+      grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
+      grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
+      var effectiveInput = effectiveInputTokens(u.inputTokens, u.cacheReadTokens, u.cacheWriteTokens);
+      var hitRate = effectiveInput > 0 && u.cacheReadTokens !== null
+        ? ((u.cacheReadTokens / effectiveInput) * 100).toFixed(1) + '%'
+        : null;
+      var cacheHitCell = usageNumCell('cache-hit', '缓存命中率', hitRate);
+      cacheHitCell.title = '缓存读取 tokens ÷ 有效输入 tokens';
+      grid.appendChild(cacheHitCell);
+      grid.appendChild(usageNumCell('ttft', '平均 TTFT', formatMs(u.avgTtftMs)));
+      grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
       body.appendChild(totals);
       totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
-      body.appendChild(buildDayChart(u.byDay));
+      body.appendChild(buildDayChart(u.byDay, u.period === 'all'));
       body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
         var rowTotal = rowTotalTokens(m);
@@ -2142,7 +2577,7 @@
 
     // Charts are plain divs; per-bar sizes go through CSSOM writes because the
     // CSP (style-src 'self') blocks inline style attributes.
-    function buildDayChart(rows) {
+    function buildDayChart(rows, compact) {
       var card = el('div', 'usage-card');
       card.appendChild(el('div', 'usage-title', '每日用量（有效输入 + 输出）'));
       var days = (Array.isArray(rows) ? rows : []).slice().sort(function (a, b) {
@@ -2152,27 +2587,54 @@
         card.appendChild(noteEl('该周期暂无调用记录'));
         return card;
       }
-      var totals = days.map(function (d) { return rowTotalTokens(d) || 0; });
-      var max = Math.max.apply(null, totals);
+      if (days.length === 1) {
+        var day = days[0];
+        var single = el('div', 'usage-day-summary');
+        single.appendChild(el('div', 'usage-day-date', String(day.name)));
+        var singleTotal = rowTotalTokens(day);
+        var totalValue = el('div', 'usage-day-total', (formatCompact(singleTotal) || '—') + ' tokens');
+        if (singleTotal !== null) totalValue.title = formatInt(singleTotal) + ' tokens';
+        single.appendChild(totalValue);
+        single.appendChild(el('div', 'usage-day-caption', '当日总量 · 有效输入 + 输出'));
+        card.appendChild(single);
+        return card;
+      }
+      var totals = days.map(function (d) { return rowTotalTokens(d); });
+      var max = Math.max.apply(null, totals.map(function (v) { return v === null ? 0 : v; }));
+      var scroll = el('div', compact ? 'usage-days-compact' : 'usage-days-scroll');
+      if (!compact) scroll.tabIndex = 0;
+      scroll.setAttribute('role', 'region');
+      scroll.setAttribute('aria-label', compact ? '每日用量，全部历史' : '每日用量，日期较多时可横向滚动');
       var bars = el('div', 'usage-bars');
       days.forEach(function (d, i) {
         var v = totals[i];
-        var pct = v > 0 && max > 0 ? Math.max(4, Math.round((v / max) * 100)) : 4;
+        var pct = v > 0 && max > 0 ? Math.max(1, Math.round((v / max) * 100)) : 0;
         var col = el('div', 'usage-bar-col');
+        if (!compact) {
+          var value = el('div', 'usage-day-value', formatCompact(v) || '—');
+          if (v !== null) value.title = formatInt(v) + ' tokens';
+          col.appendChild(value);
+        }
+        var track = el('div', 'usage-day-track');
         var bar = el('div', 'usage-bar');
         bar.style.height = pct + '%';
         bar.title = d.name + ' · 输入 ' + (formatCompact(d.inputTokens) || '—') + '（' + (formatInt(d.inputTokens) || '—') + '）'
           + ' · 输出 ' + (formatCompact(d.outputTokens) || '—') + '（' + (formatInt(d.outputTokens) || '—') + '）'
           + ' · 总量 ' + (formatCompact(v) || '—') + '（' + (formatInt(v) || '—') + '）';
-        col.appendChild(bar);
+        track.appendChild(bar);
+        col.appendChild(track);
+        if (compact) col.title = bar.title;
+        else col.appendChild(el('div', 'usage-day-date', String(d.name)));
         bars.appendChild(col);
       });
-      card.appendChild(bars);
-      var axis = el('div', 'usage-chart-axis');
-      axis.appendChild(el('span', null, String(days[0].name)));
-      axis.appendChild(el('span', 'spacer'));
-      axis.appendChild(el('span', null, String(days[days.length - 1].name)));
-      card.appendChild(axis);
+      scroll.appendChild(bars);
+      if (compact) {
+        var axis = el('div', 'usage-day-range');
+        axis.appendChild(el('span', 'usage-day-date', days[0].name));
+        axis.appendChild(el('span', 'usage-day-date', days[days.length - 1].name));
+        scroll.appendChild(axis);
+      }
+      card.appendChild(scroll);
       return card;
     }
 
@@ -2483,7 +2945,7 @@
 
     // ---- tabs -------------------------------------------------------------
 
-    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects'];
+    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects', 'plugins'];
     var tabButtons = {};
     var panels = {};
     TAB_IDS.forEach(function (id) {
@@ -2492,19 +2954,58 @@
     });
     var activeTab = 'quota';
     var loadedTabs = { quota: true };
+    var providerForm = mountProviderForm(invoke, function (name) {
+      controller.refreshProvider(name, true);
+      credentialsCtrl.refresh(true);
+      if (!loadedTabs.routing) return;
+      // A snapshot taken before the addition can still be in flight. Wait for
+      // the current routing read/write to finish so its result cannot win.
+      function busy(s) { return s.loading || s.savingKey || s.flagsSaving; }
+      if (!busy(routingCtrl.state())) { routingCtrl.refresh(); return; }
+      var unsubscribe = routingCtrl.subscribe(function (s) {
+        if (busy(s)) return;
+        unsubscribe();
+        routingCtrl.refresh();
+      });
+    });
+
+    // While the usage tab stays open, periodically refresh snapshot + records
+    // so long sessions see fresh totals. Entering the tab always loads once;
+    // leaving clears the timer. Tests/preview can shorten the interval via
+    // window.__CCR_USAGE_REFRESH_MS__.
+    var usageTimer = null;
+    function stopUsageAutoRefresh() {
+      if (usageTimer) { clearInterval(usageTimer); usageTimer = null; }
+    }
+    function startUsageAutoRefresh() {
+      stopUsageAutoRefresh();
+      if (!usageCtrl || !recordsCtrl) return;
+      var ms = 30000;
+      if (typeof window !== 'undefined' && window.__CCR_USAGE_REFRESH_MS__ > 0) ms = Number(window.__CCR_USAGE_REFRESH_MS__);
+      usageTimer = setInterval(function () { usageCtrl.refresh(); recordsCtrl.refresh(); }, ms);
+      // Tests/embedded runs must not be kept alive by the polling timer.
+      if (usageTimer && typeof usageTimer.unref === 'function') usageTimer.unref();
+    }
 
     function maybeLoadTab(name) {
       if (mode === 'missing' || loadedTabs[name]) return;
       loadedTabs[name] = true;
       if (name === 'routing') routingCtrl.refresh();
-      if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); }
+      if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); startUsageAutoRefresh(); }
       if (name === 'clients') clientsCtrl.refresh();
       if (name === 'projects') projectsCtrl.refresh();
+      if (name === 'plugins') pluginsPanel.load();
     }
 
     function selectTab(name) {
       if (TAB_IDS.indexOf(name) === -1) return;
+      if (name !== 'quota') providerForm.close(false);
+      if (name !== 'plugins') pluginsPanel.cancel(false);
       activeTab = name;
+      // Polling lifecycle lives here (maybeLoadTab early-returns once a tab
+      // has loaded, so a re-entry must still resume the timer).
+      if (name === 'usage') startUsageAutoRefresh();
+      else stopUsageAutoRefresh();
       TAB_IDS.forEach(function (id) {
         var on = id === name;
         tabButtons[id].setAttribute('aria-selected', String(on));
@@ -2592,10 +3093,12 @@
           if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
           return;
         }
+        var providerCard = target.closest('.card');
+        if (!providerCard || !providerCard.dataset.provider) return;
+        var name = providerCard.dataset.provider;
+        var edit = target.closest('.card-edit');
+        if (edit) { providerForm.edit(name, edit); return; }
         if (!credentialsCtrl) return;
-        var credsCard = target.closest('.card');
-        if (!credsCard || !credsCard.dataset.provider) return;
-        var name = credsCard.dataset.provider;
         if (target.closest('[data-creds-open]')) credentialsCtrl.open(name);
         else if (target.closest('[data-creds-cancel]')) credentialsCtrl.close();
         else if (target.closest('[data-creds-save]')) {
@@ -2630,7 +3133,7 @@
     if (usageCtrl) {
       usageCtrl.subscribe(renderUsage);
       renderUsage(usageCtrl.state());
-    } else renderUsage({ snapshot: null, loading: false, error: null, period: 'today' });
+    } else renderUsage({ snapshot: null, loading: false, error: null, period: DEFAULT_USAGE_PERIOD });
     if (recordsCtrl) {
       recordsCtrl.subscribe(renderRecords);
       renderRecords(recordsCtrl.state());
@@ -2643,7 +3146,10 @@
     els.openUi.addEventListener('click', function () { safeCommand('quota_open_ui'); });
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') safeCommand('quota_hide');
+      if (event.key === 'Escape' && !event.isComposing) {
+        if (providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
+        else safeCommand('quota_hide');
+      }
     });
     // Focus refreshes service status and quota data only; route drafts and
     // usage/client state must survive native select popups and tab changes.

@@ -435,7 +435,16 @@ export class WorkBuddyAuthService {
 
   /** Fixed-origin discovery/billing calls bypass configured CCR proxies. */
   private directFetch(url: string, init: RequestInit = {}): ReturnType<WorkBuddyFetch> {
-    return this.fetchImpl(url, { ...init, dispatcher: this.options.host.getDirectDispatcher() } as RequestInit);
+    const headers: Record<string, string> = {
+      ...(init.headers as Record<string, string> | undefined),
+    };
+    // The gateway dispatcher path has served gzipped bodies with null
+    // content-type/encoding headers, which turns JSON discovery into
+    // models_fetch_failed even while the account is connected (usage and
+    // check-in already send identity and work). Ask for identity here so
+    // every fixed-origin call parses the same way as direct requests.
+    headers["Accept-Encoding"] = "identity";
+    return this.fetchImpl(url, { ...init, headers, dispatcher: this.options.host.getDirectDispatcher() } as RequestInit);
   }
 
   private get configService(): any {

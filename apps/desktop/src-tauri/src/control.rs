@@ -32,7 +32,7 @@ const CLIENT_IDS: [&str; 5] = ["claudeCode", "codex", "pi", "qwenCode", "opencod
 /// Allowed clients_update actions; each maps to one existing gateway route.
 const CLIENT_ACTIONS: [&str; 3] = ["enable", "disable", "restore"];
 /// Usage periods offered by the panel; anything else is rejected before any request.
-const USAGE_PERIODS: [&str; 3] = ["today", "7d", "30d"];
+
 const MAX_PROVIDER_BUCKETS: usize = 50;
 const MAX_MODEL_BUCKETS: usize = 100;
 const MAX_DAY_BUCKETS: usize = 62;
@@ -270,15 +270,12 @@ impl ControlService {
     }
 
     pub(crate) async fn usage_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
-        if !USAGE_PERIODS.contains(&period) {
-            return Err(ERR_PERIOD.into());
-        }
-        let (start, end) = usage_window(period)?;
-        let path = format!(
-            "/api/usage/summary?startDate={}&endDate={}",
-            encode_query(&start),
-            encode_query(&end)
-        );
+        let query = usage_date_query(period)?;
+        let path = if query.is_empty() {
+            "/api/usage/summary".to_string()
+        } else {
+            format!("/api/usage/summary?{query}")
+        };
         let summary = self.client()?.get_json(&path).await?;
         usage_snapshot_from(&summary, period)
     }
@@ -289,19 +286,17 @@ impl ControlService {
         page: Option<u32>,
         page_size: Option<u32>,
     ) -> Result<UsageRecordsPage, String> {
-        if !USAGE_PERIODS.contains(&period) {
-            return Err(ERR_PERIOD.into());
-        }
+        let query = usage_date_query(period)?;
         let page = page.unwrap_or(DEFAULT_USAGE_PAGE).max(1);
         let page_size = page_size
             .unwrap_or(DEFAULT_USAGE_PAGE_SIZE)
             .clamp(1, MAX_USAGE_PAGE_SIZE);
-        let (start, end) = usage_window(period)?;
-        let path = format!(
-            "/api/usage?startDate={}&endDate={}&page={page}&pageSize={page_size}",
-            encode_query(&start),
-            encode_query(&end)
-        );
+        let prefix = if query.is_empty() {
+            query
+        } else {
+            format!("{query}&")
+        };
+        let path = format!("/api/usage?{prefix}page={page}&pageSize={page_size}");
         let response = self.client()?.get_json(&path).await?;
         usage_records_from(&response, period, page, page_size)
     }
@@ -838,6 +833,18 @@ fn usage_window(period: &str) -> Result<(String, String), String> {
     Ok((rfc3339(start.to_offset(time::UtcOffset::UTC)), rfc3339(now)))
 }
 
+fn usage_date_query(period: &str) -> Result<String, String> {
+    if period == "all" {
+        return Ok(String::new());
+    }
+    let (start, end) = usage_window(period)?;
+    Ok(format!(
+        "startDate={}&endDate={}",
+        encode_query(&start),
+        encode_query(&end)
+    ))
+}
+
 fn counter(summary: &Value, key: &str) -> u64 {
     summary
         .get(key)
@@ -909,7 +916,16 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
         estimated_count: counter(summary, "estimatedCount"),
         by_model: buckets(summary, "byModel", MAX_MODEL_BUCKETS, true),
         by_provider: buckets(summary, "byProvider", MAX_PROVIDER_BUCKETS, true),
-        by_day: buckets(summary, "byDay", MAX_DAY_BUCKETS, false),
+        by_day: buckets(
+            summary,
+            "byDay",
+            if period == "all" {
+                usize::MAX
+            } else {
+                MAX_DAY_BUCKETS
+            },
+            false,
+        ),
         avg_ttft_ms: optional_counter(summary, "avgTtft"),
         avg_tokens_per_second: optional_metric(summary, "avgTokensPerSecond"),
         updated_at: rfc3339(OffsetDateTime::now_utc()),
@@ -1640,6 +1656,34 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("GET /api/usage?startDate="));
         assert!(requests[0].contains("&page=1&pageSize=20"));
+    }
+
+    #[tokio::test]
+    async fn all_time_omits_date_filters_and_keeps_older_days_and_pagination() {
+        let days: serde_json::Map<String, Value> = (0..90)
+            .map(|i| {
+                (
+                    (OffsetDateTime::UNIX_EPOCH.date() + time::Duration::days(i)).to_string(),
+                    json!({"count":1}),
+                )
+            })
+            .collect();
+        let mock = Mock::new(vec![
+            response(json!({"byDay":days})),
+            response(json!({"records":[],"total":90})),
+        ]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service.usage_snapshot("all").await.unwrap().by_day.len(),
+            90
+        );
+        service
+            .usage_records("all", Some(2), Some(20))
+            .await
+            .unwrap();
+        let requests = mock.finish().await;
+        assert!(requests[0].starts_with("GET /api/usage/summary HTTP/"));
+        assert!(requests[1].starts_with("GET /api/usage?page=2&pageSize=20 HTTP/"));
     }
 
     #[tokio::test]

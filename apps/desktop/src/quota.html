@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="quota.css">
   <!-- CSP is enforced by tauri.conf.json (script-src 'self'): external scripts only, no inline script/handlers. -->
   <script src="projects.js" defer></script>
+  <script src="plugins.js" defer></script>
   <script src="quota.js" defer></script>
 </head>
 <body>
@@ -43,16 +44,47 @@
       <button id="tab-usage" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-usage" tabindex="-1">用量</button>
       <button id="tab-clients" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-clients" tabindex="-1">客户端</button>
       <button id="tab-projects" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-projects" tabindex="-1">项目</button>
+      <button id="tab-plugins" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-plugins" tabindex="-1">插件</button>
     </nav>
 
     <section id="panel-quota" class="panel" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
-      <div class="heading"><h1>额度</h1><span id="provider-count" class="count">正在读取…</span></div>
+      <div class="panel-head">
+        <h1>额度</h1><span id="provider-count" class="count">正在读取…</span><span class="spacer"></span>
+        <button id="provider-add-open" class="btn" type="button" aria-expanded="false" aria-controls="provider-add-form">添加供应商</button>
+      </div>
       <p class="hint">读取服务端额度快照，不会重置任何额度。</p>
+      <form id="provider-add-form" class="provider-form card" aria-labelledby="provider-form-title" autocomplete="off" novalidate hidden>
+        <h2 id="provider-form-title">添加供应商</h2>
+        <label>供应商名称<input id="provider-name" class="route-input" type="text" placeholder="example.com" required></label>
+        <label>API 地址<input id="provider-base-url" class="route-input" type="url" placeholder="https://example.com/v1/chat/completions" spellcheck="false" required></label>
+        <label>API 密钥<input id="provider-api-key" class="route-input" type="password" autocomplete="new-password" spellcheck="false" required></label>
+        <label>模型 ID（用换行或逗号分隔）<textarea id="provider-models" class="route-input" rows="2" spellcheck="false" required></textarea></label>
+        <fieldset id="provider-transformers" class="provider-transformers">
+          <legend>转换器</legend>
+          <div id="provider-transformer-protected" hidden>
+            <p id="provider-transformer-summary"></p>
+            <button id="provider-transformer-replace" class="btn" type="button">替换供应商转换器链</button>
+            <div id="provider-transformer-confirm" hidden>
+              <p>保存后将替换此供应商的转换器和参数。各模型的转换器配置会保留。</p>
+              <button id="provider-transformer-keep" class="btn" type="button">保留现有配置</button>
+              <button id="provider-transformer-confirm-replace" class="btn" type="button">确认替换</button>
+            </div>
+          </div>
+          <div id="provider-transformer-rows"></div>
+          <button id="provider-transformer-add" class="btn" type="button">添加转换器</button>
+        </fieldset>
+        <div class="provider-form-actions">
+          <span id="provider-add-error" class="inline-msg" role="alert"></span>
+          <button id="provider-add-cancel" class="btn" type="button">取消</button>
+          <button id="provider-add-save" class="btn btn-primary" type="submit">保存</button>
+        </div>
+      </form>
+      <div id="provider-add-status" class="hint" role="status"></div>
       <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
       <ul id="list" class="list" aria-label="提供方额度列表" aria-busy="false" tabindex="0">
         <li id="empty" class="empty" hidden>
           <p class="empty-title">暂无已配置的提供方</p>
-          <p class="empty-note">在 config.json 中配置提供方后，这里会显示额度信息。</p>
+          <p class="empty-note">点击「添加供应商」配置 API 接入信息。</p>
         </li>
       </ul>
     </section>
@@ -96,9 +128,10 @@
         <button id="usage-refresh" class="btn" type="button" title="重新读取用量统计">刷新</button>
       </div>
       <div id="usage-periods" class="periods" role="group" aria-label="统计周期">
-        <button class="period-btn" type="button" data-period="today" aria-pressed="true">今天</button>
-        <button class="period-btn" type="button" data-period="7d" aria-pressed="false">近 7 天</button>
+        <button class="period-btn" type="button" data-period="today" aria-pressed="false">今天</button>
+        <button class="period-btn" type="button" data-period="7d" aria-pressed="true">近 7 天</button>
         <button class="period-btn" type="button" data-period="30d" aria-pressed="false">近 30 天</button>
+        <button class="period-btn" type="button" data-period="all" aria-pressed="false">全部</button>
       </div>
       <div id="usage-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <div id="usage-body" class="list" aria-live="polite" aria-busy="false"></div>
@@ -121,6 +154,29 @@
       <div id="projects-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <div class="projects-picker"><label for="projects-select">当前项目</label><select id="projects-select" class="route-input" aria-label="选择项目"></select></div>
       <div id="projects-body" class="list"></div>
+    </section>
+
+    <section id="panel-plugins" class="panel" role="tabpanel" aria-labelledby="tab-plugins" tabindex="-1" hidden>
+      <div class="panel-head">
+        <h1>插件</h1><span class="spacer"></span>
+        <button id="plugins-refresh" class="btn" type="button" title="重新读取当前插件列表">刷新</button>
+      </div>
+      <div class="scopes" role="group" aria-label="插件视图">
+        <button id="plugins-installed" class="scope-btn" type="button" aria-pressed="true" aria-controls="plugins-list">已安装</button>
+        <button id="plugins-market" class="scope-btn" type="button" aria-pressed="false" aria-controls="plugins-list">插件市场</button>
+      </div>
+      <p id="plugins-advanced" class="hint">桌面仅提供插件支持的基础操作。授权登录、站点和账号管理、模型管理等高级操作请使用主窗口。</p>
+      <div id="plugins-feedback" class="banner" role="status" hidden></div>
+      <div id="plugins-restart" class="banner" data-tone="warn" role="status" hidden></div>
+      <div id="plugins-read-status" class="banner" role="status" hidden></div>
+      <div id="plugins-confirm" class="plugins-confirm card" role="group" aria-labelledby="plugins-confirm-text" hidden>
+        <p id="plugins-confirm-text" class="card-message"></p>
+        <div class="plugins-actions">
+          <button id="plugins-cancel" class="btn" type="button">取消</button>
+          <button id="plugins-confirm-button" class="btn btn-primary" type="button">确认</button>
+        </div>
+      </div>
+      <ul id="plugins-list" class="list" aria-label="已安装插件列表" aria-busy="false" tabindex="0"></ul>
     </section>
 
     <footer class="footer">

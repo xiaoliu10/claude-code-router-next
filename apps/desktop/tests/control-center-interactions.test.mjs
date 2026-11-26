@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 const projectsJs = readFileSync(new URL('../src/projects.js', import.meta.url), 'utf8');
+const pluginsJs = readFileSync(new URL('../src/plugins.js', import.meta.url), 'utf8');
 const js = readFileSync(new URL('../src/quota.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../src/quota.html', import.meta.url), 'utf8');
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -82,11 +83,12 @@ export function harness(overrides = {}) {
       const tag = text.match(/^<([a-z0-9]+)/i)[1]; const n = doc.createElement(tag);
       for (const a of text.matchAll(/([\w-]+)(?:="([^"]*)")?/g)) if (a[1] !== tag) n.setAttribute(a[1], a[2] ?? '');
       stack.at(-1).appendChild(n);
-      if (!['meta', 'link', 'input'].includes(tag)) stack.push(n);
+      if (!text.endsWith('/>') && !['meta', 'link', 'input'].includes(tag)) stack.push(n);
     } else stack.at(-1)._text += text;
   }
   doc.getElementById = id => [root, ...root.querySelectorAll('[id]')].find(n => n.getAttribute('id') === id) || null;
   const calls = []; const windowEvents = {};
+  const intervals = []; const cleared = [];
   const route = { providers: [{ name: 'alpha', models: ['one', 'two'] }], routes: [{ scope: 'global', field: 'default', target: 'alpha,one', fallback: [] }], familyRouting: false, fallbackEnabled: true, revision: '1' };
   const clients = { clients: [{ id: 'pi', name: 'Pi', enabled: true, managed: true, exists: true, activeModel: 'one', modelAlias: null }], success: true, message: null };
   const responses = {
@@ -109,9 +111,11 @@ export function harness(overrides = {}) {
     calls.push({ cmd, args });
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };
-  vm.runInNewContext(projectsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, setTimeout, setInterval, clearInterval });
+  vm.runInNewContext(projectsJs + pluginsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout,
+    setInterval: (fn, ms) => { intervals.push([fn, ms]); return setInterval(fn, ms); },
+    clearInterval: (t) => { cleared.push(t); clearInterval(t); } });
   doc.events.DOMContentLoaded();
-  return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus() };
+  return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus(), windowEvents, win, intervals, cleared };
 }
 
 test('interaction: tab keyboard, external stop disabled, offline quota never shows fake empty state', async () => {
@@ -143,6 +147,19 @@ test('interaction: typing, focus, explicit refresh and tab switch preserve draft
   assert.match(h.id('routing-body').textContent, /已保存/);
 });
 
+test('interaction: background is editable only in global routing, including with legacy family entries', async () => {
+  const h = harness();
+  h.route.routes.push({ scope: 'opus', field: 'background', target: 'alpha,two', fallback: ['alpha,one'] });
+  await flush(); h.id('tab-routing').click(); await flush();
+  const tabs = h.id('panel-routing').querySelectorAll('[data-scope]');
+  for (const scope of ['opus', 'sonnet', 'haiku', 'global']) {
+    tabs.find(t => t.getAttribute('data-scope') === scope).click();
+    const titles = h.id('routing-body').querySelectorAll('.route-name').map(n => n.textContent);
+    assert.ok(titles.includes('默认'));
+    assert.equal(titles.includes('后台'), scope === 'global');
+  }
+});
+
 test('interaction: fallback add fires once, keyboard add, move/remove and explicit save', async () => {
   const h = harness(); await flush(); h.id('tab-routing').click(); await flush();
   const card = h.id('routing-body').children[0];
@@ -158,12 +175,38 @@ test('interaction: fallback add fires once, keyboard add, move/remove and explic
   assert.deepEqual(Array.from(h.calls.find(c => c.cmd === 'routing_save').args.change.fallback), ['alpha,two']);
 });
 
+test('usage summary shows token cache hit rate for each selected period', async () => {
+  const totals = {
+    '7d': { inputTokens: 10000, cacheReadTokens: 8000, cacheWriteTokens: 2000 },
+    today: { inputTokens: 3000, cacheReadTokens: 6000, cacheWriteTokens: 1000 },
+    '30d': { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+  };
+  const h = harness({ usage_snapshot: ({ period }) => ({ period, ...totals[period] }) });
+  await openUsage(h);
+  const readRate = () => h.id('usage-body').querySelectorAll('.usage-cell')
+    .find(cell => cell.dataset.metric === 'cache-hit').querySelector('.usage-num').textContent;
+  assert.equal(readRate(), '80.0%');
+  assert.doesNotMatch(h.id('usage-body').querySelector('.usage-grid').textContent, /估算条目/);
+  for (const [period, expected] of [['today', '60.0%'], ['30d', '—']]) {
+    h.id('usage-periods').children.find(button => button.dataset.period === period).click();
+    await flush();
+    assert.equal(readRate(), expected);
+  }
+  totals.today.cacheReadTokens = 0;
+  h.id('usage-periods').children[0].click(); await flush();
+  assert.equal(readRate(), '0.0%');
+  totals.today.cacheReadTokens = null;
+  h.id('usage-refresh').click(); await flush();
+  assert.equal(readRate(), '—');
+});
+
 test('interaction: usage totals and model/provider/date cache preserve exact counts across periods', async () => {
   const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250,
     byModel: [{ name: '<img src=model>', requests: 3, inputTokens: 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-input', outputTokens: 100 }],
     byProvider: [{ name: '<img src=provider>', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: 'zero-cache', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: 'unknown-output', inputTokens: 100 }],
     byDay: [{ name: '2026-11-17', requests: 3, inputTokens: args.period === '7d' ? 2000000 : 1000000, outputTokens: 250000, cacheReadTokens: 8000000, cacheWriteTokens: 1250 }, { name: '2026-11-16', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, { name: '2026-11-15', outputTokens: 100 }], updatedAt: 1 }) });
-  await flush(); h.id('tab-usage').click(); await flush();
+  await openUsage(h);
+  h.id('usage-periods').children[0].click(); await flush();
   const body = h.id('usage-body');
   const total = body.querySelectorAll('.usage-cell').find(n => n.textContent.includes('总 tokens'));
   assert.match(total.textContent, /9.25M/);
@@ -224,8 +267,8 @@ test('interaction: restore is local confirmation then single individual IPC; usa
   h.id('tab-usage').click(); await flush();
   assert.match(h.id('usage-body').textContent, /<img src=x>/);
   assert.equal(h.id('usage-body').querySelectorAll('img').length, 0);
-  h.id('usage-periods').children[1].click(); await flush();
-  assert.equal(h.calls.filter(c => c.cmd === 'usage_snapshot').at(-1).args.period, '7d');
+  h.id('usage-periods').children[0].click(); await flush();
+  assert.equal(h.calls.filter(c => c.cmd === 'usage_snapshot').at(-1).args.period, 'today');
 });
 
 const recordFixture = (i, extra = {}) => ({
@@ -258,6 +301,51 @@ const plain = (v) => JSON.parse(JSON.stringify(v));
 
 async function openUsage(h) { await flush(); h.id('tab-usage').click(); await flush(); }
 
+test('interaction: opening usage loads the seven-day chart and matching records by default', async () => {
+  const h = harness({ usage_snapshot: ({ period }) => ({ period, byDay: Array.from({ length: 7 }, (_, i) => ({
+    name: `2026-11-${11 + i}`, inputTokens: 100 + i, outputTokens: 10,
+  })).concat(period === 'all' ? [{ name: '2026-09-01', inputTokens: 1000, outputTokens: 250 }] : []) }) });
+  await openUsage(h);
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_snapshot' || c.cmd === 'usage_records')), [
+    { cmd: 'usage_snapshot', args: { period: '7d' } },
+    { cmd: 'usage_records', args: { period: '7d', page: 1, pageSize: 20 } },
+  ]);
+  const selected = h.id('usage-periods').children.filter(button => button.getAttribute('aria-pressed') === 'true');
+  assert.deepEqual(selected.map(button => button.dataset.period), ['7d']);
+  assert.match(h.id('usage-body').textContent, /汇总 · 近 7 天/);
+  assert.equal(h.id('usage-body').querySelectorAll('.usage-bar').length, 7);
+  h.id('usage-periods').children.find(button => button.dataset.period === 'all').click(); await flush();
+  assert.match(h.id('usage-body').textContent, /汇总 · 全部/);
+  const chart = h.id('usage-body').querySelector('.usage-days-compact');
+  assert.deepEqual(chart.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-09-01', '2026-11-17']);
+  assert.equal(chart.querySelectorAll('.usage-day-value').length, 0);
+  assert.equal(chart.querySelectorAll('.usage-bar-col').length, 8);
+  assert.match(chart.querySelector('.usage-bar-col').title, /2026-09-01.*1,250/);
+  const dateTable = h.id('usage-body').querySelectorAll('.usage-card').find(n => n.textContent.includes('按日期'));
+  assert.match(dateTable.querySelector('tbody').textContent, /2026-09-01/);
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'all', page: 1, pageSize: 20 });
+});
+
+test('interaction: usage auto-refreshes on an interval while open and stops on tab switch', async () => {
+  const h = harness({ usage_snapshot: ({ period }) => ({ period, totalRequests: 1, byDay: [], byProvider: [] }), usage_records: ({ page }) => ({ period: '7d', page, pageSize: 20, total: 0, records: [] }) });
+  h.win.__CCR_USAGE_REFRESH_MS__ = 10;
+  await openUsage(h);
+  assert.ok(h.intervals.some(([, ms]) => ms === 10), 'auto-refresh interval is registered');
+  const count = () => h.calls.filter(c => c.cmd === 'usage_snapshot').length;
+  const first = count();
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.ok(count() > first, 'snapshot reloads while the usage tab stays open');
+  h.id('tab-quota').click(); await flush();
+  assert.ok(h.cleared.length >= 1, 'leaving the usage tab clears the timer');
+  const frozen = count();
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.equal(count(), frozen, 'no usage polling after leaving the tab');
+  h.id('tab-usage').click(); await flush();
+  assert.ok(h.intervals.length >= 2, 're-entering the usage tab resumes the interval');
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.ok(count() > frozen, 'polling resumes on re-entry');
+});
+
 test('interaction: records pager walks pages, resets on period switch, shows page/total info', async () => {
   const h = recordsHarness(); await openUsage(h);
   const body = h.id('usage-body');
@@ -271,7 +359,7 @@ test('interaction: records pager walks pages, resets on period switch, shows pag
   assert.equal(next.disabled, false);
   assert.equal(card.querySelectorAll('tbody')[0].children.length, 20);
   next.click(); await flush();
-  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'today', page: 2, pageSize: 20 });
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: '7d', page: 2, pageSize: 20 });
   const card2 = recordsCard(body);
   assert.match(card2.querySelector('.records-info').textContent, /第 2 \/ 3 页/);
   assert.equal(card2.querySelectorAll('tbody')[0].children.length, 20);
@@ -284,10 +372,10 @@ test('interaction: records pager walks pages, resets on period switch, shows pag
   card3.querySelectorAll('.btn')[1].click(); await flush();
   assert.equal(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args.page, 3, 'next on the last page never hits IPC');
   card3.querySelectorAll('.btn')[0].click(); await flush();
-  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'today', page: 2, pageSize: 20 });
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: '7d', page: 2, pageSize: 20 });
   // Period switch resets to page 1 for both summary and records.
-  h.id('usage-periods').children[1].click(); await flush();
-  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: '7d', page: 1, pageSize: 20 });
+  h.id('usage-periods').children[0].click(); await flush();
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'today', page: 1, pageSize: 20 });
   assert.match(recordsCard(body).querySelector('.records-info').textContent, /第 1 \/ 3 页 · 共 45 条/);
 });
 
@@ -342,7 +430,7 @@ test('interaction: records error surfaces a failed note while the usage summary 
   const buttons = card.querySelectorAll('.btn');
   assert.equal(buttons[0].disabled, true);
   assert.equal(buttons[1].disabled, true);
-  assert.match(h.id('usage-body').textContent, /汇总 · 今天/, 'summary rendering unaffected by records failure');
+  assert.match(h.id('usage-body').textContent, /汇总 · 近 7 天/, 'summary rendering unaffected by records failure');
 });
 
 test('interaction: summary gains ttft/speed/success cells and css charts sort, floor and cap at 10', async () => {
@@ -360,6 +448,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
       { name: '2026-11-18', requests: 1, inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
       { name: '2026-11-16', requests: 1, inputTokens: 900, outputTokens: 400, cacheReadTokens: 0, cacheWriteTokens: 0 },
       { name: '2026-11-17', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      { name: '2026-11-19', requests: 1, inputTokens: 100, outputTokens: null, cacheReadTokens: 0, cacheWriteTokens: 0 },
     ], updatedAt: 1 }) });
   await openUsage(h);
   const body = h.id('usage-body');
@@ -369,21 +458,22 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(numCell('生成速度').textContent, '33.4 t/s');
   // Cards order: summary → charts → detail tables → records.
   const titles = body.querySelectorAll('.usage-card').map(c => c.querySelector('.usage-title').textContent);
-  assert.deepEqual(titles.slice(0, 6), ['汇总 · 今天', '每日用量（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
-  // Daily chart: ascending dates, max day 100%, zero day floored at 4%.
+  assert.deepEqual(titles.slice(0, 6), ['汇总 · 近 7 天', '每日用量（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
+  // Daily chart: ascending dates, visible labels, and no fabricated zero bar.
   const dayCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
   const bars = dayCard.querySelectorAll('.usage-bar');
-  assert.equal(bars.length, 3);
+  assert.equal(bars.length, 4);
   assert.ok(bars[0].title.startsWith('2026-11-16'), 'bars ordered by date ascending');
   assert.equal(bars[0].style.height, '100%');
   assert.equal(bars[0].title.includes('输入 900（900）'), true);
   assert.ok(bars[0].title.includes('总量 1.3K（1,300）'));
   assert.equal(bars[1].title.startsWith('2026-11-17'), true);
-  assert.equal(bars[1].style.height, '4%', 'zero-token days floor at the minimum height');
+  assert.equal(bars[1].style.height, '0%', 'zero-token days have no filled bar');
   assert.equal(bars[2].title.startsWith('2026-11-18'), true);
   assert.equal(bars[2].style.height, '12%', 'smaller days scale relative to the max');
-  assert.ok(dayCard.querySelector('.usage-chart-axis').textContent.includes('2026-11-16'));
-  assert.ok(dayCard.querySelector('.usage-chart-axis').textContent.includes('2026-11-18'));
+  assert.equal(bars[3].style.height, '0%', 'unknown totals have no filled bar');
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19']);
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), ['1.3K', '0', '150', '—']);
   // Model chart: ranked by effective (cache-aware) input+output desc, capped at 10, exact values in title.
   const modelCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('模型 Top 10'));
   const rows = modelCard.querySelectorAll('.usage-hbar-row');
@@ -397,6 +487,22 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   // Structural safeguards against horizontal overflow at 440px (visual check in preview browser).
   assert.ok(dayCard.querySelector('.usage-bars'));
   assert.ok(recordsCard(body).querySelector('.records-scroll'));
+});
+
+test('interaction: a single day shows one date and a readable total without a chart', async () => {
+  for (const input of [1200, 0, null]) {
+    const h = harness({ usage_snapshot: ({ period }) => ({ period, byDay: [
+      { name: '2026-11-18', inputTokens: input, outputTokens: input === 0 ? 0 : 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    ] }) });
+    await openUsage(h);
+    h.id('usage-periods').children[0].click(); await flush();
+    const card = h.id('usage-body').querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
+    assert.equal(card.querySelectorAll('.usage-day-date').length, 1);
+    assert.equal(card.querySelector('.usage-day-date').textContent, '2026-11-18');
+    assert.equal(card.querySelector('.usage-bar'), null);
+    assert.equal(card.querySelector('.usage-day-total').textContent, input === null ? '— tokens' : input === 0 ? '0 tokens' : '1.25K tokens');
+    if (input === 1200) assert.equal(card.querySelector('.usage-day-total').title, '1,250 tokens');
+  }
 });
 
 test('interaction: charts and records fall back to the shared empty note when a period has no data', async () => {

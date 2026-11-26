@@ -583,7 +583,7 @@ export class ActiveProbeService {
     const tasks: Array<{ provider: string; models: string[]; type: string; promise: Promise<void> }> = [];
 
     for (const provider of providers) {
-      const adapter = getQuotaAdapter(provider.baseUrl);
+      const adapter = getQuotaAdapter(provider.baseUrl, provider);
       const models = Array.isArray(provider.models) ? provider.models : [];
       const proxyUrl = this.resolveProxyUrl?.(provider);
 
