@@ -1220,9 +1220,14 @@ export class OpenAIResponsesTransformer implements Transformer {
               // Chat can send cumulative counters in a separate, choices-free trailer.
               if (data.usage) {
                 const usage = transformer.buildResponsesUsage(data.usage);
+                const merged = mergeUsageCapture(terminalUsage, usage, false);
+                const countsChanged = merged.input_tokens !== terminalUsage?.input_tokens
+                  || merged.output_tokens !== terminalUsage?.output_tokens;
                 terminalUsage = {
-                  ...mergeUsageCapture(terminalUsage, usage, false),
-                  total_tokens: data.usage.total_tokens || terminalUsage?.total_tokens,
+                  ...merged,
+                  total_tokens: data.usage.total_tokens ?? (countsChanged
+                    ? merged.input_tokens + merged.output_tokens
+                    : terminalUsage?.total_tokens),
                   output_tokens_details: data.usage.output_tokens_details ?? terminalUsage?.output_tokens_details,
                 };
               }

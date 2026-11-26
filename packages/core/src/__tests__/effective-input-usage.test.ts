@@ -65,7 +65,7 @@ describe("effective input capture", () => {
   it.each(["[DONE]", "EOF"])("publishes and persists Chat trailer usage exactly once at %s", async terminal => {
     const req = request("/v1/responses", true);
     const frames = [
-      { choices: [{ delta: { content: "ok" } }], usage: { prompt_tokens: 1000 } },
+      { choices: [{ delta: { content: "ok" } }], usage: { prompt_tokens: 1000, total_tokens: 1000 } },
       { choices: [{ delta: {}, finish_reason: "stop" }], model: "upstream-model" },
       { choices: [], usage: { prompt_tokens: 1000, completion_tokens: 25, prompt_tokens_details: { cached_tokens: 900 } } },
     ];
