@@ -731,6 +731,7 @@
       name: toStr(o.name) || '—',
       requests: toNum(o.requests),
       inputTokens: toNum(o.inputTokens),
+      effectiveInputTokens: toNum(o.effectiveInputTokens),
       outputTokens: toNum(o.outputTokens),
       cacheReadTokens: toNum(o.cacheReadTokens),
       cacheWriteTokens: toNum(o.cacheWriteTokens),
@@ -744,6 +745,7 @@
       successCount: toNum(s.successCount),
       errorCount: toNum(s.errorCount),
       inputTokens: toNum(s.inputTokens),
+      effectiveInputTokens: toNum(s.effectiveInputTokens),
       outputTokens: toNum(s.outputTokens),
       cacheReadTokens: toNum(s.cacheReadTokens),
       cacheWriteTokens: toNum(s.cacheWriteTokens),
@@ -821,6 +823,7 @@
       clientType: toStr(o.clientType),
       scenarioType: toStr(o.scenarioType) || 'default',
       inputTokens: toNum(o.inputTokens),
+      effectiveInputTokens: toNum(o.effectiveInputTokens),
       outputTokens: toNum(o.outputTokens),
       cacheReadTokens: toNum(o.cacheReadTokens),
       cacheWriteTokens: toNum(o.cacheWriteTokens),
@@ -859,18 +862,17 @@
     return out.join(' → ');
   }
   // byModel arrives sorted by request count; charts rank by total tokens.
-  // Effective input mirrors the Web UsageStats heuristic (computeEffectiveInputTokens):
-  // some upstreams report inputTokens inclusive of cache read/write (then input
-  // ~= cache sum within a tolerance), others report net input. Never double-count.
-  function effectiveInputTokens(input, cacheRead, cacheWrite) {
-    if (input === null) return null;
-    var cacheTotal = (toNum(cacheRead) || 0) + (toNum(cacheWrite) || 0);
-    if (cacheTotal <= 0) return input;
-    var tolerance = Math.max(500, input * 0.02);
-    return Math.abs(input - cacheTotal) <= tolerance ? input : input + cacheTotal;
+  function inclusiveInputTokens(row) {
+    if (row.effectiveInputTokens != null) return row.effectiveInputTokens;
+    // Legacy raw input is unambiguous only with no recorded cache activity.
+    return row.cacheReadTokens || row.cacheWriteTokens ? null : row.inputTokens;
+  }
+  function cacheMissInputTokens(row) {
+    var input = inclusiveInputTokens(row);
+    return input == null ? null : input - (row.cacheReadTokens || 0);
   }
   function rowTotalTokens(row) {
-    var input = effectiveInputTokens(row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens);
+    var input = inclusiveInputTokens(row);
     if (input === null || row.outputTokens === null) return null;
     return input + row.outputTokens;
   }
@@ -878,8 +880,8 @@
   function topModelsByTotal(rows, limit) {
     var list = (Array.isArray(rows) ? rows : []).slice();
     list.sort(function (a, b) {
-      var ta = rowTotalTokens(a) || 0;
-      var tb = rowTotalTokens(b) || 0;
+      var ta = rowTotalTokens(a) ?? -1;
+      var tb = rowTotalTokens(b) ?? -1;
       return tb - ta;
     });
     return typeof limit === 'number' ? list.slice(0, limit) : list;
@@ -1191,48 +1193,48 @@
     var usage = {
       today: {
         period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
-        inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
+        inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
         avgTtftMs: 842, avgTokensPerSecond: 36.2,
         byProvider: [
-          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
-          { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
+          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, effectiveInputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
+          { name: 'beta.example.com', requests: 32, inputTokens: 202100, effectiveInputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
         ],
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
-        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
         updatedAt: Date.now() - 3000,
       },
       '7d': {
         period: '7d', totalRequests: 902, successCount: 890, errorCount: 12,
-        inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
+        inputTokens: 6210000, effectiveInputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
         avgTtftMs: 905, avgTokensPerSecond: 33.8,
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, effectiveInputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
-          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
+          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, effectiveInputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
+          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, effectiveInputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
-          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
-          { name: '2026-11-14', requests: 132, inputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
-          { name: '2026-11-13', requests: 147, inputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
-          { name: '2026-11-12', requests: 101, inputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
-          { name: '2026-11-11', requests: 99, inputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
+          { name: '2026-11-17', requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: '2026-11-16', requests: 140, inputTokens: 900000, effectiveInputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: '2026-11-15', requests: 155, inputTokens: 950000, effectiveInputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
+          { name: '2026-11-14', requests: 132, inputTokens: 720000, effectiveInputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
+          { name: '2026-11-13', requests: 147, inputTokens: 880000, effectiveInputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
+          { name: '2026-11-12', requests: 101, inputTokens: 520000, effectiveInputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
+          { name: '2026-11-11', requests: 99, inputTokens: 498000, effectiveInputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
         ],
         updatedAt: Date.now() - 3000,
       },
       '30d': {
         period: '30d', totalRequests: 4120, successCount: 4044, errorCount: 76,
-        inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
+        inputTokens: 28600000, effectiveInputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
         avgTtftMs: 878, avgTokensPerSecond: 34.9,
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, effectiveInputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
-          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
+          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, effectiveInputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
+          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, effectiveInputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: '2026-11-17', requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: '2026-11-16', requests: 140, inputTokens: 900000, effectiveInputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
         ],
         updatedAt: Date.now() - 3000,
       },
@@ -1279,6 +1281,7 @@
           clientType: RECORD_CLIENTS[i % RECORD_CLIENTS.length],
           scenarioType: i % 4 === 0 ? 'background' : 'default',
           inputTokens: 1200 + (i % 7) * 350,
+          effectiveInputTokens: 1200 + (i % 7) * 350 + (i % 3) * 900 + (i % 2) * 400,
           outputTokens: 300 + (i % 5) * 120,
           cacheReadTokens: (i % 3) * 900,
           cacheWriteTokens: (i % 2) * 400,
@@ -2164,32 +2167,41 @@
       grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
       grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
       grid.appendChild(usageNumCell('成功率', formatSuccessRate(u.successCount, u.totalRequests)));
+      var input = cacheMissInputTokens(u);
+      var inclusive = inclusiveInputTokens(u);
       var totalTokens = rowTotalTokens(u);
-      var totalCell = usageNumCell('总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
-      totalCell.title = '有效输入 + 输出；上游 inputTokens 已含缓存时直接采用，否则加计缓存读/写';
-      grid.appendChild(totalCell);
-      grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
-      grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
+      var estimated = u.estimatedCount > 0;
+      function summaryTokenCell(label, count) {
+        var cell = recordsTokenCell(count, estimated);
+        return usageNumCell(label, cell.text, cell.title);
+      }
+      grid.appendChild(summaryTokenCell('总 tokens', totalTokens));
+      grid.appendChild(summaryTokenCell('输入（未命中）', input));
+      grid.appendChild(summaryTokenCell('输出 tokens', u.outputTokens));
       grid.appendChild(usageNumCell('缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
       grid.appendChild(usageNumCell('缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
+      var hitRate = inclusive > 0 && u.cacheReadTokens !== null
+        ? (estimated ? '≈' : '') + (u.cacheReadTokens / inclusive * 100).toFixed(1) + '%' : null;
+      grid.appendChild(usageNumCell('缓存命中率', hitRate));
       grid.appendChild(usageNumCell('估算条目', formatInt(u.estimatedCount)));
       grid.appendChild(usageNumCell('平均 TTFT', formatMs(u.avgTtftMs)));
       grid.appendChild(usageNumCell('生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
       body.appendChild(totals);
-      totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
+      totals.appendChild(noteEl('总 tokens = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。'));
       body.appendChild(buildDayChart(u.byDay));
       body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
         var rowTotal = rowTotalTokens(m);
+        var input = cacheMissInputTokens(m);
         return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
-          { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
+          { text: formatCompact(input) || '—', title: formatInt(input) },
           { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
-          { text: (formatCompact(m.cacheReadTokens) || '—') + ' / ' + (formatCompact(m.cacheWriteTokens) || '—'),
-            title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') },
+          { text: formatCompact(m.cacheReadTokens) || '—', title: formatInt(m.cacheReadTokens) },
+          { text: formatCompact(m.cacheWriteTokens) || '—', title: formatInt(m.cacheWriteTokens) },
           { text: formatCompact(rowTotal) || '—', title: formatInt(rowTotal) }];
       }
-      var tokenHeaders = ['请求', '输入', '输出', '缓存（读 / 写）', '总 tokens'];
+      var tokenHeaders = ['请求', '输入（未命中）', '输出', '缓存读', '缓存写', '总 tokens'];
       body.appendChild(usageTable('按模型', ['模型'].concat(tokenHeaders), u.byModel.map(tokenRow), 1));
       body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
       body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
@@ -2208,7 +2220,7 @@
         card.appendChild(noteEl('该周期暂无调用记录'));
         return card;
       }
-      var totals = days.map(function (d) { return rowTotalTokens(d) || 0; });
+      var totals = days.map(rowTotalTokens);
       var max = Math.max.apply(null, totals);
       var bars = el('div', 'usage-bars');
       days.forEach(function (d, i) {
@@ -2217,9 +2229,13 @@
         var col = el('div', 'usage-bar-col');
         var bar = el('div', 'usage-bar');
         bar.style.height = pct + '%';
-        bar.title = d.name + ' · 输入 ' + (formatCompact(d.inputTokens) || '—') + '（' + (formatInt(d.inputTokens) || '—') + '）'
+        bar.hidden = v === null;
+        var input = cacheMissInputTokens(d);
+        bar.title = d.name + ' · 输入（未命中） ' + (formatCompact(input) || '—') + '（' + (formatInt(input) || '—') + '）'
+          + ' · 缓存读 ' + (formatInt(d.cacheReadTokens) || '—')
           + ' · 输出 ' + (formatCompact(d.outputTokens) || '—') + '（' + (formatInt(d.outputTokens) || '—') + '）'
           + ' · 总量 ' + (formatCompact(v) || '—') + '（' + (formatInt(v) || '—') + '）';
+        col.title = bar.title;
         col.appendChild(bar);
         bars.appendChild(col);
       });
@@ -2246,13 +2262,13 @@
       });
       var list = el('div', 'usage-hbar');
       models.forEach(function (m) {
-        var total = rowTotalTokens(m) || 0;
+        var total = rowTotalTokens(m);
         // Visible bars floor at 1% so a tiny-but-nonzero total still renders.
         var pct = total > 0 && max > 0 ? Math.max(1, Math.round((total / max) * 1000) / 10) : 0;
         var row = el('div', 'usage-hbar-row');
         var name = el('span', 'usage-hbar-name', m.name);
         name.title = m.name + ' · 请求 ' + (formatInt(m.requests) || '—')
-          + ' · 输入 ' + (formatInt(m.inputTokens) || '—') + ' · 输出 ' + (formatInt(m.outputTokens) || '—')
+          + ' · 输入（未命中） ' + (formatInt(cacheMissInputTokens(m)) || '—') + ' · 输出 ' + (formatInt(m.outputTokens) || '—')
           + ' · 缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—');
         var track = el('div', 'usage-hbar-track');
         var fill = el('div', 'usage-hbar-fill');
@@ -2275,11 +2291,11 @@
       var t = new Date(s);
       return Number.isNaN(t.getTime()) ? s : formatClock(t.getTime());
     }
-    var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
+    var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入（未命中）', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
     function recordsTokenCell(value, estimated) {
       return {
-        text: (estimated ? '≈' : '') + (formatCompact(value) || '—'),
-        title: formatInt(value) == null ? null : formatInt(value),
+        text: value == null ? '—' : (estimated ? '≈' : '') + formatCompact(value),
+        title: value == null ? null : (estimated ? '≈' : '') + formatInt(value),
       };
     }
     function recordsNumCell(cell) {
@@ -2311,7 +2327,7 @@
         modelTd.title = chain;
         tr.appendChild(modelTd);
         tr.appendChild(el('td', null, clientLabel(r.clientType)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.inputTokens, r.usageEstimated)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(cacheMissInputTokens(r), r.usageEstimated)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.outputTokens, r.usageEstimated)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheReadTokens, false)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheWriteTokens, false)));

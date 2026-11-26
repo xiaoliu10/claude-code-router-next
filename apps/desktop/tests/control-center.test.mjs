@@ -334,20 +334,20 @@ test("routing: missing invoke throws (no silent mock)", () => {
 test("usage: normalizeUsageSnapshot whitelists contract fields only", () => {
   const u = Q.normalizeUsageSnapshot({
     period: "7d", totalRequests: 10, successCount: 8, errorCount: 2,
-    inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
+    inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
     avgTtftMs: 812, avgTokensPerSecond: 33.4,
-    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, secret: "sekret" }],
+    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6, secret: "sekret" }],
     byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, cost: 9.9 }],
     byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50 }],
     updatedAt: 123, secret: "x",
   })
   assert.deepEqual(plain(u), {
     period: "7d", totalRequests: 10, successCount: 8, errorCount: 2,
-    inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
+    inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
     avgTtftMs: 812, avgTokensPerSecond: 33.4,
-    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6 }],
-    byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null }],
-    byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null }],
+    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6 }],
+    byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: null, cacheReadTokens: null, cacheWriteTokens: null }],
+    byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: null, cacheReadTokens: null, cacheWriteTokens: null }],
     updatedAt: 123,
   })
   assert.equal(JSON.stringify(u).includes("cost"), false, "no fabricated cost fields")
@@ -404,7 +404,7 @@ test("records: normalizeRecord whitelists fields; responseBody/sessionId never r
   const r = Q.normalizeRecord({
     timestamp: "2026-11-17T09:05:03Z", provider: "alpha", model: "m1",
     originalModel: "m0", upstreamModel: "m2", clientType: "claude-code", scenarioType: "think",
-    inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
+    inputTokens: 10, effectiveInputTokens: 13, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
     ttftMs: 300, tokensPerSecond: 42.5, durationMs: 1500,
     status: "error", usageEstimated: true, errorMessage: "boom",
     responseBody: "SECRET-BODY", sessionId: "session-1", apiKey: "k", id: "rec-1",
@@ -412,7 +412,7 @@ test("records: normalizeRecord whitelists fields; responseBody/sessionId never r
   assert.deepEqual(plain(r), {
     timestamp: "2026-11-17T09:05:03Z", provider: "alpha", model: "m1",
     originalModel: "m0", upstreamModel: "m2", clientType: "claude-code", scenarioType: "think",
-    inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
+    inputTokens: 10, effectiveInputTokens: 13, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
     ttftMs: 300, tokensPerSecond: 42.5, durationMs: 1500,
     status: "error", usageEstimated: true, errorMessage: "boom",
   })

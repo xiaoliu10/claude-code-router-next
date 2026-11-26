@@ -48,6 +48,7 @@ function seed(): void {
   append(makeRecord({
     id: "rec-1",
     inputTokens: 100,
+    effectiveInputTokens: 115,
     outputTokens: 50,
     cacheReadInputTokens: 10,
     cacheCreationInputTokens: 5,
@@ -63,6 +64,7 @@ function seed(): void {
     scenarioType: "image",
     clientType: "codex",
     inputTokens: 200,
+    effectiveInputTokens: 200,
     outputTokens: 0,
     ttft: 300,
     durationMs: 1500,
@@ -86,6 +88,7 @@ function seed(): void {
     id: "rec-4",
     timestamp: "2026-08-02T11:00:00.000Z",
     inputTokens: 300,
+    effectiveInputTokens: 320,
     outputTokens: 40,
     cacheReadInputTokens: 20,
     ttft: 200,
@@ -123,6 +126,7 @@ describe("SQL usage summary", () => {
     expect(summary.byModel.m1).toEqual({
       count: 3,
       inputTokens: 600,
+      effectiveInputTokens: 635,
       outputTokens: 90,
       cacheReadInputTokens: 30,
       cacheCreationInputTokens: 5,
@@ -169,6 +173,7 @@ describe("SQL usage summary", () => {
   it("returns empty aggregates without matching rows", () => {
     const empty = querySummary("2030-01-01T00:00:00.000Z", "2030-01-02T00:00:00.000Z");
     expect(empty.totalRequests).toBe(0);
+    expect(empty.totalEffectiveInputTokens).toBe(0);
     expect(empty.successCount).toBe(0);
     expect(empty.errorCount).toBe(0);
     expect(empty.avgTtft).toBeNull();
@@ -228,5 +233,58 @@ describe("non-stream ttft/tps semantics", () => {
     // avgTtft ignores non-stream rows; only pre-seeded stream rows count.
     const after = querySummary();
     expect(after.avgTtft).toBe(summaryBefore.avgTtft);
+  });
+});
+
+
+describe("inclusive input SQL aggregation", () => {
+  it("sums confirmable per-row counts across every bucket", () => {
+    const provider = "effective-known";
+    for (const record of [
+      { id: "net", inputTokens: 2, cacheReadInputTokens: 100, cacheCreationInputTokens: 8, effectiveInputTokens: 110 },
+      { id: "inclusive", inputTokens: 110, cacheReadInputTokens: 100, cacheCreationInputTokens: 8, effectiveInputTokens: 110 },
+      { id: "legacy-no-cache", inputTokens: 14 },
+      { id: "estimated", inputTokens: 17, effectiveInputTokens: 17, effectiveInputTokensSource: "estimated" as const },
+      { id: "net-zero-cache", inputTokens: 10, cacheReadInputTokens: 0, effectiveInputTokens: 10 },
+      { id: "error", status: "error" as const, inputTokens: 99, effectiveInputTokens: 99 },
+    ]) append(makeRecord({ ...record, provider }));
+    const { records, summary } = query({ provider });
+    const expected = 110 + 110 + 14 + 17 + 10;
+    expect(summary.totalEffectiveInputTokens).toBe(expected);
+    for (const buckets of [summary.byModel, summary.byDay, summary.byFamily, summary.byClient, summary.byScenario, summary.byProvider]) {
+      expect(Object.values(buckets).map(row => row.effectiveInputTokens)).toEqual([expected]);
+    }
+    const byId = Object.fromEntries(records.map(row => [row.id, row]));
+    // A legacy row with zero cache is unambiguous: its raw input is the total.
+    expect(byId["legacy-no-cache"].effectiveInputTokens).toBe(14);
+    expect(byId["legacy-no-cache"].effectiveInputTokensSource).toBeUndefined();
+    expect(byId.estimated.effectiveInputTokensSource).toBe("estimated");
+    expect(byId.net.effectiveInputTokensSource).toBeUndefined();
+    expect(query({ provider, status: "error" }).summary.totalEffectiveInputTokens).toBe(0);
+  });
+
+  it("nulls a legacy cached row and propagates null to its buckets and the total", () => {
+    const provider = "effective-unknown";
+    append(makeRecord({ id: "confirmable", provider, model: "m-confirmable", inputTokens: 5, effectiveInputTokens: 5 }));
+    append(makeRecord({ id: "ambiguous", provider, model: "m-ambiguous", inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7 }));
+    const { records, summary } = query({ provider });
+    const byId = Object.fromEntries(records.map(row => [row.id, row]));
+    expect(byId.ambiguous.effectiveInputTokens).toBeNull();
+    expect(byId.confirmable.effectiveInputTokens).toBe(5);
+    // Any unconfirmable successful row nulls the whole filtered total ...
+    expect(summary.totalEffectiveInputTokens).toBeNull();
+    expect(summary.byProvider[provider].effectiveInputTokens).toBeNull();
+    // ... and only the buckets that actually contain it; sibling buckets still sum.
+    expect(summary.byModel["m-ambiguous"].effectiveInputTokens).toBeNull();
+    expect(summary.byModel["m-confirmable"].effectiveInputTokens).toBe(5);
+    expect(querySummary().totalEffectiveInputTokens).toBeNull();
+  });
+
+  it("preserves a recorded zero without nulling aggregates", () => {
+    const provider = "effective-zero";
+    append(makeRecord({ id: "zero-effective", provider, inputTokens: 14, effectiveInputTokens: 0 }));
+    const { records, summary } = query({ provider });
+    expect(records.find(row => row.id === "zero-effective")?.effectiveInputTokens).toBe(0);
+    expect(summary.totalEffectiveInputTokens).toBe(0);
   });
 });

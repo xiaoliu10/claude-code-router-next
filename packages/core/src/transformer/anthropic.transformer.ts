@@ -1,3 +1,4 @@
+import { captureInputUsage, startInputUsageCapture } from "../ccr/effective-input-usage";
 import { ChatCompletion } from "openai/resources";
 import {
   builtinWebSearch,
@@ -519,6 +520,7 @@ export class AnthropicTransformer implements Transformer {
     openaiStream: ReadableStream,
     context: TransformerContext
   ): Promise<ReadableStream> {
+    const inputUsage = startInputUsageCapture(context?.req, "chat");
     const readable = new ReadableStream({
       start: async (controller) => {
         const encoder = new TextEncoder();
@@ -787,6 +789,7 @@ export class AnthropicTransformer implements Transformer {
 
                 const choice = chunk.choices?.[0];
                 if (chunk.usage) {
+                  captureInputUsage(inputUsage, chunk.usage);
                   // OpenAI-compatible upstreams report cache reads in either
                   // prompt_tokens_details.cached_tokens or the DeepSeek-style
                   // prompt_cache_hit_tokens; accept whichever is present.
@@ -1316,6 +1319,7 @@ export class AnthropicTransformer implements Transformer {
       `Original OpenAI response`
     );
     try {
+      captureInputUsage(startInputUsageCapture(context?.req, "chat"), openaiResponse.usage);
       const choice = openaiResponse.choices[0];
       if (!choice) {
         throw new Error("No choices found in OpenAI response");
