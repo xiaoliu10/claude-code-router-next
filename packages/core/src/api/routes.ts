@@ -5,7 +5,7 @@ import {
   FastifyReply,
 } from "fastify";
 import { CCR_SELF_PROVIDER_NAME } from "@wengine-ai/claude-code-router-shared";
-import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
+import { builtinWebSearch, RegisterProviderRequest, LLMProvider, type UnifiedTool } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
 import type { ChatCompletionCapture } from "../ccr/chat-completion-capture";
@@ -132,6 +132,7 @@ export function normalizeResponsesBody(body: any): void {
         // Codex web_search tool
         if (tool.type === "web_search") {
           return {
+            [builtinWebSearch]: true,
             type: "function",
             function: {
               name: "web_search",
@@ -404,7 +405,7 @@ async function handleTransformerEndpoint(
       if (provider?.baseUrl && response?.headers) {
         captureRateLimitHeaders(providerName, provider.baseUrl, response.headers);
       }
-    } catch {}
+    } catch { /* Header accounting is best effort. */ }
 
     // Process response transformer chain
     let finalResponse = await processResponseTransformers(
@@ -425,13 +426,12 @@ async function handleTransformerEndpoint(
       if (!req.chatCompletionCapture && providerName && model) {
         getHealthStore().recordSuccess(providerName, model);
       }
-    } catch {}
+    } catch { /* Preserve the successful response if accounting fails. */ }
 
     return result;
   } catch (error: any) {
-    // ProjectRoutingError must propagate directly — it is a configuration
-    // error, not a transient upstream failure. No retry, no fallback.
-    if (error instanceof ProjectRoutingError || (isChat && isTerminalChatError(error))) {
+    // Routing, tool-choice, and terminal chat errors cannot be recovered by replay.
+    if (error instanceof ProjectRoutingError || error?.code === "invalid_gemini_tool_choice" || (isChat && isTerminalChatError(error))) {
       throw error;
     }
     // Double-check: retry the same model once before falling back.
@@ -873,7 +873,7 @@ async function handleFallback(
             if (provider?.baseUrl && response?.headers) {
               captureRateLimitHeaders(fbProviderName, provider.baseUrl, response.headers);
             }
-          } catch {}
+          } catch { /* Header accounting is best effort. */ }
 
           // Process response transformer chain — propagate codex flags so the
           // fallback response also gets Responses API conversion when needed.
@@ -932,7 +932,7 @@ async function handleFallback(
           // Format and return response
           return formatResponse(finalResponse, reply, newBody, fastify);
         } catch (error: any) {
-          if (transformer.endPoint === "/v1/chat/completions" && isTerminalChatError(error)) {
+          if (error?.code === "invalid_gemini_tool_choice" || (transformer.endPoint === "/v1/chat/completions" && isTerminalChatError(error))) {
             throw error;
           }
           fallbackError = error;
@@ -1007,6 +1007,13 @@ async function processRequestTransformers(
   // Deep clone the request body to preserve original messages for caching
   // and to ensure thinking blocks are not lost when switching between models
   let requestBody = JSON.parse(JSON.stringify(body));
+  // The JSON clone deliberately omits internal symbols. Restore tool ownership
+  // for this attempt without exposing it in any provider’s JSON payload.
+  if (Array.isArray(body.tools)) {
+    body.tools.forEach((tool: UnifiedTool, index: number) => {
+      if (tool?.[builtinWebSearch]) requestBody.tools[index][builtinWebSearch] = true;
+    });
+  }
 
   // Normalize per-request "cch=xxx;" hash in billing header system messages.
   // Claude Code injects a rotating hash (cch=...) that changes every request,
@@ -1347,6 +1354,7 @@ async function sendProviderAttempt(
   }
 
   const managedRequest = config.__ccrManagedRequest;
+  const dispatchedModel = managedRequest?.model ?? requestBody.model;
   let response: Response;
   const dispatchUpstream = () => sendUnifiedRequest(
     url,
@@ -1405,12 +1413,12 @@ async function sendProviderAttempt(
       throw error;
     }
     fastify.log.error(
-      `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
+      `[provider_response_error] Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${errorText}`,
     );
     const errorDetail = context.req.chatCompletionCapture && (isEventStreamResponse(response) || looksLikeSSE(errorText))
       ? "Upstream SSE error" : errorText;
     const error = createApiError(
-      `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorDetail}`,
+      `Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${errorDetail}`,
       response.status,
       "provider_response_error"
     );
@@ -1425,7 +1433,7 @@ async function sendProviderAttempt(
     const isStreamRequest = requestBody.stream === true;
     // DEBUG: log response metadata to diagnose why empty responses bypass checks
     fastify.log.info(
-      `[hidden-error-check] provider=${provider.name} model=${requestBody.model} stream=${requestBody.stream} isStreamRequest=${isStreamRequest} contentType=${contentType} ok=${response.ok} status=${response.status} hasBody=${!!response.body}`
+      `[hidden-error-check] provider=${provider.name} model=${dispatchedModel} stream=${requestBody.stream} isStreamRequest=${isStreamRequest} contentType=${contentType} ok=${response.ok} status=${response.status} hasBody=${!!response.body}`
     );
     // For non-streaming requests, always validate the response body regardless
     // of content-type. Some providers return 200 with empty body or non-JSON
@@ -1473,12 +1481,12 @@ async function sendProviderAttempt(
               throw await pluginResponseError(pluginRuntime, response.status, bodyText, geminiSystemText(requestBody), undefined, managedRequest);
             }
             fastify.log.error(
-              `[provider_response_error] Hidden error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
+              `[provider_response_error] Hidden error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${bodyText}`,
             );
             // Classify as rate-limit when error text contains relevant keywords
             const isRateLimit = isRateLimitError(bodyText);
             const error = createApiError(
-              `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${bodyText}`,
+              `Error from provider(${provider.name},${dispatchedModel}: ${response.status}): ${bodyText}`,
               // Promote to 400 to trigger fallback and correct usage logging
               400,
               "provider_response_error"
@@ -1500,7 +1508,7 @@ async function sendProviderAttempt(
         // the empty response to the client, which would cause a different error.
         if (e instanceof SyntaxError) {
           fastify.log.warn(
-            `[provider_response_error] Empty or malformed JSON response from provider(${provider.name},${requestBody.model}: 200): "${bodyText}"`
+            `[provider_response_error] Empty or malformed JSON response from provider(${provider.name},${dispatchedModel}: 200): "${bodyText}"`
           );
           const error = createApiError(
             `API returned an empty or malformed response (HTTP 200) from ${provider.name} — check for a proxy or gateway intercepting the request`,
