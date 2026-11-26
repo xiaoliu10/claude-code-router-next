@@ -87,6 +87,10 @@
     };
   }
   var CODEX_PROVIDER_NAME = 'codex-subscription';
+  var RESET_UPGRADE_MESSAGE = '请先更新 Codex 订阅插件，再使用重置卡。';
+  function isAccountRevision(value) {
+    return typeof value === 'string' && value.length === 36 && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
+  }
   function normalizeProvider(p) {
     var s = p && typeof p === 'object' ? p : {};
     return {
@@ -1519,6 +1523,7 @@
     var codexQuota = { name: CODEX_PROVIDER_NAME, enabled: true, codexResetEligible: true, plan: 'Plus', status: 'ready',
       windows: [{ label: '5 小时', used: 80, limit: 100, remaining: 20, unit: '%' }], updatedAt: Date.now() };
     quotaProviders.push(codexQuota);
+    var resetAccountRevision = 'fa5f9800-4e33-42cd-a3b0-6094ca8702d3';
     var resetCredit = { id: 'preview-credit', status: 'available', expiresAt: Date.now() + 7 * 86400e3 };
 
     var providerDetails = new Map(quotaProviders.map(function (row) {
@@ -1557,8 +1562,11 @@
       if (cmd === 'quota_snapshot') {
         return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
       }
-      if (cmd === 'codex_reset_credits') return delay({ availableCount: resetCredit.status === 'available' ? 1 : 0, credits: [copy(resetCredit)] });
+      if (cmd === 'codex_reset_credits') return delay({ accountRevision: resetAccountRevision, availableCount: resetCredit.status === 'available' ? 1 : 0, credits: [copy(resetCredit)] });
       if (cmd === 'codex_reset_consume') {
+        if (Object.keys(a).length !== 2 || !isAccountRevision(a.accountRevision) || typeof a.creditId !== 'string' ||
+            !a.creditId.trim() || a.creditId.length > 256 || /[\x00-\x1f\x7f-\x9f]/.test(a.creditId)) return Promise.reject(new Error('codex_reset_invalid'));
+        if (a.accountRevision !== resetAccountRevision) return Promise.reject(new Error('codex_reset_account_changed'));
         if (a.creditId !== resetCredit.id || resetCredit.status !== 'available') return delay({ outcome: 'no_credit', windowsReset: 0 });
         resetCredit.status = 'redeemed';
         codexQuota.windows[0].used = 0;
@@ -1861,10 +1869,14 @@
     var summary = el('p', 'card-message');
     summary.setAttribute('role', 'status');
     var actions = el('div', 'codex-reset-actions');
-    var recheck = mkBtn('重查张数', null, function () { readCredits(); });
+    var recheck = mkBtn('重查张数', null, function () {
+      if (reading || consuming || confirmation) return;
+      feedback.textContent = '';
+      readCredits();
+    });
     var open = mkBtn('重置用量', null, function () {
-      if (!eligibleProvider || !target || reading || consuming || confirming) return;
-      confirming = true;
+      if (!eligibleProvider || !target || reading || consuming || confirmation) return;
+      confirmation = target;
       feedback.textContent = '';
       render();
       cancel.focus();
@@ -1890,9 +1902,9 @@
     root.appendChild(feedback);
 
     var card = null, eligibleProvider = null, generation = 0, count = null, target = null;
-    var reading = false, consuming = false, confirming = false;
+    var reading = false, consuming = false, confirmation = null, upgradeRequired = false;
     function render() {
-      var text = '无法读取重置卡张数。';
+      var text = upgradeRequired ? RESET_UPGRADE_MESSAGE : '无法读取重置卡张数。';
       if (reading) text = '正在查询重置卡…';
       else if (consuming) text = '正在提交重置请求…';
       else if (count !== null) {
@@ -1901,23 +1913,24 @@
         if (count > 0 && !target) text += ' · 暂无可选择的卡，请重查';
       }
       summary.textContent = text;
-      recheck.disabled = reading || consuming || confirming;
-      open.disabled = !target || reading || consuming || confirming;
-      prompt.hidden = !confirming;
-      confirm.disabled = !confirming;
+      recheck.disabled = reading || consuming || !!confirmation;
+      open.disabled = !target || reading || consuming || !!confirmation;
+      prompt.hidden = !confirmation;
+      confirm.disabled = !confirmation;
       feedback.hidden = !feedback.textContent;
     }
     function cancelConfirm(restoreFocus) {
-      if (!confirming) return false;
-      confirming = false;
+      if (!confirmation) return false;
+      confirmation = null;
       render();
       if (restoreFocus) open.focus();
       return true;
     }
     async function readCredits() {
-      if (!eligibleProvider || reading || consuming || confirming) return;
+      if (!eligibleProvider || reading || consuming || confirmation) return;
       var current = generation;
       reading = true;
+      upgradeRequired = false;
       target = null;
       count = null;
       render();
@@ -1925,6 +1938,10 @@
         var list = await invoke('codex_reset_credits');
         if (current !== generation) return;
         if (!list || !Number.isSafeInteger(list.availableCount) || list.availableCount < 0 || !Array.isArray(list.credits)) return;
+        if (!isAccountRevision(list.accountRevision)) {
+          upgradeRequired = list.accountRevision === undefined;
+          return;
+        }
         count = list.availableCount;
         // Same ordering as the Web card: first expiring available credit, undated last.
         if (count > 0) list.credits.forEach(function (credit) {
@@ -1932,25 +1949,26 @@
           var expiry = toNum(credit.expiresAt);
           if (!(expiry > 0 && Number.isFinite(new Date(expiry).getTime()))) expiry = null;
           if (!target || (expiry !== null && (target.expiresAt === null || expiry < target.expiresAt))) {
-            target = { id: credit.id, expiresAt: expiry };
+            target = { creditId: credit.id, accountRevision: list.accountRevision, expiresAt: expiry };
           }
         });
-      } catch { /* Keep the count unknown until an explicit recheck succeeds. */ }
-      finally {
+      } catch (err) {
+        if (current === generation) upgradeRequired = errorMessage(err) === 'codex_reset_upgrade_required';
+      } finally {
         if (current === generation) { reading = false; render(); }
       }
     }
     async function consume() {
-      if (!eligibleProvider || !confirming || !target || consuming) return;
-      var current = generation, creditId = target.id;
+      if (!eligibleProvider || !confirmation || consuming) return;
+      var current = generation, selected = confirmation;
       consuming = true;
-      confirming = false;
+      confirmation = null;
       target = null;
       count = null;
       render();
       var relist = false;
       try {
-        var result = await invoke('codex_reset_consume', { creditId: creditId });
+        var result = await invoke('codex_reset_consume', { creditId: selected.creditId, accountRevision: selected.accountRevision });
         var sameGeneration = generation === current;
         if (result?.outcome === 'reset' || result?.outcome === 'already_redeemed') refreshQuota();
         if (!sameGeneration) return;
@@ -1964,7 +1982,8 @@
       } catch (err) {
         if (generation === current) {
           switch (errorMessage(err)) {
-            case 'codex_reset_upgrade_required': feedback.textContent = '请先更新 Codex 订阅插件，再使用重置卡。'; break;
+            case 'codex_reset_upgrade_required': feedback.textContent = RESET_UPGRADE_MESSAGE; break;
+            case 'codex_reset_account_changed': feedback.textContent = 'Codex 账号已切换。请重查张数，再确认使用当前账号的卡。'; break;
             case 'codex_reset_no_credit': feedback.textContent = '所选重置卡已不可用，请重新查询。'; break;
             case 'codex_reset_busy': feedback.textContent = '正在处理另一项操作，请稍后重新查询。'; break;
             default: feedback.textContent = '无法确认是否已使用重置卡。请先重查张数并核对额度。';
@@ -1984,7 +2003,8 @@
       card = next;
       eligibleProvider = provider;
       root.remove();
-      confirming = reading = false;
+      confirmation = null;
+      reading = false;
       count = target = null;
       render();
       if (eligibleProvider) { card.appendChild(root); readCredits(); }

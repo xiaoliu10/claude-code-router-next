@@ -219,6 +219,20 @@ test("preview: quota_snapshot keeps the existing quota contract", async () => {
   assert.equal(typeof s.online, "boolean")
 })
 
+test("preview: Codex reset requires the listed account revision and rejects stale confirmations before mutation", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const list = await previewCall(invoke, "codex_reset_credits")
+  assert.equal(list.availableCount, 1)
+  assert.match(list.accountRevision, /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i)
+  const selection = { creditId: list.credits[0].id, accountRevision: list.accountRevision }
+  await assert.rejects(previewCall(invoke, "codex_reset_consume", { creditId: selection.creditId }), /codex_reset_invalid/)
+  await assert.rejects(previewCall(invoke, "codex_reset_consume", { ...selection, extra: true }), /codex_reset_invalid/)
+  await assert.rejects(previewCall(invoke, "codex_reset_consume", { ...selection, accountRevision: "00112233-4455-4677-8899-aabbccddeeff" }), /codex_reset_account_changed/)
+  assert.equal((await previewCall(invoke, "codex_reset_credits")).availableCount, 1)
+  assert.equal((await previewCall(invoke, "codex_reset_consume", selection)).outcome, "reset")
+  assert.equal((await previewCall(invoke, "codex_reset_credits")).availableCount, 0)
+})
+
 test("preview: provider_add returns only the name and updates safe quota and routing projections", async () => {
   const invoke = Q.createPreviewInvoke()
   const provider = { name: 'example.com', baseUrl: 'https://example.com/v1', apiKey: 'test-key', models: ['one'] }

@@ -5,7 +5,7 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::Value;
 use std::{collections::HashSet, time::Duration};
-use tauri::WebviewWindow;
+use tauri::{ipc::InvokeBody, WebviewWindow};
 
 const INVALID: &str = "codex_reset_invalid";
 const UNAVAILABLE: &str = "codex_reset_unavailable";
@@ -14,6 +14,7 @@ const NO_CREDIT: &str = "codex_reset_no_credit";
 const FAILED: &str = "codex_reset_failed";
 const UNAUTHORIZED: &str = "codex_unauthorized";
 const DISCONNECTED: &str = "codex_not_connected";
+const ACCOUNT_CHANGED: &str = "codex_reset_account_changed";
 const UPGRADE_REQUIRED: &str = "codex_reset_upgrade_required";
 // The strict plugin route may make three sequential 30-second upstream requests.
 // Leave a small response margin, but never retry this mutating POST automatically.
@@ -22,6 +23,7 @@ const CONSUME_CONFIRMED_TIMEOUT: Duration = Duration::from_secs(100);
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResetCredits {
+    account_revision: String,
     available_count: u64,
     credits: Vec<ResetCredit>,
 }
@@ -46,10 +48,14 @@ pub struct ResetResult {
     available_count: Option<u64>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConsumeConfirmedRequest<'a> {
-    credit_id: &'a str,
+fn account_revision(value: &Value) -> Option<&str> {
+    value.as_str().filter(|s| {
+        s.len() == 36
+            && s.bytes().enumerate().all(|(i, b)| match i {
+                8 | 13 | 18 | 23 => b == b'-',
+                _ => b.is_ascii_hexdigit(),
+            })
+    })
 }
 
 fn safe_integer(value: &Value) -> Option<u64> {
@@ -90,6 +96,7 @@ fn parse_credits(value: &Value) -> Option<ResetCredits> {
         });
     }
     Some(ResetCredits {
+        account_revision: account_revision(&value["accountRevision"])?.into(),
         available_count,
         credits,
     })
@@ -120,6 +127,7 @@ fn plugin_error(status: u16, value: &Value, fallback: &'static str) -> &'static 
     match (status, value["error"].as_str()) {
         (401 | 403, _) => UNAUTHORIZED,
         (409, Some("codex_not_connected")) => DISCONNECTED,
+        (409, Some(ACCOUNT_CHANGED)) => ACCOUNT_CHANGED,
         (409, Some("codex_reset_no_credit")) => NO_CREDIT,
         (429, Some("codex_reset_busy")) => BUSY,
         (422, Some("codex_reauth_required" | "codex_credential_invalid")) => {
@@ -162,39 +170,43 @@ impl QuotaService {
         if !status.is_success() {
             return Err(plugin_error(status.as_u16(), &value, UNAVAILABLE));
         }
+        if value.get("accountRevision").is_none() && value.get("credits").is_some() {
+            return Err(UPGRADE_REQUIRED);
+        }
         parse_credits(&value).ok_or(UNAVAILABLE)
     }
 
     async fn consume_reset_credit(
         &self,
-        credit_id: Option<Value>,
+        request: &InvokeBody,
     ) -> Result<ResetResult, &'static str> {
-        // Desktop always confirms a concrete credit. Reject missing and malformed IDs
-        // before acquiring the write gate or doing even the eligibility config read.
-        let credit_id = credit_id
-            .as_ref()
-            .and_then(|value| bounded_text(value, 256))
-            .ok_or(INVALID)?;
+        // Inspect the entire IPC body: named Tauri arguments would ignore extra fields.
+        let InvokeBody::Json(body) = request else {
+            return Err(INVALID);
+        };
+        if body.as_object().map(|obj| obj.len()) != Some(2)
+            || bounded_text(&body["creditId"], 256).is_none()
+            || account_revision(&body["accountRevision"]).is_none()
+        {
+            return Err(INVALID);
+        }
         let client = self.client.as_ref().ok_or(UNAVAILABLE)?;
         // Reject simultaneous desktop confirmations immediately, including while rechecking config.
         let _guard = client.try_write_guard().ok_or(BUSY)?;
         // The confirmed route re-lists and validates this same ID inside the plugin's
         // single flight, so a second cached native listing would only add a stale race.
         self.reset_client().await?;
-        let body =
-            serde_json::to_value(ConsumeConfirmedRequest { credit_id }).map_err(|_| INVALID)?;
         let (status, value) = client
             .bounded_json(
                 Method::POST,
-                "/api/codex/reset-credits/consume-confirmed",
-                Some(&body),
+                "/api/codex/reset-credits/consume-confirmed-v2",
+                Some(body),
                 CONSUME_CONFIRMED_TIMEOUT,
             )
             .await
             .map_err(|_| FAILED)?;
         if status == reqwest::StatusCode::NOT_FOUND {
-            // Older plugins do not have the strict route; never fall back to their
-            // legacy endpoint because that would bypass confirmed-ID validation.
+            // Older routes cannot verify the displayed account revision.
             return Err(UPGRADE_REQUIRED);
         }
         if !status.is_success() {
@@ -249,10 +261,10 @@ pub async fn codex_reset_credits(
 pub async fn codex_reset_consume(
     window: WebviewWindow,
     service: tauri::State<'_, QuotaService>,
-    credit_id: Option<Value>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ResetResult, &'static str> {
     guard(&window)?;
-    service.consume_reset_credit(credit_id).await
+    service.consume_reset_credit(request.body()).await
 }
 
 #[cfg(test)]
@@ -277,11 +289,19 @@ mod tests {
         ));
     }
 
+    fn request_json(request: &str) -> Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
     fn config() -> (u16, String) {
         response(json!({"Providers":[{"name":"codex-subscription","codex_managed":true}]}))
     }
+    const REVISION: &str = "b71292d0-9f11-4a58-a7f2-a14c54bd2c3d";
+
+    fn confirmation() -> InvokeBody {
+        InvokeBody::Json(json!({"creditId":"gift", "accountRevision":REVISION}))
+    }
     fn listing() -> Value {
-        json!({"availableCount":2,"credits":[{"id":"gift","status":"available","expiresAt":123,"title":"Full reset","description":"private"},{"id":"spent","status":"redeemed"}]})
+        json!({"accountRevision":REVISION,"availableCount":2,"credits":[{"id":"gift","status":"available","expiresAt":123,"title":"Full reset","description":"private"},{"id":"spent","status":"redeemed"}]})
     }
     fn result(outcome: &str) -> Value {
         json!({"ok":true,"success":true,"outcome":outcome,"windowsReset":2,"availableCount":0,"ignored":"private"})
@@ -299,15 +319,11 @@ mod tests {
         let credits = serde_json::to_value(service.list_reset_credits().await.unwrap()).unwrap();
         assert_eq!(
             credits,
-            json!({"availableCount":2,"credits":[{"id":"gift","status":"available","expiresAt":123,"title":"Full reset"},{"id":"spent","status":"redeemed"}]})
+            json!({"accountRevision":REVISION,"availableCount":2,"credits":[{"id":"gift","status":"available","expiresAt":123,"title":"Full reset"},{"id":"spent","status":"redeemed"}]})
         );
-        let receipt = serde_json::to_value(
-            service
-                .consume_reset_credit(Some(json!("gift")))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let receipt =
+            serde_json::to_value(service.consume_reset_credit(&confirmation()).await.unwrap())
+                .unwrap();
         assert_eq!(
             receipt,
             json!({"outcome":"reset","windowsReset":2,"availableCount":0})
@@ -322,13 +338,16 @@ mod tests {
                 "GET /api/config HTTP/1.1",
                 "GET /api/codex/reset-credits HTTP/1.1",
                 "GET /api/config HTTP/1.1",
-                "POST /api/codex/reset-credits/consume-confirmed HTTP/1.1"
+                "POST /api/codex/reset-credits/consume-confirmed-v2 HTTP/1.1"
             ]
         );
         assert!(requests.iter().all(|r| r
             .to_ascii_lowercase()
             .contains("x-api-key: test-admin-key\r\n")));
-        assert!(requests[3].ends_with(r#"{"creditId":"gift"}"#));
+        assert_eq!(
+            request_json(&requests[3]),
+            json!({"accountRevision":REVISION,"creditId":"gift"})
+        );
     }
 
     #[tokio::test]
@@ -369,7 +388,7 @@ mod tests {
                 let service = QuotaService::new(Some(mock.client()));
                 assert_eq!(
                     service
-                        .consume_reset_credit(Some(json!("gift")))
+                        .consume_reset_credit(&confirmation())
                         .await
                         .unwrap_err(),
                     DISCONNECTED
@@ -390,21 +409,44 @@ mod tests {
         let mock = Mock::new(vec![]);
         let client = mock.client();
         let service = QuotaService::new(Some(client.clone()));
-        for id in [
-            None,
-            Some(Value::Null),
-            Some(json!("")),
-            Some(json!("   ")),
-            Some(json!(42)),
-            Some(json!("a\nb")),
-            Some(json!("😀".repeat(129))),
+        for body in [
+            InvokeBody::Raw(vec![]),
+            InvokeBody::Json(Value::Null),
+            InvokeBody::Json(json!(["gift", REVISION])),
+            InvokeBody::Json(json!({"accountRevision":REVISION})),
+            InvokeBody::Json(json!({"creditId":"gift"})),
+            InvokeBody::Json(json!({"creditId":"gift","accountRevision":REVISION,"extra":null})),
         ] {
-            assert_eq!(service.consume_reset_credit(id).await.unwrap_err(), INVALID);
+            assert_eq!(
+                service.consume_reset_credit(&body).await.unwrap_err(),
+                INVALID
+            );
+        }
+        for (key, bad) in [
+            ("creditId", Value::Null),
+            ("creditId", json!("")),
+            ("creditId", json!("   ")),
+            ("creditId", json!(42)),
+            ("creditId", json!("a\nb")),
+            ("creditId", json!("😀".repeat(129))),
+            ("accountRevision", Value::Null),
+            ("accountRevision", json!(42)),
+            ("accountRevision", json!("not-a-uuid")),
+        ] {
+            let mut body = json!({"creditId":"gift", "accountRevision":REVISION});
+            body[key] = bad;
+            assert_eq!(
+                service
+                    .consume_reset_credit(&InvokeBody::Json(body))
+                    .await
+                    .unwrap_err(),
+                INVALID
+            );
         }
         let _held = client.write_guard().await;
         assert_eq!(
             service
-                .consume_reset_credit(Some(json!("gift")))
+                .consume_reset_credit(&confirmation())
                 .await
                 .unwrap_err(),
             BUSY
@@ -421,6 +463,7 @@ mod tests {
     #[test]
     fn malformed_listing_and_unconfirmed_receipts_fail_closed() {
         for (key, bad) in [
+            ("accountRevision", json!("invalid")),
             ("availableCount", json!(1.5)),
             ("availableCount", json!(-1)),
             ("availableCount", json!(1u64 << 53)),
@@ -473,6 +516,7 @@ mod tests {
     #[tokio::test]
     async fn failed_consume_maps_only_stable_codes_and_sends_one_post() {
         for (status, body, expected) in [
+            (409, "codex_reset_account_changed", ACCOUNT_CHANGED),
             (429, "codex_reset_busy", BUSY),
             (409, "codex_reset_no_credit", NO_CREDIT),
             (409, "codex_not_connected", DISCONNECTED),
@@ -489,7 +533,7 @@ mod tests {
             ]);
             assert_eq!(
                 QuotaService::new(Some(mock.client()))
-                    .consume_reset_credit(Some(json!("gift")))
+                    .consume_reset_credit(&confirmation())
                     .await
                     .unwrap_err(),
                 expected
@@ -497,32 +541,55 @@ mod tests {
             let requests = mock.finish().await;
             assert_eq!(requests.len(), 2);
             assert!(requests[1]
-                .starts_with("POST /api/codex/reset-credits/consume-confirmed HTTP/1.1\r\n"));
+                .starts_with("POST /api/codex/reset-credits/consume-confirmed-v2 HTTP/1.1\r\n"));
         }
     }
 
     #[tokio::test]
-    async fn an_old_plugin_without_the_confirmed_route_fails_closed_without_fallback() {
+    async fn an_unmarked_list_requires_an_upgrade_before_selection() {
+        let mut old_list = listing();
+        old_list.as_object_mut().unwrap().remove("accountRevision");
+        let mock = Mock::new(vec![config(), response(old_list)]);
+        assert_eq!(
+            QuotaService::new(Some(mock.client()))
+                .list_reset_credits()
+                .await
+                .unwrap_err(),
+            UPGRADE_REQUIRED
+        );
+        assert!(mock
+            .finish()
+            .await
+            .iter()
+            .all(|req| req.starts_with("GET ")));
+    }
+
+    #[tokio::test]
+    async fn a_plugin_downgrade_after_listing_never_falls_back_to_an_old_consume_route() {
         let mock = Mock::new(vec![
+            config(),
+            response(listing()),
             config(),
             (404, json!({"error":"not_found"}).to_string()),
         ]);
+        let service = QuotaService::new(Some(mock.client()));
+        let list = service.list_reset_credits().await.unwrap();
+        let selection =
+            json!({"accountRevision":list.account_revision,"creditId":list.credits[0].id});
         assert_eq!(
-            QuotaService::new(Some(mock.client()))
-                .consume_reset_credit(Some(json!("gift")))
+            service
+                .consume_reset_credit(&InvokeBody::Json(selection.clone()))
                 .await
                 .unwrap_err(),
             UPGRADE_REQUIRED
         );
         let requests = mock.finish().await;
-        assert_eq!(requests.len(), 2);
+        let posts: Vec<_> = requests.iter().filter(|r| r.starts_with("POST ")).collect();
+        assert_eq!(posts.len(), 1);
         assert!(
-            requests[1].starts_with("POST /api/codex/reset-credits/consume-confirmed HTTP/1.1\r\n")
+            posts[0].starts_with("POST /api/codex/reset-credits/consume-confirmed-v2 HTTP/1.1\r\n")
         );
-        assert!(requests[1].ends_with(r#"{"creditId":"gift"}"#));
-        assert!(!requests.iter().any(
-            |request| request.starts_with("POST /api/codex/reset-credits/consume HTTP/1.1\r\n")
-        ));
+        assert_eq!(request_json(posts[0]), selection);
     }
 
     #[tokio::test]
@@ -539,7 +606,8 @@ mod tests {
             let service = QuotaService::new(Some(mock.client()));
             let target = Some("codex-subscription".into());
             let mut refresh = service.cache.lock().await;
-            let consume = service.consume_reset_credit(Some(json!("gift")));
+            let request = confirmation();
+            let consume = service.consume_reset_credit(&request);
             tokio::pin!(consume);
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), &mut consume)
@@ -588,7 +656,7 @@ mod tests {
 
         assert_eq!(
             service
-                .consume_reset_credit(Some(json!("gift")))
+                .consume_reset_credit(&confirmation())
                 .await
                 .unwrap()
                 .outcome,
