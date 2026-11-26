@@ -30,12 +30,17 @@
  */
 import { codexFinalizeBody, codexSessionKey } from "./finalize-body";
 import type { CodexRateLimitWindow, CodexRateLimits } from "./protocol-quota";
-import { classifyCodexError, codexError, codexEmptyAnswerError, responseHasOutput } from "./protocol";
+import { classifyCodexError, codexError, codexEmptyAnswerError, isCodexRuntime, responseHasOutput } from "./protocol";
 import type { CodexServiceLike } from "./protocol";
-import type { PluginClassifiedError, PluginTransformer, PluginTransformerContext, PluginUnifiedChatRequest } from "./core-types";
+import type { CodexServiceTier } from "./service-tier";
+import type { PluginContext, PluginClassifiedError, PluginTransformer, PluginTransformerContext, PluginUnifiedChatRequest } from "./core-types";
 
 /** Validated at transformer construction; the seam requires a service. */
-export type CodexTransformerOptions = { service: CodexServiceLike };
+export type CodexTransformerOptions = {
+  service: CodexServiceLike;
+  getServiceTier?: () => CodexServiceTier;
+  logger?: PluginContext["log"];
+};
 
 /** Bounded prefix scan for the quota event (magpie codexLimitsScan = 64 KiB). */
 export const CODEX_RATE_LIMIT_SCAN_BYTES = 64 * 1024;
@@ -204,9 +209,12 @@ export class CodexTransformer implements PluginTransformer {
 
   private readonly service: CodexServiceLike;
 
+  private readonly getServiceTier?: () => CodexServiceTier;
+
   constructor(options: CodexTransformerOptions) {
     if (!options?.service) throw new Error("CodexTransformer requires { service }");
     this.service = options.service;
+    this.getServiceTier = options.getServiceTier;
     this.logger = options.logger;
   }
 
@@ -217,7 +225,7 @@ export class CodexTransformer implements PluginTransformer {
    */
   async transformRequestIn(
     request: PluginUnifiedChatRequest,
-    _provider?: any,
+    provider?: any,
     context?: PluginTransformerContext
   ): Promise<{ body: any; config?: Record<string, any> }> {
     const model = typeof (request as any)?.model === "string" ? (request as any).model : "";
@@ -229,7 +237,12 @@ export class CodexTransformer implements PluginTransformer {
       modelInstructions = undefined;
     }
     const sessionId = this.sessionIdFor(request, context);
-    const body = codexFinalizeBody(request, { modelInstructions, sessionId });
+    const serviceTier = isCodexRuntime(provider) ? this.getServiceTier?.() ?? "follow" : undefined;
+    // The Messages adapter rebuilds the body and can omit the caller's tier.
+    const originalTier = context?.req?.body?.service_tier;
+    const source = serviceTier === "follow" && request.service_tier === undefined && typeof originalTier === "string"
+      ? { ...request, service_tier: originalTier } : request;
+    const body = codexFinalizeBody(source, { modelInstructions, sessionId, serviceTier });
     // Remember the finalized session key so the response phase can attribute
     // quota observations to the same conversation without touching the body.
     if (context) context.codexSessionKey = codexSessionKey(body);

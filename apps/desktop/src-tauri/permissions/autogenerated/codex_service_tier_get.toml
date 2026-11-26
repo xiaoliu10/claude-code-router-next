@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-codex-service-tier-get"
+description = "Enables the codex_service_tier_get command without any pre-configured scope."
+commands.allow = ["codex_service_tier_get"]
+
+[[permission]]
+identifier = "deny-codex-service-tier-get"
+description = "Denies the codex_service_tier_get command without any pre-configured scope."
+commands.deny = ["codex_service_tier_get"]

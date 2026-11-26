@@ -6,6 +6,7 @@
  * Protocol source (first-hand): yetone/magpie
  *   - internal/provider/codex_request.go  codexBody / codexInput /
  *     conversationKey / sessionHeaders
+ *   - internal/gateway/codex_tier.go  subscription tier selection and fast alias
  *   - docs/design/provider-plugins.md §5.2 (approved product spec)
  *   - research: codex-dataplane.md §2 (research artefacts, quoted verbatim)
  *
@@ -36,6 +37,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { CodexServiceTier } from "./service-tier";
 
 export const CODEX_PARALLEL_TOOL_CALLS_DEFAULT = true;
 export const CODEX_TEXT_VERBOSITY_DEFAULT = "medium";
@@ -62,6 +64,8 @@ const DROP_FIELDS = [
 const ALLOWED_SERVICE_TIERS = new Set(["priority", "ultrafast"]);
 
 export interface CodexFinalizeOptions {
+  /** Only the managed subscription route opts into tier selection. */
+  serviceTier?: CodexServiceTier;
   /**
    * Codex's own instructions for THIS model (from the /models response's
    * base_instructions / instructions_template, cached by the auth service).
@@ -288,7 +292,13 @@ export function codexFinalizeBody(body: any, options: CodexFinalizeOptions = {})
   const out: Record<string, any> = { ...source };
 
   for (const key of DROP_FIELDS) delete out[key];
-  if (typeof out.service_tier === "string" && !ALLOWED_SERVICE_TIERS.has(out.service_tier)) delete out.service_tier;
+  if (options.serviceTier === "standard") {
+    delete out.service_tier;
+  } else if (options.serviceTier === "priority" || (options.serviceTier === "follow" && out.service_tier === "fast")) {
+    out.service_tier = "priority";
+  } else if (typeof out.service_tier === "string" && !ALLOWED_SERVICE_TIERS.has(out.service_tier)) {
+    delete out.service_tier;
+  }
 
   // Stateless streaming is mandatory.
   out.store = false;

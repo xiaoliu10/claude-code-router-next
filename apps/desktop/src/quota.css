@@ -103,6 +103,8 @@ body {
 .status.tone-ok::before { background: var(--ok); }
 .status.tone-warn::before { background: var(--warn-dot); }
 .status.tone-muted::before { background: var(--text-3); }
+.codex-tier { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 7px; font-size: 12px; color: var(--text-2); }
+.codex-tier select { appearance: auto; max-width: 100%; }
 .card-message { margin: 6px 0 0; font-size: 11.5px; color: var(--text-2); overflow-wrap: anywhere; }
 .card-error { margin: 6px 0 0; font-size: 11.5px; color: var(--danger); overflow-wrap: anywhere; }
 .card-loading { margin: 6px 0 0; font-size: 11.5px; color: var(--text-3); }

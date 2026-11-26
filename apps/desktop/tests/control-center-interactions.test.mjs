@@ -133,7 +133,7 @@ export function harness(overrides = {}, options = {}) {
     usage_records: args => ({ period: args.period || 'today', page: args.page || 1, pageSize: args.pageSize || 20, total: 0, records: [] }),
     ...overrides,
   };
-  const win = { __TAURI__: { core: { invoke(cmd, args) {
+  const win = { __TAURI__: { window: { getCurrentWindow: () => ({ label: options.windowLabel ?? 'main' }) }, core: { invoke(cmd, args) {
     calls.push({ cmd, args });
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };

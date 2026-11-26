@@ -1,8 +1,10 @@
 /**
- * Codex subscription — ten local-only, explicit user-action admin routes
+ * Codex subscription — local-only, explicit user-action admin routes
  * under the `/api/codex` namespace (the manifest name is `codex`, and the UI
  * bridge builds `/api` + `/codex${path}`).
  *
+ *  GET  /service-tier
+ *  PUT  /service-tier    {tier}
  *  GET  /status
  *  POST /login/start     {}
  *  POST /login/poll      {loginId}
@@ -27,8 +29,10 @@
 import type { FastifyInstance } from "fastify";
 import type { CodexAuthService } from "./auth-service";
 import { codexAdminError, isCodexModelId } from "./protocol";
+import { isCodexServiceTierSetting, type CodexServiceTierStore } from "./service-tier";
 
 export interface CodexAdminRouteDeps {
+  serviceTier: Pick<CodexServiceTierStore, "tier" | "set">;
   /** Resolved per request so tests and late wiring stay race-free. */
   getService: () => CodexAuthService | undefined;
 }
@@ -47,9 +51,8 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
       err.statusCode = 403;
       throw err;
     };
-    const ip = req.ip || (req as any).connection?.remoteAddress || "";
-    const isLoopback = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
-    if (!isLoopback) deny();
+    const isLoopback = (ip: unknown) => ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+    if (!isLoopback(req.raw?.socket?.remoteAddress) || !isLoopback(req.ip)) deny();
     const origin = req.headers?.origin;
     let host = "";
     try {
@@ -133,6 +136,31 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
     reply.status(422);
     return { ok: false, success: false, error: "codex_login_state_rejected" };
   }
+
+  app.get("/api/codex/service-tier", async (req, reply) => {
+    try {
+      assertLocalCodexRequest(req);
+      return { tier: deps.serviceTier.tier };
+    } catch (error) {
+      return codexRouteError(error, reply, "service-tier", "codex_request_failed");
+    }
+  });
+
+  app.put("/api/codex/service-tier", async (req, reply) => {
+    try {
+      assertLocalCodexRequest(req);
+      if (req.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json" ||
+          !isCodexServiceTierSetting(req.body)) {
+        reply.status(422);
+        return { ok: false, success: false, error: "codex_service_tier_invalid" };
+      }
+      const { tier } = req.body;
+      await deps.serviceTier.set(tier);
+      return { tier };
+    } catch (error) {
+      return codexRouteError(error, reply, "service-tier", "codex_config_write_failed");
+    }
+  });
 
   app.get("/api/codex/status", async (req: any, reply: any) => {
     try {

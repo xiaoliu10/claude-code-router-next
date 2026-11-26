@@ -1491,10 +1491,12 @@
         { name: '火山agent plan', enabled: true, plan: null, status: 'unavailable', message: '未提供可用额度数据（来源未声明查询能力）', windows: [], updatedAt: null },
       ];
     }
+    var codexPreviewTier = 'follow';
     var quotaProviders = previewQuotaProviders(Date.now());
+    quotaProviders.push({ name: 'codex-subscription', enabled: true, plan: 'Plus', status: 'ready', windows: [], updatedAt: null });
     var providerDetails = new Map(quotaProviders.map(function (row) {
       var route = routing.providers.find(function (p) { return p.name === row.name; });
-      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false, transformer: null, transformerProtected: false }];
+      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: row.name === 'codex-subscription', transformer: null, transformerProtected: false }];
     }));
 
     var previewCatalog = { names: ['OpenAI', 'customparams'], parameterizedNames: ['customparams'] };
@@ -1524,6 +1526,12 @@
       if (cmd === 'login_start_set') {
         loginStart = a.enabled;
         return Promise.resolve();
+      }
+      if (cmd === 'codex_service_tier_get') return delay({ tier: codexPreviewTier });
+      if (cmd === 'codex_service_tier_set') {
+        if (!['follow', 'standard', 'priority'].includes(a.tier)) return Promise.reject(new Error('无效的服务层级'));
+        codexPreviewTier = a.tier;
+        return delay({ tier: codexPreviewTier });
       }
       if (cmd === 'quota_snapshot') {
         return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
@@ -2248,6 +2256,14 @@
     var pluginsPanel = PluginsUI.mount(document, invoke);
     var settings = GeneralSettingsUI.mount(document, invoke);
     var cards = new Map();
+    var tierPanel = (mode === 'preview' || tauri?.window?.getCurrentWindow?.().label === 'main')
+      ? CodexServiceTierUI.mount(invoke) : null;
+
+    function syncCodexTier(refresh) {
+      if (!tierPanel) return;
+      var card = cards.get('codex-subscription');
+      tierPanel.sync(activeTab === 'quota' && card && card.li.dataset.disabled === 'false' ? card.li : null, refresh);
+    }
 
     function safeCommand(cmd) {
       if (!invoke) return;
@@ -2387,6 +2403,7 @@
         if (!seen.has(name)) { refs.li.remove(); cards.delete(name); }
       });
       state.rows.forEach(function (row) { els.list.insertBefore(cards.get(row.provider.name).li, els.empty); });
+      syncCodexTier();
       // A missing snapshot or an offline gateway is NOT an empty state; keep
       // the loading/offline banner instead of claiming no providers exist.
       els.empty.hidden = state.rows.length !== 0 || !state.snapshot || !state.snapshot.online || !!state.fullError || !!state.snapshot.error;
@@ -3312,6 +3329,7 @@
         keepScrollAcrossHide = true;
       }
       activeTab = name;
+      syncCodexTier();
       // Show the target panel before refreshing: reading layout/scroll state
       // while a panel is display:none is unreliable in real browsers.
       TAB_IDS.forEach(function (id) {
@@ -3501,6 +3519,7 @@
     window.addEventListener('focus', function () {
       if (serviceCtrl) serviceCtrl.refresh();
       if (activeTab === 'projects' && projectsCtrl) projectsCtrl.refresh();
+      syncCodexTier(true);
       if (activeTab === 'quota' && controller) controller.refreshAll();
       if (activeTab === 'quota' && credentialsCtrl) credentialsCtrl.refresh();
     });

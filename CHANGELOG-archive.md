@@ -8,6 +8,7 @@ This document archives the older release summaries that fall outside the "latest
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2428** | <ul><li>**配额适配器 gzip 修复**：经代理的配额请求固定 `Accept-Encoding: identity`，避免 undici 未解压 gzip 导致解析失败、卡片不显示用量（智谱等供应商恢复配额展示）。</li></ul> |
 | **v2.3.2426** | <ul><li>**Gemini (Antigravity) 模型隐藏/恢复**：卡片列出可见模型 chips（带隐藏按钮）与隐藏列表（恢复/全部恢复）；隐藏时自动清理 Router 引用并回退默认路由，失败完整回滚。</li></ul> |
 | **v2.3.2425** | <ul><li>**供应商拖动排序**：卡片可拖动重排，顺序立即写入配置；拖拽按稳定行 ID 定位，搜索过滤下依然正确，无 name 的供应商也能拖。</li><li>**grok 与 cursor 卡片对齐家族样式**：统一按钮词汇、尺寸、图标与 destructive 变体，七张供应商卡片外观一致。</li></ul> |
 | **v2.3.2424** | <ul><li>**新增 Kiro 订阅 provider 插件**：Kiro 门户 / AWS Builder ID / IAM Identity Center 三种 OAuth 登录，运行时区域由 profile ARN 推导，多账号卡片与配额管理。</li><li>**估算用量溯源**：用量库新增 <code>usage_estimated</code> 列（v3 加法式迁移），估算值不再被当作精确计量展示，也不参与缓存读推断。</li></ul> |
@@ -75,6 +76,7 @@ This document archives the older release summaries that fall outside the "latest
 
 | Version | Release Details |
 | --- | --- |
+| **v2.3.2428** | <ul><li><strong>Quota adapter gzip fix</strong>: proxied quota requests pin <code>Accept-Encoding: identity</code> so an undecoded gzip body can no longer fail the parse and hide the provider quota (Zhipu and similar providers show usage again).</li></ul> |
 | **v2.3.2426** | <ul><li><strong>Gemini (Antigravity) model hide/restore</strong>: the card lists visible model chips with hide buttons plus a hidden list with restore/restore-all; hiding clears Router references with a first-visible default and rolls back completely on failure.</li></ul> |
 | **v2.3.2425** | <ul><li><strong>Provider drag-and-drop reordering</strong>: drag a provider card to reorder the list; the order is written to the config immediately. Drags resolve by stable row id, so they stay correct while the list is search-filtered, and unnamed providers can be dragged too.</li><li><strong>grok and cursor cards follow the family style</strong>: shared button vocabulary, sizes, icons and destructive variant, so all seven provider cards look alike.</li></ul> |
 | **v2.3.2424** | <ul><li>**New Kiro subscription provider plugin**: Kiro portal / AWS Builder ID / IAM Identity Center OAuth sign-in, runtime region derived from the profile ARN, multi-account card and quota management.</li><li>**Estimated-usage provenance**: the usage store gains an additive <code>usage_estimated</code> column (schema v3); estimates are never presented as metered figures and no longer feed the cache-read heuristic.</li></ul> |

@@ -60,6 +60,21 @@ describe("CodexTransformer — request phase", () => {
     expect(out.body.input[0].role).toBe("developer");
   });
 
+  it("consults the tier setting only for a managed subscription", async () => {
+    const getServiceTier = vi.fn(() => "priority" as const);
+    const transformer = new CodexTransformer({ service: stubService(), getServiceTier });
+    const request = { model: "m", messages: [], input: [], service_tier: "ultrafast", reasoning: { effort: "high", summary: "auto" } };
+    const original = structuredClone(request);
+    const baseline = new CodexTransformer({ service: stubService() });
+    const expected = await baseline.transformRequestIn(request);
+    expect(await transformer.transformRequestIn(request, { name: "codex", apiKey: "user" })).toEqual(expected);
+    expect(getServiceTier).not.toHaveBeenCalled();
+    const managed = { name: "codex-subscription", codexManaged: true };
+    const out = await transformer.transformRequestIn(request, managed);
+    expect(out.body).toEqual({ ...expected.body, service_tier: "priority" });
+    expect(request).toEqual(original);
+  });
+
   it("injects the cached model instructions when the service has them", async () => {
     const service = stubService({ getModelInstructions: (m) => (m === "gpt-5.1-codex" ? "You are Codex." : undefined) });
     const t = new CodexTransformer({ service });
