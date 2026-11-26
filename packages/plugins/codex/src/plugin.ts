@@ -8,9 +8,9 @@
  *   - registerManagedRuntime:   fixed chatgpt.com origin, token/account
  *                               injection, final-body session headers, error
  *                               taxonomy, 401-once refresh, cooling breaker;
- *   - registerAdminRoutes:      ten local-only management routes under
+ *   - registerAdminRoutes:      local-only management routes under
  *                               /api/codex (status, login x4, sync, usage,
- *                               disconnect, models/hide, models/restore);
+ *                               disconnect, model visibility, service tier);
  *   - registerConfigProtector:  the managed entry can neither be redirected
  *                               nor dropped by a generic config save;
  *   - registerUiCard:           the prebuilt card chunk (dist/card.js);
@@ -24,6 +24,7 @@
  * type-only imports (erased at build time).
  */
 import { CodexAuthService } from "./auth-service";
+import { CodexServiceTierStore } from "./service-tier";
 import { CodexTransformer } from "./transformer";
 import { createCodexManagedRuntime } from "./managed-runtime";
 import { registerCodexAdminRoutes } from "./admin-routes";
@@ -61,12 +62,14 @@ async function activate(ctx: PluginContext): Promise<void> {
     logger: ctx.log,
   });
 
+  const serviceTier = await CodexServiceTierStore.load(ctx.host.configDir, ctx.log);
+
   // Static TransformerName ("codex") is inherited; the registry reads it
   // without instantiating. Each activation still owns its service-bound
   // instance when the core constructs it.
   class ActivatedCodexTransformer extends CodexTransformer {
     constructor() {
-      super({ service, logger: ctx.log });
+      super({ service, logger: ctx.log, getServiceTier: () => serviceTier.tier });
     }
   }
 
@@ -88,7 +91,7 @@ async function activate(ctx: PluginContext): Promise<void> {
 
   ctx.registerTransformer(ActivatedCodexTransformer as unknown as new () => any);
   ctx.registerManagedRuntime(runtime);
-  ctx.registerAdminRoutes((app) => registerCodexAdminRoutes(app, { getService: () => service }));
+  ctx.registerAdminRoutes((app) => registerCodexAdminRoutes(app, { getService: () => service, serviceTier }));
   ctx.registerConfigProtector((next, prev) => protectCodexConfig(next, prev));
   ctx.registerUiCard({ cardPath: "card.js" });
   ctx.registerLocales(codexLocales);

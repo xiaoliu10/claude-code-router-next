@@ -425,6 +425,46 @@ describe("codex plugin integration — data plane through the real server", () =
     } finally { await app.app.close(); }
   });
 
+  it("applies service-tier writes to the next subscription request without rewriting host config", async () => {
+    await installViaProductionInstaller();
+    writeCredential();
+    const upstream = scenarioUpstream(() => upstream.sseOk());
+    vi.stubGlobal("fetch", upstream.impl);
+    const config = baseConfig();
+    const app = await startServer(config);
+    const url = "/api/codex/service-tier";
+    const headers = { host: "localhost:3456" };
+    try {
+      await wire(app, config);
+      const initial = await app.app.inject({ method: "GET", url, headers });
+      expect(initial.statusCode).toBe(200);
+      expect(initial.json()).toEqual({ tier: "follow" });
+      for (const [setting, inputTier, wireTier] of [
+        [undefined, undefined, undefined], [undefined, "fast", "priority"],
+        ["standard", "priority", undefined], ["priority", undefined, "priority"],
+        ["follow", "ultrafast", "ultrafast"],
+      ] as const) {
+        if (setting) {
+          const put = await app.app.inject({ method: "PUT", url, headers, payload: { tier: setting } });
+          expect(put.statusCode, put.body).toBe(200);
+          expect(put.json()).toEqual({ tier: setting });
+          expect((await app.app.inject({ method: "GET", url, headers })).json()).toEqual({ tier: setting });
+        }
+        const reasoning = { effort: "high", summary: "auto" };
+        const res = await app.app.inject({ method: "POST", url: "/v1/responses", payload: {
+          model: "codex-subscription,gpt-5.1-codex", stream: true, reasoning, service_tier: inputTier,
+          input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+        } });
+        expect(res.statusCode, res.body).toBe(200);
+        const dataCall = upstream.calls.filter(c => c.url === UPSTREAM).at(-1)!;
+        const body = JSON.parse(dataCall.init.body);
+        expect(body.service_tier).toBe(wireTier);
+        expect(body.reasoning).toEqual(reasoning);
+      }
+      expect(configModule.writeConfigFile).not.toHaveBeenCalled();
+    } finally { await app.app.close(); }
+  });
+
   it("runs a tool-call turn: request finalizes tools and sets session headers", async () => {
     await installViaProductionInstaller();
     writeCredential();

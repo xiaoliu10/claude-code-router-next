@@ -4,14 +4,14 @@
  * covered by auth-service.test.ts against the real store/config seams. */
 import { describe, expect, it, vi } from "vitest";
 import Fastify from "fastify";
-import { registerCodexAdminRoutes } from "../src/admin-routes";
+import { registerCodexAdminRoutes, type CodexAdminRouteDeps } from "../src/admin-routes";
 import { codexAdminError } from "../src/protocol";
 
 const localHeaders = { host: "localhost:3456" };
 
-function app(service: any) {
+function app(service: any, serviceTier: CodexAdminRouteDeps["serviceTier"] = { tier: "follow", set: vi.fn() }) {
   const instance = Fastify({ trustProxy: true });
-  registerCodexAdminRoutes(instance, { getService: () => service });
+  registerCodexAdminRoutes(instance, { getService: () => service, serviceTier });
   return instance;
 }
 
@@ -117,9 +117,6 @@ describe("Codex admin routes — models hide/restore", () => {
     const service = { hideModel: vi.fn(), restoreModels: vi.fn() };
     const instance = app(service);
     try {
-      // The codex guard reads req.ip first (fastify honors X-Forwarded-For
-      // under trustProxy), so the socket-spoof cases pass a plain remote
-      // address — same convention as create-server.test.ts.
       const remote = { remoteAddress: "203.0.113.2" };
       expect((await instance.inject({ method: "POST", url: "/api/codex/models/hide", payload: { model: "m" }, headers: localHeaders, ...remote })).statusCode).toBe(403);
       expect((await instance.inject({ method: "POST", url: "/api/codex/models/restore", payload: {}, headers: localHeaders, ...remote })).statusCode).toBe(403);
@@ -148,6 +145,39 @@ describe("Codex admin routes — models hide/restore", () => {
       const res = await instance.inject({ url: "/api/codex/status", headers: localHeaders });
       expect(res.statusCode).toBe(200);
       expect(res.json()).toMatchObject({ status: "connected", models: ["m2"], hiddenModels: ["m1"] });
+    } finally { await instance.close(); }
+  });
+});
+
+describe("Codex admin routes — service tier", () => {
+  const url = "/api/codex/service-tier";
+
+  it("rejects invalid tier payloads and non-local GET/PUT before changing the setting", async () => {
+    const setting = { tier: "priority" as const, set: vi.fn() };
+    const instance = app(undefined, setting);
+    try {
+      for (const payload of [null, [], "fast", {}, { tier: "fast" }, { tier: "ultrafast" },
+        { tier: 1 }, { tier: " follow " }, { tier: "standard", extra: true }]) {
+        const res = await instance.inject({ method: "PUT", url, payload: JSON.stringify(payload),
+          headers: { ...localHeaders, "content-type": "application/json" } });
+        expect(res.statusCode).toBe(422);
+        expect(res.json().error).toBe("codex_service_tier_invalid");
+      }
+      const text = await instance.inject({ method: "PUT", url, payload: '{"tier":"follow"}',
+        headers: { ...localHeaders, "content-type": "text/plain" } });
+      expect(text.statusCode).toBe(422);
+      for (const method of ["GET", "PUT"] as const) {
+        const payload = method === "PUT" ? { tier: "standard" } : undefined;
+        for (const denied of [
+          { remoteAddress: "203.0.113.2", headers: localHeaders },
+          { headers: { host: "other.invalid" } },
+          { headers: { ...localHeaders, origin: "https://other.invalid" } },
+        ]) {
+          const res = await instance.inject({ method, url, payload, ...denied });
+          expect(res.statusCode).toBe(403);
+        }
+      }
+      expect(setting.set).not.toHaveBeenCalled();
     } finally { await instance.close(); }
   });
 });
