@@ -49,6 +49,9 @@ async function buildRuntime(overrides: Record<string, any> = {}) {
   return { server, config };
 }
 
+const proxiedFetch = vi.hoisted(() => vi.fn());
+vi.mock("undici", async (load) => ({ ...await load<typeof import("undici")>(), fetch: proxiedFetch }));
+
 function nonStreamResponse() {
   return new Response(JSON.stringify({
     id: "chatcmpl-1",
@@ -72,6 +75,11 @@ describe("provider-level proxy on the request path", () => {
   let dispatchers: unknown[];
 
   beforeEach(() => {
+    proxiedFetch.mockReset().mockImplementation(async (_url, init) => {
+      expect(init.dispatcher?.constructor.name).toBe("ProxyAgent");
+      dispatchers.push(init.dispatcher);
+      return nonStreamResponse();
+    });
     originalFetch = globalThis.fetch;
     dispatchers = [];
     globalThis.fetch = vi.fn(async (_url: any, init: any) => {
@@ -87,7 +95,7 @@ describe("provider-level proxy on the request path", () => {
   });
 
   async function sendRequest(server: Server) {
-    return server.app.inject({
+    const response = await server.app.inject({
       method: "POST",
       url: "/v1/messages",
       headers: { "x-anthropic-billing-header": "cc_version=9.9" },
@@ -98,6 +106,8 @@ describe("provider-level proxy on the request path", () => {
         stream: false,
       },
     });
+    if (dispatchers[0]) expect(proxiedFetch).toHaveBeenCalled();
+    return response;
   }
 
   it("uses the proxy when the provider opts in while the global switch is off", async () => {
@@ -140,6 +150,7 @@ describe("provider-level proxy on the request path", () => {
       expect(res.statusCode).toBe(200);
       expect(dispatchers.length).toBeGreaterThan(0);
       expect(dispatchers[0]).toBeUndefined();
+      expect(proxiedFetch).not.toHaveBeenCalled();
     } finally {
       await server.app.close();
     }

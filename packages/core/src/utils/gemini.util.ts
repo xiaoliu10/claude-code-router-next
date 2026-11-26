@@ -239,6 +239,17 @@ export function tTool(tool: any): any {
   return tool;
 }
 
+// A unified thinking block may carry a local stream marker or a foreign
+// provider's ID. Only byte-transportable signatures belong on Gemini parts.
+function replaySignature(value: unknown): string | undefined {
+  if (typeof value !== "string" || /^(?:ccr_|rs_)/.test(value) || /^[a-f0-9]{24}$/i.test(value)) return;
+  const match = /^([A-Za-z0-9+/_-]+)(={0,2})$/.exec(value);
+  if (!match) return;
+  const remainder = match[1].length % 4;
+  const padding = match[2].length;
+  if (remainder !== 1 && (!padding || padding === (4 - remainder) % 4)) return value;
+}
+
 export function buildRequestBody(
   request: UnifiedChatRequest
 ): Record<string, any> {
@@ -270,6 +281,7 @@ export function buildRequestBody(
 
   const contents: any[] = [];
   const toolResponses = request.messages.filter((item) => item.role === "tool");
+  const strictToolSignatures = /(?:^|\/)gemini-[34](?:[.-]|$)/i.test(request.model);
 
 
   request.messages
@@ -284,10 +296,12 @@ export function buildRequestBody(
         role = "user"; // Default to user if role is not recognized
       }
       const parts: any[] = [];
+      const signature = role === "model" ? replaySignature(message.thinking?.signature) : undefined;
+      const strictCalls = strictToolSignatures && !!message.tool_calls?.length;
       if (typeof message.content === "string") {
         const part: any = { text: message.content };
-        if (message.thinking?.signature) {
-          part.thoughtSignature = message.thinking.signature;
+        if (signature && !strictCalls) {
+          part.thoughtSignature = signature;
         }
         parts.push(part);
       } else if (Array.isArray(message.content)) {
@@ -330,7 +344,7 @@ export function buildRequestBody(
 
       if (Array.isArray(message.tool_calls)) {
         parts.push(
-          ...message.tool_calls.map((toolCall) => {
+          ...message.tool_calls.map((toolCall, index) => {
             const part: any = {
               functionCall: {
                 id:
@@ -340,8 +354,12 @@ export function buildRequestBody(
                 args: JSON.parse(toolCall.function.arguments || "{}"),
               },
             };
-            if (message.thinking?.signature) {
-              part.thoughtSignature = message.thinking.signature;
+            if (signature && (!strictCalls || index === 0)) {
+              part.thoughtSignature = signature;
+            } else if (role === "model" && index === 0 && (strictCalls || message.thinking?.signature)) {
+              // Gemini 3/4 require a signature on the first call of each step.
+              // Use Google’s documented placeholder for imported unsigned history.
+              part.thoughtSignature = "skip_thought_signature_validator";
             }
             return part;
           })
