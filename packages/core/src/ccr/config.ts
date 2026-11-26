@@ -15,7 +15,7 @@ import {
 } from "@wengine-ai/claude-code-router-shared";
 
 // Function to interpolate environment variables in config values
-const interpolateEnvVars = (obj: any): any => {
+export const interpolateEnvVars = (obj: any): any => {
   if (typeof obj === "string") {
     // Replace $VAR_NAME or ${VAR_NAME} with environment variable values
     return obj.replace(/\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/g, (match, braced, unbraced) => {

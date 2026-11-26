@@ -1,13 +1,16 @@
 //! Current user's login item. Registration always points directly to this executable.
 use std::{io, path::Path};
+use tauri::WebviewWindow;
 
 #[tauri::command]
-pub fn login_start_status() -> Result<bool, String> {
+pub async fn login_start_status(window: WebviewWindow) -> Result<bool, String> {
+    crate::popup::guard(&window)?;
     registration(None)
 }
 
 #[tauri::command]
-pub fn login_start_set(enabled: bool) -> Result<(), String> {
+pub async fn login_start_set(window: WebviewWindow, enabled: bool) -> Result<(), String> {
+    crate::popup::guard(&window)?;
     registration(Some(enabled)).map(|_| ())
 }
 
@@ -33,15 +36,21 @@ mod platform {
         run_value(&RegKey::predef(HKEY_CURRENT_USER), RUN, exe, change)
     }
 
+    fn quoted_exe(exe: &Path) -> OsString {
+        let mut command = OsString::from("\"");
+        command.push(exe);
+        command.push("\"");
+        command
+    }
+
     fn run_value(
         root: &RegKey,
         subkey: &str,
         exe: &Path,
         change: Option<bool>,
     ) -> io::Result<bool> {
-        let mut command = OsString::from("\"");
-        command.push(exe);
-        command.push("\"");
+        // Use a shell-compatible drive path when current_exe returns a verbatim path.
+        let command = quoted_exe(dunce::simplified(exe));
         match change {
             Some(true) => {
                 if command.encode_wide().count() > 260 {
@@ -64,7 +73,7 @@ mod platform {
                 .open_subkey(subkey)
                 .and_then(|k| k.get_value::<OsString, _>(NAME))
             {
-                Ok(value) => Ok(value == command),
+                Ok(value) => Ok(value == command || value == quoted_exe(exe)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(e),
             },
@@ -75,10 +84,15 @@ mod platform {
     fn isolated_registry_round_trip() {
         let root = RegKey::predef(HKEY_CURRENT_USER);
         let key = format!(r"Software\CCRDesktopLoginTest-{}", std::process::id());
-        let exe = Path::new(r"C:\Programs With Spaces\ccr-desktop.exe");
+        let exe = Path::new(r"\\?\C:\Programs With Spaces\桌面\ccr-desktop.exe");
         run_value(&root, &key, exe, Some(true)).unwrap();
         let saved: String = root.open_subkey(&key).unwrap().get_value(NAME).unwrap();
-        assert_eq!(saved, r#""C:\Programs With Spaces\ccr-desktop.exe""#);
+        assert_eq!(saved, r#""C:\Programs With Spaces\桌面\ccr-desktop.exe""#);
+        assert!(run_value(&root, &key, exe, None).unwrap());
+        root.open_subkey_with_flags(&key, KEY_SET_VALUE)
+            .unwrap()
+            .set_value(NAME, &quoted_exe(exe))
+            .unwrap();
         assert!(run_value(&root, &key, exe, None).unwrap());
         run_value(&root, &key, exe, Some(false)).unwrap();
         assert!(!run_value(&root, &key, exe, None).unwrap());

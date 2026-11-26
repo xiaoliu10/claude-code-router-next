@@ -11,6 +11,7 @@ use tauri::WebviewWindow;
 const STALE: &str = "Settings draft is stale; refresh the panel and retry";
 const FORMAT: &str = "This setting uses an unsupported configuration format";
 const UNCONFIRMED: &str = "Settings save could not be confirmed. Check the gateway connection and refresh before retrying.";
+const INVALID_API_KEY: &str = "Invalid APIKEY. Use up to 4096 printable ASCII characters without $, leading spaces, or trailing spaces.";
 const PROXY_KEYS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "httpsProxy", "PROXY_URL"];
 const LOG_LEVELS: [&str; 6] = ["fatal", "error", "warn", "info", "debug", "trace"];
 
@@ -20,6 +21,7 @@ pub struct GeneralSettingsSnapshot {
     revision: String,
     values: Map<String, Value>,
     port_from_env: bool,
+    host_is_empty: bool,
     api_key_configured: bool,
     proxy_configured: bool,
 }
@@ -48,10 +50,10 @@ fn token_entry(config: &Value) -> Option<&Value> {
         .rfind(|e| token_speed(e))
 }
 
-// Defaults match the General tab in packages/ui/src/components/SettingsPage.tsx.
+// The gateway enables its logger unless LOG is explicitly false.
 fn defaults() -> Value {
     json!({
-        "LOG": false, "LOG_LEVEL": "error", "statusLineEnabled": false,
+        "LOG": true, "LOG_LEVEL": "error", "statusLineEnabled": false,
         "tokenSpeedEnabled": false, "disableAttributionHeader": true,
         "enableConcurrencyPriority": false, "concurrencyThreshold": 3,
         "WAKEUP_ENABLED": false, "WAKEUP_TIME": "06:00", "CLAUDE_PATH": "",
@@ -139,7 +141,7 @@ fn valid_value(key: &str, value: &Value) -> bool {
                     "HOST" => valid_host(s),
                     "WAKEUP_TIME" => valid_time(s),
                     "LOG_LEVEL" => LOG_LEVELS.contains(&s),
-                    "APIKEY" => s.trim() == s && reqwest::header::HeaderValue::from_str(s).is_ok(),
+                    "APIKEY" => s.is_ascii() && s.trim() == s && !s.contains('$'),
                     "PROXY_URL" => s.trim() == s && valid_proxy(s),
                     _ => false,
                 }
@@ -200,6 +202,7 @@ fn snapshot_from(config: &Value) -> GeneralSettingsSnapshot {
         revision: revision_of(config),
         values,
         port_from_env,
+        host_is_empty: config["HOST"] == "",
         api_key_configured: configured("APIKEY"),
         proxy_configured: PROXY_KEYS.into_iter().any(configured),
     }
@@ -237,7 +240,7 @@ fn apply(config: &mut Value, key: &str, value: &Value) -> Result<(), String> {
                 entries.push(json!({"name":"token-speed", "enabled":value}));
             }
         }
-        "PROXY_URL" | "APIKEY" if value == "" => {
+        "HOST" | "PROXY_URL" | "APIKEY" if value == "" => {
             root.remove(key);
         }
         _ => {
@@ -249,7 +252,9 @@ fn apply(config: &mut Value, key: &str, value: &Value) -> Result<(), String> {
 
 fn confirmed(config: &Value, key: &str, value: &Value) -> bool {
     let stored = leaf(config, key);
-    if matches!(key, "PROXY_URL" | "APIKEY") && value == "" {
+    if key == "HOST" && value == "" {
+        stored.is_none()
+    } else if matches!(key, "PROXY_URL" | "APIKEY") && value == "" {
         stored.is_none_or(|raw| raw.is_null() || raw == "")
     } else {
         stored == Some(value)
@@ -277,12 +282,20 @@ impl GeneralService {
         let changes = changes
             .as_object()
             .ok_or("Invalid general settings changes")?;
-        if !changes.iter().all(|(k, v)| valid_value(k, v)) {
-            return Err("Invalid general settings changes".into());
+        for (key, value) in changes {
+            if !valid_value(key, value) {
+                return Err(if key == "APIKEY" {
+                    INVALID_API_KEY
+                } else {
+                    "Invalid general settings changes"
+                }
+                .into());
+            }
         }
         let client = self.client()?;
         let _write = client.write_guard().await;
-        let mut config = client.config().await?;
+        let (mut config, gateway_revision) = client.config_with_revision().await?;
+        // Bind the server precondition to the raw document the user edited.
         if revision != revision_of(&config) {
             return Err(STALE.into());
         }
@@ -294,10 +307,16 @@ impl GeneralService {
                 apply(&mut config, key, value)?;
             }
         }
+        let gateway_revision = gateway_revision.ok_or(
+            "Gateway does not support conditional settings saves; update the gateway and refresh",
+        )?;
         let verified = client
-            .post_config_and_readback(&config)
+            .put_config_and_readback(&config, &gateway_revision)
             .await
-            .map_err(|_| UNCONFIRMED)?;
+            .map_err(|error| match error {
+                crate::api::ConditionalSaveError::Stale => STALE,
+                crate::api::ConditionalSaveError::Unconfirmed => UNCONFIRMED,
+            })?;
         if !changes.iter().all(|(k, v)| confirmed(&verified, k, v)) {
             return Err(UNCONFIRMED.into());
         }
@@ -331,7 +350,7 @@ mod tests {
     use crate::api::mock::{response, Mock};
 
     #[test]
-    fn web_defaults_and_legacy_projection_expose_only_public_scalars() {
+    fn gateway_defaults_and_legacy_projection_expose_only_public_scalars() {
         let raw = json!({
             "APIKEY": "private-admin", "HTTPS_PROXY": "http://user:private-proxy@proxy.invalid",
             "PORT": "$PRIVATE_PORT_NAME", "Router": {"concurrencyThreshold": "9"}, "API_TIMEOUT_MS": "7000",
@@ -343,9 +362,9 @@ mod tests {
         assert_eq!(
             snapshot,
             json!({
-                "revision": revision_of(&raw), "portFromEnv":true, "apiKeyConfigured":true, "proxyConfigured":true,
+                "revision": revision_of(&raw), "portFromEnv":true, "hostIsEmpty":false, "apiKeyConfigured":true, "proxyConfigured":true,
                 "values": {
-                    "LOG":false, "LOG_LEVEL":"error", "statusLineEnabled":false, "tokenSpeedEnabled":true,
+                    "LOG":true, "LOG_LEVEL":"error", "statusLineEnabled":false, "tokenSpeedEnabled":true,
                     "disableAttributionHeader":true, "enableConcurrencyPriority":false, "concurrencyThreshold":9,
                     "WAKEUP_ENABLED":true, "WAKEUP_TIME":"06:00", "CLAUDE_PATH":"", "HOST":"",
                     "API_TIMEOUT_MS":7000, "PROBE_TIMEOUT_MS":15000, "PROBE_SLOW_THRESHOLD_MS":3000,
@@ -364,12 +383,62 @@ mod tests {
         assert_eq!(numeric.values["PORT"], 4000);
         let empty = snapshot_from(&json!({}));
         assert!(!empty.port_from_env);
+        assert_eq!(empty.values["LOG"], true);
+        assert_eq!(snapshot_from(&json!({"LOG":false})).values["LOG"], false);
         assert_eq!(empty.values["PORT"], 3456);
         assert_eq!(empty.values["API_TIMEOUT_MS"], 600000);
         assert_eq!(empty.values["concurrencyThreshold"], 3);
         assert_eq!(empty.values["PROXY_GLOBAL_ENABLED"], true);
         assert_eq!(empty.values["WAKEUP_ENABLED"], false);
         assert!(!empty.api_key_configured && !empty.proxy_configured);
+    }
+
+    const GATEWAY_REVISION: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn conditional_mock(replies: Vec<(u16, String)>) -> Mock {
+        Mock::with_config_revision(replies, Some(GATEWAY_REVISION))
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_gateway_revision_blocks_writes() {
+        let raw = json!({"LOG":false});
+        for revision in [None, Some("malformed")] {
+            let mock = Mock::with_config_revision(vec![response(raw.clone())], revision);
+            let error = GeneralService::new(Some(mock.client()))
+                .save(&revision_of(&raw), &json!({"LOG":true}))
+                .await
+                .unwrap_err();
+            assert!(error.contains("update the gateway"));
+            assert_eq!(mock.finish().await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_web_edit_before_save_invalidates_the_draft() {
+        let original = json!({"LOG":false, "Router":{"default":"old,model"}});
+        let updated = json!({"LOG":false, "Router":{"default":"web,model"}});
+        let mock = conditional_mock(vec![response(updated)]);
+        let error = GeneralService::new(Some(mock.client()))
+            .save(&revision_of(&original), &json!({"LOG":true}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, STALE);
+        assert_eq!(mock.finish().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_conflict_reports_stale_without_retry() {
+        let raw = json!({"LOG":false});
+        let mock = conditional_mock(vec![response(raw.clone()), (409, "private".into())]);
+        let error = GeneralService::new(Some(mock.client()))
+            .save(&revision_of(&raw), &json!({"LOG":true}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, STALE);
+        let requests = mock.finish().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("PUT /api/config "));
     }
 
     #[tokio::test]
@@ -392,7 +461,7 @@ mod tests {
         expected["PORT"] = json!(3456);
         let mut readback = expected.clone();
         readback["Providers"][0]["normalized"] = json!(true);
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success":true})),
             response(readback.clone()),
@@ -410,14 +479,78 @@ mod tests {
             .contains("new-test-key"));
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 3);
-        for (request, method) in requests.iter().zip(["GET", "POST", "GET"]) {
+        for (request, method) in requests.iter().zip(["GET", "PUT", "GET"]) {
             assert!(request.starts_with(&format!("{method} /api/config ")));
             assert!(request
                 .to_lowercase()
                 .contains("x-api-key: test-admin-key\r\n"));
         }
         let body = requests[1].split_once("\r\n\r\n").unwrap().1;
-        assert_eq!(serde_json::from_str::<Value>(body).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({"config":expected, "revision":GATEWAY_REVISION})
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_host_requires_an_absent_key_and_preserves_the_raw_api_key() {
+        for host in ["localhost", ""] {
+            let original = json!({"HOST":host, "APIKEY":"prefix-${UNCHANGED}"});
+            assert_eq!(snapshot_from(&original).host_is_empty, host.is_empty());
+            let cleared = json!({"APIKEY":"prefix-${UNCHANGED}"});
+            for readback in [cleared.clone(), json!({"HOST":""}), json!({"HOST":null})] {
+                let mock = conditional_mock(vec![
+                    response(original.clone()),
+                    response(json!({"success":true})),
+                    response(readback.clone()),
+                ]);
+                let result = GeneralService::new(Some(mock.client()))
+                    .save(&revision_of(&original), &json!({"HOST":""}))
+                    .await;
+                if readback.get("HOST").is_none() {
+                    let snapshot = result.unwrap();
+                    assert!(!snapshot.host_is_empty);
+                    assert_eq!(snapshot.values["HOST"], "");
+                } else {
+                    assert_eq!(result.unwrap_err(), UNCONFIRMED);
+                }
+                let requests = mock.finish().await;
+                assert_eq!(requests.len(), 3);
+                let body = requests[1].split_once("\r\n\r\n").unwrap().1;
+                assert!(requests[1].starts_with("PUT /api/config "));
+                assert_eq!(
+                    serde_json::from_str::<Value>(body).unwrap(),
+                    json!({"config":cleared, "revision":GATEWAY_REVISION})
+                );
+            }
+        }
+        assert!(confirmed(&json!({}), "HOST", &json!("")));
+    }
+
+    #[tokio::test]
+    async fn invalid_api_key_edits_report_only_the_format_before_any_request() {
+        let mock = Mock::new(vec![]);
+        let service = GeneralService::new(Some(mock.client()));
+        for key in [
+            json!("$UNSET"),
+            json!("prefix-${VAR}"),
+            json!("${broken"),
+            json!("tail$"),
+            json!(" key"),
+            json!("secret\n"),
+            json!("密钥"),
+            json!("a".repeat(4097)),
+            Value::Null,
+        ] {
+            assert_eq!(
+                service
+                    .save("revision", &json!({"APIKEY":key}))
+                    .await
+                    .unwrap_err(),
+                INVALID_API_KEY
+            );
+        }
+        assert!(mock.finish().await.is_empty());
     }
 
     #[tokio::test]
@@ -430,7 +563,7 @@ mod tests {
         }
         let mut readback = expected.clone();
         readback["APIKEY"] = json!("");
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success":true})),
             response(readback),
@@ -447,7 +580,10 @@ mod tests {
         assert!(!result.api_key_configured && result.proxy_configured);
         let requests = mock.finish().await;
         let body = requests[1].split_once("\r\n\r\n").unwrap().1;
-        assert_eq!(serde_json::from_str::<Value>(body).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({"config":expected, "revision":GATEWAY_REVISION})
+        );
     }
 
     #[tokio::test]
@@ -483,8 +619,6 @@ mod tests {
             json!({"concurrencyThreshold":-1}),
             json!({"LOG_LEVEL":"silent"}),
             json!({"WAKEUP_TIME":"23:60"}),
-            json!({"APIKEY":null}),
-            json!({"APIKEY":"secret\n"}),
             json!({"PROXY_URL":"ftp://secret"}),
             json!({"PROXY_URL":" "}),
             json!({"HOST":"x:1234/path"}),
@@ -518,7 +652,7 @@ mod tests {
             ],
         ] {
             let len = replies.len();
-            let mock = Mock::new(replies);
+            let mock = conditional_mock(replies);
             assert_eq!(
                 GeneralService::new(Some(mock.client()))
                     .save(&revision_of(&raw), &json!({"APIKEY":"new-key"}))

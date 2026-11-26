@@ -454,7 +454,8 @@ async fn refresh(
                             return project_step_plan(row, raw);
                         }
                     } else {
-                        row.windows = project_aggregate_windows(quota, entry.local_limits, entry.coding_plan);
+                        row.windows =
+                            project_aggregate_windows(quota, entry.local_limits, entry.coding_plan);
                     }
                 }
                 let has_data = row.windows.iter().any(|window| window.limit.is_some());

@@ -28,7 +28,7 @@ vi.mock("../ccr/config", async (importOriginal) => {
     ...actual,
     backupConfigFile: vi.fn().mockResolvedValue(null),
     readConfigFile: readConfigFileMock,
-    readConfigFileRaw: vi.fn(),
+    readConfigFileRaw: vi.fn().mockResolvedValue(null),
     writeConfigFile: vi.fn().mockResolvedValue(undefined),
   };
 });
@@ -52,6 +52,7 @@ async function buildAdminRuntime() {
     initialConfig: {
       providers: config.Providers,
       Router: config.Router,
+      ACTIVE_PROBE_ENABLED: false,
       HOST: "127.0.0.1",
       PORT: 0,
     },
@@ -180,9 +181,7 @@ describe("POST /api/config proxy URL validation", () => {
         },
       });
 
-      // 400 would mean the validator rejected the value; anything else means
-      // it passed (write/reload errors are tolerated and surface as 200).
-      expect(res.statusCode, `proxyUrl=${proxyUrl}`).not.toBe(400);
+      expect(res.statusCode, `proxyUrl=${proxyUrl}`).toBe(200);
     }
   });
 
