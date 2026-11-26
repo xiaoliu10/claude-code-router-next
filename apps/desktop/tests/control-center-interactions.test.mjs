@@ -137,9 +137,12 @@ export function harness(overrides = {}, options = {}) {
     calls.push({ cmd, args });
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };
+  if (options.windowLabel) win.__TAURI__.window = { getCurrentWindow: () => ({ label: options.windowLabel }) };
+  if (options.listen) win.__TAURI__.event = { listen: options.listen };
+  if (options.storage) win.localStorage = options.storage;
   // options.setTimeout lets tests capture toast auto-hide timers deterministically.
   vm.runInNewContext(scripts, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout: options.setTimeout || setTimeout,
-    setInterval: (fn, ms) => { intervals.push([fn, ms]); return setInterval(fn, ms); },
+    setInterval: (fn, ms) => { intervals.push([fn, ms]); return options.setInterval ? options.setInterval(fn, ms) : setInterval(fn, ms); },
     clearInterval: (t) => { cleared.push(t); clearInterval(t); } });
   doc.events.DOMContentLoaded();
   return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus(), windowEvents, win, intervals, cleared };
