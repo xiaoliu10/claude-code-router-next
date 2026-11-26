@@ -200,7 +200,32 @@ describe("dynamic models", () => {
     expect(seen[0].url).toBe(`${CODEX_BACKEND_BASE}/models?client_version=9.9.9`);
     expect(seen[0].init.headers.Authorization).toBe("Bearer at");
     expect(seen[0].init.headers["chatgpt-account-id"]).toBe("acct_1");
+    expect(seen[0].init.headers.version).toBe("9.9.9");
+    expect(seen[0].init.headers["User-Agent"].split(" ")[0]).toBe("codex_cli_rs/9.9.9");
     expect(models.map((m) => m.slug)).toEqual(["gpt-y", "gpt-x", "gpt-z"]);
+  });
+});
+
+describe("model discovery client version", () => {
+  it.each([undefined, "0.171.0"])("keeps query and headers aligned with default/env version %s", async (override) => {
+    vi.stubEnv("CODEX_CLIENT_VERSION", override);
+    try {
+      const expected = override ?? "0.170.0";
+      const fetchImpl = vi.fn(async (url: string, init?: any) => {
+        expect(new URL(url).searchParams.get("client_version")).toBe(expected);
+        expect(init.headers.version).toBe(expected);
+        expect(init.headers["User-Agent"].split(" ")[0]).toBe("codex_cli_rs/" + expected);
+        // Model discovery stays dynamic; upstream-hidden entries stay hidden.
+        return json({ models: [
+          { slug: "model-new", visibility: "list" },
+          { slug: "model-hidden", visibility: "hide" },
+        ] });
+      });
+      const models = await fetchCodexModels({ accessToken: "test-key", fetchImpl });
+      expect(models.map(m => m.slug)).toEqual(["model-new"]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
