@@ -45,7 +45,7 @@ class Element {
   remove() { if (this.parentNode) this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); this.parentNode = null; }
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   fire(type, extra = {}) {
-    const e = { target: this, preventDefault() {}, ...extra };
+    const e = { target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...extra };
     let n = this;
     while (n) { for (const fn of n.listeners[type] || []) fn(e); n = n.parentNode; }
   }
@@ -89,6 +89,7 @@ export function harness(overrides = {}) {
   doc.getElementById = id => [root, ...root.querySelectorAll('[id]')].find(n => n.getAttribute('id') === id) || null;
   const calls = []; const windowEvents = {};
   const intervals = []; const cleared = [];
+  root.addEventListener('keydown', event => windowEvents.keydown?.(event));
   const route = { providers: [{ name: 'alpha', models: ['one', 'two'] }], routes: [{ scope: 'global', field: 'default', target: 'alpha,one', fallback: [] }], familyRouting: false, fallbackEnabled: true, revision: '1' };
   const clients = { clients: [{ id: 'pi', name: 'Pi', enabled: true, managed: true, exists: true, activeModel: 'one', modelAlias: null }], success: true, message: null };
   const responses = {
