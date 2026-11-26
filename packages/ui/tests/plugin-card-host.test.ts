@@ -415,6 +415,20 @@ test("pluginLocaleOf stays in sync with the controller locale contract", () => {
   assert.equal(pluginLocaleOf("en-US"), "en");
 });
 
+test("ordinary config saves preserve desktop-managed quota credentials; raw JSON saves are explicit", async () => {
+  const client = new ApiClient("/api"); const original = globalThis.fetch;
+  const modes: (string | null)[] = [];
+  globalThis.fetch = (async (_url, init) => {
+    modes.push(new Headers(init?.headers).get("X-CCR-Preserve-Quota-Credentials"));
+    return Response.json({ success: true });
+  }) as typeof fetch;
+  try {
+    await client.updateConfig({} as never);
+    await client.updateConfig({} as never, "raw");
+    assert.deepEqual(modes, ["1", null]);
+  } finally { globalThis.fetch = original; }
+});
+
 // Generic capabilities formerly covered only by one built-in provider's API.
 test("provider management lease excludes full-config writes in both directions", async () => {
   const client = new ApiClient("/api"); const original = globalThis.fetch;

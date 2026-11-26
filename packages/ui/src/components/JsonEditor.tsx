@@ -100,7 +100,7 @@ export function JsonEditor({ open, onOpenChange, showToast }: JsonEditorProps) {
   const performSave = async (parsedConfig: Config) => {
     try {
       setIsSaving(true);
-      const response = await api.updateConfig(parsedConfig);
+      const response = await api.updateConfig(parsedConfig, "raw");
 
       const success = handleSaveResponse(
         response,
@@ -125,7 +125,7 @@ export function JsonEditor({ open, onOpenChange, showToast }: JsonEditorProps) {
     try {
       setIsSaving(true);
       // Save config first
-      const saveResponse = await api.updateConfig(parsedConfig);
+      const saveResponse = await api.updateConfig(parsedConfig, "raw");
       const saveSuccessful = handleSaveResponse(
         saveResponse,
         t('app.config_saved_success'),

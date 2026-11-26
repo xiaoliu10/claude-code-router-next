@@ -5,6 +5,10 @@ import {
   volcengineSigV4Sign,
 } from "../services/quota-adapters";
 import type { LLMProvider } from "../types/llm";
+import { ProviderService } from "../services/provider";
+import { ActiveProbeService } from "../services/active-probe";
+import { ConfigService } from "../services/config";
+import { clearQuotaStore, getQuotaResult } from "../services/quota-store";
 
 // Tests for the Volcengine Ark Coding Plan quota adapter: V4-variant signing
 // (fixed vector with a hand-calculated HMAC chain), hostname+path dispatch,
@@ -215,6 +219,38 @@ describe("getQuotaAdapter Volcengine dispatch", () => {
     expect(
       getQuotaAdapter("https://ark.cn-beijing.volces.com/api/v3?next=/api/coding/")
     ).toBeNull();
+  });
+});
+
+describe("Coding Plan credentials saved in provider config", () => {
+  it("uses the current keys on a quota tick after reload and keeps registered providers free of quota keys", async () => {
+    const entry = { name: "subscription", api_base_url: CODING_BASE_URL, api_key: "test-key", models: [] };
+    const config = new ConfigService({ useJsonFile: false, initialConfig: { providers: [entry] } });
+    const providers = new ProviderService(config, {} as any, { info: vi.fn() });
+    const probe = new ActiveProbeService(() => providers.getProviders(), {}, undefined, undefined, key => config.get(key));
+    const tick = () => (probe as any).runQuotaProbe();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(usagePayload([
+      { Level: "weekly", Percent: 8.5, ResetTimestamp: WEEKLY_RESET_SECONDS },
+    ]))));
+    globalThis.fetch = fetchMock;
+    clearQuotaStore();
+    try {
+      await tick();
+      expect(fetchMock).not.toHaveBeenCalled();
+      config.set("providers", [{ ...entry, quotaAccessKey: "test-key", quotaSecretKey: "sekret" }]);
+      providers.reload();
+      await tick();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(getQuotaResult(entry.name)).toMatchObject({ usedBalance: 8.5, totalBalance: 100 });
+      expect(providers.getProvider(entry.name)).not.toHaveProperty("quotaAccessKey");
+      expect(providers.getProvider(entry.name)).not.toHaveProperty("quotaSecretKey");
+      config.set("providers", [entry]);
+      providers.reload();
+      await tick();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      clearQuotaStore();
+    }
   });
 });
 
