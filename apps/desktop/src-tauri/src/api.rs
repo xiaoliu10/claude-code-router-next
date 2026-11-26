@@ -318,7 +318,10 @@ pub(crate) fn provider_list_key(config: &Value) -> &'static str {
 pub(crate) fn providers(config: &Value) -> Vec<TrayProvider> {
     let mut result = Vec::new();
     let mut names = HashSet::new();
-    if let Some(entries) = config.get(provider_list_key(config)).and_then(Value::as_array) {
+    if let Some(entries) = config
+        .get(provider_list_key(config))
+        .and_then(Value::as_array)
+    {
         for entry in entries {
             if !entry.is_object() || !matches!(entry.get("enabled"), None | Some(Value::Bool(true)))
             {

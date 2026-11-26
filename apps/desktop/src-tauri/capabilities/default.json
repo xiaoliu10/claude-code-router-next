@@ -15,6 +15,7 @@
     "allow-general-settings-save",
     "allow-routing-snapshot",
     "allow-routing-save",
+    "allow-routing-save-groups",
     "allow-routing-flags",
     "allow-usage-snapshot",
     "allow-usage-records",
@@ -37,6 +38,7 @@
     "allow-quota-credentials-save",
     "allow-service-snapshot",
     "allow-service-action",
+    "allow-config-reload",
     "allow-login-start-set",
     "allow-login-start-status"
   ]

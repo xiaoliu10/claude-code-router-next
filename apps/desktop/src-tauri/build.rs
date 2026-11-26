@@ -11,6 +11,7 @@ fn main() {
             "general_settings_save",
             "routing_snapshot",
             "routing_save",
+            "routing_save_groups",
             "routing_flags",
             "usage_snapshot",
             "usage_records",
@@ -33,6 +34,7 @@ fn main() {
             "quota_credentials_save",
             "service_snapshot",
             "service_action",
+            "config_reload",
         ]),
     ))
     .expect("desktop build failed");

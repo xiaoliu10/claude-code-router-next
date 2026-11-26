@@ -45,7 +45,8 @@ test('plugins: lazy mounted tab and advertised actions use manifest ID with expl
   const h = harness({ plugin_inventory: inventory, plugin_action: () => action.promise });
   await flush();
   assert.equal(h.calls.some(({ cmd }) => cmd.startsWith('plugin_')), false);
-  h.id('tab-quota').fire('keydown', { key: 'End' });
+  h.id('tab-projects').click();
+  h.id('tab-projects').fire('keydown', { key: 'ArrowRight' });
   await flush();
   assert.equal(h.doc.activeElement, h.id('tab-plugins'));
   assert.equal(h.id('panel-plugins').hidden, false);

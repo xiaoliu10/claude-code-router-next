@@ -2698,6 +2698,10 @@
       els.usageUpdated.textContent = ts ? '更新于 ' + ts : (s.loading ? '正在读取…' : '');
       setBanner(els.usageMsg, s.error ? '用量读取失败：' + s.error : null, s.error ? 'error' : null);
       var body = els.usageBody;
+      // Capture scroll/focus from the live scroller before teardown: the
+      // browser resets them when the nodes are detached, and these programmatic
+      // resets do not fire scroll/focus events to update an anchor.
+      captureRecordsState();
       body.textContent = '';
       body.setAttribute('aria-busy', String(s.loading));
       if (!s.snapshot) {
@@ -2942,8 +2946,14 @@
       pager.appendChild(info);
       pager.appendChild(next);
       root.appendChild(pager);
+      // The horizontal scroller lives in a sticky wrapper so its scrollbar
+      // floats at the bottom of the visible list instead of only at the end
+      // of a tall record set. refs.scroll keeps pointing at the actual
+      // scroller so every existing append/clear call is unchanged.
+      var sticky = el('div', 'records-scroll-sticky');
       var scroll = el('div', 'records-scroll');
-      root.appendChild(scroll);
+      sticky.appendChild(scroll);
+      root.appendChild(sticky);
       return { root: root, prev: prev, info: info, next: next, scroll: scroll };
     }
 
@@ -2982,14 +2992,46 @@
     }
 
     var recordsRefs = null;
+    // Synchronously captured UI state, read BEFORE the usage body is torn
+    // down. Real browsers reset scrollLeft (and drop button focus) when the
+    // scroller is detached or its panel hidden, and programmatic changes do
+    // not reliably fire scroll/focus events — so the anchors must be captured
+    // directly from the live nodes rather than maintained by event listeners.
+    var pendingRecordsScroll = 0;
+    var pendingPagerFocus = null;
+    var keepScrollAcrossHide = false;
+    function captureRecordsState() {
+      if (!recordsRefs || !recordsRefs.root.parentNode) return;
+      // While the panel is hidden the browser already reports scrollLeft 0;
+      // keep the value selectTab captured before hiding instead.
+      var visible = recordsRefs.scroll.offsetParent !== null;
+      if (!keepScrollAcrossHide && visible) pendingRecordsScroll = recordsRefs.scroll.scrollLeft;
+      pendingPagerFocus = document.activeElement === recordsRefs.next ? 'next'
+        : document.activeElement === recordsRefs.prev ? 'prev' : null;
+    }
     function renderRecords(rs) {
       // renderUsage rebuilds usage-body on every emit, so the records card is
       // re-appended after it; records-only updates sync the existing card.
-      if (!recordsRefs || !recordsRefs.root.parentNode) {
+      var attached = !!(recordsRefs && recordsRefs.root.parentNode);
+      var preservedScroll = attached ? recordsRefs.scroll.scrollLeft : pendingRecordsScroll;
+      var restoreFocus = attached ? null : pendingPagerFocus;
+      if (!attached) {
         recordsRefs = buildRecordsCard();
         els.usageBody.appendChild(recordsRefs.root);
       }
       syncRecordsCard(recordsRefs, rs);
+      if (preservedScroll > 0) recordsRefs.scroll.scrollLeft = preservedScroll;
+      // Restore keyboard focus to the rebuilt pager when the user had a pager
+      // button focused before the rebuild, unless focus moved elsewhere.
+      if (restoreFocus) {
+        var target = restoreFocus === 'next' ? recordsRefs.next : recordsRefs.prev;
+        var focusElsewhere = document.activeElement &&
+          document.activeElement !== target && document.activeElement !== document.body;
+        if (target && !target.disabled && !focusElsewhere) target.focus();
+      }
+      pendingRecordsScroll = 0;
+      pendingPagerFocus = null;
+      keepScrollAcrossHide = false;
     }
 
     // ---- clients tab ------------------------------------------------------
@@ -3187,7 +3229,6 @@
       if (loadedTabs[name]) return;
       loadedTabs[name] = true;
       if (name === 'routing') routingCtrl.refresh();
-      if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); startUsageAutoRefresh(); }
       if (name === 'clients') clientsCtrl.refresh();
       if (name === 'plugins') pluginsPanel.load();
       if (name === 'settings') settings.reload();
@@ -3197,17 +3238,33 @@
       if (TAB_IDS.indexOf(name) === -1) return;
       if (name !== 'quota') providerForm.close(false);
       if (name !== 'plugins') pluginsPanel.cancel(false);
+      // Before hiding the current panel, capture the usage scroller while it
+      // is still visible: once display:none applies, the browser reports
+      // scrollLeft 0, so a read after hiding cannot preserve the position.
+      if (activeTab === 'usage' && name !== 'usage' && recordsRefs && recordsRefs.root.parentNode) {
+        pendingRecordsScroll = recordsRefs.scroll.scrollLeft;
+        keepScrollAcrossHide = true;
+      }
       activeTab = name;
-      // Polling lifecycle lives here (maybeLoadTab early-returns once a tab
-      // has loaded, so a re-entry must still resume the timer).
-      if (name === 'usage') startUsageAutoRefresh();
-      else stopUsageAutoRefresh();
+      // Show the target panel before refreshing: reading layout/scroll state
+      // while a panel is display:none is unreliable in real browsers.
       TAB_IDS.forEach(function (id) {
         var on = id === name;
         tabButtons[id].setAttribute('aria-selected', String(on));
         tabButtons[id].tabIndex = on ? 0 : -1;
         panels[id].hidden = !on;
       });
+      // Polling lifecycle lives here, not in maybeLoadTab (which early-returns
+      // once a tab has loaded): re-entering the tab must both resume the
+      // timer and reload immediately, so the panel never shows stale data
+      // for up to one interval.
+      if (name === 'usage' && usageCtrl && recordsCtrl) {
+        usageCtrl.refresh();
+        recordsCtrl.refresh();
+        startUsageAutoRefresh();
+      } else {
+        stopUsageAutoRefresh();
+      }
       if (name === 'clients') refreshAutostart();
       maybeLoadTab(name);
     }

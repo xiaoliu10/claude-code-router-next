@@ -250,6 +250,10 @@ body {
 #panel-settings :is(.flag, .settings-group-title) { font-size: 14px; }
 #panel-settings .route-input { font-size: 15px; }
 
+#panel-settings :is(.hint, .note, .btn, .count, .settings-note, .settings-field, .settings-field > label) { font-size: 13px; }
+#panel-settings :is(.flag, .settings-group-title) { font-size: 14px; }
+#panel-settings .route-input { font-size: 15px; }
+
 
 /* Usage tab */
 .periods { display: flex; gap: 4px; padding: 0 14px 6px; }
@@ -319,6 +323,9 @@ body {
 .records-pager { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-2); }
 .records-pager .btn { padding: 1px 8px; font-size: 11.5px; }
 .records-info { font-variant-numeric: tabular-nums; }
+/* Sticky wrapper keeps the horizontal scrollbar floating at the visible
+   bottom of the records card while the outer list scrolls vertically. */
+.records-scroll-sticky { position: sticky; bottom: 0; z-index: 1; background: var(--surface); }
 .records-scroll { overflow-x: auto; min-width: 0; }
 .records-scroll::-webkit-scrollbar { height: 8px; }
 .records-scroll::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.14); border-radius: 999px; }
