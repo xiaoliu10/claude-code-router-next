@@ -1,7 +1,16 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { classifyDylibDeps, satisfiesRange } from "../scripts/prepare-runtime.mjs";
+import {
+  classifyDylibDeps,
+  isPeBuffer,
+  nodeDistFilename,
+  nodeDistPlatform,
+  npmCmdWrapper,
+  readPeHeader,
+  satisfiesRange,
+} from "../scripts/prepare-runtime.mjs";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const scriptsDir = path.dirname(new URL(import.meta.url).pathname);
@@ -31,6 +40,39 @@ test("official node distribution dylib dependencies are classified portable", ()
   const result = classifyDylibDeps(officialOtool);
   assert.equal(result.portable, true);
   assert.deepEqual(result.offending, []);
+});
+
+test("windows node dist uses the win zip family that SHASUMS256.txt lists", () => {
+  assert.equal(nodeDistPlatform("win32"), "win");
+  assert.equal(nodeDistPlatform("darwin"), "darwin");
+  assert.equal(nodeDistPlatform("linux"), "linux");
+  assert.equal(nodeDistFilename("v26.4.0", "win32", "x64"), "node-v26.4.0-win-x64.zip");
+  assert.equal(nodeDistFilename("v26.4.0", "darwin", "arm64"), "node-v26.4.0-darwin-arm64.tar.gz");
+});
+
+test("npm cmd wrappers use CRLF and resolve the bundled npm through relative paths", () => {
+  const npm = npmCmdWrapper("npm");
+  assert.match(npm, /^@echo off\r\n/);
+  assert.match(npm, /\\node\.exe" "%~dp0\.\.\\lib\\node_modules\\npm\\bin\\npm-cli\.js" %\*/);
+  assert.match(npmCmdWrapper("npx"), /npx-cli\.js/);
+  assert.ok(npm.includes("\r\n"), "line endings are CRLF-only");
+});
+
+test("pe gate accepts the DOS image header and rejects text", () => {
+  assert.equal(isPeBuffer(Buffer.from([0x4d, 0x5a, 0x00, 0x01])), true);
+  assert.equal(isPeBuffer(Buffer.from("#!/bin/sh\n")), false);
+  assert.equal(isPeBuffer(Buffer.alloc(1)), false);
+  assert.equal(isPeBuffer(undefined), false);
+});
+
+test("readPeHeader reads the DOS header without loading the whole binary", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pe-header-"));
+  const binary = path.join(dir, "node.exe");
+  fs.writeFileSync(binary, Buffer.concat([Buffer.from([0x4d, 0x5a]), Buffer.alloc(64)]));
+  assert.deepEqual(readPeHeader(binary), Buffer.from([0x4d, 0x5a]));
+  fs.writeFileSync(binary, Buffer.from("#"));
+  assert.equal(readPeHeader(binary).length, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("semver subset covers caret tilde bare-major and exact ranges", () => {

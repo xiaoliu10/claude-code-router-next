@@ -11,8 +11,11 @@
     "allow-quota-hide",
     "allow-quota-open-ui",
     "allow-quota-quit",
+    "allow-general-settings-snapshot",
+    "allow-general-settings-save",
     "allow-routing-snapshot",
     "allow-routing-save",
+    "allow-routing-save-groups",
     "allow-routing-flags",
     "allow-usage-snapshot",
     "allow-usage-records",
@@ -23,9 +26,20 @@
     "allow-projects-save",
     "allow-projects-takeover",
     "allow-projects-delete",
+    "allow-provider-add",
+    "allow-provider-get",
+    "allow-provider-update",
+    "allow-provider-transformers",
+    "allow-plugin-inventory",
+    "allow-plugin-catalog",
+    "allow-plugin-install",
+    "allow-plugin-action",
     "allow-quota-credentials-status",
     "allow-quota-credentials-save",
     "allow-service-snapshot",
-    "allow-service-action"
+    "allow-service-action",
+    "allow-config-reload",
+    "allow-login-start-set",
+    "allow-login-start-status"
   ]
 }

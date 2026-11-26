@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-config-reload"
+description = "Enables the config_reload command without any pre-configured scope."
+commands.allow = ["config_reload"]
+
+[[permission]]
+identifier = "deny-config-reload"
+description = "Denies the config_reload command without any pre-configured scope."
+commands.deny = ["config_reload"]

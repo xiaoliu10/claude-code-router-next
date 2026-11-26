@@ -49,7 +49,7 @@ pub struct CredentialsStatus {
 
 /// True only for the Ark Coding Plan endpoint the core adapter signs for.
 /// `/api/v3` (pay-as-you-go) and `/api/plan` (Agent Plan) never match.
-fn coding_plan_provider(entry: &Value) -> bool {
+pub(super) fn coding_plan_provider(entry: &Value) -> bool {
     let Some(base) = entry["api_base_url"].as_str() else {
         return false;
     };
@@ -82,7 +82,7 @@ fn field_present(entry: &Value, key: &str) -> bool {
 
 fn status_from(config: &Value) -> CredentialsStatus {
     let mut seen = HashSet::new();
-    let providers = config["Providers"]
+    let providers = config[crate::api::provider_list_key(config)]
         .as_array()
         .into_iter()
         .flatten()
@@ -104,7 +104,7 @@ fn status_from(config: &Value) -> CredentialsStatus {
 
 /// Locates the first matching Coding Plan entry with this exact name.
 fn find_entry<'a>(config: &'a Value, name: &str) -> Option<&'a Value> {
-    config["Providers"]
+    config[crate::api::provider_list_key(config)]
         .as_array()?
         .iter()
         .find(|entry| coding_plan_provider(entry) && provider_name(entry).as_deref() == Some(name))
@@ -200,7 +200,8 @@ impl CredentialsService {
         let _write = client.write_guard().await;
         // Always mutate the freshest config; never a cached snapshot.
         let mut config = client.config().await?;
-        let index = config["Providers"]
+        let key = crate::api::provider_list_key(&config);
+        let index = config[key]
             .as_array()
             .and_then(|entries| {
                 entries.iter().position(|entry| {
@@ -208,7 +209,7 @@ impl CredentialsService {
                 })
             })
             .ok_or_else(|| ERR_NOT_FOUND.to_string())?;
-        let entry = &config["Providers"][index];
+        let entry = &config[key][index];
         let mut updated = entry.clone();
         access.apply(&mut updated, ACCESS_KEY_FIELD);
         secret.apply(&mut updated, SECRET_KEY_FIELD);
@@ -217,7 +218,7 @@ impl CredentialsService {
             // the full-config POST so an unchanged save never churns backups.
             return Ok(status_from(&config));
         }
-        config["Providers"][index] = updated;
+        config[key][index] = updated;
         let verified = client.post_config_and_readback(&config).await?;
         let readback =
             find_entry(&verified, name).ok_or_else(|| ERR_SAVE_NOT_CONFIRMED.to_string())?;

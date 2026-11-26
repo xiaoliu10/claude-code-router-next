@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-catalog"
+description = "Enables the plugin_catalog command without any pre-configured scope."
+commands.allow = ["plugin_catalog"]
+
+[[permission]]
+identifier = "deny-plugin-catalog"
+description = "Denies the plugin_catalog command without any pre-configured scope."
+commands.deny = ["plugin_catalog"]

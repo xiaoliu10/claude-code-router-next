@@ -53,6 +53,10 @@ node --test apps/desktop/tests/runtime-staging.test.mjs   # 脚本纯函数测�
 
 用量中的 token 数统一显示为 K/M/B，最多两位小数；悬停保留完整数量。
 
+## 供应商编辑
+
+桌面编辑器使用供应商名称定位配置。为保留全局及项目路由对该名称的引用，现有供应商的名称只读。可修改地址、密钥、模型及供应商级转换器；留空密钥或保持转换器不变会保留最新配置。只有网关目录明确支持参数的转换器可配置参数。地址查询仅支持数字版本（如 `?version=1`）或日期版本（如 `?api-version=2024-10-21`，可带 `-preview`）。系统托管的供应商由对应插件管理。
+
 ## Coding Plan 用量凭证
 
 额度页中 `api_base_url` 命中 `ark.cn-beijing.volces.com` 且路径含 `/api/coding/` 的提供方（与 core 火山 Coding Plan adapter 同一条件）会显示「用量凭证」按钮；未配置时卡片提示「未配置 AK/SK，无法查询套餐用量」。内联面板提供两个 password 输入（AccessKey ID / Secret AccessKey），已保存的凭证不回显：留空保存=不修改，「清除凭证」显式清空。
@@ -95,7 +99,19 @@ cargo clippy --all-targets -- -D warnings
 cd ../.. && node apps/desktop/scripts/build-standalone.mjs
 ```
 
-macOS 输出：`apps/desktop/src-tauri/target/release/bundle/macos/CCR Desktop.app`。正式分发仍需独立签名/公证；无 auto-updater。Windows/Linux 未验证。
+macOS 输出：`apps/desktop/src-tauri/target/release/bundle/macos/CCR Desktop.app`。正式分发仍需独立签名/公证；无 auto-updater。
+
+**Windows（x64，实验支持）**：在 Windows 10 1809+ 主机上构建（staging 校验会执行 node.exe，不支持交叉构建）。
+
+```sh
+# 仓库根：先构建 shared/core
+pnpm build:shared && pnpm build:core
+cd apps/desktop
+node scripts/prepare-runtime.mjs --arch x64   # nodejs.org win-x64.zip + SHA256 校验 + tar.exe 解压
+node scripts/build-standalone-windows.mjs     # cargo tauri build --bundles nsis
+```
+
+前置：rustup stable-msvc、VS Build Tools 2022（C++ workload）、cargo-tauri；Windows zip 的 better-sqlite3 需要 win32-x64 对应 Node ABI 的 prebuilt（npmmirror 镜像可取）。runtime 通过 `tauri.windows.conf.json` 的 resources 映射随 NSIS 安装包分发，构建脚本在每次构建前清空旧暂存树，并以 `target/release/runtime` 暂存树的存在性为结构化校验（安装包体积只是弱信号，防止映射失效打出空壳）。产物：`apps/desktop/src-tauri/target/release/bundle/nsis/*.exe`。已知限制：未签名；runtime 解压依赖系统 tar.exe（1809+ 内置）；`better-sqlite3` ABI 必须与 Node 大版本匹配，staging 末尾的 require 往返是权威校验。
 
 ### 本次实际验证（2026-11-17）
 

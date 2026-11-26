@@ -1,31 +1,45 @@
 mod api;
+mod autostart;
 mod control;
 mod credentials;
+mod general;
 mod lifecycle;
+mod plugins;
 mod popup;
 mod projects;
+mod providers;
 mod quota;
 mod settings;
 mod tray;
+mod webview_retry;
 
 use std::sync::Arc;
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // Must be first so a second launch never starts another desktop/gateway.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let handle = app.clone();
             let _ = app.run_on_main_thread(move || tray::open_window(&handle));
-        }))
+        }));
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+    let app = builder
         .invoke_handler(tauri::generate_handler![
+            autostart::login_start_status,
+            autostart::login_start_set,
             popup::quota_snapshot,
             popup::quota_hide,
             popup::quota_open_ui,
             popup::quota_quit,
+            general::general_settings_snapshot,
+            general::general_settings_save,
             control::routing_snapshot,
             control::routing_save,
+            control::routing_save_groups,
+            control::config_reload,
             control::routing_flags,
             control::usage_snapshot,
             control::usage_records,
@@ -36,31 +50,41 @@ pub fn run() {
             projects::projects_save,
             projects::projects_takeover,
             projects::projects_delete,
+            providers::provider_add,
+            providers::provider_get,
+            providers::provider_update,
+            providers::provider_transformers,
+            plugins::plugin_inventory,
+            plugins::plugin_catalog,
+            plugins::plugin_install,
+            plugins::plugin_action,
             credentials::quota_credentials_status,
             credentials::quota_credentials_save,
             lifecycle::service_snapshot,
             lifecycle::service_action
         ])
         .setup(|app| {
-            popup::install(app.handle())?;
-            // The main window is the local control center: the same local
-            // quota.html as the popup, no remote Web UI navigation. Navigation
-            // and new-window rules mirror the popup so no remote page can load.
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("quota.html".into()))
-                .title("Claude Code Router")
-                .inner_size(1200.0, 800.0)
-                .min_inner_size(800.0, 600.0)
-                .visible(false)
-                .on_navigation(popup::trusted_url)
-                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
-                .build()?;
+            // Both webview/window creations are retried for the
+            // no-interactive-desktop case and exit cleanly if retries are
+            // exhausted; other setup errors below still propagate and fail
+            // fast. The popup must exist first so the main window never sees a
+            // missing quota label.
+            webview_retry::retry_webview_creation("quota popup window", || {
+                popup::install(app.handle())
+            });
+            webview_retry::retry_webview_creation("main control-center window", || {
+                webview_retry::build_main_window(app.handle())
+            });
             match settings::ConnectionSettings::from_environment().and_then(|settings| {
                 api::AdminClient::new(settings.clone()).map(|client| (settings, client))
             }) {
                 Ok((settings, client)) => {
                     app.manage(quota::QuotaService::new(Some(client.clone())));
                     app.manage(control::ControlService::new(Some(client.clone())));
+                    app.manage(general::GeneralService::new(Some(client.clone())));
                     app.manage(projects::ProjectsService::new(Some(client.clone())));
+                    app.manage(providers::ProvidersService::new(Some(client.clone())));
+                    app.manage(plugins::PluginsService::new(Some(client.clone())));
                     app.manage(credentials::CredentialsService::new(Some(client.clone())));
                     let resources = app.path().resource_dir().ok();
                     let bundle = lifecycle::RuntimeBundle::detect(resources.as_deref());
@@ -76,7 +100,10 @@ pub fn run() {
                 Err(e) => {
                     app.manage(quota::QuotaService::new(None));
                     app.manage(control::ControlService::new(None));
+                    app.manage(general::GeneralService::new(None));
                     app.manage(projects::ProjectsService::new(None));
+                    app.manage(providers::ProvidersService::new(None));
+                    app.manage(plugins::PluginsService::new(None));
                     app.manage(credentials::CredentialsService::new(None));
                     eprintln!("Invalid CCR connection settings: {e}");
                     tray::install_offline(app.handle(), e.clone())?;

@@ -134,6 +134,7 @@
     "search": "搜索供应商...",
     "quota_5h": "5小时",
     "quota_7d": "7天",
+    "quota_30d": "30天",
     "quota_balance": "余额",
     "quota_reset": "重置：{{time}}",
     "quota_token": "限额查询 Token",

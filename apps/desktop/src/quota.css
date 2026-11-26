@@ -5,14 +5,14 @@
   --surface-hover: #f7f7f9;
   --border: rgba(0, 0, 0, 0.08);
   --border-strong: rgba(0, 0, 0, 0.16);
-  --text: #1d1d1f;
-  --text-2: #56565c;
-  --text-3: #8e8e93;
+  --text: #161618;
+  --text-2: #353539;
+  --text-3: #54545a;
   --accent: #d96f23;
-  --accent-deep: #c25f18;
+  --accent-deep: #92450e;
   --accent-soft: #fbeee3;
-  --ok: #2e9e4f;
-  --warn: #a96a0a;
+  --ok: #21723a;
+  --warn: #805008;
   --warn-dot: #d99a1f;
   --warn-bg: #fdf3e0;
   --warn-border: rgba(169, 106, 10, 0.28);
@@ -160,8 +160,23 @@ body {
 .note[data-tone="error"] { color: var(--danger); }
 
 
+/* Manual API provider (quota tab) */
+.provider-form { margin: 0 14px 8px; display: grid; gap: 8px; min-height: 0; overflow-y: auto; }
+.provider-form h2 { margin: 0; font-size: 13px; }
+.provider-form label { display: grid; gap: 3px; min-width: 0; font-size: 12px; }
+.provider-form .route-input { width: 100%; }
+.provider-form textarea { resize: vertical; }
+.provider-transformers { min-width: 0; margin: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+.transformer-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; margin-bottom: 8px; }
+.transformer-params { grid-column: 1 / -1; }
+.transformer-row > .btn:last-child { justify-self: start; }
+.transformer-param { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.5fr) auto; gap: 4px; margin-top: 4px; }
+.provider-form-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; }
+.provider-form-actions .inline-msg { flex: 1 1 10em; }
+#provider-add-status:empty { margin: 0; }
+
 /* Routing tab */
-.flags { display: flex; align-items: center; gap: 12px; padding: 0 14px 6px; }
+.flags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 0 14px 6px; }
 .flag { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
 .switch {
   appearance: none; -webkit-appearance: none;
@@ -193,14 +208,15 @@ body {
 
 .route { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05); }
 .route[data-dirty="true"] { border-style: dashed; }
-.route-head { display: flex; align-items: center; gap: 6px; }
-.route-name { font-weight: 600; font-size: 12.5px; }
+.route-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.route-unset { font-size: 13px; }
+.route-name { font-weight: 600; font-size: 12.5px; overflow-wrap: anywhere; min-width: 0; }
 .route-target { display: flex; align-items: center; gap: 4px; margin-top: 5px; }
 .route-input {
   flex: 1; min-width: 0; font: inherit; font-size: 12px;
   border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px; background: var(--surface); color: var(--text);
 }
-.route-input::placeholder { color: var(--text-3); }
+.route-input::placeholder { color: var(--text-3); opacity: 1; }
 .route-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
 .route-clear { flex: none; }
 .route-fallback { margin-top: 6px; }
@@ -213,15 +229,30 @@ body {
 .fallback-add { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
 .fallback-add .route-input { flex: 1; }
 .route-foot { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
-.route-msg { font-size: 11px; color: var(--danger); overflow-wrap: anywhere; }
+.route-msg { font-size: 13px; color: var(--danger); overflow-wrap: anywhere; }
 .route-msg[data-tone="ok"] { color: var(--ok); }
 .route-foot .spacer { flex: 1; }
 .route-foot .btn { padding: 2px 8px; font-size: 11.5px; }
-.btn-primary { background: var(--accent); border-color: var(--accent-deep); color: #fff; }
-.btn-primary:hover { background: var(--accent-deep); }
-.btn-primary:active { background: var(--accent-deep); }
+.btn-primary { background: var(--accent-deep); border-color: var(--accent-deep); color: #fff; }
+.btn-primary:hover { background: #803c0b; }
+.btn-primary:active { background: #703409; }
 .btn-danger-quiet { color: var(--danger); }
-.routing-note { margin: 2px 14px 6px; font-size: 11px; color: var(--text-3); }
+.routing-note { margin: 2px 14px 6px; font-size: 13px; color: var(--text-3); }
+
+#panel-routing :is(.hint, .inline-msg, .note, .btn, .count, .route-fallback-label) { font-size: 13px; }
+#panel-routing :is(.flag, .scope-btn, .fallback-item) { font-size: 14px; }
+#panel-routing .scope-btn { padding-block: 3px; }
+#panel-routing .route-name { font-size: 16px; }
+#panel-routing .route-input { font-size: 15px; }
+#panel-routing .route-fallback-label { font-weight: 600; }
+
+#panel-settings :is(.hint, .note, .btn, .count, .settings-note, .settings-field, .settings-field > label) { font-size: 13px; }
+#panel-settings :is(.flag, .settings-group-title) { font-size: 14px; }
+#panel-settings .route-input { font-size: 15px; }
+
+#panel-settings :is(.hint, .note, .btn, .count, .settings-note, .settings-field, .settings-field > label) { font-size: 13px; }
+#panel-settings :is(.flag, .settings-group-title) { font-size: 14px; }
+#panel-settings .route-input { font-size: 15px; }
 
 
 /* Usage tab */
@@ -237,8 +268,20 @@ body {
 .period-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .usage-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05); }
 .usage-title { font-weight: 600; font-size: 12px; color: var(--text-2); margin-bottom: 6px; }
-.usage-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px 8px; }
-.usage-cell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.usage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 90px), 1fr)); gap: 6px; }
+.usage-cell { display: flex; flex-direction: column; align-items: center; text-align: center; justify-content: center; gap: 2px; min-width: 0; padding: 6px 4px; border: 1px solid var(--border); border-radius: 7px; }
+.usage-cell[data-metric="requests"] { background: #eff6ff; color: #1e40af; }
+.usage-cell[data-metric="success"] { background: #ecfdf5; color: #166534; }
+.usage-cell[data-metric="errors"] { background: #fef2f2; color: #991b1b; }
+.usage-cell[data-metric="rate"] { background: #f3f4f6; color: #374151; }
+.usage-cell[data-metric="total"] { background: #eef2ff; color: #3730a3; }
+.usage-cell[data-metric="input"] { background: #f0fdf4; color: #166534; }
+.usage-cell[data-metric="output"] { background: #fefce8; color: #854d0e; }
+.usage-cell[data-metric="cache-read"] { background: #ecfdf5; color: #065f46; }
+.usage-cell[data-metric="cache-write"] { background: #f0fdfa; color: #115e59; }
+.usage-cell[data-metric="cache-hit"] { background: #ecfeff; color: #155e75; }
+.usage-cell[data-metric="ttft"] { background: #faf5ff; color: #6b21a8; }
+.usage-cell[data-metric="speed"] { background: #fdf2f8; color: #9d174d; }
 .usage-num { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .usage-label { font-size: 10.5px; color: var(--text-3); }
 .usage-table { width: 100%; border-collapse: collapse; font-size: 11.5px; font-variant-numeric: tabular-nums; }
@@ -247,16 +290,26 @@ body {
 .usage-table tr:last-child td { border-bottom: none; }
 .usage-table td.num, .usage-table th.num { text-align: right; }
 
-/* Usage charts: pure CSS divs, no libraries. Per-bar sizes are written via
-   CSSOM from quota.js because the CSP (style-src 'self') forbids inline
-   style attributes. Flex + min-width:0 keeps 440px free of horizontal
-   overflow; details live in title tooltips. */
-.usage-bars { display: flex; align-items: stretch; gap: 2px; height: 96px; min-width: 0; }
-/* Explicit height so the bar's percentage height resolves against the column. */
-.usage-bar-col { flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: flex-end; }
-.usage-bar { width: 100%; min-height: 4%; background: var(--accent); border-radius: 2px 2px 0 0; opacity: 0.85; }
+/* CSSOM sets bar heights under the CSP. Single-day data needs a readable
+   total, not a full-width bar; multiple days keep labels and bounded bars. */
+.usage-day-summary { padding: 8px 2px 6px; }
+.usage-day-total { margin: 4px 0; font-size: 24px; font-weight: 650; color: var(--text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.usage-day-caption { font-size: 11px; color: var(--text-2); }
+.usage-days-scroll { min-width: 0; max-width: 100%; overflow-x: auto; padding: 4px 0; }
+.usage-days-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.usage-bars { display: flex; align-items: stretch; gap: 12px; min-width: 100%; width: max-content; }
+.usage-bar-col { flex: 1 0 76px; min-width: 76px; text-align: center; }
+.usage-day-value { height: 22px; font-size: 12px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.usage-day-track { height: 96px; display: flex; align-items: flex-end; justify-content: center; border-bottom: 1px solid var(--border-strong); }
+.usage-bar { width: 32px; max-width: 100%; background: var(--accent); border-radius: 3px 3px 0 0; opacity: 0.85; }
 .usage-bar:hover { opacity: 1; }
-.usage-chart-axis { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 10.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+/* All-history tracks share one viewport, even when individual days are subpixel. */
+.usage-days-compact .usage-bars { width: 100%; gap: 0; }
+.usage-days-compact .usage-bar-col { flex: 1 1 0; min-width: 0; }
+.usage-days-compact .usage-day-track { height: 56px; }
+.usage-days-compact .usage-bar { width: 84%; max-width: 32px; }
+.usage-day-range { display: flex; justify-content: space-between; }
+.usage-day-date { margin-top: 6px; font-size: 10.5px; color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .usage-hbar { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .usage-hbar-row { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 11px; }
 .usage-hbar-name { flex: 0 1 auto; min-width: 0; max-width: 38%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
@@ -270,6 +323,9 @@ body {
 .records-pager { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-2); }
 .records-pager .btn { padding: 1px 8px; font-size: 11.5px; }
 .records-info { font-variant-numeric: tabular-nums; }
+/* Sticky wrapper keeps the horizontal scrollbar floating at the visible
+   bottom of the records card while the outer list scrolls vertically. */
+.records-scroll-sticky { position: sticky; bottom: 0; z-index: 1; background: var(--surface); }
 .records-scroll { overflow-x: auto; min-width: 0; }
 .records-scroll::-webkit-scrollbar { height: 8px; }
 .records-scroll::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.14); border-radius: 999px; }
@@ -306,7 +362,7 @@ body {
 .btn-danger:active { background: #b32e24; }
 
 /* Coding Plan quota credentials: inline AK/SK editor on matching quota cards */
-.card-creds { padding: 2px 8px; font-size: 11.5px; }
+.card-edit, .card-creds { padding: 2px 8px; font-size: 11.5px; }
 .card-creds-note { margin: 6px 0 0; font-size: 11px; color: var(--warn); overflow-wrap: anywhere; }
 .creds-panel {
   margin-top: 8px; padding: 8px; border-radius: 8px;
@@ -321,14 +377,23 @@ body {
 .creds-actions { display: flex; gap: 6px; }
 .creds-actions .btn { padding: 2px 8px; font-size: 11.5px; }
 
-/* The same panel doubles as the local main window: keep the compact popup
-   column but center it and relax grids on wide viewports. */
+/* General settings tab: grouped static form reusing the card language. */
+.settings-group { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05); }
+.settings-group-title { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--text-2); }
+.settings-rows { display: flex; flex-direction: column; gap: 8px; }
+.settings-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.settings-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 11.5px; color: var(--text-2); }
+.settings-field > label { font-size: 11.5px; color: var(--text-2); }
+.settings-field .route-input { width: 100%; }
+.settings-field .route-input[aria-invalid="true"] { border-style: dashed; border-color: var(--border-strong); }
+.settings-note { margin: 0; font-size: 11px; color: var(--text-3); overflow-wrap: anywhere; }
+.settings-note[data-tone="warn"] { color: var(--warn); }
+/* Fill the main window using the same small gutters as the tray popup;
+   only the grids need additional columns on wide viewports. */
 @media (min-width: 720px) {
-  .shell > header, .shell > .service-bar, .shell > .tabs, .shell > .panel, .shell > .footer {
-    width: 100%; max-width: 780px; margin-left: auto; margin-right: auto;
-  }
-  .usage-grid { grid-template-columns: repeat(5, 1fr); }
-  #routing-body { display: grid; grid-template-columns: 1fr 1fr; align-content: start; }
+  .usage-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  #routing-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; }
+  .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -342,7 +407,15 @@ body {
 /* Projects reuse the compact control-center cards and orange save affordance. */
 .projects-picker { display: flex; align-items: center; gap: 8px; padding: 0 14px 8px; min-width: 0; }
 .projects-picker label { flex: none; font-size: 12px; color: var(--text-2); }
-.projects-picker select { width: 0; text-overflow: ellipsis; }
+.project-combo { position: relative; flex: 1; min-width: 0; }
+.project-combo input { width: 100%; text-overflow: ellipsis; padding-right: 24px; }
+.project-combo::after { content: '▾'; pointer-events: none; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: var(--text-2); }
+.project-popup { position: absolute; z-index: 4; top: 100%; left: 0; right: 0; max-height: min(240px, 36vh); overflow-y: auto; padding: 4px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface); box-shadow: 0 4px 12px var(--border); }
+.project-option, #projects-no-match { padding: 5px 8px; overflow-wrap: anywhere; }
+.project-option { cursor: pointer; border-radius: 4px; }
+.project-option:hover, .project-option.active { background: var(--accent-soft); }
+.project-option[aria-selected="true"] { font-weight: 600; }
+#projects-no-match { color: var(--text-2); }
 #projects-body { overflow-x: hidden; }
 #projects-body > * { flex-shrink: 0; min-width: 0; }
 #projects-body .route-input { width: 100%; max-width: 100%; }
@@ -359,3 +432,9 @@ body {
   .project-routes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .project-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+#plugins-list > li { flex-shrink: 0; min-width: 0; }
+.plugins-card-title, .plugins-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.plugins-actions { margin-top: 8px; }
+.plugins-confirm { margin: 0 14px 8px; }
+.plugins-confirm .card-message { margin-top: 0; }

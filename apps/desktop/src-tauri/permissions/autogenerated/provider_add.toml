@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-provider-add"
+description = "Enables the provider_add command without any pre-configured scope."
+commands.allow = ["provider_add"]
+
+[[permission]]
+identifier = "deny-provider-add"
+description = "Denies the provider_add command without any pre-configured scope."
+commands.deny = ["provider_add"]

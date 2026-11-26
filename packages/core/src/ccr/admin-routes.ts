@@ -19,7 +19,7 @@ import { clearProviderHealth } from "./health-reconcile";
 import { reloadProviderRuntime } from "../provider-plugins/host";
 import { describeInstalledPlugins } from "../provider-plugins/loader";
 import { registerPluginMarketRoutes } from "./plugin-install-routes";
-import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
+import { readConfigFile, readConfigFileRaw, readConfigFileSafe, writeConfigFile, backupConfigFile } from "./config";
 import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -69,6 +69,18 @@ import AdmZip from "adm-zip";
 import { query as queryUsage, querySummary as queryUsageSummary, clear as clearUsage } from "./usage-store";
 import { listAnthropicCompatibleModels } from "./models";
 
+// A tuple calls `new` on the registry value. Probe its constructor capability
+// without executing plugin code or requiring default constructor options.
+function isTransformerConstructor(value: unknown): boolean {
+  if (typeof value !== "function") return false;
+  try {
+    Reflect.construct(Object, [], value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The model list a client should see: models whose circuit is open are hidden.
  *
@@ -97,6 +109,11 @@ interface ProviderQuotaUsage {
   type5h?: 'rateLimit' | 'balance';
   /** Display type for the 7d slot: 'rateLimit' (限额) or 'balance' (余额) */
   type7d?: 'rateLimit' | 'balance';
+  /** Usage/limit for the monthly (30d) slot, when an adapter exposes one. */
+  used30d?: number;
+  limit30d?: number;
+  reset30d?: string;
+  type30d?: 'rateLimit' | 'balance';
   /** Currency for balance display (e.g. "CNY", "USD") */
   currency?: string;
 }
@@ -275,6 +292,7 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       ([name, transformer]: any) => ({
         name,
         endpoint: transformer.endPoint || null,
+        supportsParameters: isTransformerConstructor(transformer),
       })
     );
     return { transformers: transformerList };
@@ -336,6 +354,58 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     }
     reloadProviderRuntime(server, newConfig, _app.log);
     return { success: true, message: "Config saved successfully", projectTakeoverSync };
+  });
+
+  // Hot-reload the runtime from the config file as edited on disk. Read-only:
+  // unlike POST /api/config this never writes, backs up, or reshapes the file.
+  // Responses carry fixed error strings only — config values, keys and parse
+  // details must never leak into replies or logs.
+  _app.post("/api/config/reload", async (_req: any, reply: any) => {
+    const before = server.configService.getAll();
+
+    let newConfig: any;
+    try {
+      newConfig = await readConfigFileSafe();
+    } catch {
+      reply.status(500);
+      return { success: false, error: "config file unreadable" };
+    }
+    if (newConfig === null || typeof newConfig !== "object" || Array.isArray(newConfig)) {
+      reply.status(500);
+      return { success: false, error: "config file invalid" };
+    }
+
+    let reloaded = false;
+    try {
+      reloaded = reloadProviderRuntime(server, newConfig, _app.log, "Config reload requested");
+      if (reloaded) {
+        // configService.reload() inside reloadProviderRuntime replays its own
+        // sources (JSON file / initialConfig). Overlay the interpolated config
+        // just read so runtime values (e.g. Router) match the request-path read
+        // even when the JSON source is disabled or holds un-interpolated values.
+        for (const [key, value] of Object.entries(newConfig)) {
+          server.configService.set(key, value);
+        }
+      }
+    } catch (error: any) {
+      _app.log?.warn?.(`Config reload failed: ${error?.message || error}`);
+      reloaded = false;
+    }
+    if (!reloaded) {
+      reply.status(500);
+      return { success: false, error: "runtime reload failed" };
+    }
+
+    // Listener settings cannot be hot-applied; report them so the caller can
+    // prompt for a restart. Missing vs present counts as a change. Compare as
+    // strings so an interpolated "$PORT" ("3456") matches the numeric listener
+    // port. Listener values forced at startup (HOST without APIKEY, the
+    // SERVICE_PORT override) can differ from the file even when it is
+    // unchanged; such setups will report a restart on every reload.
+    const restartRequired = (["PORT", "HOST"] as const).filter(
+      (key) => String(before[key]) !== String(newConfig[key])
+    );
+    return { success: true, restartRequired };
   });
 
   // ========== Client Integrations API ==========
@@ -993,6 +1063,35 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
           }
         } else if (typeof stored.usedBalance === 'number') {
           quota.used7d = stored.usedBalance;
+        }
+
+        const storeReset30dExpired = isQuotaWindowExpired(
+          typeof stored.resetTimeMonthly === 'string'
+            ? Date.parse(stored.resetTimeMonthly) / 1000
+            : undefined
+        );
+        // Monthly window (e.g. Volcengine Coding Plan's 30-day cap): same
+        // percentage-vs-balance semantics as the 7d slot. An expired monthly
+        // sample is dropped entirely — keeping its usage would show an
+        // exhausted window for a period that has already reset.
+        if (!storeReset30dExpired) {
+          if (typeof stored.limitMonthly === 'number') {
+            quota.limit30d = stored.limitMonthly;
+            quota.type30d = stored.currency ? 'balance' : 'rateLimit';
+            quota.used30d = typeof stored.usedMonthlyBalance === 'number'
+              ? stored.usedMonthlyBalance
+              : 0;
+          } else if (typeof stored.usedMonthlyBalance === 'number') {
+            quota.used30d = stored.usedMonthlyBalance;
+          }
+          // A monthly-only balance carries its currency here: the 7d branch
+          // above never runs without totalBalance/usedBalance.
+          if (stored.currency) {
+            quota.currency = stored.currency;
+          }
+          if (typeof stored.resetTimeMonthly === 'string') {
+            quota.reset30d = stored.resetTimeMonthly;
+          }
         }
 
         // Same staleness rule as the header merge above: a window whose reset
