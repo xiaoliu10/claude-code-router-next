@@ -38,6 +38,10 @@ jobs:
           CCR_DESKTOP_NODE_VERSION: v22.23.3
         run: node scripts/prepare-runtime.mjs --arch x64
 
+      - name: Verify per-user login registration in a temporary registry key
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked --lib autostart::platform::isolated_registry_round_trip -- --exact --test-threads=1
+
       - name: Install tauri-cli
         run: cargo install tauri-cli --locked
 
