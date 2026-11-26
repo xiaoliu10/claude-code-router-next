@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [2.3.2437] - 2026-11-26
+
+### English
+
+- CCR Desktop adds a Windows x64 installer, launch at login, general settings, provider and plugin management, project search, and automatic usage refresh. This release also updates quota reporting, usage accounting, and Gemini and Codex request handling.
+- The desktop usage tab refreshes every 30 seconds while open. The charts support weekly and all-time views, and the call records retain their horizontal scroll position across refreshes.
+- Quota reporting covers Step Plan, LiteLLM relay budgets, and the Volcengine monthly window. The web settings form preserves stored Coding Plan credentials on unrelated saves.
+- Family routing skips Agy for tool requests on the Anthropic and Chat paths. Explicit Agy requests can still use caller-provided tools.
+
+### 中文
+
+- CCR Desktop 新增 Windows x64 安装包、登录启动、通用设置、供应商与插件管理、项目搜索及用量自动刷新。本版也更新了额度展示、用量统计和 Gemini、Codex 的请求处理。
+- 用量页打开时每 30 秒刷新。图表支持最近七天和全部历史，调用记录刷新后保留横向滚动位置。
+- 额度展示涵盖 Step Plan、LiteLLM 中转用户预算和火山月度窗口。网页端保存其他配置时保留已有的 Coding Plan 凭据。
+- Anthropic 和 Chat 的家族路由会为带工具的请求跳过 Agy。显式选择 Agy 时仍可使用调用方提供的工具。
+
 ## [2.3.2436] - 2026-11-24
 
 ### Added
