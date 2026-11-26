@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { StepPlanQuotaCard } from "./StepPlanQuotaCard";
 import type { Provider, ProviderHealthState, ProviderProbeTelemetry, ProviderQuotaUsage } from "@/types";
 import { formatFailureTime, isFailureStale } from "@/utils/provider-health-display";
 
@@ -407,7 +408,7 @@ export function ProviderList({ providers, providerIds, healthStates, quotaUsages
 
         return (
           <ProviderCard key={rowId} dragId={rowId} onReorder={onReorder} saving={saving}>
-          <div className="flex items-start justify-between rounded-2xl border border-white/10 bg-white/5 p-5 transition-all hover:bg-white/10 hover:border-primary/30 group animate-in shadow-lg shadow-black/5 glass-card">
+          <div className={`flex items-start justify-between rounded-2xl border border-white/10 bg-white/5 p-5 transition-all hover:bg-white/10 hover:border-primary/30 group animate-in shadow-lg shadow-black/5 glass-card ${quota?.stepPlan ? "flex-wrap gap-y-3" : ""}`}>
             {dragEnabled && (
               <div
                 className="mr-2 -ml-1 flex h-full cursor-grab items-center self-stretch text-muted-foreground/30 transition-colors hover:text-muted-foreground active:cursor-grabbing"
@@ -416,7 +417,7 @@ export function ProviderList({ providers, providerIds, healthStates, quotaUsages
                 <GripVertical className="h-4 w-4" />
               </div>
             )}
-            <div className="flex-1 space-y-3">
+            <div className={`flex-1 space-y-3 ${quota?.stepPlan ? "min-w-0" : ""}`}>
                 <div className="flex flex-col gap-1">
                   <p className="text-lg font-bold tracking-tight text-foreground">{providerName}</p>
                   <p className="text-xs font-medium text-muted-foreground/60 truncate max-w-md">{apiBaseUrl}</p>
@@ -451,7 +452,7 @@ export function ProviderList({ providers, providerIds, healthStates, quotaUsages
                 </div>
               )}
               
-              {quota && (quota.used5h > 0 || quota.used7d > 0 || quota.limit5h !== undefined || quota.limit7d !== undefined) && (
+              {quota && !quota.stepPlan && (quota.used5h > 0 || quota.used7d > 0 || quota.limit5h !== undefined || quota.limit7d !== undefined) && (
                 <div className="space-y-2 py-1 max-w-md">
                   <QuotaProgressBar
                     label={quota.type5h === 'balance' ? t("providers.quota_balance") : t("providers.quota_5h")}
@@ -574,6 +575,7 @@ export function ProviderList({ providers, providerIds, healthStates, quotaUsages
                 </Button>
               </div>
             </div>
+            {quota?.stepPlan && <StepPlanQuotaCard snapshot={quota.stepPlan} />}
           </div>
           </ProviderCard>
         );
