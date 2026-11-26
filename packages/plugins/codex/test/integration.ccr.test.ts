@@ -461,6 +461,13 @@ describe("codex plugin integration — data plane through the real server", () =
         expect(body.service_tier).toBe(wireTier);
         expect(body.reasoning).toEqual(reasoning);
       }
+      const previousCount = upstream.calls.filter(c => c.url === UPSTREAM).length;
+      await app.app.inject({ method: "POST", url: "/v1/messages", headers: { "user-agent": CODEX_UA },
+        payload: msgPayload({ stream: true, service_tier: "fast" }) });
+      // The Messages adapter rebuilds the body. Check the wire tier on every upstream attempt.
+      const messagesCalls = upstream.calls.filter(c => c.url === UPSTREAM).slice(previousCount);
+      expect(messagesCalls.length).toBeGreaterThan(0);
+      for (const call of messagesCalls) expect(JSON.parse(call.init.body).service_tier).toBe("priority");
       expect(configModule.writeConfigFile).not.toHaveBeenCalled();
     } finally { await app.app.close(); }
   });

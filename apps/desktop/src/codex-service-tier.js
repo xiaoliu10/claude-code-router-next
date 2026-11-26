@@ -23,7 +23,13 @@
     hint.textContent = '快速模式可能消耗更多额度。';
     const status = document.createElement('span');
     status.setAttribute('role', 'status');
-    for (const node of [label, select, hint, status]) root.appendChild(node);
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'btn';
+    retry.textContent = '重新读取';
+    retry.hidden = true;
+    retry.addEventListener('click', () => read());
+    for (const node of [label, select, hint, status, retry]) root.appendChild(node);
 
     let host = null;
     let generation = 0;
@@ -47,11 +53,12 @@
         ? '请更新 CCR 网关和 Codex 插件以使用服务层级。' : fallback;
     }
 
-    async function read() {
+    async function read(afterUnconfirmed = false) {
       if (!host) return;
       if (saving) { readAfterSave = true; return; }
       const current = ++generation;
       confirmed = null;
+      retry.hidden = true;
       // Eligibility is confirmed by the bridge. A same-name ordinary provider
       // should never flash a selector or a default tier while this read runs.
       root.hidden = true;
@@ -61,10 +68,11 @@
         if (current !== generation || result === null) return;
         if (!tiers.has(result?.tier)) throw new Error();
         confirmed = result.tier;
-        paint('');
+        paint(afterUnconfirmed ? '已重新读取当前层级。' : '');
       } catch (err) {
         if (current !== generation) return;
-        paint(failure(err, '未能读取服务层级。'), true);
+        paint(failure(err, '当前服务层级未知。'), true);
+        retry.hidden = false;
       }
       root.hidden = false;
     }
@@ -75,6 +83,7 @@
       if (!host || !confirmed || saving || requested === confirmed || !tiers.has(requested)) return;
       const current = generation;
       const hadFocus = document.activeElement === select;
+      let verify = false;
       saving = true;
       paint('保存中…');
       try {
@@ -84,11 +93,17 @@
         confirmed = result.tier;
         paint('已保存');
       } catch (err) {
-        if (current === generation) paint(failure(err, '未能确认保存结果。'), true);
+        if (current === generation) {
+          if ((err?.message || err) === 'codex_tier_upgrade_required') {
+            confirmed = null;
+            paint(failure(err), true);
+            retry.hidden = false;
+          } else verify = true;
+        }
       } finally {
         saving = false;
         select.disabled = confirmed === null;
-        if (readAfterSave) { readAfterSave = false; read(); }
+        if (readAfterSave || verify) { readAfterSave = false; read(verify); }
         else if (current === generation && hadFocus && document.activeElement === document.body && document.hasFocus()) {
           select.focus();
         }

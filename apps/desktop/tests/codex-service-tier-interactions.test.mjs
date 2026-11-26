@@ -81,12 +81,36 @@ test('Codex tier shows bridge upgrade guidance and never confirms failed or mism
   assert.equal(panel(h).hidden, false); assert.match(panel(h).textContent, /请更新/);
   assert.equal(select(h).disabled, true);
   readError = ''; h.focusWindow(); await flush();
-  for (const [result, message] of [[() => { throw Error('codex_tier_upgrade_required'); }, /请更新/],
-    [() => { throw 'failed'; }, /未能确认/], [() => ({ tier: 'follow' }), /未能确认/], [() => null, /未能确认/]]) {
+  reply = () => { throw Error('codex_tier_upgrade_required'); };
+  change(h, 'priority'); await flush();
+  assert.match(panel(h).textContent, /请更新/);
+  assert.equal(select(h).disabled, true);
+  panel(h).querySelector('button').click(); await flush();
+  for (const result of [() => { throw 'failed'; }, () => ({ tier: 'follow' }), () => null]) {
     reply = result; change(h, 'priority'); await flush();
-    assert.match(panel(h).textContent, message); assert.doesNotMatch(panel(h).textContent, /已保存/);
-    assert.equal(select(h).disabled, false); assert.equal(select(h).value, 'standard');
+    assert.match(panel(h).textContent, /已重新读取/);
+    assert.doesNotMatch(panel(h).textContent, /已保存/);
+    assert.equal(select(h).value, 'standard');
   }
+});
+
+test('Lost save response reads the committed tier or lets the user retry the read', async () => {
+  let tier = 'standard', offline = false;
+  const h = harness({ quota_snapshot: () => quota(),
+    codex_service_tier_get: () => { if (offline) throw Error(); return { tier }; },
+    codex_service_tier_set: args => { tier = args.tier; throw Error(); } });
+  await flush();
+  change(h, 'priority'); await flush();
+  assert.equal(select(h).value, 'priority');
+  assert.equal(panel(h).querySelector('span').hidden, false);
+  offline = true; change(h, 'standard'); await flush();
+  assert.match(panel(h).textContent, /当前服务层级未知/);
+  assert.equal(select(h).hidden, true);
+  const retry = panel(h).querySelector('button');
+  assert.equal(retry.hidden, false);
+  offline = false; retry.click(); await flush();
+  assert.equal(select(h).value, 'standard');
+  assert.equal(sets(h).length, 2);
 });
 
 test('Codex tier discards superseded reads and waits for a pending write before reading a new card', async () => {

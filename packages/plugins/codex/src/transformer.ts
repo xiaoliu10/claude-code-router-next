@@ -238,7 +238,11 @@ export class CodexTransformer implements PluginTransformer {
     }
     const sessionId = this.sessionIdFor(request, context);
     const serviceTier = isCodexRuntime(provider) ? this.getServiceTier?.() ?? "follow" : undefined;
-    const body = codexFinalizeBody(request, { modelInstructions, sessionId, serviceTier });
+    // The Messages adapter rebuilds the body and can omit the caller's tier.
+    const originalTier = context?.req?.body?.service_tier;
+    const source = serviceTier === "follow" && request.service_tier === undefined && typeof originalTier === "string"
+      ? { ...request, service_tier: originalTier } : request;
+    const body = codexFinalizeBody(source, { modelInstructions, sessionId, serviceTier });
     // Remember the finalized session key so the response phase can attribute
     // quota observations to the same conversation without touching the body.
     if (context) context.codexSessionKey = codexSessionKey(body);
