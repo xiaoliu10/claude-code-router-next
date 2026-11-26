@@ -15,8 +15,8 @@ function app(service: any) {
   return instance;
 }
 
-describe("POST /api/codex/reset-credits/consume-confirmed", () => {
-  const url = "/api/codex/reset-credits/consume-confirmed";
+describe("POST /api/codex/reset-credits/consume-confirmed-v2", () => {
+  const url = "/api/codex/reset-credits/consume-confirmed-v2";
 
   const accountRevision = "12345678-1234-4321-8765-001122334455";
 
@@ -39,6 +39,9 @@ describe("POST /api/codex/reset-credits/consume-confirmed", () => {
       expect(res.json()).toEqual({ ok: true, success: true, outcome: "reset", windowsReset: 2 });
       expect(service.consumeConfirmedResetCredit).toHaveBeenCalledExactlyOnceWith("gift", accountRevision);
       expect(service.consumeResetCredit).not.toHaveBeenCalled();
+      const obsolete = await instance.inject({ method: "POST", url: "/api/codex/reset-credits/consume-confirmed", payload: { creditId: "gift", accountRevision }, headers: localHeaders });
+      expect(obsolete.statusCode).toBe(404);
+      expect(service.consumeConfirmedResetCredit).toHaveBeenCalledTimes(1);
 
       const legacy = await instance.inject({ method: "POST", url: "/api/codex/reset-credits/consume", payload: {}, headers: localHeaders });
       expect(legacy.statusCode).toBe(200);

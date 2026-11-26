@@ -390,7 +390,7 @@ describe("consumeConfirmedResetCredit", () => {
       return listing.accountRevision as string;
     };
     const confirm = (accountRevision: string) => app.inject({
-      method: "POST", url: `${url}/consume-confirmed`, headers, payload: { creditId: "credit-old", accountRevision },
+      method: "POST", url: `${url}/consume-confirmed-v2`, headers, payload: { creditId: "credit-old", accountRevision },
     });
     const expectStale = async (revision: string) => {
       const response = await confirm(revision);
@@ -399,6 +399,14 @@ describe("consumeConfirmedResetCredit", () => {
       expect(h.consumeCalls()).toHaveLength(0);
     };
     try {
+      const unmarked = await app.inject({ method: "POST", url: `${url}/consume-confirmed-v2`, headers, payload: { creditId: "credit-old" } });
+      expect(unmarked.statusCode).toBe(422);
+      expect(unmarked.json()).toEqual({ ok: false, success: false, error: "codex_reset_invalid" });
+      const malformed = await app.inject({ method: "POST", url: `${url}/consume-confirmed-v2`, headers, payload: { creditId: "credit-old", accountRevision: "wrong" } });
+      expect(malformed.statusCode).toBe(422);
+      expect(malformed.json()).toEqual({ ok: false, success: false, error: "codex_reset_invalid" });
+      expect(h.consumeCalls()).toHaveLength(0);
+
       const original = await read();
       await h.switchAccount();
       await expectStale(original);
@@ -419,7 +427,7 @@ describe("consumeConfirmedResetCredit", () => {
     } finally { await app.close(); }
   });
 
-  it.each(["consume", "consume-confirmed"] as const)("%s keeps the unsettled key across a transient credential read failure", async route => {
+  it.each(["consume", "consume-confirmed-v2"] as const)("%s keeps the unsettled key across a transient credential read failure", async route => {
     let attempt = 0;
     const h = await connected({ now: () => beforeExpiry, consume: () => {
       if (++attempt === 1) throw new Error("connection lost after POST");
@@ -427,7 +435,7 @@ describe("consumeConfirmedResetCredit", () => {
     } });
     const app = Fastify();
     registerCodexAdminRoutes(app, { getService: () => h.service });
-    const confirmed = route === "consume-confirmed";
+    const confirmed = route === "consume-confirmed-v2";
     const revision = (await h.service.getResetCredits())!.accountRevision;
     const payload = confirmed ? { creditId: "credit-old", accountRevision: revision } : {};
     const submit = () => app.inject({ method: "POST", url: `/api/codex/reset-credits/${route}`, headers: { host: "localhost:3456" }, payload });

@@ -15,7 +15,7 @@
  *  POST /models/restore  {model?}           (no model = restore ALL)
  *  GET  /reset-credits
  *  POST /reset-credits/consume {creditId?}
- *  POST /reset-credits/consume-confirmed {creditId, accountRevision}
+ *  POST /reset-credits/consume-confirmed-v2 {creditId, accountRevision}
  *
  * Guard shape is identical to the gemini-oauth / workbuddy plugins: the loopback
  * socket address is the only trustworthy identity, plus a Host/Origin allowlist
@@ -352,7 +352,7 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
     }
   });
 
-  app.post("/api/codex/reset-credits/consume-confirmed", async (req, reply) => {
+  app.post("/api/codex/reset-credits/consume-confirmed-v2", async (req, reply) => {
     try {
       assertLocalCodexRequest(req);
       const service = deps.getService();
@@ -367,7 +367,7 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
       const result = await service.consumeConfirmedResetCredit(creditId, accountRevision);
       return { ok: true, success: true, ...result };
     } catch (error: any) {
-      return codexRouteError(error, reply, "reset-credits/consume-confirmed", "codex_reset_failed");
+      return codexRouteError(error, reply, "reset-credits/consume-confirmed-v2", "codex_reset_failed");
     }
   });
 
