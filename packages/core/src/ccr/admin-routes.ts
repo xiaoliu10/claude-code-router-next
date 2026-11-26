@@ -19,7 +19,8 @@ import { clearProviderHealth } from "./health-reconcile";
 import { reloadProviderRuntime } from "../provider-plugins/host";
 import { describeInstalledPlugins } from "../provider-plugins/loader";
 import { registerPluginMarketRoutes } from "./plugin-install-routes";
-import { readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
+import { createHash } from "node:crypto";
+import { interpolateEnvVars, readConfigFile, readConfigFileRaw, writeConfigFile, backupConfigFile } from "./config";
 import { ensureCcrSelfProvider } from "@wengine-ai/claude-code-router-shared";
 import { join, isAbsolute, normalize, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -262,10 +263,23 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     return { "input_tokens": tokenCount }
   });
 
+  // Serialize reads and both save methods through disk persistence and reload.
+  let configQueue = Promise.resolve();
+  function withConfigLock<T>(operation: () => Promise<T>): Promise<T> {
+    const result = configQueue.then(operation);
+    configQueue = result.then(() => {}, () => {});
+    return result;
+  }
+  function configRevision(raw: unknown): string {
+    return createHash("sha256").update(JSON.stringify(raw)).digest("hex");
+  }
+
   // Return raw (un-interpolated) config so that $VAR placeholders survive UI round-trips.
   // The runtime path (readConfigFile) still interpolates env vars for actual request processing.
   _app.get("/api/config", async (req: any, reply: any) => {
-    return await readConfigFileRaw();
+    const raw = await withConfigLock(readConfigFileRaw);
+    reply.header("X-CCR-Config-Revision", configRevision(raw));
+    return raw;
   });
 
   _app.get("/api/transformers", async (req: any, reply: any) => {
@@ -280,10 +294,21 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     return { transformers: transformerList };
   });
 
-  // Add endpoint to save config.json with access control
-  _app.post("/api/config", async (req: any, reply: any) => {
-    const newConfig = req.body;
+  _app.post("/api/config", (req: any, reply: any) =>
+    withConfigLock(() => saveConfig(req.body, reply)));
 
+  // A distinct HTTP method prevents older gateways from treating a conditional
+  // write as an unconditional full-config POST.
+  _app.put("/api/config", async (req: any, reply: any) => {
+    const { revision, config } = req.body ?? {};
+    if (typeof revision !== "string" || !/^[a-f0-9]{64}$/.test(revision) ||
+        !config || typeof config !== "object" || Array.isArray(config)) {
+      return reply.code(400).send({ success: false, error: "Expected a config object and revision" });
+    }
+    return withConfigLock(() => saveConfig(config, reply, revision));
+  });
+
+  async function saveConfig(newConfig: any, reply: any, revision?: string) {
     // Validate proxy URL values before touching disk so an invalid value
     // never overwrites a good config.json or creates a misleading backup.
     const proxyErrors = findInvalidProxyUrls((newConfig || {}) as Record<string, unknown>);
@@ -297,6 +322,16 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
       };
     }
 
+    let previousConfig = null;
+    try {
+      previousConfig = await readConfigFileRaw();
+    } catch (error: any) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (revision !== undefined && (previousConfig === null || revision !== configRevision(previousConfig))) {
+      return reply.code(409).send({ success: false, error: "Config revision changed" });
+    }
+
     // Backup existing config file if it exists
     const backupPath = await backupConfigFile();
     if (backupPath) {
@@ -306,13 +341,6 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     // Preset the self-referential "ccr" provider (unless deleted/tombstoned),
     // and record the tombstone when a save drops the managed provider, so a
     // UI deletion is never resurrected by a later save or restart.
-    let previousConfig: any = null;
-    try {
-      previousConfig = await readConfigFile();
-    } catch {
-      // No readable previous config (first run / unreadable file): keep null so
-      // ensureCcrSelfProvider re-arms the self-referential provider.
-    }
     ensureCcrSelfProvider(newConfig, previousConfig);
 
     // Installed provider plugins protect their own managed entries (see
@@ -334,9 +362,9 @@ export async function registerAdminRoutes(server: any, config: any): Promise<any
     } catch (syncError: any) {
       _app.log?.warn?.(`Config saved but global project takeover sync failed: ${syncError?.message || syncError}`);
     }
-    reloadProviderRuntime(server, newConfig, _app.log);
+    reloadProviderRuntime(server, interpolateEnvVars(newConfig), _app.log);
     return { success: true, message: "Config saved successfully", projectTakeoverSync };
-  });
+  }
 
   // ========== Client Integrations API ==========
 

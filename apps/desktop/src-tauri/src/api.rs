@@ -29,6 +29,11 @@ pub struct AdminClient {
     writes: Arc<Mutex<()>>,
 }
 
+pub(crate) enum ConditionalSaveError {
+    Stale,
+    Unconfirmed,
+}
+
 impl AdminClient {
     pub fn new(settings: ConnectionSettings) -> Result<Self, String> {
         // Revalidate public settings so hand-built values cannot send credentials off-host.
@@ -86,6 +91,24 @@ impl AdminClient {
         timeout: Duration,
     ) -> Result<reqwest::Response, String> {
         let operation = format!("{method} {path}");
+        let response = self.send(method, path, body, timeout).await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "{operation} returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, String> {
+        let operation = format!("{method} {path}");
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base_url));
@@ -95,18 +118,11 @@ impl AdminClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request
+        request
             .timeout(timeout)
             .send()
             .await
-            .map_err(|_| format!("{operation} failed"))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "{operation} returned HTTP {}",
-                response.status().as_u16()
-            ));
-        }
-        Ok(response)
+            .map_err(|_| format!("{operation} failed"))
     }
 
     pub(crate) async fn get_json(&self, path: &str) -> Result<Value, String> {
@@ -118,11 +134,63 @@ impl AdminClient {
     }
 
     pub(crate) async fn config(&self) -> Result<Value, String> {
-        let config = self.get_json("/api/config").await?;
+        self.config_with_revision().await.map(|(raw, _)| raw)
+    }
+
+    pub(crate) async fn config_with_revision(&self) -> Result<(Value, Option<String>), String> {
+        let response = self.request(Method::GET, "/api/config", None).await?;
+        let revision = response
+            .headers()
+            .get("X-CCR-Config-Revision")
+            .and_then(|header| header.to_str().ok())
+            .filter(|revision| {
+                revision.len() == 64
+                    && revision
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .map(str::to_owned);
+        let config = response
+            .json::<Value>()
+            .await
+            .map_err(|_| "GET /api/config returned invalid JSON".to_string())?;
         if !config.is_object() {
             return Err("GET /api/config returned invalid configuration".into());
         }
-        Ok(config)
+        Ok((config, revision))
+    }
+
+    pub(crate) async fn put_config_and_readback(
+        &self,
+        config: &Value,
+        revision: &str,
+    ) -> Result<Value, ConditionalSaveError> {
+        let body = json!({ "config": config, "revision": revision });
+        let response = self
+            .send(
+                Method::PUT,
+                "/api/config",
+                Some(&body),
+                Duration::from_secs(20),
+            )
+            .await
+            .map_err(|_| ConditionalSaveError::Unconfirmed)?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(ConditionalSaveError::Stale);
+        }
+        if !response.status().is_success()
+            || response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v["success"].as_bool())
+                != Some(true)
+        {
+            return Err(ConditionalSaveError::Unconfirmed);
+        }
+        self.config()
+            .await
+            .map_err(|_| ConditionalSaveError::Unconfirmed)
     }
 
     /// Only fixed read-only adapter routes call this helper. Never return response bodies as errors.
@@ -436,6 +504,16 @@ pub(crate) mod mock {
 
     impl Mock {
         pub(crate) fn new(replies: Vec<(u16, String)>) -> Self {
+            Self::with_config_revision(replies, None)
+        }
+
+        pub(crate) fn with_config_revision(
+            replies: Vec<(u16, String)>,
+            revision: Option<&str>,
+        ) -> Self {
+            let revision_header = revision.map_or(String::new(), |revision| {
+                format!("X-CCR-Config-Revision: {revision}\r\n")
+            });
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -512,7 +590,7 @@ pub(crate) mod mock {
                     } else {
                         String::new()
                     };
-                    write!(socket, "HTTP/1.1 {status} Mock\r\n{redirect}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    write!(socket, "HTTP/1.1 {status} Mock\r\n{redirect}{revision_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 }
             });
             Self {

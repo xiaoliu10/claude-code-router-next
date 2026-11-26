@@ -294,7 +294,8 @@ impl GeneralService {
         }
         let client = self.client()?;
         let _write = client.write_guard().await;
-        let mut config = client.config().await?;
+        let (mut config, gateway_revision) = client.config_with_revision().await?;
+        // Bind the server precondition to the raw document the user edited.
         if revision != revision_of(&config) {
             return Err(STALE.into());
         }
@@ -306,10 +307,16 @@ impl GeneralService {
                 apply(&mut config, key, value)?;
             }
         }
+        let gateway_revision = gateway_revision.ok_or(
+            "Gateway does not support conditional settings saves; update the gateway and refresh",
+        )?;
         let verified = client
-            .post_config_and_readback(&config)
+            .put_config_and_readback(&config, &gateway_revision)
             .await
-            .map_err(|_| UNCONFIRMED)?;
+            .map_err(|error| match error {
+                crate::api::ConditionalSaveError::Stale => STALE,
+                crate::api::ConditionalSaveError::Unconfirmed => UNCONFIRMED,
+            })?;
         if !changes.iter().all(|(k, v)| confirmed(&verified, k, v)) {
             return Err(UNCONFIRMED.into());
         }
@@ -386,6 +393,54 @@ mod tests {
         assert!(!empty.api_key_configured && !empty.proxy_configured);
     }
 
+    const GATEWAY_REVISION: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn conditional_mock(replies: Vec<(u16, String)>) -> Mock {
+        Mock::with_config_revision(replies, Some(GATEWAY_REVISION))
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_gateway_revision_blocks_writes() {
+        let raw = json!({"LOG":false});
+        for revision in [None, Some("malformed")] {
+            let mock = Mock::with_config_revision(vec![response(raw.clone())], revision);
+            let error = GeneralService::new(Some(mock.client()))
+                .save(&revision_of(&raw), &json!({"LOG":true}))
+                .await
+                .unwrap_err();
+            assert!(error.contains("update the gateway"));
+            assert_eq!(mock.finish().await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_web_edit_before_save_invalidates_the_draft() {
+        let original = json!({"LOG":false, "Router":{"default":"old,model"}});
+        let updated = json!({"LOG":false, "Router":{"default":"web,model"}});
+        let mock = conditional_mock(vec![response(updated)]);
+        let error = GeneralService::new(Some(mock.client()))
+            .save(&revision_of(&original), &json!({"LOG":true}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, STALE);
+        assert_eq!(mock.finish().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_conflict_reports_stale_without_retry() {
+        let raw = json!({"LOG":false});
+        let mock = conditional_mock(vec![response(raw.clone()), (409, "private".into())]);
+        let error = GeneralService::new(Some(mock.client()))
+            .save(&revision_of(&raw), &json!({"LOG":true}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, STALE);
+        let requests = mock.finish().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("PUT /api/config "));
+    }
+
     #[tokio::test]
     async fn fresh_save_merges_only_submitted_leaves_and_verifies_on_same_connection() {
         let original = json!({
@@ -406,7 +461,7 @@ mod tests {
         expected["PORT"] = json!(3456);
         let mut readback = expected.clone();
         readback["Providers"][0]["normalized"] = json!(true);
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success":true})),
             response(readback.clone()),
@@ -424,14 +479,17 @@ mod tests {
             .contains("new-test-key"));
         let requests = mock.finish().await;
         assert_eq!(requests.len(), 3);
-        for (request, method) in requests.iter().zip(["GET", "POST", "GET"]) {
+        for (request, method) in requests.iter().zip(["GET", "PUT", "GET"]) {
             assert!(request.starts_with(&format!("{method} /api/config ")));
             assert!(request
                 .to_lowercase()
                 .contains("x-api-key: test-admin-key\r\n"));
         }
         let body = requests[1].split_once("\r\n\r\n").unwrap().1;
-        assert_eq!(serde_json::from_str::<Value>(body).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({"config":expected, "revision":GATEWAY_REVISION})
+        );
     }
 
     #[tokio::test]
@@ -501,7 +559,7 @@ mod tests {
         }
         let mut readback = expected.clone();
         readback["APIKEY"] = json!("");
-        let mock = Mock::new(vec![
+        let mock = conditional_mock(vec![
             response(original.clone()),
             response(json!({"success":true})),
             response(readback),
@@ -518,7 +576,10 @@ mod tests {
         assert!(!result.api_key_configured && result.proxy_configured);
         let requests = mock.finish().await;
         let body = requests[1].split_once("\r\n\r\n").unwrap().1;
-        assert_eq!(serde_json::from_str::<Value>(body).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({"config":expected, "revision":GATEWAY_REVISION})
+        );
     }
 
     #[tokio::test]
@@ -587,7 +648,7 @@ mod tests {
             ],
         ] {
             let len = replies.len();
-            let mock = Mock::new(replies);
+            let mock = conditional_mock(replies);
             assert_eq!(
                 GeneralService::new(Some(mock.client()))
                     .save(&revision_of(&raw), &json!({"APIKEY":"new-key"}))
