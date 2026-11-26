@@ -104,6 +104,7 @@ export function SettingsDialog({
 
   const handleStatusLineEnabledChange = (checked: boolean) => {
     const newStatusLineConfig: StatusLineConfig = {
+      ...config.StatusLine,
       enabled: checked,
       currentStyle: config.StatusLine?.currentStyle || "default",
       default: config.StatusLine?.default || { modules: [] },

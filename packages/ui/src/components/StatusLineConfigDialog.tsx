@@ -16,7 +16,6 @@ import { ColorPicker } from "@/components/ui/color-picker";
 import { Badge } from "@/components/ui/badge";
 import { Toast } from "@/components/ui/toast";
 import { useConfig } from "./ConfigProvider";
-import { api } from "@/lib/api";
 import {
   validateStatusLineConfig,
   formatValidationError,
@@ -451,29 +450,22 @@ export function StatusLineConfigDialog({
   onOpenChange,
 }: StatusLineConfigDialogProps) {
   const { t } = useTranslation();
-  const { config, setConfig } = useConfig();
+  const { config, saveDraft, revision } = useConfig();
 
+  const [editorRevision, setEditorRevision] = useState<string | null | undefined>(undefined);
   const [statusLineConfig, setStatusLineConfig] = useState<StatusLineConfig>(
     config?.StatusLine ? migrateStatusLineConfig(config.StatusLine) : createDefaultStatusLineConfig()
   );
 
-  // Sync local state when config changes (e.g. after server reload)
   useEffect(() => {
-    if (config?.StatusLine) {
-      setStatusLineConfig(migrateStatusLineConfig(config.StatusLine));
-      setFontFamily(config.StatusLine.fontFamily || "Hack Nerd Font Mono");
-    }
-  }, [config?.StatusLine]);
-
-  // Reset local state when dialog opens to reflect latest saved config
-  useEffect(() => {
-    if (isOpen && config?.StatusLine) {
-      setStatusLineConfig(migrateStatusLineConfig(config.StatusLine));
-      setFontFamily(config.StatusLine.fontFamily || "Hack Nerd Font Mono");
-      setSelectedModuleIndex(null);
-      setValidationErrors([]);
-    }
-  }, [isOpen]);
+    if (!isOpen) { setEditorRevision(undefined); return; }
+    if (!config || editorRevision !== undefined) return;
+    setEditorRevision(revision);
+    setStatusLineConfig(config.StatusLine ? migrateStatusLineConfig(config.StatusLine) : createDefaultStatusLineConfig());
+    setFontFamily(config.StatusLine?.fontFamily || "Hack Nerd Font Mono");
+    setSelectedModuleIndex(null);
+    setValidationErrors([]);
+  }, [isOpen, config, revision, editorRevision]);
 
   // 字体状态
   const [fontFamily, setFontFamily] = useState<string>(
@@ -673,12 +665,9 @@ export function StatusLineConfigDialog({
         },
       };
 
-      // Update local state first
-      setConfig(newConfig);
-
       // Persist to server
       try {
-        const response = await api.updateConfig(newConfig);
+        const response = await saveDraft(newConfig, editorRevision ?? null);
         if (response.success) {
           setToast({ message: t('app.config_saved_success'), type: 'success' });
           onOpenChange(false);

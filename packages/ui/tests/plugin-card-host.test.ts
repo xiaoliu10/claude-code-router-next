@@ -423,8 +423,8 @@ test("ordinary config saves preserve desktop-managed quota credentials; raw JSON
     return Response.json({ success: true });
   }) as typeof fetch;
   try {
-    await client.updateConfig({} as never);
-    await client.updateConfig({} as never, "raw");
+    await client.updateConfig({} as never, "a".repeat(64));
+    await client.updateConfig({} as never, "a".repeat(64), "raw");
     assert.deepEqual(modes, ["1", null]);
   } finally { globalThis.fetch = original; }
 });
@@ -437,9 +437,9 @@ test("provider management lease excludes full-config writes in both directions",
   try {
     const release = client.acquireProviderManagement(); assert.ok(release);
     assert.equal(client.acquireProviderManagement(), null);
-    assert.deepEqual(await client.updateConfig({} as never), { success: false });
+    assert.deepEqual(await client.updateConfig({} as never, "a".repeat(64)), { success: false });
     release();
-    const pending = client.updateConfig({} as never);
+    const pending = client.updateConfig({} as never, "a".repeat(64));
     assert.equal(client.acquireProviderManagement(), null);
     finish(new Response('{"success":true}')); await pending;
     const next = client.acquireProviderManagement(); assert.ok(next); next();

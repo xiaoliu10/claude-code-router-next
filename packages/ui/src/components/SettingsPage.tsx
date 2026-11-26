@@ -51,7 +51,7 @@ export function SettingsPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
-  const { config, setConfig } = useConfig();
+  const { config, saveDraft, setConfig, error } = useConfig();
   const [isStatusLineConfigOpen, setIsStatusLineConfigOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -175,10 +175,13 @@ export function SettingsPage() {
     loadClients();
   }, [loadClients]);
 
+  const [proxyValidationErrors, setProxyValidationErrors] = useState<Array<{ key: string; error: string }>>([]);
+  const [pendingSaveAction, setPendingSaveAction] = useState<"save" | "saveAndRestart" | null>(null);
+
   if (!config) {
     return (
       <div className="h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-gray-500">Loading...</div>
+        <div className="text-gray-500">{error?.message ?? "Loading..."}</div>
       </div>
     );
   }
@@ -277,6 +280,7 @@ export function SettingsPage() {
 
   const handleStatusLineEnabledChange = (checked: boolean) => {
     const newStatusLineConfig: StatusLineConfig = {
+      ...config.StatusLine,
       enabled: checked,
       currentStyle: config.StatusLine?.currentStyle || "default",
       default: config.StatusLine?.default || { modules: [] },
@@ -334,7 +338,7 @@ export function SettingsPage() {
   };
 
 
-  const checkForUpdates = useCallback(async () => {
+  const checkForUpdates = async () => {
     setIsCheckingUpdate(true);
     try {
       const updateInfo = await api.checkForUpdates();
@@ -349,10 +353,7 @@ export function SettingsPage() {
     } finally {
       setIsCheckingUpdate(false);
     }
-  }, [t]);
-
-  const [proxyValidationErrors, setProxyValidationErrors] = useState<Array<{ key: string; error: string }>>([]);
-  const [pendingSaveAction, setPendingSaveAction] = useState<"save" | "saveAndRestart" | null>(null);
+  };
 
   // Pre-flight check: returns the list of invalid proxy URL entries in the
   // current config. When non-empty, a confirmation dialog is shown before the
@@ -393,7 +394,7 @@ export function SettingsPage() {
     if (managedProviderBusy) return;
     setIsSaving(true);
     try {
-      const response = await api.updateConfig(config);
+      const response = await saveDraft(config);
       if (response.success) {
         setToast({ message: response.message || t('app.config_saved_success'), type: 'success' });
       } else {
@@ -410,7 +411,7 @@ export function SettingsPage() {
     if (managedProviderBusy) return;
     setIsRestarting(true);
     try {
-      const response = await api.updateConfig(config);
+      const response = await saveDraft(config);
       if (!response.success) {
         setToast({ message: response.message || t('app.config_saved_failed'), type: 'error' });
         return;
@@ -420,7 +421,7 @@ export function SettingsPage() {
         setToast({ message: t('app.config_saved_restart_success'), type: 'success' });
       }
     } catch (error) {
-      setToast({ message: t('app.config_saved_restart_failed'), type: 'error' });
+      setToast({ message: t('app.config_saved_restart_failed') + ': ' + (error as Error).message, type: 'error' });
     } finally {
       setIsRestarting(false);
     }

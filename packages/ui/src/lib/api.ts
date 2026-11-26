@@ -2,6 +2,11 @@ import type { ClientApplyResponse, ClientId, ClientStatus, Config, ManualProbeRe
 import type { GeminiOauthDisconnectResponse, GeminiOauthLoginPollResponse, GeminiOauthLoginStartResponse, GeminiOauthStatusResponse, GeminiOauthSyncResponse, PluginInfo } from '@/types';
 import { isSameOriginCardUrl, sanitizePluginErrorCode } from '../utils/plugin-card.ts';
 
+export interface ConfigSnapshot {
+  config: Config;
+  revision: string | null;
+}
+
 // API Client Class for handling requests with baseUrl and apikey authentication
 class ApiClient {
   private baseUrl: string;
@@ -70,7 +75,7 @@ class ApiClient {
   // Generic fetch wrapper with base URL and authentication.
   // An optional `timeoutMs` on `options` aborts the request after that many
   // milliseconds so a hung server can't leave the caller pending forever.
-  private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number; plugin?: string } = {}): Promise<T> {
+  private async apiFetch<T>(endpoint: string, options: RequestInit & { timeoutMs?: number; plugin?: string } = {}, onResponse?: (response: Response) => void): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
     const pluginName = (options as any).plugin as string | undefined;
     const isPluginApi = typeof pluginName === 'string' && pluginName.length > 0;
@@ -129,9 +134,10 @@ class ApiClient {
         } catch {
           // If parsing fails, use default error message
         }
-        throw new Error(errorMessage);
+        throw Object.assign(new Error(errorMessage), { status: response.status });
       }
 
+      onResponse?.(response);
       if (response.status === 204) {
         return {} as T;
       }
@@ -268,13 +274,24 @@ class ApiClient {
     return this.get<Config>('/config');
   }
 
+  async getConfigSnapshot(): Promise<ConfigSnapshot> {
+    let revision: string | null = null;
+    const config = await this.apiFetch<Config>('/config', { method: 'GET' }, response => {
+      revision = response.headers.get('X-CCR-Config-Revision');
+    });
+    return { config, revision };
+  }
+
   // Update entire configuration
-  async updateConfig(config: Config, mode: "form" | "raw" = "form"): Promise<{ success: boolean; message?: string }> {
+  async updateConfig(config: Config, revision: string | null, mode: "form" | "raw" = "form"): Promise<{ success: boolean; message?: string }> {
     if (this.managedProviderBusy) return { success: false };
+    if (!revision || !/^[a-f0-9]{64}$/.test(revision)) {
+      throw new Error('Missing configuration revision');
+    }
     this.configWrites += 1;
     try {
       return await this.apiFetch<{ success: boolean; message?: string }>('/config', {
-        method: 'POST', body: JSON.stringify(config),
+        method: 'PUT', body: JSON.stringify({ revision, config }),
         headers: mode === 'form' ? { 'X-CCR-Preserve-Quota-Credentials': '1' } : {},
       });
     } finally {

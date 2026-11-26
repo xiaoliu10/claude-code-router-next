@@ -26,7 +26,7 @@ import "@/styles/animations.css";
 function App() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { config, error } = useConfig();
+  const { config, saveDraft, error } = useConfig();
   const [isJsonEditorOpen, setIsJsonEditorOpen] = useState(false);
   const [isLogViewerOpen, setIsLogViewerOpen] = useState(false);
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
@@ -46,7 +46,7 @@ function App() {
       return;
     }
     try {
-      const response = await api.updateConfig(config);
+      const response = await saveDraft(config);
       if (response.success) {
         setToast({ message: response.message || t('app.config_saved_success'), type: 'success' });
       } else {
@@ -64,7 +64,7 @@ function App() {
       return;
     }
     try {
-      const response = await api.updateConfig(config);
+      const response = await saveDraft(config);
       if (!response.success) {
         setToast({ message: response.message || t('app.config_saved_failed'), type: 'error' });
         return;
