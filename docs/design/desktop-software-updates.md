@@ -4,7 +4,7 @@ The Windows x64 `v2.3.2437` release ships `CCR-Desktop-0.1.1-Windows-x64-setup.e
 
 ## Settings interaction
 
-Place a software update section in Settings that works even when the gateway is offline. Show the installed desktop version, keep the manual check button visible throughout a check, and persist the automatic check switch. Check every six hours by default. An available version has release notes and an explicit installation action. Show transferred bytes while the content length is unknown, then a percentage if a total is available. Confirm the installation before interrupting a desktop-owned gateway.
+Place a software update section in Settings that works even when the gateway is offline. Show the installed desktop version, keep the manual check button visible throughout a check, and persist the automatic check switch. Check every six hours by default. When a newer desktop version is available, show a notice on the active main-window tab with the version and an “Update now” action. Put the brief gateway interruption notice beside the action. A single click starts download, signature verification and installation. Keep release notes available in Settings. Show transferred bytes while the content length is unknown, then a percentage if a total is available.
 
 Magpie's upstream interaction tests cover these details in `internal/gui/tests/update-check.test.cjs`, `update-auto.test.cjs`, `update-download-percent.test.cjs` and `update-restart.test.cjs` ([upstream tests](https://github.com/yetone/magpie/tree/main/internal/gui/tests)). The main CCR control center and tray popup load the same frontend. Only the main window should initiate update checks or offer installation.
 
