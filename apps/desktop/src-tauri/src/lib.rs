@@ -31,6 +31,7 @@ pub fn run() {
             popup::quota_quit,
             control::routing_snapshot,
             control::routing_save,
+            control::routing_save_groups,
             control::routing_flags,
             control::usage_snapshot,
             control::usage_records,

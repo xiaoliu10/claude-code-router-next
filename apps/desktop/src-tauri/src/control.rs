@@ -219,15 +219,45 @@ impl ControlService {
         &self,
         change: RoutingChange,
     ) -> Result<RoutingSnapshot, String> {
+        self.save_routing_changes(&[change]).await
+    }
+
+    async fn routing_save_groups(
+        &self,
+        changes: Vec<RoutingChange>,
+    ) -> Result<RoutingSnapshot, String> {
+        let mut seen = HashSet::new();
+        if changes.is_empty()
+            || changes.len() > FAMILIES.len() * (SCENARIOS.len() - 1)
+            || changes.iter().any(|change| {
+                let field = change.field.trim();
+                !FAMILIES.contains(&change.scope.as_str())
+                    || field == "background"
+                    || !SCENARIOS.contains(&field)
+                    || !seen.insert((change.scope.as_str(), field))
+            })
+        {
+            return Err("Invalid model group changes".into());
+        }
+        self.save_routing_changes(&changes).await
+    }
+
+    async fn save_routing_changes(
+        &self,
+        changes: &[RoutingChange],
+    ) -> Result<RoutingSnapshot, String> {
         let client = self.client()?;
         let _write = client.write_guard().await;
-        // Always mutate the freshest config; the UI draft's revision must match
-        // it or the whole write is rejected before touching the gateway.
         let mut config = client.config().await?;
-        if change.revision != revision_of(&config) {
+        let revision = revision_of(&config);
+        if changes.iter().any(|change| change.revision != revision) {
             return Err(ERR_STALE.into());
         }
-        let expected = apply_change(&mut config, &change)?;
+        // Validate and apply every edit to the local copy before posting once.
+        let mut expected = Vec::new();
+        for change in changes {
+            expected.extend(apply_change(&mut config, change)?);
+        }
         let verified = client.post_config_and_readback(&config).await?;
         if !expected.iter().all(|check| check.matches(&verified)) {
             return Err(ERR_SAVE_NOT_CONFIRMED.into());
@@ -278,6 +308,20 @@ impl ControlService {
         };
         let summary = self.client()?.get_json(&path).await?;
         usage_snapshot_from(&summary, period)
+    }
+
+    async fn usage_trend_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
+        let (start, end) = usage_trend_window(period, OffsetDateTime::now_utc())?;
+        let path = format!(
+            "/api/usage/summary?startDate={}&endDate={}",
+            encode_query(&start),
+            encode_query(&end)
+        );
+        let summary = self.client()?.get_json(&path).await?;
+        let mut snapshot = usage_snapshot_from(&summary, period)?;
+        // Anchor chart labels to the instant queried, even across local midnight.
+        snapshot.updated_at = end;
+        Ok(snapshot)
     }
 
     pub(crate) async fn usage_records(
@@ -393,6 +437,16 @@ pub async fn routing_save(
 }
 
 #[tauri::command]
+pub async fn routing_save_groups(
+    window: WebviewWindow,
+    service: tauri::State<'_, ControlService>,
+    changes: Vec<RoutingChange>,
+) -> Result<RoutingSnapshot, String> {
+    crate::popup::guard(&window)?;
+    service.routing_save_groups(changes).await
+}
+
+#[tauri::command]
 pub async fn routing_flags(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
@@ -411,9 +465,14 @@ pub async fn usage_snapshot(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
     period: String,
+    trend: Option<bool>,
 ) -> Result<UsageSnapshot, String> {
     crate::popup::guard(&window)?;
-    service.usage_snapshot(&period).await
+    if trend.unwrap_or(false) {
+        service.usage_trend_snapshot(&period).await
+    } else {
+        service.usage_snapshot(&period).await
+    }
 }
 
 #[tauri::command]
@@ -814,6 +873,17 @@ fn rfc3339(moment: OffsetDateTime) -> String {
     moment
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+// A fall-back transition can make N local calendar dates span more than N
+// 24-hour days. Fetch one day of headroom; the chart selects exact local keys.
+fn usage_trend_window(period: &str, now: OffsetDateTime) -> Result<(String, String), String> {
+    let days = match period {
+        "7d" => 7,
+        "30d" => 30,
+        _ => return Err(ERR_PERIOD.into()),
+    };
+    Ok((rfc3339(now - time::Duration::days(days + 1)), rfc3339(now)))
 }
 
 /// (startDate, endDate) for the panel periods: today starts at local midnight
@@ -1249,6 +1319,94 @@ mod tests {
             serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
         // Unrelated raw fields (placeholders, unknown keys) preserved verbatim.
         assert_eq!(posted, expected);
+    }
+
+    fn group_change(revision: &str, scope: &str, field: &str, target: &str) -> RoutingChange {
+        RoutingChange {
+            revision: revision.into(),
+            scope: scope.into(),
+            field: field.into(),
+            target: Some(target.into()),
+            fallback: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn group_save_posts_once_and_verifies_all_changes() {
+        let original = config();
+        let revision = revision_of(&original);
+        let mut expected = original.clone();
+        expected["Router"]["families"]["opus"]["think"] = json!("alpha,one");
+        expected["Router"]["families"]["opus"]["fallback"]["think"] = json!(["alpha,two"]);
+        expected["Router"]["families"]["sonnet"] = json!({"default": "alpha,two"});
+        let mut opus = group_change(&revision, "opus", "think", "alpha,one");
+        opus.fallback = Some(vec!["alpha,two".into()]);
+        let changes = vec![
+            opus,
+            group_change(&revision, "sonnet", "default", "alpha,two"),
+        ];
+        for readback in [expected.clone(), original.clone()] {
+            let confirmed = readback == expected;
+            let mock = Mock::new(vec![
+                response(original.clone()),
+                response(json!({"success": true})),
+                response(readback),
+            ]);
+            let service = ControlService::new(Some(mock.client()));
+            let result = service.routing_save_groups(changes.clone()).await;
+            if confirmed {
+                assert_eq!(result.unwrap().revision, revision_of(&expected));
+            } else {
+                assert_eq!(result.unwrap_err(), ERR_SAVE_NOT_CONFIRMED);
+            }
+            let requests = mock.finish().await;
+            assert_eq!(requests.len(), 3);
+            assert!(requests[1].starts_with("POST /api/config "));
+            let posted: Value =
+                serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(posted, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn group_save_rejects_invalid_or_stale_batch_without_posting() {
+        let original = config();
+        let revision = revision_of(&original);
+        let valid = group_change(&revision, "opus", "default", "alpha,two");
+        for (other, expected) in [
+            (
+                group_change(&revision, "sonnet", "think", "alpha,missing"),
+                ERR_TARGET_UNAVAILABLE,
+            ),
+            (
+                group_change("stale", "sonnet", "think", "alpha,one"),
+                ERR_STALE,
+            ),
+        ] {
+            let mock = Mock::new(vec![response(original.clone())]);
+            let service = ControlService::new(Some(mock.client()));
+            assert_eq!(
+                service
+                    .routing_save_groups(vec![valid.clone(), other])
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(mock.finish().await.len(), 1);
+        }
+        for other in [
+            valid.clone(),
+            group_change(&revision, "opus", "background", "alpha,two"),
+            group_change(&revision, "global", "default", "alpha,two"),
+        ] {
+            let mock = Mock::new(vec![]);
+            let service = ControlService::new(Some(mock.client()));
+            assert!(service
+                .routing_save_groups(vec![valid.clone(), other])
+                .await
+                .is_err());
+            assert!(mock.finish().await.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1774,6 +1932,23 @@ mod tests {
             .unwrap_err();
         assert!(!error.contains("LEAK_SECRET"));
         assert_eq!(mock.finish().await.len(), 1);
+    }
+
+    #[test]
+    fn trend_window_covers_the_full_first_date_across_fall_back() {
+        // 23:30 PST on Nov 2; the oldest midnights were still PDT (UTC-7).
+        let now = OffsetDateTime::parse("2026-11-03T07:30:00Z", &Rfc3339).unwrap();
+        for (period, days, midnight) in [
+            ("7d", 7, "2026-10-27T07:00:00Z"),
+            ("30d", 30, "2026-10-04T07:00:00Z"),
+        ] {
+            let first = OffsetDateTime::parse(midnight, &Rfc3339).unwrap();
+            assert!(now - time::Duration::days(days) > first);
+            let (start, end) = usage_trend_window(period, now).unwrap();
+            assert!(OffsetDateTime::parse(&start, &Rfc3339).unwrap() <= first);
+            assert_eq!(OffsetDateTime::parse(&end, &Rfc3339).unwrap(), now);
+        }
+        assert_eq!(usage_trend_window("today", now).unwrap_err(), ERR_PERIOD);
     }
 
     #[test]

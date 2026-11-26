@@ -68,6 +68,8 @@ class Element {
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
 }
+// Local midnight near a US DST transition catches UTC-key and 24-hour-step bugs.
+const trendNow = new Date(2026, 10, 2, 0, 5).getTime();
 export function harness(overrides = {}) {
   const doc = { readyState: 'loading', activeElement: null, events: {},
     addEventListener(type, fn) { this.events[type] = fn; },
@@ -159,6 +161,45 @@ test('interaction: background is editable only in global routing, including with
     assert.ok(titles.includes('默认'));
     assert.equal(titles.includes('后台'), scope === 'global');
   }
+});
+
+test('interaction: one save button commits edits across model groups only', async () => {
+  const h = harness({ routing_save_groups: ({ changes }) => {
+    for (const change of changes) h.route.routes.push(change);
+    h.route.revision = '2';
+    return structuredClone(h.route);
+  } });
+  await flush(); h.id('tab-routing').click(); await flush();
+  const body = h.id('routing-body');
+  const save = h.id('routing-save-groups');
+  const selectScope = scope => h.id('routing-scopes').querySelectorAll('[data-scope]')
+    .find(button => button.dataset.scope === scope).click();
+  const edit = (key, value) => {
+    const input = body.querySelectorAll('.route').find(row => row.dataset.key === key).querySelector('.route-input');
+    input.value = value;
+    input.fire('input');
+  };
+  assert.equal(save.hidden, true);
+  edit('global|default', 'alpha,two');
+  selectScope('opus');
+  assert.equal(save.disabled, true);
+  assert.equal(body.querySelectorAll('.route-save').length, 0);
+  edit('opus|default', 'alpha,one');
+  edit('opus|think', 'alpha,two');
+  selectScope('sonnet');
+  edit('sonnet|default', 'alpha,two');
+  assert.equal(save.textContent, '保存模型组（3 项）');
+  save.click(); await flush();
+  const writes = h.calls.filter(call => call.cmd.startsWith('routing_save'));
+  assert.deepEqual(writes.map(call => call.cmd), ['routing_save_groups']);
+  assert.deepEqual(Array.from(writes[0].args.changes, x => [x.scope, x.field, x.revision]), [
+    ['opus', 'default', '1'], ['opus', 'think', '1'], ['sonnet', 'default', '1'],
+  ]);
+  assert.equal(save.disabled, true);
+  assert.match(h.id('routing-msg').textContent, /已保存 3 项/);
+  selectScope('global');
+  assert.equal(body.querySelector('.route-input').value, 'alpha,two');
+  assert.equal(body.querySelector('.route-save').disabled, false);
 });
 
 test('interaction: fallback add fires once, keyboard add, move/remove and explicit save', async () => {
@@ -269,7 +310,7 @@ test('interaction: restore is local confirmation then single individual IPC; usa
   assert.match(h.id('usage-body').textContent, /<img src=x>/);
   assert.equal(h.id('usage-body').querySelectorAll('img').length, 0);
   h.id('usage-periods').children[0].click(); await flush();
-  assert.equal(h.calls.filter(c => c.cmd === 'usage_snapshot').at(-1).args.period, 'today');
+  assert.deepEqual(h.calls.filter(c => c.cmd === 'usage_snapshot').slice(-2).map(c => c.args.period), ['today', '7d']);
 });
 
 const recordFixture = (i, extra = {}) => ({
@@ -303,12 +344,13 @@ const plain = (v) => JSON.parse(JSON.stringify(v));
 async function openUsage(h) { await flush(); h.id('tab-usage').click(); await flush(); }
 
 test('interaction: opening usage loads the seven-day chart and matching records by default', async () => {
-  const h = harness({ usage_snapshot: ({ period }) => ({ period, byDay: Array.from({ length: 7 }, (_, i) => ({
+  const h = harness({ usage_snapshot: ({ period }) => ({ period, updatedAt: new Date(2026, 10, 17).toISOString(), byDay: Array.from({ length: 7 }, (_, i) => ({
     name: `2026-11-${11 + i}`, inputTokens: 100 + i, outputTokens: 10,
   })).concat(period === 'all' ? [{ name: '2026-09-01', inputTokens: 1000, outputTokens: 250 }] : []) }) });
   await openUsage(h);
   assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_snapshot' || c.cmd === 'usage_records')), [
     { cmd: 'usage_snapshot', args: { period: '7d' } },
+    { cmd: 'usage_snapshot', args: { period: '7d', trend: true } },
     { cmd: 'usage_records', args: { period: '7d', page: 1, pageSize: 20 } },
   ]);
   const selected = h.id('usage-periods').children.filter(button => button.getAttribute('aria-pressed') === 'true');
@@ -450,7 +492,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
       { name: '2026-11-16', requests: 1, inputTokens: 900, outputTokens: 400, cacheReadTokens: 0, cacheWriteTokens: 0 },
       { name: '2026-11-17', requests: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
       { name: '2026-11-19', requests: 1, inputTokens: 100, outputTokens: null, cacheReadTokens: 0, cacheWriteTokens: 0 },
-    ], updatedAt: 1 }) });
+    ], updatedAt: new Date(2026, 10, 22).toISOString() }) });
   await openUsage(h);
   const body = h.id('usage-body');
   const numCell = label => body.querySelectorAll('.usage-cell').find(n => n.textContent.includes(label)).querySelector('.usage-num');
@@ -459,11 +501,11 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(numCell('生成速度').textContent, '33.4 t/s');
   // Cards order: summary → charts → detail tables → records.
   const titles = body.querySelectorAll('.usage-card').map(c => c.querySelector('.usage-title').textContent);
-  assert.deepEqual(titles.slice(0, 6), ['汇总 · 近 7 天', '每日用量（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
+  assert.deepEqual(titles.slice(0, 6), ['汇总 · 近 7 天', '每日用量 · 近 7 天（有效输入 + 输出）', '模型 Top 10（按有效总量）', '按模型', '按提供方', '按日期']);
   // Daily chart: ascending dates, visible labels, and no fabricated zero bar.
   const dayCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
   const bars = dayCard.querySelectorAll('.usage-bar');
-  assert.equal(bars.length, 4);
+  assert.equal(bars.length, 7);
   assert.ok(bars[0].title.startsWith('2026-11-16'), 'bars ordered by date ascending');
   assert.equal(bars[0].style.height, '100%');
   assert.equal(bars[0].title.includes('输入 900（900）'), true);
@@ -473,8 +515,8 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(bars[2].title.startsWith('2026-11-18'), true);
   assert.equal(bars[2].style.height, '12%', 'smaller days scale relative to the max');
   assert.equal(bars[3].style.height, '0%', 'unknown totals have no filled bar');
-  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19']);
-  assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), ['1.3K', '0', '150', '—']);
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19', '2026-11-20', '2026-11-21', '2026-11-22']);
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), ['1.3K', '0', '150', '—', '0', '0', '0']);
   // Model chart: ranked by effective (cache-aware) input+output desc, capped at 10, exact values in title.
   const modelCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('模型 Top 10'));
   const rows = modelCard.querySelectorAll('.usage-hbar-row');
@@ -490,23 +532,70 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.ok(recordsCard(body).querySelector('.records-scroll'));
 });
 
-test('interaction: a single day shows one date and a readable total without a chart', async () => {
-  for (const input of [1200, 0, null]) {
-    const h = harness({ usage_snapshot: ({ period }) => ({ period, byDay: [
-      { name: '2026-11-18', inputTokens: input, outputTokens: input === 0 ? 0 : 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
-    ] }) });
-    await openUsage(h);
-    h.id('usage-periods').children[0].click(); await flush();
-    const card = h.id('usage-body').querySelectorAll('.usage-card').find(c => c.textContent.includes('每日用量'));
-    assert.equal(card.querySelectorAll('.usage-day-date').length, 1);
-    assert.equal(card.querySelector('.usage-day-date').textContent, '2026-11-18');
-    assert.equal(card.querySelector('.usage-bar'), null);
-    assert.equal(card.querySelector('.usage-day-total').textContent, input === null ? '— tokens' : input === 0 ? '0 tokens' : '1.25K tokens');
-    if (input === 1200) assert.equal(card.querySelector('.usage-day-total').title, '1,250 tokens');
-  }
+test('interaction: Today uses the same seven calendar dates and values as 7d while its other views use Today', async () => {
+  const bucket = (name, value) => ({ name, inputTokens: value, outputTokens: 0 });
+  const h = harness({ usage_snapshot: ({ period }) => ({ period,
+    totalRequests: period === 'today' ? 1 : 42,
+    byDay: period === 'today' ? [bucket('2026-11-02', 12)] : [
+      bucket('2026-10-03', 99999), bucket('2026-10-04', 3000), bucket('2026-10-26', 888),
+      bucket('2026-10-27', 71), bucket('2026-10-29', 99), bucket('2026-11-02', 12),
+    ],
+    byModel: [bucket('model-' + period, 1)], byProvider: [bucket('provider-' + period, 1)], updatedAt: new Date(trendNow).toISOString(),
+  }) });
+  await openUsage(h);
+  const body = h.id('usage-body');
+  const trend = () => body.querySelectorAll('.usage-bar-col').map(col => [
+    col.querySelector('.usage-day-date').textContent, col.querySelector('.usage-day-value').textContent,
+  ]);
+  const week = [
+    ['2026-10-27', '71'], ['2026-10-28', '0'], ['2026-10-29', '99'], ['2026-10-30', '0'],
+    ['2026-10-31', '0'], ['2026-11-01', '0'], ['2026-11-02', '12'],
+  ];
+  assert.deepEqual(trend(), week);
+  h.id('usage-periods').children[0].click(); await flush();
+  assert.deepEqual(trend(), week);
+  assert.equal(body.querySelector('.usage-num').textContent, '1');
+  assert.equal(body.querySelector('.usage-hbar-name').textContent, 'model-today');
+  const table = name => body.querySelectorAll('.usage-card').find(c => c.querySelector('.usage-title').textContent === name).querySelector('tbody');
+  assert.equal(table('按日期').children.length, 1);
+  assert.equal(table('按日期').querySelector('td').textContent, '2026-11-02');
+  assert.equal(table('按提供方').querySelector('td').textContent, 'provider-today');
+  assert.equal(table('按模型').querySelector('td').textContent, 'model-today');
+  assert.equal(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args.period, 'today');
+  h.id('usage-periods').children[2].click(); await flush();
+  const month = trend();
+  const monthDates = Array.from({ length: 28 }, (_, i) => `2026-10-${String(i + 4).padStart(2, '0')}`).concat('2026-11-01', '2026-11-02');
+  assert.deepEqual(month.map(([date]) => date), monthDates);
+  assert.deepEqual(month[0], ['2026-10-04', '3K']);
+  assert.deepEqual(month[1], ['2026-10-05', '0']);
+  assert.deepEqual(month.slice(-7), week);
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_snapshot' && c.args.period === '30d').map(c => c.args)), [
+    { period: '30d' }, { period: '30d', trend: true },
+  ]);
 });
 
-test('interaction: charts and records fall back to the shared empty note when a period has no data', async () => {
+test('interaction: Today renders its summary and records when the weekly trend fails, and refresh retries', async () => {
+  let failWeek = false;
+  const h = harness({ usage_snapshot: ({ period }) => {
+    if (period === '7d' && failWeek) throw new Error('weekly unavailable');
+    return { period, totalRequests: 3, updatedAt: trendNow, byDay: [{ name: '2026-10-27', inputTokens: 88, outputTokens: 0 }] };
+  } });
+  await openUsage(h);
+  failWeek = true;
+  h.id('usage-periods').children[0].click(); await flush();
+  const body = h.id('usage-body');
+  assert.match(body.textContent, /汇总 · 今天/);
+  assert.equal(body.querySelector('.usage-num').textContent, '3');
+  assert.equal(h.id('usage-msg').textContent, '');
+  assert.ok(recordsCard(body));
+  assert.match(body.textContent, /趋势读取失败：weekly unavailable/);
+  assert.equal(body.querySelector('.usage-bar'), null);
+  failWeek = false;
+  h.id('usage-refresh').click(); await flush();
+  assert.equal(body.querySelector('.usage-day-value').textContent, '88');
+});
+
+test('interaction: empty periods show zero trend values and an empty model chart', async () => {
   const h = harness({ usage_snapshot: args => ({ period: args.period, totalRequests: 0, successCount: 0, errorCount: 0,
     inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estimatedCount: 0,
     avgTtftMs: null, avgTokensPerSecond: null,
@@ -517,7 +606,7 @@ test('interaction: charts and records fall back to the shared empty note when a 
   const titledCard = (label) => cards.find(c => { const t = c.querySelector('.usage-title'); return t && t.textContent.includes(label); });
   const dayCard = titledCard('每日用量');
   const modelCard = titledCard('模型 Top 10');
-  assert.ok(dayCard && dayCard.textContent.includes('该周期暂无调用记录'), 'daily chart renders the shared empty note');
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), Array(7).fill('0'));
   assert.ok(modelCard && modelCard.textContent.includes('该周期暂无调用记录'), 'model chart renders the shared empty note');
   const numCell = label => body.querySelectorAll('.usage-cell').find(n => n.textContent.includes(label)).querySelector('.usage-num');
   assert.equal(numCell('成功率').textContent, '—', 'total=0 keeps the success rate unset');

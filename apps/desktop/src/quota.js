@@ -448,9 +448,11 @@
   //             familyRouting, fallbackEnabled, revision}
   // save    = routing_save({change:{revision,scope,field,target:string|null,fallback:[string]|null}})
   //           null fallback preserves it; null/empty target clears the override.
+  // groups  = routing_save_groups({changes:[...]}) uses one revision and one write.
   // flags   = routing_flags({revision,familyRouting,fallbackEnabled})
 
   var ROUTING_SCOPES = ['global', 'opus', 'sonnet', 'haiku', 'models'];
+  var MODEL_GROUPS = ['opus', 'sonnet', 'haiku'];
   var ROUTING_SCENARIOS = ['default', 'background', 'think', 'longContext', 'extendedContext', 'webSearch', 'image'];
   var USAGE_PERIOD_LABELS = { today: '今天', '7d': '近 7 天', '30d': '近 30 天', all: '全部' };
   var USAGE_PERIODS = Object.keys(USAGE_PERIOD_LABELS);
@@ -462,6 +464,11 @@
   function splitKey(key) {
     var i = String(key).indexOf('|');
     return { scope: i === -1 ? String(key) : String(key).slice(0, i), field: i === -1 ? '' : String(key).slice(i + 1) };
+  }
+  function isModelGroup(scope) { return MODEL_GROUPS.indexOf(scope) !== -1; }
+  function isModelGroupKey(key) {
+    var parts = splitKey(key);
+    return isModelGroup(parts.scope) && parts.field !== 'background' && ROUTING_SCENARIOS.indexOf(parts.field) !== -1;
   }
   function routeLabel(scope, field) {
     if (scope === 'models') return field || '(空别名)';
@@ -517,6 +524,7 @@
     var snapshot = null, loading = false, error = null;
     var flagsSaving = false, flagsError = null;
     var savingKey = null, saveQueue = [], saveError = null, savedFlash = null;
+    var savingGroups = false, groupSaveMessage = '';
     var drafts = new Map(); // key -> {target, fallback, fallbackDirty}
     var epoch = 0;
     var listeners = new Set();
@@ -539,6 +547,8 @@
         flagsSaving: flagsSaving, flagsError: flagsError,
         savingKey: savingKey, queued: saveQueue.slice(),
         saveError: saveError, savedFlash: savedFlash,
+        savingGroups: savingGroups, groupSaveMessage: groupSaveMessage,
+        dirtyGroupKeys: dirtyKeys.filter(isModelGroupKey),
         dirtyKeys: dirtyKeys, isClean: isClean,
         draftKeys: Array.from(drafts.keys()),
         draft: function (key) { return drafts.get(key) || null; },
@@ -546,14 +556,23 @@
     }
     function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
     function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
-    function clearFlash(key) { if (savedFlash && savedFlash.key === key) savedFlash = null; }
+    function clearFlash(key) {
+      if (savedFlash && savedFlash.key === key) savedFlash = null;
+      if (isModelGroupKey(key)) groupSaveMessage = '';
+    }
 
     // Adopt a server snapshot: drafts whose values now match the server are
     // dropped; drafts that still differ survive refreshes and saves.
     function adopt(result) {
       snapshot = normalizeRoutingSnapshot(result);
       error = null;
-      Array.from(drafts.keys()).forEach(function (k) { if (isClean(k)) drafts.delete(k); });
+      drafts.forEach(function (draft, key) {
+        if (isClean(key)) drafts.delete(key);
+        else if (!draft.fallbackDirty) {
+          var parts = splitKey(key);
+          draft.fallback = canonicalFallback(snapshot, parts.scope, parts.field);
+        }
+      });
     }
 
     function ensureDraft(key) {
@@ -570,7 +589,7 @@
     }
 
     function refresh() {
-      if (loading || savingKey || flagsSaving) return;
+      if (loading || savingKey || savingGroups || flagsSaving) return;
       loading = true;
       error = null;
       emit();
@@ -638,13 +657,14 @@
     }
 
     function resetDraft(key) {
-      if (!snapshot) return;
+      if (!snapshot || (savingGroups && isModelGroupKey(key))) return;
       drafts.delete(key);
       clearFlash(key);
       emit();
     }
 
     function createAlias(field, target) {
+      if (savingGroups) return { ok: false, message: '正在保存模型组，请稍后重试' };
       if (!snapshot) return { ok: false, message: '路由配置尚未读取' };
       var name = String(field == null ? '' : field).trim();
       if (!name) return { ok: false, message: '请输入模型别名' };
@@ -660,6 +680,43 @@
       return { ok: true };
     }
 
+    function routeChange(key, draft) {
+      var parts = splitKey(key);
+      return {
+        revision: snapshot.revision,
+        scope: parts.scope,
+        field: parts.field,
+        target: draft.target.trim() || null,
+        fallback: draft.fallbackDirty ? draft.fallback.slice() : null,
+      };
+    }
+
+    function saveGroups() {
+      if (!snapshot || loading || flagsSaving || savingKey || savingGroups || saveQueue.length) return;
+      var keys = state().dirtyGroupKeys;
+      if (!keys.length) return;
+      var targets = keys.map(function (key) { return drafts.get(key).target; });
+      var changes = keys.map(function (key) { return routeChange(key, drafts.get(key)); });
+      savingGroups = true;
+      saveError = null;
+      groupSaveMessage = '';
+      emit();
+      invoke('routing_save_groups', { changes: changes }).then(function (response) {
+        keys.forEach(function (key, index) {
+          var draft = drafts.get(key);
+          if (draft && draft.target === targets[index]) draft.target = changes[index].target || '';
+        });
+        adopt(response);
+        savingGroups = false;
+        groupSaveMessage = '已保存 ' + keys.length + ' 项模型组修改';
+        emit();
+      }, function (err) {
+        savingGroups = false;
+        saveError = { message: errorMessage(err) };
+        emit();
+      });
+    }
+
     // Saves run one at a time so every change carries the latest known
     // revision; the server rejects stale revisions instead of merging.
     function pump() {
@@ -668,26 +725,17 @@
       var d = drafts.get(key);
       if (!d || isClean(key)) { pump(); return; }
       savingKey = key;
-      emit();
-      var parts = splitKey(key);
       var submittedTarget = d.target;
-      var t = String(submittedTarget).trim();
-      var change = {
-        revision: snapshot ? snapshot.revision : '',
-        scope: parts.scope,
-        field: parts.field,
-        target: t === '' ? null : t,
-        // Null fallback preserves the server list; only an edited list is sent.
-        fallback: d.fallbackDirty ? d.fallback.slice() : null,
-      };
+      var change = routeChange(key, d);
+      emit();
       var my = ++epoch;
       invoke('routing_save', { change: change }).then(function (resp) {
         if (my !== epoch) return;
         savingKey = null;
-        var hadError = saveError && saveError.key === key;
+        var hadError = saveError && (!saveError.key || saveError.key === key);
         var currentDraft = drafts.get(key);
         // Normalize only the submitted target; newer typing remains a draft.
-        if (currentDraft && currentDraft.target === submittedTarget) currentDraft.target = t;
+        if (currentDraft && currentDraft.target === submittedTarget) currentDraft.target = change.target || '';
         adopt(resp);
         if (isClean(key)) {
           drafts.delete(key);
@@ -705,7 +753,7 @@
       });
     }
     function saveRow(key) {
-      if (!snapshot || loading || flagsSaving) return;
+      if (!snapshot || loading || flagsSaving || savingGroups) return;
       if (savingKey === key || saveQueue.indexOf(key) !== -1) return;
       if (isClean(key)) return;
       saveQueue.push(key);
@@ -714,7 +762,7 @@
     }
 
     function setFlag(name, value) {
-      if (!snapshot || flagsSaving || savingKey || loading) return false;
+      if (!snapshot || flagsSaving || savingKey || savingGroups || loading) return false;
       if (typeof value !== 'boolean') return false;
       if (name !== 'familyRouting' && name !== 'fallbackEnabled') return false;
       var payload = {
@@ -744,7 +792,7 @@
       subscribe: subscribe, state: state, refresh: refresh,
       setTarget: setTarget, addFallback: addFallback, removeFallback: removeFallback,
       moveFallback: moveFallback, resetDraft: resetDraft,
-      saveRow: saveRow, setFlag: setFlag, createAlias: createAlias,
+      saveRow: saveRow, saveGroups: saveGroups, setFlag: setFlag, createAlias: createAlias,
     };
   }
 
@@ -785,15 +833,32 @@
     };
   }
 
+  // Core's SQLite buckets use date(timestamp, 'localtime'). Step through local
+  // calendar dates so UTC offsets and daylight-saving transitions match them.
+  function usageDayKey(end, daysAgo) {
+    var date = new Date(end.getFullYear(), end.getMonth(), end.getDate() - daysAgo, 12);
+    return date.getFullYear() + '-' + pad2(date.getMonth() + 1) + '-' + pad2(date.getDate());
+  }
+
+  function usageTrendRows(rows, dayCount, end) {
+    var byDate = new Map(rows.map(function (row) { return [row.name, row]; }));
+    var days = [];
+    for (var i = dayCount - 1; i >= 0; i--) {
+      var name = usageDayKey(end, i);
+      days.push(byDate.get(name) || { name: name, inputTokens: 0, outputTokens: 0 });
+    }
+    return days;
+  }
+
   function createUsageController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createUsageController: 需要 invoke 函数');
     var snapshot = null, loading = false, error = null, period = DEFAULT_USAGE_PERIOD;
-    var epoch = 0;
+    var epoch = 0, trend = null;
     var listeners = new Set();
 
     function state() {
-      return { snapshot: snapshot, loading: loading, error: error, period: period };
+      return { snapshot: snapshot, loading: loading, error: error, period: period, trend: trend };
     }
     function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
     function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
@@ -803,8 +868,10 @@
       period = p;
       loading = true;
       error = null;
-      emit();
       var my = ++epoch;
+      var dayCount = p === 'today' || p === '7d' ? 7 : p === '30d' ? 30 : 0;
+      trend = dayCount ? { dayCount: dayCount, rows: null, error: null } : null;
+      emit();
       invoke('usage_snapshot', { period: p }).then(function (r) {
         if (my !== epoch) return;
         snapshot = normalizeUsageSnapshot(r);
@@ -816,6 +883,19 @@
         error = errorMessage(err);
         emit();
       });
+      if (trend) {
+        invoke('usage_snapshot', { period: dayCount + 'd', trend: true }).then(function (r) {
+          if (my !== epoch) return;
+          var end = new Date(r.updatedAt);
+          if (!Number.isFinite(end.getTime())) throw new Error('趋势时间无效');
+          trend.rows = usageTrendRows(r.byDay.map(usageRow), dayCount, end);
+          emit();
+        }).catch(function (err) {
+          if (my !== epoch) return;
+          trend.error = errorMessage(err);
+          emit();
+        });
+      }
     }
 
     return {
@@ -1216,6 +1296,7 @@
       fallbackEnabled: true,
       revision: 'rev-1',
     };
+    var previewDay = new Date();
     var usage = {
       today: {
         period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
@@ -1226,7 +1307,7 @@
           { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
         ],
         byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
-        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byDay: [{ name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
         updatedAt: Date.now() - 3000,
       },
       '7d': {
@@ -1239,13 +1320,13 @@
           { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
-          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
-          { name: '2026-11-14', requests: 132, inputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
-          { name: '2026-11-13', requests: 147, inputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
-          { name: '2026-11-12', requests: 101, inputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
-          { name: '2026-11-11', requests: 99, inputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
+          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: usageDayKey(previewDay, 2), requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
+          { name: usageDayKey(previewDay, 3), requests: 132, inputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
+          { name: usageDayKey(previewDay, 4), requests: 147, inputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
+          { name: usageDayKey(previewDay, 5), requests: 101, inputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
+          { name: usageDayKey(previewDay, 6), requests: 99, inputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
         ],
         updatedAt: Date.now() - 3000,
       },
@@ -1259,8 +1340,8 @@
           { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
         ],
         updatedAt: Date.now() - 3000,
       },
@@ -1363,6 +1444,22 @@
     }));
 
     var previewCatalog = { names: ['OpenAI', 'customparams'], parameterizedNames: ['customparams'] };
+
+    function applyPreviewRoute(change) {
+      var idx = routing.routes.findIndex(function (route) {
+        return route.scope === change.scope && route.field === change.field;
+      });
+      var target = typeof change.target === 'string' ? change.target.trim() || null : null;
+      var fallback = Array.isArray(change.fallback)
+        ? change.fallback.map(function (f) { return typeof f === 'string' ? f.trim() : ''; }).filter(Boolean)
+        : (idx !== -1 ? routing.routes[idx].fallback : []);
+      var entry = { scope: change.scope, field: change.field, target: target, fallback: fallback };
+      if (!target && !fallback.length) {
+        if (idx !== -1) routing.routes.splice(idx, 1);
+      } else if (idx === -1) routing.routes.push(entry);
+      else routing.routes[idx] = entry;
+    }
+
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
@@ -1423,20 +1520,26 @@
         if (change.revision !== routing.revision) return Promise.reject(new Error(STALE_MSG));
         if (ROUTING_SCOPES.indexOf(change.scope) === -1) return Promise.reject(new Error('路由范围无效'));
         if (typeof change.field !== 'string' || !change.field) return Promise.reject(new Error('路由字段无效'));
-        var target = typeof change.target === 'string' && change.target ? change.target : null;
-        var idx = -1;
-        for (var i = 0; i < routing.routes.length; i++) {
-          if (routing.routes[i].scope === change.scope && routing.routes[i].field === change.field) { idx = i; break; }
+        applyPreviewRoute(change);
+        bump();
+        return delay(copy(routing));
+      }
+      if (cmd === 'routing_save_groups') {
+        var changes = Array.isArray(a.changes) ? a.changes : [];
+        var seen = new Set();
+        if (!changes.length || changes.some(function (change) {
+          if (!change || typeof change.field !== 'string') return true;
+          var key = routeKey(change.scope, change.field.trim());
+          if (!isModelGroupKey(key) || seen.has(key)) return true;
+          seen.add(key);
+          return false;
+        })) return Promise.reject(new Error('模型组修改无效'));
+        if (changes.some(function (change) { return change.revision !== routing.revision; })) {
+          return Promise.reject(new Error(STALE_MSG));
         }
-        if (target === null) {
-          if (idx !== -1) routing.routes.splice(idx, 1); // null/empty target clears the override
-        } else {
-          var fallback = Array.isArray(change.fallback)
-            ? change.fallback.filter(function (f) { return typeof f === 'string' && f; })
-            : (idx !== -1 ? routing.routes[idx].fallback : []); // null fallback preserves
-          var entry = { scope: change.scope, field: change.field, target: target, fallback: fallback };
-          if (idx === -1) routing.routes.push(entry); else routing.routes[idx] = entry;
-        }
+        changes.forEach(function (change) {
+          applyPreviewRoute(Object.assign({}, change, { field: change.field.trim() }));
+        });
         bump();
         return delay(copy(routing));
       }
@@ -1449,7 +1552,9 @@
       }
       if (cmd === 'usage_snapshot') {
         var period = USAGE_PERIODS.indexOf(a.period) !== -1 ? a.period : 'today';
-        return delay(copy(usage[period]));
+        var result = copy(usage[period]);
+        if (a.trend) result.updatedAt = previewDay.getTime();
+        return delay(result);
       }
       if (cmd === 'usage_records') {
         // Mirrors the native contract: invalid period is a fixed error, page
@@ -2032,6 +2137,7 @@
       serviceRefresh: document.getElementById('service-refresh'),
       routingRevision: document.getElementById('routing-revision'),
       routingRefresh: document.getElementById('routing-refresh'),
+      routingSaveGroups: document.getElementById('routing-save-groups'),
       flagFamily: document.getElementById('flag-family'),
       flagFallback: document.getElementById('flag-fallback'),
       routingFlagsMsg: document.getElementById('routing-flags-msg'),
@@ -2319,10 +2425,13 @@
       refs.unset.hidden = targetVal !== '';
       var isDirty = !!draft && !s.isClean(key);
       var saving = s.savingKey === key;
-      refs.saveBtn.disabled = !isDirty || saving || s.flagsSaving || s.loading || mode === 'missing';
-      refs.saveBtn.textContent = saving ? '保存中…' : '保存';
-      refs.saveBtn.setAttribute('aria-busy', String(saving));
+      if (refs.saveBtn) {
+        refs.saveBtn.disabled = !isDirty || saving || s.savingGroups || s.flagsSaving || s.loading || mode === 'missing';
+        refs.saveBtn.textContent = saving ? '保存中…' : '保存';
+        refs.saveBtn.setAttribute('aria-busy', String(saving));
+      }
       refs.resetBtn.hidden = !isDirty;
+      refs.resetBtn.disabled = s.savingGroups && isModelGroupKey(key);
       refs.root.setAttribute('data-dirty', String(isDirty));
       var list = draft ? draft.fallback : canonicalF;
       var sig = JSON.stringify(list);
@@ -2384,10 +2493,13 @@
       foot.appendChild(msg);
       foot.appendChild(el('span', 'spacer'));
       var resetBtn = mkBtn('撤销', '撤销未保存的修改', function () { routingCtrl.resetDraft(key); });
-      var saveBtn = mkBtn('保存', '保存 ' + labelText, function () { routingCtrl.saveRow(key); });
-      saveBtn.className = 'btn btn-primary route-save';
       foot.appendChild(resetBtn);
-      foot.appendChild(saveBtn);
+      var saveBtn = null;
+      if (!isModelGroup(parts.scope)) {
+        saveBtn = mkBtn('保存', '保存 ' + labelText, function () { routingCtrl.saveRow(key); });
+        saveBtn.className = 'btn btn-primary route-save';
+        foot.appendChild(saveBtn);
+      }
       root.appendChild(foot);
 
       function submitAdd() {
@@ -2440,20 +2552,28 @@
     }
 
     function renderRouting(s) {
-      els.routingRefresh.disabled = mode === 'missing' || s.loading || !!s.savingKey || s.flagsSaving;
+      var busy = mode === 'missing' || s.loading || !!s.savingKey || s.savingGroups || s.flagsSaving;
+      els.routingRefresh.disabled = busy;
       var snap = s.snapshot;
+      var groupCount = (s.dirtyGroupKeys || []).length;
+      els.routingSaveGroups.hidden = !isModelGroup(activeScope) && !groupCount && !s.savingGroups;
+      els.routingSaveGroups.disabled = busy || !snap || !groupCount;
+      els.routingSaveGroups.setAttribute('aria-busy', String(!!s.savingGroups));
+      els.routingSaveGroups.textContent = s.savingGroups ? '保存模型组…' : '保存模型组' + (groupCount ? '（' + groupCount + ' 项）' : '');
+      els.aliasAddBtn.disabled = !!s.savingGroups;
       els.routingRevision.textContent = snap ? '修订 ' + (snap.revision || '—') : '';
       if (snap && !s.flagsSaving) {
         els.flagFamily.checked = snap.familyRouting;
         els.flagFallback.checked = snap.fallbackEnabled;
       }
-      var flagsBlocked = mode === 'missing' || !snap || s.flagsSaving || !!s.savingKey || s.loading;
+      var flagsBlocked = busy || !snap;
       els.flagFamily.disabled = flagsBlocked;
       els.flagFallback.disabled = flagsBlocked;
       els.routingFlagsMsg.textContent = s.flagsError || '';
       var banner = null, tone = null;
       if (s.error) { banner = '路由配置读取失败：' + s.error; tone = 'error'; }
       else if (s.saveError) { banner = s.saveError.message + '（未保存的修改已保留）'; tone = 'error'; }
+      else if (s.groupSaveMessage) { banner = s.groupSaveMessage; tone = 'ok'; }
       setBanner(els.routingMsg, banner, tone);
       els.aliasAdd.hidden = activeScope !== 'models' || mode === 'missing';
       if (!snap) { rebuildRouting(); els.routingBody.setAttribute('aria-busy', String(s.loading)); return; }
@@ -2526,6 +2646,7 @@
       if (!s.snapshot) {
         // No snapshot yet: never fabricate an empty state.
         body.appendChild(noteEl(s.loading ? '正在读取用量…' : (s.error ? '用量读取失败：' + s.error : '尚未读取用量数据')));
+        if (s.trend) body.appendChild(buildUsageTrend(s.trend));
         renderRecords(recordsCtrl ? recordsCtrl.state() : null);
         return;
       }
@@ -2557,7 +2678,11 @@
       totals.appendChild(grid);
       body.appendChild(totals);
       totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
-      body.appendChild(buildDayChart(u.byDay, u.period === 'all'));
+      if (s.trend) {
+        body.appendChild(buildUsageTrend(s.trend));
+      } else {
+        body.appendChild(buildDayChart(u.byDay, u.period === 'all'));
+      }
       body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
         var rowTotal = rowTotalTokens(m);
@@ -2573,6 +2698,17 @@
       body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
       body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
       renderRecords(recordsCtrl ? recordsCtrl.state() : null);
+    }
+
+    function buildUsageTrend(trend) {
+      var title = '每日用量 · 近 ' + trend.dayCount + ' 天（有效输入 + 输出）';
+      var card = trend.rows ? buildDayChart(trend.rows) : el('div', 'usage-card');
+      if (trend.rows) card.querySelector('.usage-title').textContent = title;
+      else {
+        card.appendChild(el('div', 'usage-title', title));
+        card.appendChild(noteEl(trend.error ? '趋势读取失败：' + trend.error : '正在读取趋势…'));
+      }
+      return card;
     }
 
     // Charts are plain divs; per-bar sizes go through CSSOM writes because the
@@ -3050,6 +3186,7 @@
       if (routingCtrl) routingCtrl.setFlag('fallbackEnabled', els.flagFallback.checked);
     });
     els.routingRefresh.addEventListener('click', function () { if (routingCtrl) routingCtrl.refresh(); });
+    els.routingSaveGroups.addEventListener('click', function () { if (routingCtrl) routingCtrl.saveGroups(); });
     els.aliasAddBtn.addEventListener('click', function () {
       if (!routingCtrl) return;
       var r = routingCtrl.createAlias(els.aliasName.value, els.aliasTarget.value);
