@@ -3,7 +3,7 @@ use super::{configured, QuotaService};
 use crate::api::{admin_auth_failed, AdminClient};
 use reqwest::Method;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{collections::HashSet, time::Duration};
 use tauri::WebviewWindow;
 
@@ -14,6 +14,10 @@ const NO_CREDIT: &str = "codex_reset_no_credit";
 const FAILED: &str = "codex_reset_failed";
 const UNAUTHORIZED: &str = "codex_unauthorized";
 const DISCONNECTED: &str = "codex_not_connected";
+const UPGRADE_REQUIRED: &str = "codex_reset_upgrade_required";
+// The strict plugin route may make three sequential 30-second upstream requests.
+// Leave a small response margin, but never retry this mutating POST automatically.
+const CONSUME_CONFIRMED_TIMEOUT: Duration = Duration::from_secs(100);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +44,12 @@ pub struct ResetResult {
     windows_reset: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     available_count: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConsumeConfirmedRequest<'a> {
+    credit_id: &'a str,
 }
 
 fn safe_integer(value: &Value) -> Option<u64> {
@@ -159,34 +169,34 @@ impl QuotaService {
         &self,
         credit_id: Option<Value>,
     ) -> Result<ResetResult, &'static str> {
-        let credit_id = match credit_id.as_ref() {
-            Some(Value::Null) | None => None,
-            Some(v) => Some(bounded_text(v, 256).ok_or(INVALID)?),
-        };
+        // Desktop always confirms a concrete credit. Reject missing and malformed IDs
+        // before acquiring the write gate or doing even the eligibility config read.
+        let credit_id = credit_id
+            .as_ref()
+            .and_then(|value| bounded_text(value, 256))
+            .ok_or(INVALID)?;
         let client = self.client.as_ref().ok_or(UNAVAILABLE)?;
         // Reject simultaneous desktop confirmations immediately, including while rechecking config.
         let _guard = client.try_write_guard().ok_or(BUSY)?;
-        let listing = self.list_reset_credits().await?;
-        if listing.available_count == 0
-            || credit_id.is_some_and(|id| {
-                !listing
-                    .credits
-                    .iter()
-                    .any(|c| c.id == id && c.status == "available")
-            })
-        {
-            return Err(NO_CREDIT);
-        }
-        let body = credit_id.map_or_else(|| json!({}), |id| json!({"creditId":id}));
+        // The confirmed route re-lists and validates this same ID inside the plugin's
+        // single flight, so a second cached native listing would only add a stale race.
+        self.reset_client().await?;
+        let body =
+            serde_json::to_value(ConsumeConfirmedRequest { credit_id }).map_err(|_| INVALID)?;
         let (status, value) = client
             .bounded_json(
                 Method::POST,
-                "/api/codex/reset-credits/consume",
+                "/api/codex/reset-credits/consume-confirmed",
                 Some(&body),
-                Duration::from_secs(60),
+                CONSUME_CONFIRMED_TIMEOUT,
             )
             .await
             .map_err(|_| FAILED)?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // Older plugins do not have the strict route; never fall back to their
+            // legacy endpoint because that would bypass confirmed-ID validation.
+            return Err(UPGRADE_REQUIRED);
+        }
         if !status.is_success() {
             return Err(plugin_error(status.as_u16(), &value, FAILED));
         }
@@ -201,7 +211,7 @@ impl QuotaService {
                 .snapshot
                 .providers
                 .iter_mut()
-                .find(|r| r.codex_reset_eligible)
+                .find(|r| r.name == super::CODEX_PROVIDER)
             {
                 row.windows.clear();
                 row.updated_at = None;
@@ -249,6 +259,7 @@ pub async fn codex_reset_consume(
 mod tests {
     use super::*;
     use crate::api::mock::{response, Mock};
+    use serde_json::json;
 
     #[test]
     fn reset_commands_require_the_exact_local_main_view() {
@@ -282,7 +293,6 @@ mod tests {
             config(),
             response(listing()),
             config(),
-            response(listing()),
             response(result("reset")),
         ]);
         let service = QuotaService::new(Some(mock.client()));
@@ -312,18 +322,17 @@ mod tests {
                 "GET /api/config HTTP/1.1",
                 "GET /api/codex/reset-credits HTTP/1.1",
                 "GET /api/config HTTP/1.1",
-                "GET /api/codex/reset-credits HTTP/1.1",
-                "POST /api/codex/reset-credits/consume HTTP/1.1"
+                "POST /api/codex/reset-credits/consume-confirmed HTTP/1.1"
             ]
         );
         assert!(requests.iter().all(|r| r
             .to_ascii_lowercase()
             .contains("x-api-key: test-admin-key\r\n")));
-        assert!(requests[4].ends_with(r#"{"creditId":"gift"}"#));
+        assert!(requests[3].ends_with(r#"{"creditId":"gift"}"#));
     }
 
     #[tokio::test]
-    async fn eligibility_and_credit_selection_are_checked_again_before_post() {
+    async fn eligibility_is_checked_again_before_post() {
         for (entry, expected) in [
             (
                 json!({"name":"codex-subscription","api_key":"ordinary"}),
@@ -374,32 +383,6 @@ mod tests {
                 .row
                 .codex_reset_eligible
         );
-        for id in ["spent", "different-account"] {
-            let mock = Mock::new(vec![config(), response(listing())]);
-            assert_eq!(
-                QuotaService::new(Some(mock.client()))
-                    .consume_reset_credit(Some(json!(id)))
-                    .await
-                    .unwrap_err(),
-                NO_CREDIT
-            );
-            assert_eq!(mock.finish().await.len(), 2);
-        }
-        for value in [Value::Null, json!({"availableCount":0,"credits":[]})] {
-            let mock = Mock::new(vec![config(), response(value.clone())]);
-            assert_eq!(
-                QuotaService::new(Some(mock.client()))
-                    .consume_reset_credit(None)
-                    .await
-                    .unwrap_err(),
-                if value.is_null() {
-                    UNAVAILABLE
-                } else {
-                    NO_CREDIT
-                }
-            );
-            assert_eq!(mock.finish().await.len(), 2);
-        }
     }
 
     #[tokio::test]
@@ -408,40 +391,31 @@ mod tests {
         let client = mock.client();
         let service = QuotaService::new(Some(client.clone()));
         for id in [
-            json!(""),
-            json!("   "),
-            json!(42),
-            json!("a\nb"),
-            json!("😀".repeat(129)),
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("   ")),
+            Some(json!(42)),
+            Some(json!("a\nb")),
+            Some(json!("😀".repeat(129))),
         ] {
-            assert_eq!(
-                service.consume_reset_credit(Some(id)).await.unwrap_err(),
-                INVALID
-            );
+            assert_eq!(service.consume_reset_credit(id).await.unwrap_err(), INVALID);
         }
         let _held = client.write_guard().await;
-        assert_eq!(service.consume_reset_credit(None).await.unwrap_err(), BUSY);
+        assert_eq!(
+            service
+                .consume_reset_credit(Some(json!("gift")))
+                .await
+                .unwrap_err(),
+            BUSY
+        );
         assert!(mock.finish().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn absent_or_null_credit_leaves_backend_selection_to_the_plugin() {
-        for id in [None, Some(Value::Null)] {
-            let mock = Mock::new(vec![
-                config(),
-                response(listing()),
-                response(result("nothing_to_reset")),
-            ]);
-            assert_eq!(
-                QuotaService::new(Some(mock.client()))
-                    .consume_reset_credit(id)
-                    .await
-                    .unwrap()
-                    .outcome,
-                "nothing_to_reset"
-            );
-            assert!(mock.finish().await[2].ends_with("\r\n\r\n{}"));
-        }
+    #[test]
+    fn confirmed_consume_budget_covers_the_plugin_request_chain() {
+        assert_eq!(CONSUME_CONFIRMED_TIMEOUT, Duration::from_secs(100));
+        assert!(CONSUME_CONFIRMED_TIMEOUT > 3 * Duration::from_secs(30));
     }
 
     #[test]
@@ -511,7 +485,6 @@ mod tests {
         ] {
             let mock = Mock::new(vec![
                 config(),
-                response(listing()),
                 (status, json!({"ok":false,"error":body}).to_string()),
             ]);
             assert_eq!(
@@ -521,8 +494,35 @@ mod tests {
                     .unwrap_err(),
                 expected
             );
-            assert_eq!(mock.finish().await.len(), 3);
+            let requests = mock.finish().await;
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1]
+                .starts_with("POST /api/codex/reset-credits/consume-confirmed HTTP/1.1\r\n"));
         }
+    }
+
+    #[tokio::test]
+    async fn an_old_plugin_without_the_confirmed_route_fails_closed_without_fallback() {
+        let mock = Mock::new(vec![
+            config(),
+            (404, json!({"error":"not_found"}).to_string()),
+        ]);
+        assert_eq!(
+            QuotaService::new(Some(mock.client()))
+                .consume_reset_credit(Some(json!("gift")))
+                .await
+                .unwrap_err(),
+            UPGRADE_REQUIRED
+        );
+        let requests = mock.finish().await;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].starts_with("POST /api/codex/reset-credits/consume-confirmed HTTP/1.1\r\n")
+        );
+        assert!(requests[1].ends_with(r#"{"creditId":"gift"}"#));
+        assert!(!requests.iter().any(
+            |request| request.starts_with("POST /api/codex/reset-credits/consume HTTP/1.1\r\n")
+        ));
     }
 
     #[tokio::test]
@@ -531,7 +531,6 @@ mod tests {
             let current_usage = response(json!({"status":"connected","primary":{"usedPercent":0}}));
             let mock = Mock::new(vec![
                 config(),
-                response(listing()),
                 response(result(outcome)),
                 config(),
                 current_usage.clone(),
@@ -555,7 +554,65 @@ mod tests {
             assert!(!service.cache.lock().await.attempts.contains_key(&None));
             let snapshot = service.snapshot(target).await.unwrap();
             assert_eq!(snapshot.providers[0].windows[0].used, Some(0.0));
-            assert_eq!(mock.finish().await.len(), 6);
+            assert_eq!(mock.finish().await.len(), 5);
         }
+    }
+
+    #[tokio::test]
+    async fn confirmed_success_recovers_provider_cache_after_an_offline_snapshot() {
+        let stale_usage = response(json!({"status":"connected","primary":{"usedPercent":75}}));
+        let current_usage = response(json!({"status":"connected","primary":{"usedPercent":0}}));
+        let mock = Mock::new(vec![
+            config(),
+            stale_usage.clone(),
+            stale_usage,
+            (500, json!({"error":"offline"}).to_string()),
+            config(),
+            response(result("reset")),
+            config(),
+            current_usage.clone(),
+            current_usage,
+        ]);
+        let service = QuotaService::new(Some(mock.client()));
+        let target = Some(super::super::CODEX_PROVIDER.into());
+
+        let initial = service.snapshot(target.clone()).await.unwrap();
+        assert!(initial.providers[0].codex_reset_eligible);
+        assert!(!initial.providers[0].windows.is_empty());
+        // Move past the refresh throttle so the next snapshot observes a transport failure.
+        service.cache.lock().await.attempts.clear();
+        let offline = service.snapshot(target.clone()).await.unwrap();
+        assert!(!offline.online);
+        assert!(!offline.providers[0].codex_reset_eligible);
+        assert!(!offline.providers[0].windows.is_empty());
+
+        assert_eq!(
+            service
+                .consume_reset_credit(Some(json!("gift")))
+                .await
+                .unwrap()
+                .outcome,
+            "reset"
+        );
+        {
+            let cache = service.cache.lock().await;
+            assert!(!cache.attempts.contains_key(&None));
+            assert!(!cache.attempts.contains_key(&target));
+            let row = cache
+                .snapshot
+                .providers
+                .iter()
+                .find(|row| row.name == super::super::CODEX_PROVIDER)
+                .unwrap();
+            assert!(!row.codex_reset_eligible);
+            assert!(row.windows.is_empty());
+            assert_eq!(row.updated_at, None);
+        }
+
+        let recovered = service.snapshot(target).await.unwrap();
+        assert!(recovered.online);
+        assert!(recovered.providers[0].codex_reset_eligible);
+        assert_eq!(recovered.providers[0].windows[0].used, Some(0.0));
+        assert_eq!(mock.finish().await.len(), 9);
     }
 }
