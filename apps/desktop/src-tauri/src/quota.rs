@@ -68,6 +68,7 @@ enum Adapter {
 struct ConfiguredProvider {
     row: ProviderQuota,
     adapter: Adapter,
+    coding_plan: bool,
     local_limits: [bool; 3],
 }
 
@@ -162,6 +163,7 @@ fn configured(config: &Value) -> Vec<ConfiguredProvider> {
                     updated_at: None,
                 },
                 adapter,
+                coding_plan: crate::credentials::coding_plan_provider(entry),
                 local_limits: [
                     !entry["quota"]["limit5h"].is_null(),
                     !entry["quota"]["limit7d"].is_null(),
@@ -306,15 +308,17 @@ async fn refresh(
                     .iter()
                     .find(|q| q["provider"].as_str() == Some(&row.name))
                 {
-                    row.windows = aggregate_windows(quota, entry.local_limits);
+                    row.windows =
+                        project_aggregate_windows(quota, entry.local_limits, entry.coding_plan);
                 }
-                row.status = if row.windows.is_empty() {
-                    QuotaStatus::Unavailable
-                } else {
+                let has_data = row.windows.iter().any(|window| window.limit.is_some());
+                row.status = if has_data {
                     QuotaStatus::Ready
+                } else {
+                    QuotaStatus::Unavailable
                 };
                 row.message = Some(
-                    if row.windows.is_empty() {
+                    if !has_data {
                         "未提供可用额度数据（来源未声明查询能力）"
                     } else {
                         "服务端聚合统计，可能包含本地用量；读取时间不代表上游采样时间。单卡刷新仍读取聚合缓存"
@@ -454,17 +458,45 @@ fn measured(
         reset_at,
     }
 }
+#[cfg(test)]
 fn aggregate_windows(value: &Value, local_limits: [bool; 3]) -> Vec<QuotaWindow> {
-    [("5h", "5 小时"), ("7d", "7 天"), ("30d", "30 天")]
+    project_aggregate_windows(value, local_limits, false)
+}
+
+fn project_aggregate_windows(
+    value: &Value,
+    local_limits: [bool; 3],
+    coding_plan: bool,
+) -> Vec<QuotaWindow> {
+    let ark_periods = coding_plan
+        && ["type5h", "type7d", "type30d"]
+            .iter()
+            .any(|k| value[*k] == "rateLimit");
+    ["5h", "7d", "30d"]
         .into_iter()
         .enumerate()
-        .filter_map(|(index, (slot, slot_label))| {
-            let limit = number(&value[format!("limit{slot}")]).filter(|n| *n > 0.0)?;
+        .filter_map(|(index, slot)| {
             let kind = value[format!("type{slot}")].as_str();
+            let period = ["5 小时", "7 天", "30 天"][index];
+            let limit = number(&value[format!("limit{slot}")]).filter(|n| *n > 0.0);
+            let raw_reset = &value[format!("reset{slot}")];
+            if ark_periods
+                && kind != Some("balance")
+                && (kind != Some("rateLimit") || limit.is_none() || !live(raw_reset))
+            {
+                return Some(QuotaWindow {
+                    label: period.into(),
+                    used: None,
+                    remaining: None,
+                    limit: None,
+                    unit: None,
+                    reset_at: None,
+                });
+            }
+            let limit = limit?;
             if local_limits[index] && kind.is_none() {
                 return None;
             }
-            let raw_reset = &value[format!("reset{slot}")];
             if !live(raw_reset) {
                 return None;
             }
@@ -488,7 +520,7 @@ fn aggregate_windows(value: &Value, local_limits: [bool; 3]) -> Vec<QuotaWindow>
                 // real window duration — keep the generic label.
                 "配额"
             } else {
-                slot_label
+                period
             };
             Some(measured(label.into(), used, limit, unit, reset(raw_reset)))
         })
@@ -760,6 +792,57 @@ mod tests {
         assert_eq!(stale.providers[0].windows[0].used, Some(40.0));
         assert_eq!(stale.updated_at, snapshot.updated_at);
     }
+    #[tokio::test]
+    async fn ark_snapshot_preserves_all_three_named_periods_in_order() {
+        let config = json!({"Providers":[{"name":"custom-plan", "api_base_url":"https://ark.cn-beijing.volces.com/api/coding/v3"}]});
+        let balance = json!({"type7d":"balance","limit7d":25,"used7d":0,"currency":"USD"});
+        let ws = project_aggregate_windows(&balance, [false; 3], true);
+        assert_eq!(
+            (
+                ws[0].label.as_str(),
+                ws[0].limit,
+                ws[0].remaining,
+                ws[0].unit.as_deref()
+            ),
+            ("余额", Some(25.0), None, Some("USD"))
+        );
+        for (extra, expected) in [
+            (
+                json!({"type5h":"rateLimit","limit5h":100,"used5h":0,"type7d":"rateLimit","limit7d":100,"used7d":12}),
+                [Some(0.0), Some(12.0), Some(32.0)],
+            ),
+            (
+                json!({"used5h":999,"limit5h":100,"type7d":"rateLimit","limit7d":100,"used7d":12,"reset7d":"2000-01-01T00:00:00Z"}),
+                [None, None, Some(32.0)],
+            ),
+        ] {
+            let mut row =
+                json!({"provider":"custom-plan","type30d":"rateLimit","limit30d":100,"used30d":32});
+            row.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mock = Mock::new(
+                config.clone(),
+                vec![(
+                    "GET /api/providers/quota HTTP/1.1".into(),
+                    200,
+                    json!({"quotas":[row]}),
+                )],
+            );
+            let snapshot = QuotaService::new(Some(mock.client.clone()))
+                .snapshot(None)
+                .await
+                .unwrap();
+            let ws = &snapshot.providers[0].windows;
+            assert_eq!(
+                ws.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(),
+                ["5 小时", "7 天", "30 天"]
+            );
+            assert_eq!(ws.iter().map(|w| w.used).collect::<Vec<_>>(), expected);
+            mock.finish().await;
+        }
+    }
+
     #[test]
     fn all_configured_rows_in_order_without_models_or_enabled_filter() {
         let providers: Vec<_> = (0..25)
@@ -779,7 +862,10 @@ mod tests {
     #[test]
     fn local_counts_and_config_limits_are_not_upstream_available_quota() {
         assert!(aggregate_windows(&json!({"used5h": 800, "used7d": 1200}), [false; 3]).is_empty());
-        assert!(aggregate_windows(&json!({"used5h": 0, "limit5h": 100}), [true, false, false]).is_empty());
+        assert!(
+            aggregate_windows(&json!({"used5h": 0, "limit5h": 100}), [true, false, false])
+                .is_empty()
+        );
         let windows = aggregate_windows(
             &json!({"used7d": 0, "limit7d": 25, "type7d": "balance", "currency":"USD"}),
             [false; 3],
@@ -794,10 +880,7 @@ mod tests {
         assert_eq!(rate[0].used, Some(34.0));
         assert_eq!(rate[0].remaining, Some(66.0));
         assert_eq!(rate[0].label, "5 小时");
-        let untyped = aggregate_windows(
-            &json!({"used5h": 34, "limit5h": 100}),
-            [false; 3],
-        );
+        let untyped = aggregate_windows(&json!({"used5h": 34, "limit5h": 100}), [false; 3]);
         assert_eq!(untyped[0].label, "配额");
         let monthly = aggregate_windows(
             &json!({"used30d": 14.6, "limit30d": 100, "type30d":"rateLimit"}),

@@ -49,7 +49,7 @@ pub struct CredentialsStatus {
 
 /// True only for the Ark Coding Plan endpoint the core adapter signs for.
 /// `/api/v3` (pay-as-you-go) and `/api/plan` (Agent Plan) never match.
-fn coding_plan_provider(entry: &Value) -> bool {
+pub(super) fn coding_plan_provider(entry: &Value) -> bool {
     let Some(base) = entry["api_base_url"].as_str() else {
         return false;
     };
