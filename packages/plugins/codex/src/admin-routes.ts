@@ -15,7 +15,7 @@
  *  POST /models/restore  {model?}           (no model = restore ALL)
  *  GET  /reset-credits
  *  POST /reset-credits/consume {creditId?}
- *  POST /reset-credits/consume-confirmed {creditId}
+ *  POST /reset-credits/consume-confirmed {creditId, accountRevision}
  *
  * Guard shape is identical to the gemini-oauth / workbuddy plugins: the loopback
  * socket address is the only trustworthy identity, plus a Host/Origin allowlist
@@ -29,7 +29,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import type { CodexAuthService } from "./auth-service";
-import { codexAdminError, isCodexModelId, isCodexResetCreditId } from "./protocol";
+import { codexAdminError, isCodexAccountRevision, isCodexModelId, isCodexResetCreditId } from "./protocol";
 
 export interface CodexAdminRouteDeps {
   /** Resolved per request so tests and late wiring stay race-free. */
@@ -97,6 +97,7 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
     codex_models_fetch_failed: 422,
     codex_reauth_required: 422,
     codex_model_invalid: 422,
+    codex_reset_account_changed: 409,
     codex_reset_busy: 429,
     codex_reset_no_credit: 409,
     codex_reset_unavailable: 502,
@@ -359,9 +360,11 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
         reply.status(503);
         return { ok: false, success: false, error: "codex_request_failed" };
       }
-      const creditId = (req.body as { creditId?: unknown } | null)?.creditId;
-      if (!isCodexResetCreditId(creditId)) throw codexAdminError("codex_reset_invalid", 422);
-      const result = await service.consumeConfirmedResetCredit(creditId);
+      const { creditId, accountRevision } = (req.body ?? {}) as { creditId?: unknown; accountRevision?: unknown };
+      if (!isCodexResetCreditId(creditId) || !isCodexAccountRevision(accountRevision)) {
+        throw codexAdminError("codex_reset_invalid", 422);
+      }
+      const result = await service.consumeConfirmedResetCredit(creditId, accountRevision);
       return { ok: true, success: true, ...result };
     } catch (error: any) {
       return codexRouteError(error, reply, "reset-credits/consume-confirmed", "codex_reset_failed");

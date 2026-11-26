@@ -44,6 +44,7 @@ import {
   fetchCodexModels,
   fetchCodexResetCredits,
   fetchCodexUsage,
+  isCodexAccountRevision,
   isCodexManagedConfigProvider,
   isCodexResetCreditId,
   isCodexModelId,
@@ -349,6 +350,8 @@ export interface CodexAuthServiceOptions {
 // Service
 // ---------------------------------------------------------------------------
 
+type CodexResetCreditsListing = CodexResetCredits & { accountRevision: string };
+
 export class CodexAuthService {
   private readonly store: CodexCredentialStore;
   private mutationTail: Promise<unknown> = Promise.resolve();
@@ -366,8 +369,9 @@ export class CodexAuthService {
   /** Reject quota reads overtaken by a reset or a data-plane observation. */
   private quotaRevision = 0;
   private usageFlight: Promise<CodexUsage | null> | null = null;
-  private resetCache: { at: number; value: CodexResetCredits | null } | null = null;
+  private resetCache: { at: number; value: CodexResetCreditsListing | null } | null = null;
   private resetRevision = 0;
+  private accountRevision = randomUUID();
   /** Reject concurrent reset confirmations instead of queueing a second spend. */
   private resetFlight = false;
   /** Unsettled redeem keys for the current account, indexed by selected credit. */
@@ -413,16 +417,29 @@ export class CodexAuthService {
     if (this.loaded && !force) return this.data;
     const previous = this.data;
     const epoch = this.epoch;
-    const data = await this.store.load().catch((): CodexCredentialData | null => null);
+    let data: CodexCredentialData | null;
+    try {
+      data = await this.store.load();
+    } catch {
+      // A failed read cannot authorize this operation or settle the identity
+      // of an outstanding redemption. Retry the store on the next operation.
+      if (this.data === previous && this.epoch === epoch) this.loaded = false;
+      return null;
+    }
     if (this.data === previous && this.epoch === epoch) {
       this.applyLoaded(data);
       this.loaded = true;
+    } else if (this.epoch === epoch && !sameCodexAccount(data?.account, this.data?.account)) {
+      // Concurrent reads completed with conflicting identities. A discarded
+      // read cannot establish which one is current for a confirmation.
+      return this.ensureLoaded(true);
     }
     return this.data;
   }
 
   private applyLoaded(data: CodexCredentialData | null): void {
     if (!sameCodexAccount(this.data?.account, data?.account)) {
+      this.accountRevision = randomUUID();
       if (this.data?.account) this.invalidateUsage();
       this.invalidateResetCredits();
       this.pendingReset.clear();
@@ -1323,8 +1340,18 @@ export class CodexAuthService {
     }).catch(() => null);
   }
 
+  private cacheResetListing(listing: CodexResetCredits | null): CodexResetCreditsListing | null {
+    const value = listing && {
+      ...listing,
+      credits: listing.credits.filter(c => !this.spentResetCredits.has(c.id)),
+      accountRevision: this.accountRevision,
+    };
+    this.resetCache = { at: this.now, value };
+    return value;
+  }
+
   /** Available gifted resets, cached briefly for display. */
-  async getResetCredits(): Promise<CodexResetCredits | null> {
+  async getResetCredits(): Promise<CodexResetCreditsListing | null> {
     const epoch = this.epoch;
     const data = await this.ensureLoaded(true);
     if (!data?.account || this.epoch !== epoch) return null;
@@ -1339,31 +1366,39 @@ export class CodexAuthService {
     if (!accessToken || !account || account.accessToken !== accessToken || !isCurrent()) return null;
     const listing = await this.fetchResetCredits(account);
     if (!isCurrent()) return null;
-    const value = listing && { ...listing, credits: listing.credits.filter((c) => !this.spentResetCredits.has(c.id)) };
-    this.resetCache = { at: this.now, value };
-    return value;
+    return this.cacheResetListing(listing);
   }
 
   /** Legacy route preserves optional credit selection and the authoritative recount. */
   async consumeResetCredit(creditId?: string): Promise<CodexResetConsumeResult & { availableCount?: number }> {
-    return this.redeemResetCredit(creditId, false);
+    return this.redeemResetCredit(creditId);
   }
 
-  async consumeConfirmedResetCredit(creditId: string): Promise<CodexResetConsumeResult> {
-    if (!isCodexResetCreditId(creditId)) throw codexAdminError("codex_reset_invalid", 422);
-    return this.redeemResetCredit(creditId, true);
+  async consumeConfirmedResetCredit(creditId: string, accountRevision: string): Promise<CodexResetConsumeResult> {
+    if (!isCodexResetCreditId(creditId) || !isCodexAccountRevision(accountRevision)) {
+      throw codexAdminError("codex_reset_invalid", 422);
+    }
+    return this.redeemResetCredit(creditId, accountRevision);
   }
 
-  private async redeemResetCredit(creditId: string | undefined, confirmed: boolean): Promise<CodexResetConsumeResult & { availableCount?: number }> {
+  private async redeemResetCredit(creditId: string | undefined, accountRevision?: string): Promise<CodexResetConsumeResult & { availableCount?: number }> {
     if (this.resetFlight) throw codexAdminError("codex_reset_busy", 429);
     this.resetFlight = true;
     const epoch = this.epoch;
+    const confirmed = accountRevision !== undefined;
+    const assertConfirmedRevision = () => {
+      if (confirmed && (accountRevision !== this.accountRevision || this.epoch !== epoch)) {
+        throw codexAdminError("codex_reset_account_changed", 409);
+      }
+    };
     try {
       await this.mutationTail;
       const data = await this.ensureLoaded(true);
+      assertConfirmedRevision();
       if (!data?.account || this.epoch !== epoch) throw codexAdminError("codex_not_connected", 409);
       const revision = this.resetRevision;
       const assertCurrentAccount = () => {
+        assertConfirmedRevision();
         if (this.epoch !== epoch || this.resetRevision !== revision || !sameCodexAccount(data.account, this.data?.account)) {
           throw codexAdminError("codex_not_connected", 409);
         }
@@ -1381,12 +1416,15 @@ export class CodexAuthService {
         // cannot authorize a spend, even for a retry of an unsettled POST.
         const listing = await this.fetchResetCredits(account);
         await this.mutationTail;
-        await this.ensureLoaded(true);
+        const fresh = await this.ensureLoaded(true);
         assertCurrentAccount();
+        if (!fresh?.account) throw codexAdminError("codex_not_connected", 409);
         if (!listing) throw codexAdminError("codex_reset_unavailable", 502);
         const selected = listing.credits.filter(c => c.id === creditId);
         if (!listing.availableCount || selected.length !== 1 || selected[0].status !== "available" ||
             (selected[0].expiresAt !== undefined && selected[0].expiresAt <= this.now)) {
+          this.invalidateResetCredits();
+          this.cacheResetListing({ ...listing, credits: listing.credits.filter(c => c.id !== creditId || c.status !== "available") });
           if (pendingKey) throw codexAdminError("codex_reset_unavailable", 502);
           throw codexAdminError("codex_reset_no_credit", 409);
         }
@@ -1397,7 +1435,7 @@ export class CodexAuthService {
         redeemRequest, creditId, accessToken: account.accessToken, accountId: account.accountId || undefined,
         fetchImpl: (url, init) => this.directFetch(url, init),
       }).catch((error: any) => {
-        if (error?.code === "codex_reauth_required") throw error;
+        if (!confirmed || error?.code === "codex_reauth_required") throw error;
         // Transport failure or an unrecognized response leaves the key unsettled.
         throw codexAdminError("codex_reset_unavailable", 502);
       });
@@ -1415,10 +1453,11 @@ export class CodexAuthService {
         }
       } else if (result.outcome === "no_credit") {
         this.invalidateResetCredits();
-        if (!confirmed) this.resetCache = { at: this.now, value: { credits: [], availableCount: 0 } };
+        if (!confirmed) this.cacheResetListing({ credits: [], availableCount: 0 });
       }
       return result;
     } catch (error: any) {
+      assertConfirmedRevision();
       if (error?.code === "codex_reauth_required") throw codexAdminError("codex_reauth_required", 422);
       if (error?.code === "codex_upstream_error") throw codexAdminError("codex_reset_unavailable", 502);
       throw error;

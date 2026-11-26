@@ -192,6 +192,7 @@ export type CodexAdminCode =
   | "codex_credential_unreadable"
   | "codex_config_write_failed"
   | "codex_model_invalid"
+  | "codex_reset_account_changed"
   | "codex_reset_busy"
   | "codex_reset_no_credit"
   | "codex_reset_unavailable"
@@ -692,6 +693,10 @@ export interface CodexResetConsumeResult {
 
 export function isCodexResetCreditId(value: unknown): value is string {
   return typeof value === "string" && value.length <= 256 && !!value.trim() && !/[\x00-\x1f\x7f-\x9f]/.test(value);
+}
+
+export function isCodexAccountRevision(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 
 const RESET_CREDIT_TITLES: Record<string, string> = {

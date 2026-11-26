@@ -18,24 +18,26 @@ function app(service: any) {
 describe("POST /api/codex/reset-credits/consume-confirmed", () => {
   const url = "/api/codex/reset-credits/consume-confirmed";
 
-  it("requires a specific, bounded creditId and uses the strict service path", async () => {
+  const accountRevision = "12345678-1234-4321-8765-001122334455";
+
+  it("requires an account revision and specific, bounded creditId and uses the strict service path", async () => {
     const service = {
       consumeConfirmedResetCredit: vi.fn(async () => ({ outcome: "reset", windowsReset: 2 })),
       consumeResetCredit: vi.fn(async () => ({ outcome: "reset", windowsReset: 2, availableCount: 1 })),
     };
     const instance = app(service);
     try {
-      for (const payload of [undefined, {}, { creditId: null }, { creditId: "" }, { creditId: " " },
-        { creditId: 1 }, { creditId: "id\u0000" }, { creditId: "x".repeat(257) }]) {
+      for (const payload of [undefined, {}, { creditId: "gift" }, { creditId: "gift", accountRevision: "invalid" },
+        { accountRevision }, ...[null, "", " ", 1, "id\u0000", "x".repeat(257)].map(creditId => ({ creditId, accountRevision }))]) {
         const res = await instance.inject({ method: "POST", url, payload, headers: localHeaders });
         expect(res.statusCode).toBe(422);
         expect(res.json()).toEqual({ ok: false, success: false, error: "codex_reset_invalid" });
       }
       expect(service.consumeConfirmedResetCredit).not.toHaveBeenCalled();
-      const res = await instance.inject({ method: "POST", url, payload: { creditId: "gift" }, headers: localHeaders });
+      const res = await instance.inject({ method: "POST", url, payload: { creditId: "gift", accountRevision }, headers: localHeaders });
       expect(res.statusCode).toBe(200);
       expect(res.json()).toEqual({ ok: true, success: true, outcome: "reset", windowsReset: 2 });
-      expect(service.consumeConfirmedResetCredit).toHaveBeenCalledExactlyOnceWith("gift");
+      expect(service.consumeConfirmedResetCredit).toHaveBeenCalledExactlyOnceWith("gift", accountRevision);
       expect(service.consumeResetCredit).not.toHaveBeenCalled();
 
       const legacy = await instance.inject({ method: "POST", url: "/api/codex/reset-credits/consume", payload: {}, headers: localHeaders });
@@ -51,7 +53,7 @@ describe("POST /api/codex/reset-credits/consume-confirmed", () => {
     };
     const instance = app(service);
     try {
-      const request = { method: "POST" as const, url, payload: { creditId: "gift" }, headers: localHeaders };
+      const request = { method: "POST" as const, url, payload: { creditId: "gift", accountRevision }, headers: localHeaders };
       const remote = await instance.inject({ ...request, remoteAddress: "192.0.2.42" });
       expect(remote.statusCode).toBe(403);
       expect(service.consumeConfirmedResetCredit).not.toHaveBeenCalled();
