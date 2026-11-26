@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -34,7 +34,8 @@ import { api } from "@/lib/api";
 import { getConfiguredProxyUrl, isGlobalProxyEnabled } from "@/utils/proxy";
 import { parseParamValue, formatParamValue } from "@/utils/params";
 import { Toast } from "@/components/ui/toast";
-import type { Provider, ProviderHealthState, ProviderProbeTelemetry, ProviderQuotaUsage } from "@/types";
+import type { Provider } from "@/types";
+import { useProviderTelemetry } from "./use-provider-telemetry";
 
 interface ProviderType extends Provider {}
 
@@ -143,7 +144,7 @@ const isManagedProvider = (provider: ProviderType | null | undefined) =>
 
 export function Providers() {
   const { t } = useTranslation();
-  const { config, refreshConfig } = useConfig();
+  const { config, saveDraft, revision, refreshConfig } = useConfig();
   const [isSaving, setIsSaving] = useState(false);
   const navigate = useNavigate();
   // Plugin-owned managed entries are edited/disconnected on their own cards.
@@ -159,6 +160,7 @@ export function Providers() {
   const showGeminiOauthManagement = () => {
     navigate('/settings?tab=providers', { state: { geminiOauthManagedNotice: true } });
   };
+  const dialogRevision = useRef<string | null>(null);
   const [editingProviderIndex, setEditingProviderIndex] = useState<number | null>(null);
   const [deletingProviderIndex, setDeletingProviderIndex] = useState<number | null>(null);
   const [hasFetchedModels, setHasFetchedModels] = useState<Record<number, boolean>>({});
@@ -172,16 +174,11 @@ export function Providers() {
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [nameError, setNameError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState<string>("");
-  const [healthStates, setHealthStates] = useState<ProviderHealthState[]>([]);
-  const [quotaUsages, setQuotaUsages] = useState<ProviderQuotaUsage[]>([]);
-  const [probeTelemetry, setProbeTelemetry] = useState<ProviderProbeTelemetry[]>([]);
+  const { healthStates, quotaUsages, probeTelemetry, refreshTelemetryRef } = useProviderTelemetry(config, isSaving);
   const [isProbingAllProviders, setIsProbingAllProviders] = useState(false);
   const [probingProviders, setProbingProviders] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'warning' } | null>(null);
   const comboInputRef = useRef<HTMLInputElement>(null);
-  // Stable handle to the telemetry refresh loop defined in the mount effect,
-  // so manual probe handlers can trigger a refresh without re-creating it.
-  const refreshTelemetryRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     const fetchProviderTemplates = async () => {
@@ -215,91 +212,6 @@ export function Providers() {
     fetchTransformers();
   }, []);
 
-  // Provider telemetry refresh loop:
-  // - self-scheduling: the next 60s refresh is armed only after the previous
-  //   one settled, so slow responses never overlap;
-  // - single-flight with a pending flag: concurrent triggers (timer, tab
-  //   visibility, manual probe) collapse into one extra refresh;
-  // - health/quota are independent: one failing keeps the other's last data;
-  // - paused while the page is hidden; on return, refresh immediately when the
-  //   last successful fetch is older than 30 seconds.
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let inFlight = false;
-    let pending = false;
-    let lastSuccessAt = 0;
-    let disposed = false;
-
-    const schedule = () => {
-      if (timer) clearTimeout(timer);
-      timer = null;
-      if (disposed || document.visibilityState !== "visible") return;
-      timer = setTimeout(() => void refresh(), 60_000);
-    };
-
-    const refresh = async () => {
-      if (inFlight) {
-        pending = true;
-        return;
-      }
-      inFlight = true;
-      try {
-        const [healthResult, quotaResult] = await Promise.allSettled([
-          api.getProviderHealth(),
-          api.getProviderQuota(),
-        ]);
-        if (disposed) return;
-        let anySuccess = false;
-        if (healthResult.status === "fulfilled") {
-          setHealthStates(healthResult.value.states || []);
-          setProbeTelemetry(healthResult.value.probes || []);
-          anySuccess = true;
-        } else {
-          console.error("Failed to fetch provider health:", healthResult.reason);
-        }
-        if (quotaResult.status === "fulfilled") {
-          setQuotaUsages(quotaResult.value.quotas || []);
-          anySuccess = true;
-        } else {
-          console.error("Failed to fetch provider quota:", quotaResult.reason);
-        }
-        if (anySuccess) lastSuccessAt = Date.now();
-      } finally {
-        inFlight = false;
-        if (disposed) return;
-        if (pending) {
-          pending = false;
-          void refresh();
-          return;
-        }
-        schedule();
-      }
-    };
-
-    refreshTelemetryRef.current = refresh;
-    void refresh();
-
-    const handleVisibility = () => {
-      if (document.visibilityState === "visible") {
-        if (Date.now() - lastSuccessAt > 30_000) {
-          void refresh();
-        } else {
-          schedule();
-        }
-      } else if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    };
-    document.addEventListener("visibilitychange", handleVisibility);
-
-    return () => {
-      disposed = true;
-      if (timer) clearTimeout(timer);
-      document.removeEventListener("visibilitychange", handleVisibility);
-    };
-  }, []);
-
   // Handle case where config is null or undefined
   if (!config) {
     return (
@@ -329,13 +241,14 @@ export function Providers() {
 
   const handleAddProvider = () => {
     const newProvider: ProviderType = { name: "", api_base_url: "", api_key: "", models: [] };
-    setEditingProviderIndex(config.Providers.length);
+    dialogRevision.current = revision;
+    setEditingProviderIndex(validProviders.length);
     setEditingProviderData(newProvider);
     setIsNewProvider(true);
     // Reset API key visibility and error when adding new provider
     setShowApiKey(prev => ({
       ...prev,
-      [config.Providers.length]: false
+      [validProviders.length]: false
     }));
     setApiKeyError(null);
     setNameError(null);
@@ -343,13 +256,13 @@ export function Providers() {
 
   // Shared helper: patch a single provider field and persist the full config.
   // Used by enabled toggle and proxy toggle so both go through the same
-  // POST /api/config path and refreshConfig afterwards.
+  // conditional save path.
   const persistProviderPatch = async (filteredIndex: number, patch: Partial<Provider>) => {
     if (isSaving) return;
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
     if (actualIndex === -1) return;
 
-    const newProviders = [...config.Providers];
+    const newProviders = [...validProviders];
     newProviders[actualIndex] = {
       ...newProviders[actualIndex],
       ...patch,
@@ -358,19 +271,15 @@ export function Providers() {
     const newConfig = { ...config, Providers: newProviders };
     setIsSaving(true);
     try {
-      const response = await api.updateConfig(newConfig);
+      const response = await saveDraft(newConfig);
       if (response.success) {
         setToast({ message: t('app.config_saved_success'), type: 'success' });
       } else {
         setToast({ message: response.message || t('app.config_saved_failed'), type: 'error' });
       }
-      // Re-fetch from server so UI reflects the exact persisted state
-      await refreshConfig();
     } catch (e) {
       console.error("Failed to persist provider patch:", e);
       setToast({ message: t('app.config_saved_failed') + ': ' + (e as Error).message, type: 'error' });
-      // Revert to server state on failure
-      await refreshConfig();
     } finally {
       setIsSaving(false);
     }
@@ -387,10 +296,11 @@ export function Providers() {
   const handleEditProvider = (index: number) => {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[index]);
-    const provider = config.Providers[actualIndex];
+    const provider = validProviders[actualIndex];
     if (isManagedProvider(provider)) { showManagedProviderManagement(provider.name); return; }
     if (isManagedGeminiOauth(provider)) { showGeminiOauthManagement(); return; }
     if (isSaving) return;
+    dialogRevision.current = revision;
     setEditingProviderIndex(actualIndex);
     setEditingProviderData(JSON.parse(JSON.stringify(provider))); // 深拷贝
     setIsNewProvider(false);
@@ -405,15 +315,19 @@ export function Providers() {
 
   const handleSaveProvider = async () => {
     if (!editingProviderData || isSaving) return;
+    if (dialogRevision.current !== revision) {
+      setToast({ message: t('app.config_conflict'), type: 'error' });
+      return;
+    }
     // Defense in depth: never allow the generic editor to mutate a managed
     // identity, key, URL, model set or transformer, even if config refreshed.
     if (isManagedProvider(editingProviderData) ||
-        (editingProviderIndex !== null && isManagedProvider(config.Providers[editingProviderIndex]))) {
+        (editingProviderIndex !== null && isManagedProvider(validProviders[editingProviderIndex]))) {
       showManagedProviderManagement(editingProviderData.name);
       return;
     }
     if (isManagedGeminiOauth(editingProviderData) ||
-        (editingProviderIndex !== null && isManagedGeminiOauth(config.Providers[editingProviderIndex]))) {
+        (editingProviderIndex !== null && isManagedGeminiOauth(validProviders[editingProviderIndex]))) {
       showGeminiOauthManagement();
       return;
     }
@@ -426,7 +340,7 @@ export function Providers() {
     
     // Check for duplicate names (case-insensitive)
     const trimmedName = editingProviderData.name.trim();
-    const isDuplicate = config.Providers.some((provider, index) => {
+    const isDuplicate = validProviders.some((provider, index) => {
       // For edit mode, skip checking the current provider being edited
       if (!isNewProvider && index === editingProviderIndex) {
         return false;
@@ -450,13 +364,13 @@ export function Providers() {
     setNameError(null);
     
     if (editingProviderIndex !== null && editingProviderData) {
-      const newProviders = [...config.Providers];
+      const newProviders = [...validProviders];
       let deletedModels: string[] = [];
       const editingProviderName = editingProviderData.name;
       if (isNewProvider) {
         newProviders.push(editingProviderData);
       } else {
-        const oldModels = config.Providers[editingProviderIndex]?.models || [];
+        const oldModels = validProviders[editingProviderIndex]?.models || [];
         const newModels = editingProviderData.models || [];
         deletedModels = oldModels.filter((m: string) => !newModels.includes(m));
         newProviders[editingProviderIndex] = editingProviderData;
@@ -468,19 +382,17 @@ export function Providers() {
       // Persist to server immediately
       setIsSaving(true);
       try {
-        const response = await api.updateConfig(newConfig);
+        const response = await saveDraft(newConfig, dialogRevision.current);
         if (response.success) {
           setToast({ message: t('app.config_saved_success'), type: 'success' });
         } else {
           setToast({ message: response.message || t('app.config_saved_failed'), type: 'error' });
+          return;
         }
-        // Re-fetch from server so UI reflects the exact persisted state
-        await refreshConfig();
       } catch (e) {
         console.error('Failed to persist provider changes:', e);
         setToast({ message: t('app.config_saved_failed') + ': ' + (e as Error).message, type: 'error' });
-        // Revert to server state on failure
-        await refreshConfig();
+        return;
       } finally {
         setIsSaving(false);
       }
@@ -524,10 +436,11 @@ export function Providers() {
   const handleSetDeletingProviderIndex = (filteredIndex: number) => {
     if (isSaving) return;
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
-    if (isManagedProvider(config.Providers[actualIndex])) { showManagedProviderManagement(config.Providers[actualIndex].name); return; }
+    if (isManagedProvider(validProviders[actualIndex])) { showManagedProviderManagement(validProviders[actualIndex].name); return; }
     // Contract D7: the Gemini subscription row is removed on its own card, so
     // delete navigates there instead of opening the generic confirmation.
     if (isManagedGeminiOauth(config.Providers[actualIndex])) { showGeminiOauthManagement(); return; }
+    dialogRevision.current = revision;
     setDeletingProviderIndex(filteredIndex);
   };
 
@@ -535,7 +448,11 @@ export function Providers() {
   const handleRemoveProvider = async (filteredIndex: number) => {
     // Find the actual index in the original providers array
     const actualIndex = validProviders.indexOf(filteredProviders[filteredIndex]);
-    const deletedProvider = config.Providers[actualIndex];
+    if (dialogRevision.current !== revision) {
+      setToast({ message: t('app.config_conflict'), type: 'error' });
+      return;
+    }
+    const deletedProvider = validProviders[actualIndex];
     if (isManagedProvider(deletedProvider)) { showManagedProviderManagement(deletedProvider.name); return; }
     setDeletingProviderIndex(null);
     if (isSaving) return;
@@ -559,7 +476,7 @@ export function Providers() {
     }
     const deletedModels = deletedProvider?.models || [];
     const deletedProviderName = deletedProvider?.name;
-    const newProviders = [...config.Providers];
+    const newProviders = [...validProviders];
     newProviders.splice(actualIndex, 1);
     let newConfig = { ...config, Providers: newProviders };
     if (deletedModels.length > 0) {
@@ -570,19 +487,15 @@ export function Providers() {
     // toggle/edit cannot overwrite this removal with a stale snapshot.
     setIsSaving(true);
     try {
-      const response = await api.updateConfig(newConfig);
+      const response = await saveDraft(newConfig);
       if (response.success) {
         setToast({ message: t('app.config_saved_success'), type: 'success' });
       } else {
         setToast({ message: response.message || t('app.config_saved_failed'), type: 'error' });
       }
-      // Re-fetch from server so UI reflects the exact persisted state
-      await refreshConfig();
     } catch (e) {
       console.error('Failed to persist provider removal:', e);
       setToast({ message: t('app.config_saved_failed') + ': ' + (e as Error).message, type: 'error' });
-      // Revert to server state on failure
-      await refreshConfig();
     } finally {
       setIsSaving(false);
     }
@@ -599,16 +512,14 @@ export function Providers() {
     const newConfig = { ...config, Providers: reordered };
     setIsSaving(true);
     try {
-      const response = await api.updateConfig(newConfig);
+      const response = await saveDraft(newConfig);
       if (response.success) {
         setToast({ message: t('app.config_saved_success'), type: 'success' });
       } else {
         setToast({ message: response.message || t('app.config_saved_failed'), type: 'error' });
       }
-      await refreshConfig();
     } catch (e) {
       setToast({ message: t('app.config_saved_failed') + ': ' + (e as Error).message, type: 'error' });
-      await refreshConfig();
     } finally {
       setIsSaving(false);
     }

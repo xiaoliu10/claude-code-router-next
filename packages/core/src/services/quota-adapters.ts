@@ -12,9 +12,16 @@ export interface ProviderQuotaResult {
   currency?: string;
   resetTime?: string;
   resetTime7d?: string;
+  /** Explicit limit for the monthly (30d) window, when the endpoint exposes one. */
+  limitMonthly?: number;
+  /** Spend/usage inside the monthly (30d) window. */
+  usedMonthlyBalance?: number;
+  /** ISO timestamp at which the monthly window resets. */
+  resetTimeMonthly?: string;
 }
 
 export interface QuotaAdapter {
+  readonly usesVolcengineCredentials?: boolean;
   queryQuota(
     provider: LLMProvider,
     timeoutMs: number,
@@ -71,7 +78,10 @@ abstract class BaseQuotaAdapter implements QuotaAdapter {
       result.remainingBalance !== undefined ||
       result.usedDailyBalance !== undefined ||
       result.limitDaily !== undefined ||
-      result.resetTime !== undefined
+      result.resetTime !== undefined ||
+      result.limitMonthly !== undefined ||
+      result.usedMonthlyBalance !== undefined ||
+      result.resetTimeMonthly !== undefined
     );
   }
 }
@@ -421,7 +431,15 @@ export function parseAliyunTokenPlanUsage(payload: any): ProviderQuotaResult | n
 
   // Reject gateway-level errors early (e.g. BailianGateway.Login.NotLogined).
   const gatewayError = readGatewayError(payload);
-  if (gatewayError) return null;
+  if (gatewayError) {
+    // Fixed, credential-free hint: a NotLogined answer means the saved console
+    // cookie no longer authenticates (stale capture or console session
+    // rotation) and must be re-copied from a live bailian-cs request.
+    if (gatewayError.includes("NotLogined")) {
+      console.debug("aliyun-token-plan: gateway rejected the saved cookie as not-logined; re-copy a fresh Cookie and sec_token from a live bailian-cs.console.aliyun.com usage request");
+    }
+    return null;
+  }
 
   // The usage object lives at payload.data.DataV2.data.data. Walk every nested
   // object candidate so shallower wraps are still tolerated.
@@ -1102,8 +1120,8 @@ function rfc3986Encode(value: string): string {
  *
  * Only percentages are available (no absolute counts), so each window maps to
  * limit=100 / used=Percent with no currency, which admin-routes classifies as
- * a rateLimit quota. session fills the 5h slot, weekly the 7d slot; monthly
- * has no UI slot and is intentionally not mapped. A reclaimed/unsubscribed
+ * a rateLimit quota. session fills the 5h slot, weekly the 7d slot, and
+ * monthly the 30d slot. A reclaimed/unsubscribed
  * plan returns Status without QuotaUsage — that is "no data", not an error.
  */
 function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | null {
@@ -1119,7 +1137,7 @@ function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | nul
   const result: ProviderQuotaResult = {};
   for (const window of quotaUsage) {
     const level = window?.Level;
-    if (level !== "session" && level !== "weekly") continue;
+    if (level !== "session" && level !== "weekly" && level !== "monthly") continue;
 
     const percent = parseOptionalNumber(window?.Percent);
     if (percent === undefined) continue;
@@ -1139,6 +1157,10 @@ function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | nul
       result.limitDaily = 100;
       result.usedDailyBalance = percent;
       if (resetIso) result.resetTime = resetIso;
+    } else if (level === "monthly") {
+      result.limitMonthly = 100;
+      result.usedMonthlyBalance = percent;
+      if (resetIso) result.resetTimeMonthly = resetIso;
     } else {
       result.totalBalance = 100;
       result.usedBalance = percent;
@@ -1146,14 +1168,18 @@ function parseVolcengineCodingPlanUsage(payload: any): ProviderQuotaResult | nul
     }
   }
 
-  // limit/reset fields are only ever set alongside a used value, so the two
-  // used slots fully decide whether any window was mapped.
-  return result.usedDailyBalance !== undefined || result.usedBalance !== undefined
+  // limit/reset fields are only ever set alongside a used value, so the used
+  // slots fully decide whether any window was mapped.
+  return result.usedDailyBalance !== undefined ||
+    result.usedBalance !== undefined ||
+    result.usedMonthlyBalance !== undefined
     ? result
     : null;
 }
 
 class VolcengineCodingPlanQuotaAdapter extends BaseQuotaAdapter {
+  readonly usesVolcengineCredentials = true;
+
   async queryQuota(
     provider: LLMProvider,
     timeoutMs: number,
@@ -1210,6 +1236,148 @@ class VolcengineCodingPlanQuotaAdapter extends BaseQuotaAdapter {
   }
 }
 
+
+// ============================== LiteLLM relays ==============================
+
+// LiteLLM proxy relays expose the signed-in user's budget through
+// GET /user/info (UserInfoResponse): the "user_info" row carries spend,
+// max_budget, budget_duration and budget_reset_at. spend is the CURRENT
+// budget window when budget_duration is set (LiteLLM resets the counter per
+// window) and lifetime spend otherwise — either way max_budget/spend is the
+// pair the relay enforces, so both are projected onto the shared balance
+// window (limit/used) with the USD denomination LiteLLM computes spend in.
+export function parseLitellmUserBudgetUsage(payload: any): ProviderQuotaResult | null {
+  const row =
+    payload && typeof payload.user_info === "object" && payload.user_info !== null
+      ? payload.user_info
+      : payload;
+  if (!row || typeof row !== "object") return null;
+  const number = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  const maxBudget = number(row.max_budget) ?? number(row.maxBudget);
+  if (maxBudget === undefined || maxBudget <= 0) return null;
+  const result: ProviderQuotaResult = {
+    totalBalance: maxBudget,
+    currency: "USD",
+  };
+  const spend = number(row.spend);
+  if (spend !== undefined && spend >= 0) result.usedBalance = spend;
+  const resetAt = [row.budget_reset_at, row.budgetResetAt].find(
+    (value): value is string =>
+      typeof value === "string" && Number.isFinite(Date.parse(value))
+  );
+  if (resetAt) result.resetTime7d = resetAt;
+  return result;
+}
+
+class LitellmUserBudgetQuotaAdapter extends BaseQuotaAdapter {
+  async queryQuota(
+    provider: LLMProvider,
+    timeoutMs: number,
+    proxyUrl?: string
+  ): Promise<ProviderQuotaResult | null> {
+    const record = provider as unknown as Record<string, unknown>;
+    const token = [record.quotaLitellmToken, record.quota_litellm_token].find(
+      (value): value is string => typeof value === "string" && value.trim().length > 0
+    );
+    if (!token) return null;
+    // Trim defensively: a padded PAT (routine paste artifact) would otherwise
+    // reach the Authorization header verbatim and fail relay auth silently.
+    const credential = token.trim();
+    // The budget API lives on the relay origin itself, not on the inference
+    // path: strip any /v1/... suffix from the configured baseUrl.
+    let origin: string;
+    try {
+      origin = new URL(provider.baseUrl).origin;
+    } catch {
+      return null;
+    }
+    const payload = await this.fetchJson(
+      origin + "/user/info",
+      provider,
+      timeoutMs,
+      proxyUrl,
+      credential
+    );
+    if (!payload) return null;
+    const result = parseLitellmUserBudgetUsage(payload);
+    return result && this.hasQuotaData(result) ? result : null;
+  }
+}
+
+// ============================== one-api / new-api relays ==============================
+
+// one-api / new-api style relays implement the legacy OpenAI billing
+// endpoints with the relay's own sk- token:
+//   GET /v1/dashboard/billing/subscription -> hard_limit_usd (total quota)
+//                                           + access_until (epoch seconds)
+//   GET /v1/dashboard/billing/usage?start_date&end_date -> total_usage in
+//                                           0.01 USD (cumulative)
+// Both paths are served with and without the /v1 prefix, so origin-rooted
+// paths work regardless of the configured inference path. The *_usd fields
+// are re-denominated by some operators, but USD is the documented format,
+// so the window is projected as USD.
+export function parseOneApiBillingUsage(subscription: any, usage: any): ProviderQuotaResult | null {
+  const number = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  const hardLimit = number(subscription?.hard_limit_usd);
+  const totalUsage = number(usage?.total_usage);
+  // A REAL cap is required. Relays serve user-quota fallbacks as
+  // astronomically large caps when the token is unlimited (nothing meaningful
+  // to cap-display), and a spend-only sample would project USD into the
+  // token-counted used7d slot downstream — so both cases yield no window.
+  if (hardLimit === undefined || hardLimit <= 0 || hardLimit >= 10000000) return null;
+  const result: ProviderQuotaResult = {
+    totalBalance: hardLimit,
+    currency: "USD",
+  };
+  if (totalUsage !== undefined && totalUsage >= 0) result.usedBalance = totalUsage / 100;
+  const accessUntil = number(subscription?.access_until);
+  if (accessUntil !== undefined && accessUntil > 0) {
+    const reset = new Date(accessUntil * 1000).toISOString();
+    if (Number.isFinite(Date.parse(reset))) result.resetTime7d = reset;
+  }
+  return result;
+}
+
+class OpenAiBillingQuotaAdapter extends BaseQuotaAdapter {
+  async queryQuota(
+    provider: LLMProvider,
+    timeoutMs: number,
+    proxyUrl?: string
+  ): Promise<ProviderQuotaResult | null> {
+    let origin: string;
+    try {
+      origin = new URL(provider.baseUrl).origin;
+    } catch {
+      return null;
+    }
+    // The usage endpoint accepts a range but relays return the cumulative
+    // total regardless, so a wide fixed range keeps the request well-formed.
+    const subscription = await this.fetchJson(
+      origin + "/v1/dashboard/billing/subscription",
+      provider,
+      timeoutMs,
+      proxyUrl
+    );
+    const usage = await this.fetchJson(
+      origin + "/v1/dashboard/billing/usage?start_date=2000-01-01&end_date=2037-12-31",
+      provider,
+      timeoutMs,
+      proxyUrl
+    );
+    // Require BOTH halves: a cap-only sample (usage request failed) would
+    // drop the spend, clear the probe's quota-exhausted flag and reopen
+    // routing to an exhausted relay. Returning null keeps the last complete
+    // sample in the quota store instead.
+    if (!subscription || !usage) return null;
+    const result = parseOneApiBillingUsage(subscription, usage);
+    // A 200 with a non-billing body (no numeric total_usage) must not yield a
+    // cap-only sample: it would display a full balance and clear the probe's
+    // exhausted flag from incomplete data.
+    return result && result.usedBalance !== undefined ? result : null;
+  }
+}
 const deepSeekQuotaAdapter = new DeepSeekQuotaAdapter();
 const openRouterQuotaAdapter = new OpenRouterQuotaAdapter();
 const siliconFlowQuotaAdapter = new SiliconFlowQuotaAdapter();
@@ -1220,8 +1388,33 @@ const xfyunCodingPlanQuotaAdapter = new XfyunCodingPlanQuotaAdapter();
 const kimiCodingPlanQuotaAdapter = new KimiCodingPlanQuotaAdapter();
 const miniMaxCodingPlanQuotaAdapter = new MiniMaxCodingPlanQuotaAdapter();
 const volcengineCodingPlanQuotaAdapter = new VolcengineCodingPlanQuotaAdapter();
+const litellmUserBudgetQuotaAdapter = new LitellmUserBudgetQuotaAdapter();
+const openAiBillingQuotaAdapter = new OpenAiBillingQuotaAdapter();
 
-export function getQuotaAdapter(baseUrl: string): QuotaAdapter | null {
+export function getQuotaAdapter(baseUrl: string, provider?: LLMProvider): QuotaAdapter | null {
+  // Field-based detection first: private relays (LiteLLM, one-api/new-api)
+  // have no fixed public hostname, so operators select the quota backend per
+  // provider via quota_framework (values: litellm | newapi | oneapi; unknown
+  // values fall through to hostname matching unchanged) or, for LiteLLM, via
+  // its quota_litellm_token / quotaLitellmToken config field.
+  const record = provider as unknown as Record<string, unknown> | undefined;
+  const framework =
+    typeof record?.quotaFramework === "string" ? record.quotaFramework.trim().toLowerCase() : "";
+  if (framework === "litellm") return litellmUserBudgetQuotaAdapter;
+  if (
+    framework === "newapi" ||
+    framework === "new-api" ||
+    framework === "oneapi" ||
+    framework === "one-api"
+  )
+    return openAiBillingQuotaAdapter;
+  const litellmToken = record
+    ? [record.quotaLitellmToken, record.quota_litellm_token].find(
+        (value): value is string => typeof value === "string" && value.trim().length > 0
+      )
+    : undefined;
+  if (litellmToken) return litellmUserBudgetQuotaAdapter;
+
   const hostname = getHostname(baseUrl);
   if (!hostname) return null;
 

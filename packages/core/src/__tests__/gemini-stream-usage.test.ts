@@ -140,3 +140,18 @@ describe("GeminiTransformer streaming trailing usage & cache preservation", () =
     expect(tail.usage.prompt_tokens_details.cached_tokens).toBe(400);
   });
 });
+
+describe("GeminiTransformer upstream request headers", () => {
+  it("requests an identity encoding so proxied responses arrive uncompressed", async () => {
+    const gemini = new GeminiTransformer();
+    const out = await gemini.transformRequestIn(
+      { model: "gemini-4-hydrogen", messages: [{ role: "user", content: "hi" }] } as any,
+      { apiKey: "AIza-test", baseUrl: "https://generativelanguage.googleapis.com/v1beta/models/" } as any
+    );
+    expect(out.config.url.toString()).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
+    );
+    expect(out.config.headers["x-goog-api-key"]).toBe("AIza-test");
+    expect(out.config.headers["Accept-Encoding"]).toBe("identity");
+  });
+});

@@ -1,3 +1,5 @@
+import { mergeUsageCapture } from "../ccr/usage-merge";
+import { captureInputUsage, startInputUsageCapture } from "../ccr/effective-input-usage";
 import { UnifiedChatRequest, MessageContent } from "@/types/llm";
 import { Transformer } from "@/types/transformer";
 import {
@@ -1083,6 +1085,9 @@ export class OpenAIResponsesTransformer implements Transformer {
     // Non-stream: assume OpenAI Chat JSON → wrap in Responses API shape
     try {
       const json = await parseResponseJson(response);
+      const format = json.type === "message" ? (context?.provider?.cacheMode === "inclusive" ? "anthropic-inclusive" : "anthropic") :
+        json.object === "response" ? "responses" : "chat";
+      captureInputUsage(startInputUsageCapture(context?.req, format), json.usage);
       return new Response(JSON.stringify(this.wrapChatInResponses(json)), {
         headers: { "Content-Type": "application/json" },
       });
@@ -1099,6 +1104,7 @@ export class OpenAIResponsesTransformer implements Transformer {
     stream: ReadableStream,
     context?: any
   ): ReadableStream {
+    const inputUsage = startInputUsageCapture(context?.req, "chat");
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     const model = (context?.provider?.models?.[0]) || "gpt-5.4";
@@ -1122,19 +1128,22 @@ export class OpenAIResponsesTransformer implements Transformer {
       status,
       model,
       output,
-      usage: this.buildResponsesUsage(),
+      usage: transformer.buildResponsesUsage(),
     });
 
+    const transformer = this;
     return new ReadableStream({
       async start(controller) {
         try {
           const reader = stream.getReader();
           let buffer = "";
           let completedEmitted = false;
+          let responseModel = model;
+          let terminalUsage: ResponsesAPIPayload["usage"];
 
           // Emit response.function_call_arguments.done + output_item.done for
           // each pending tool call, then emit response.completed.
-          const finalizeResponse = (data: any) => {
+          const finalizeResponse = () => {
             if (completedEmitted) return;
             completedEmitted = true;
 
@@ -1177,32 +1186,28 @@ export class OpenAIResponsesTransformer implements Transformer {
                 object: "response",
                 created_at: Math.floor(Date.now() / 1000),
                 status: "completed",
-                model: data?.model || model,
+                model: responseModel,
                 output: outputItems.slice(),
-                usage: data?.usage ? {
-                  ...this.buildResponsesUsage(data.usage),
-                } : this.buildResponsesUsage(),
+                usage: transformer.buildResponsesUsage(terminalUsage),
               },
             }));
           };
 
           while (true) {
             const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
+            buffer += decoder.decode(value, { stream: !done });
             const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
+            buffer = done ? "" : lines.pop() || "";
 
             for (const line of lines) {
               const trimmed = line.trim();
-              if (!trimmed || trimmed.startsWith("event:")) continue;
+              if (completedEmitted || !trimmed || trimmed.startsWith("event:")) continue;
               if (!trimmed.startsWith("data:")) continue;
 
               const raw = trimmed.slice(5).trim();
               if (raw === "[DONE]") {
                 // Ensure response.completed is emitted before [DONE].
-                finalizeResponse({});
+                finalizeResponse();
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                 continue;
               }
@@ -1210,6 +1215,22 @@ export class OpenAIResponsesTransformer implements Transformer {
               let data: any;
               try { data = JSON.parse(raw); } catch { continue; }
 
+              captureInputUsage(inputUsage, data.usage);
+              if (data.model) responseModel = data.model;
+              // Chat can send cumulative counters in a separate, choices-free trailer.
+              if (data.usage) {
+                const usage = transformer.buildResponsesUsage(data.usage);
+                const merged = mergeUsageCapture(terminalUsage, usage, false);
+                const countsChanged = merged.input_tokens !== terminalUsage?.input_tokens
+                  || merged.output_tokens !== terminalUsage?.output_tokens;
+                terminalUsage = {
+                  ...merged,
+                  total_tokens: data.usage.total_tokens ?? (countsChanged
+                    ? merged.input_tokens + merged.output_tokens
+                    : terminalUsage?.total_tokens),
+                  output_tokens_details: data.usage.output_tokens_details ?? terminalUsage?.output_tokens_details,
+                };
+              }
               // Emit response.created on first chunk
               if (!sentCreated) {
                 sentCreated = true;
@@ -1250,18 +1271,12 @@ export class OpenAIResponsesTransformer implements Transformer {
                   }
                 }
               }
-
-              // Handle finish_reason → finalize tool calls and emit response.completed
-              if (choice.finish_reason) {
-                finalizeResponse(data);
-              }
             }
+            if (done) break;
           }
 
           // Stream ended without [DONE] — still emit response.completed
-          if (!completedEmitted) {
-            finalizeResponse({});
-          }
+          finalizeResponse();
 
           controller.close();
         } catch (e) {
@@ -1275,6 +1290,7 @@ export class OpenAIResponsesTransformer implements Transformer {
     stream: ReadableStream,
     context?: any
   ): ReadableStream {
+    const inputUsage = startInputUsageCapture(context?.req, context?.provider?.cacheMode === "inclusive" ? "anthropic-inclusive" : "anthropic");
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     const model = (context?.provider?.models?.[0]) || "gpt-5.4";
@@ -1396,6 +1412,7 @@ export class OpenAIResponsesTransformer implements Transformer {
               let data: any;
               try { data = JSON.parse(raw); } catch { continue; }
 
+              captureInputUsage(inputUsage, data.message?.usage ?? data.usage);
               if (data.type === "message_start") {
                 responseId = data.message?.id || responseId;
                 ensureCreated();

@@ -1,0 +1,59 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/windows-installer]
+
+jobs:
+  build:
+    name: build nsis installer (x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared and core
+        run: |
+          pnpm build:shared
+          pnpm build:core
+
+      - name: Stage Windows runtime
+        working-directory: apps/desktop
+        env:
+          CCR_DESKTOP_NODE_VERSION: v22.23.3
+        run: node scripts/prepare-runtime.mjs --arch x64
+
+      - name: Verify per-user login registration in a temporary registry key
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked --lib autostart::platform::isolated_registry_round_trip -- --exact --test-threads=1
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --locked
+
+      - name: Build NSIS installer
+        working-directory: apps/desktop
+        env:
+          CI: "true"
+        run: node scripts/build-standalone-windows.mjs
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccr-desktop-windows-x64
+          path: apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

@@ -1,13 +1,7 @@
 import type { ChatCompletionMessageParam as OpenAIMessage } from "openai/resources/chat/completions";
 import type { MessageParam as AnthropicMessage } from "@anthropic-ai/sdk/resources/messages";
-import type {
-  ChatCompletion,
-  ChatCompletionChunk,
-} from "openai/resources/chat/completions";
-import type {
-  Message,
-  MessageStreamEvent,
-} from "@anthropic-ai/sdk/resources/messages";
+import type { ChatCompletionChunk } from "openai/resources/chat/completions";
+import type { MessageStreamEvent } from "@anthropic-ai/sdk/resources/messages";
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
 import type { Tool as AnthropicTool } from "@anthropic-ai/sdk/resources/messages";
 import { Transformer } from "./transformer";
@@ -66,8 +60,12 @@ export interface UnifiedMessage {
   };
 }
 
+// Kept off the JSON wire when forwarding unified tools to other providers.
+export const builtinWebSearch = Symbol("builtinWebSearch");
+
 // 统一的工具定义接口
 export interface UnifiedTool {
+  [builtinWebSearch]?: true;
   type: "function";
   function: {
     name: string;
@@ -221,6 +219,16 @@ export interface LLMProvider {
   /** Optional Volcengine account Secret Access Key paired with quotaAccessKey.
    *  Never projected into desktop DTOs, logs, or error messages. */
   quotaSecretKey?: string;
+  /** Optional LiteLLM personal access token for the relay GET /user/info
+   *  budget API (self-user budget behind a LiteLLM proxy). The inference
+   *  apiKey is normally route-restricted by such relays, so this separate
+   *  token is required. Never projected into desktop DTOs, logs, or errors. */
+  quotaLitellmToken?: string;
+  /** Optional quota backend framework for private relays without a fixed
+   *  public hostname: 'litellm' | 'newapi' | 'oneapi' (hyphenated aliases
+   *  accepted). Selects the matching quota adapter ahead of hostname
+   *  detection; unknown values are ignored. */
+  quotaFramework?: string;
   transformer?: {
     [key: string]: {
       use?: Transformer[];
@@ -269,6 +277,13 @@ export interface ConfigProvider {
   quota_token?: string;
   /** Optional sec_token for the Aliyun Bailian console official quota API (efm-fe 3.5.613 format) */
   quota_sec_token?: string;
+  /** Optional LiteLLM personal access token for the relay GET /user/info budget API */
+  quota_litellm_token?: string;
+  /** Optional quota backend framework selector (litellm | newapi | oneapi) */
+  quota_framework?: string;
+  /** Control-plane credentials for Volcengine Coding Plan quota probes. */
+  quotaAccessKey?: string;
+  quotaSecretKey?: string;
   transformer: {
     use?: string[] | Array<any>[];
   } & {

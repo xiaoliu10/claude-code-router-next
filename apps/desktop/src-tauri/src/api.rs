@@ -29,6 +29,16 @@ pub struct AdminClient {
     writes: Arc<Mutex<()>>,
 }
 
+/// Admin request errors contain only the fixed operation and status code.
+pub(crate) fn admin_auth_failed(error: &str) -> bool {
+    error.ends_with("returned HTTP 401") || error.ends_with("returned HTTP 403")
+}
+
+pub(crate) enum ConditionalSaveError {
+    Stale,
+    Unconfirmed,
+}
+
 impl AdminClient {
     pub fn new(settings: ConnectionSettings) -> Result<Self, String> {
         // Revalidate public settings so hand-built values cannot send credentials off-host.
@@ -86,6 +96,24 @@ impl AdminClient {
         timeout: Duration,
     ) -> Result<reqwest::Response, String> {
         let operation = format!("{method} {path}");
+        let response = self.send(method, path, body, timeout).await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "{operation} returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, String> {
+        let operation = format!("{method} {path}");
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base_url));
@@ -95,18 +123,11 @@ impl AdminClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request
+        request
             .timeout(timeout)
             .send()
             .await
-            .map_err(|_| format!("{operation} failed"))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "{operation} returned HTTP {}",
-                response.status().as_u16()
-            ));
-        }
-        Ok(response)
+            .map_err(|_| format!("{operation} failed"))
     }
 
     pub(crate) async fn get_json(&self, path: &str) -> Result<Value, String> {
@@ -118,11 +139,63 @@ impl AdminClient {
     }
 
     pub(crate) async fn config(&self) -> Result<Value, String> {
-        let config = self.get_json("/api/config").await?;
+        self.config_with_revision().await.map(|(raw, _)| raw)
+    }
+
+    pub(crate) async fn config_with_revision(&self) -> Result<(Value, Option<String>), String> {
+        let response = self.request(Method::GET, "/api/config", None).await?;
+        let revision = response
+            .headers()
+            .get("X-CCR-Config-Revision")
+            .and_then(|header| header.to_str().ok())
+            .filter(|revision| {
+                revision.len() == 64
+                    && revision
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .map(str::to_owned);
+        let config = response
+            .json::<Value>()
+            .await
+            .map_err(|_| "GET /api/config returned invalid JSON".to_string())?;
         if !config.is_object() {
             return Err("GET /api/config returned invalid configuration".into());
         }
-        Ok(config)
+        Ok((config, revision))
+    }
+
+    pub(crate) async fn put_config_and_readback(
+        &self,
+        config: &Value,
+        revision: &str,
+    ) -> Result<Value, ConditionalSaveError> {
+        let body = json!({ "config": config, "revision": revision });
+        let response = self
+            .send(
+                Method::PUT,
+                "/api/config",
+                Some(&body),
+                Duration::from_secs(20),
+            )
+            .await
+            .map_err(|_| ConditionalSaveError::Unconfirmed)?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(ConditionalSaveError::Stale);
+        }
+        if !response.status().is_success()
+            || response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v["success"].as_bool())
+                != Some(true)
+        {
+            return Err(ConditionalSaveError::Unconfirmed);
+        }
+        self.config()
+            .await
+            .map_err(|_| ConditionalSaveError::Unconfirmed)
     }
 
     /// Only fixed read-only adapter routes call this helper. Never return response bodies as errors.
@@ -307,10 +380,21 @@ fn default_value(config: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+pub(crate) fn provider_list_key(config: &Value) -> &'static str {
+    if config.get("Providers").is_none() && config.get("providers").is_some() {
+        "providers"
+    } else {
+        "Providers"
+    }
+}
+
 pub(crate) fn providers(config: &Value) -> Vec<TrayProvider> {
     let mut result = Vec::new();
     let mut names = HashSet::new();
-    if let Some(entries) = config.get("Providers").and_then(Value::as_array) {
+    if let Some(entries) = config
+        .get(provider_list_key(config))
+        .and_then(Value::as_array)
+    {
         for entry in entries {
             if !entry.is_object() || !matches!(entry.get("enabled"), None | Some(Value::Bool(true)))
             {
@@ -362,6 +446,9 @@ fn quota_lines(response: &Value, current_default: Option<&str>) -> Result<Vec<St
     else {
         return Ok(Vec::new());
     };
+    if let Some(plan) = quota.get("stepPlan") {
+        return Ok(crate::quota::step_plan_tray_lines(plan));
+    }
     let number = |name: &str| {
         quota
             .get(name)
@@ -369,7 +456,7 @@ fn quota_lines(response: &Value, current_default: Option<&str>) -> Result<Vec<St
             .filter(|n| n.is_finite() && *n >= 0.0)
     };
     let mut lines = Vec::new();
-    for window in ["5h", "7d"] {
+    for window in ["5h", "7d", "30d"] {
         let (Some(used), Some(limit)) = (
             number(&format!("used{window}")),
             number(&format!("limit{window}")),
@@ -436,6 +523,28 @@ pub(crate) mod mock {
 
     impl Mock {
         pub(crate) fn new(replies: Vec<(u16, String)>) -> Self {
+            Self::delayed(replies, Duration::ZERO)
+        }
+
+        pub(crate) fn delayed(replies: Vec<(u16, String)>, delay: Duration) -> Self {
+            Self::with_options(replies, delay, None)
+        }
+
+        pub(crate) fn with_config_revision(
+            replies: Vec<(u16, String)>,
+            revision: Option<&str>,
+        ) -> Self {
+            Self::with_options(replies, Duration::ZERO, revision)
+        }
+
+        fn with_options(
+            replies: Vec<(u16, String)>,
+            delay: Duration,
+            revision: Option<&str>,
+        ) -> Self {
+            let revision_header = revision.map_or(String::new(), |revision| {
+                format!("X-CCR-Config-Revision: {revision}\r\n")
+            });
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -504,6 +613,7 @@ pub(crate) mod mock {
                         .lock()
                         .unwrap()
                         .push(String::from_utf8(bytes).unwrap());
+                    thread::sleep(delay);
                     let redirect = if status == 302 {
                         format!(
                             "Location: http://{}/unexpected\r\n",
@@ -512,7 +622,7 @@ pub(crate) mod mock {
                     } else {
                         String::new()
                     };
-                    write!(socket, "HTTP/1.1 {status} Mock\r\n{redirect}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    write!(socket, "HTTP/1.1 {status} Mock\r\n{redirect}{revision_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 }
             });
             Self {
@@ -807,6 +917,38 @@ mod tests {
                     models: vec!["custom".into()]
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn step_plan_tray_preserves_coding_and_credit_semantics() {
+        let lines = |plan| {
+            quota_lines(
+                &json!({"quotas":[{"provider":"alpha","stepPlan":plan,"used5h":55,"limit5h":100}]}),
+                Some("alpha,one"),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            lines(
+                json!({"state":"stale","family":"coding","name":"Legacy","allowed":false,"windows":[{"id":"five_hour","limited":true,"usedPercent":0}, {"id":"weekly","limited":false}]})
+            ),
+            ["Legacy · stale · blocked", "5h used 0%", "7d unlimited"]
+        );
+        assert_eq!(
+            lines(
+                json!({"state":"partial","family":"coding","windows":[{"id":"weekly","limited":true}]})
+            ),
+            ["Step Plan · partial", "7d used —"]
+        );
+        assert_eq!(lines(json!({"state":"partial","family":"token","creditBuckets":[{"type":"topup","total":"12345678901234567890","remaining":"1.2300","expiresAt":1000}]})), ["Step Plan · partial", "topup Credit · 1.2300 / 12345678901234567890 remaining · used — · expires 1970-01-01T00:00:01Z"]);
+    }
+    #[test]
+    fn monthly_only_quota_is_shown_in_tray() {
+        let response = json!({"quotas":[{"provider":"volcengine","used30d":75,"limit30d":300}]});
+        assert_eq!(
+            quota_lines(&response, Some("volcengine,model")).unwrap(),
+            ["30d 75/300 (25.0%)"]
         );
     }
 

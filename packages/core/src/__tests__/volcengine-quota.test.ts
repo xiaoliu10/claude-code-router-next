@@ -5,6 +5,10 @@ import {
   volcengineSigV4Sign,
 } from "../services/quota-adapters";
 import type { LLMProvider } from "../types/llm";
+import { ProviderService } from "../services/provider";
+import { ActiveProbeService } from "../services/active-probe";
+import { ConfigService } from "../services/config";
+import { clearQuotaStore, getQuotaResult } from "../services/quota-store";
 
 // Tests for the Volcengine Ark Coding Plan quota adapter: V4-variant signing
 // (fixed vector with a hand-calculated HMAC chain), hostname+path dispatch,
@@ -218,6 +222,38 @@ describe("getQuotaAdapter Volcengine dispatch", () => {
   });
 });
 
+describe("Coding Plan credentials saved in provider config", () => {
+  it("uses the current keys on a quota tick after reload and keeps registered providers free of quota keys", async () => {
+    const entry = { name: "subscription", api_base_url: CODING_BASE_URL, api_key: "test-key", models: [] };
+    const config = new ConfigService({ useJsonFile: false, initialConfig: { providers: [entry] } });
+    const providers = new ProviderService(config, {} as any, { info: vi.fn() });
+    const probe = new ActiveProbeService(() => providers.getProviders(), {}, undefined, undefined, key => config.get(key));
+    const tick = () => (probe as any).runQuotaProbe();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(usagePayload([
+      { Level: "weekly", Percent: 8.5, ResetTimestamp: WEEKLY_RESET_SECONDS },
+    ]))));
+    globalThis.fetch = fetchMock;
+    clearQuotaStore();
+    try {
+      await tick();
+      expect(fetchMock).not.toHaveBeenCalled();
+      config.set("providers", [{ ...entry, quotaAccessKey: "test-key", quotaSecretKey: "sekret" }]);
+      providers.reload();
+      await tick();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(getQuotaResult(entry.name)).toMatchObject({ usedBalance: 8.5, totalBalance: 100 });
+      expect(providers.getProvider(entry.name)).not.toHaveProperty("quotaAccessKey");
+      expect(providers.getProvider(entry.name)).not.toHaveProperty("quotaSecretKey");
+      config.set("providers", [entry]);
+      providers.reload();
+      await tick();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      clearQuotaStore();
+    }
+  });
+});
+
 describe("VolcengineCodingPlanQuotaAdapter request shape", () => {
   it("POSTs the signed GetCodingPlanUsage request with the fixed-vector Authorization", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -303,8 +339,8 @@ describe("VolcengineCodingPlanQuotaAdapter window mapping", () => {
     const adapter = getQuotaAdapter(CODING_BASE_URL);
     const result = await adapter!.queryQuota(makeProvider(), 5000);
 
-    // toEqual pins the exact shape: no currency (rateLimit classification),
-    // no remainingBalance, and monthly intentionally unmapped (no UI slot).
+    // toEqual pins the exact shape: no currency (rateLimit classification) and
+    // no remainingBalance; all three windows map onto their UI slots.
     expect(result).toEqual({
       limitDaily: 100,
       usedDailyBalance: 37.5,
@@ -312,6 +348,9 @@ describe("VolcengineCodingPlanQuotaAdapter window mapping", () => {
       totalBalance: 100,
       usedBalance: 62,
       resetTime7d: WEEKLY_RESET_ISO,
+      limitMonthly: 100,
+      usedMonthlyBalance: 80,
+      resetTimeMonthly: new Date(1766000000 * 1000).toISOString(),
     });
   });
 
@@ -374,12 +413,16 @@ describe("VolcengineCodingPlanQuotaAdapter window mapping", () => {
     expect(await adapter!.queryQuota(makeProvider(), 5000)).toBeNull();
   });
 
-  it("returns null when only the unmapped monthly window is present", async () => {
+  it("maps a monthly-only response to the 30d slot alone", async () => {
     mockFetchJson(usagePayload([
       { Level: "monthly", Percent: 80, ResetTimestamp: 1766000000 },
     ]));
     const adapter = getQuotaAdapter(CODING_BASE_URL);
-    expect(await adapter!.queryQuota(makeProvider(), 5000)).toBeNull();
+    expect(await adapter!.queryQuota(makeProvider(), 5000)).toEqual({
+      limitMonthly: 100,
+      usedMonthlyBalance: 80,
+      resetTimeMonthly: new Date(1766000000 * 1000).toISOString(),
+    });
   });
 
   it("ignores entries with a non-numeric Percent", async () => {

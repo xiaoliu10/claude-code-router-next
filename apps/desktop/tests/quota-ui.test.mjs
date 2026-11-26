@@ -276,6 +276,18 @@ test("controller: merged apply protects other in-flight cards from a stale paylo
   assert.equal(rowByName(c.state().rows, "b").loading, false)
 })
 
+test("controller: old card refresh cannot hide a newly added provider in either response order", async () => {
+  for (const oldFirst of [true, false]) {
+    const ipc = fakeInvoke(); const c = Q.createController({ invoke: ipc.fn });
+    c.refreshAll(); await flush(); ipc.resolve(0, snap([prov("a")])); await flush();
+    c.refreshProvider("a"); c.refreshProvider("b", true); await flush();
+    for (const n of oldFirst ? [1, 2] : [2, 1]) {
+      ipc.resolve(n, snap(n === 1 ? [prov("a")] : [prov("a"), prov("b")])); await flush();
+    }
+    assert.deepEqual(c.state().rows.map(r => r.provider.name), ["a", "b"]);
+  }
+});
+
 test("controller: provider removed by a merged snapshot is dropped and its in-flight response cannot resurrect it", async () => {
   const ipc = fakeInvoke()
   const c = Q.createController({ invoke: ipc.fn })
@@ -329,4 +341,18 @@ test("controller: a successful per-card apply clears fullError from an earlier f
 
 test("controller: missing invoke throws (production must not silently mock)", () => {
   assert.throws(() => Q.createController({}))
+})
+
+test('controller: refresh of another card clears a revoked Step Plan before an older result lands', async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createController({ invoke: ipc.fn })
+  const merged = (updatedAt, state) => snap([prov('step', { stepPlan: { state, family: 'token', name: 'Previous account' } }), prov('other')], { updatedAt })
+  c.refreshAll(); ipc.resolve(0, merged(1, 'known')); await flush()
+  c.refreshProvider('step'); c.refreshProvider('other')
+  ipc.resolve(2, merged(3, 'unavailable')); await flush()
+  const account = () => rowByName(c.state().rows, 'step').provider.stepPlan
+  assert.equal(account().name, null)
+  ipc.resolve(1, merged(2, 'known')); await flush()
+  assert.equal(account().state, 'unavailable')
+  assert.equal(account().name, null)
 })

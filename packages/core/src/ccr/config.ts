@@ -15,7 +15,7 @@ import {
 } from "@wengine-ai/claude-code-router-shared";
 
 // Function to interpolate environment variables in config values
-const interpolateEnvVars = (obj: any): any => {
+export const interpolateEnvVars = (obj: any): any => {
   if (typeof obj === "string") {
     // Replace $VAR_NAME or ${VAR_NAME} with environment variable values
     return obj.replace(/\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/g, (match, braced, unbraced) => {
@@ -110,6 +110,20 @@ export const readConfigFile = async () => {
       process.exit(1);
     }
   }
+};
+
+// Non-exiting, non-writing, non-logging reader for the hot-reload route.
+// The bootstrap reader (readConfigFile) exits the process on parse/read
+// failure and auto-creates a default file on ENOENT — right for CLI startup,
+// fatal for a live gateway. This variant throws on any failure so the caller
+// can answer a fixed 500 with the runtime and the file untouched.
+export const readConfigFileSafe = async (jsonPath: string = CONFIG_FILE) => {
+  const raw = await fs.readFile(jsonPath, "utf-8");
+  const parsed = JSON5.parse(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("config root is not an object");
+  }
+  return interpolateEnvVars(parsed);
 };
 
 function assertNotTestEnv() {

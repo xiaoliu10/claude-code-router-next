@@ -723,6 +723,9 @@ impl Controller {
                     return;
                 }
                 v.online = false;
+                if crate::api::admin_auth_failed(&e) {
+                    v.snapshot = None;
+                }
                 v.status = format!("API unavailable: {e}");
             }),
         }
@@ -763,6 +766,9 @@ impl Controller {
                 Err(e) => controller.update(|v| {
                     v.switching = false;
                     v.online = false;
+                    if crate::api::admin_auth_failed(&e) {
+                        v.snapshot = None;
+                    }
                     v.status = format!("Switch failed: {e} — Refresh to retry");
                 }),
             }
@@ -776,6 +782,7 @@ mod tests {
     use crate::lifecycle::MANAGED_ENV;
 
     /// Fake "gateway" child for ownership tests; no network, no config access.
+    #[cfg(unix)]
     fn fake_child(dir: &std::path::Path) -> Child {
         let script = dir.join("sleepy.sh");
         std::fs::write(&script, "#!/bin/sh\nwhile :; do sleep 0.5; done\n").unwrap();
@@ -789,6 +796,7 @@ mod tests {
             .spawn()
             .unwrap()
     }
+    #[cfg(unix)]
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ccr-tray-test-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -820,6 +828,7 @@ mod tests {
         assert!(quit_label(false).contains("gateway stays running"));
     }
     #[test]
+    #[cfg(unix)]
     fn shutdown_disposes_only_the_owned_child_in_the_slot() {
         let dir = temp_dir("shutdown");
         let slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(fake_child(&dir))));
@@ -836,6 +845,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    #[cfg(unix)]
     fn owned_state_classifies_live_starting_and_exited() {
         let dir = temp_dir("states");
         let controller_state = |reached_ready: bool, exited_script: bool| {
@@ -872,6 +882,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    #[cfg(unix)]
     fn quit_waits_for_explicit_stop_to_finish_reaping() {
         let child = std::process::Command::new("/bin/sh")
             .args(["-c", "trap '' TERM; exec sleep 30"])

@@ -93,6 +93,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2437** | CCR Desktop 新增 Windows x64 安装包、登录启动、通用设置、供应商与插件管理、项目搜索及用量自动刷新。本版也更新了额度展示、用量统计和 Gemini、Codex 的请求处理。 |
 | **v2.3.2436** | Agy ACP 供应商支持工具调用：插件把调用方的工具通过只监听 127.0.0.1 的本地 MCP 服务发布给 agent，调用方收到 `tool_calls`，带回结果的后续请求续跑同一个 ACP 回合；agent 不执行任何工具，桥的凭据只传给 agent 子进程。卡片补全连接/断开/模型同步/模型隐藏闭环，并支持 agy 首次使用自动安装与 Google 账号登录。用量记录保留上游稳定错误码，Chat Completions 的最终结果按实际服务方记入。 |
 | **v2.3.2435** | 修复流式 Chat 请求启用用量统计时被 Codex 拒绝的问题。CCR 转为 Responses 请求时会移除 Chat 专用的 include_usage 字段。 |
 | **v2.3.2434** | Chat Completions 按模型族配置切换备用通道。Anthropic 备用通道返回标准 Chat 格式，调用记录按实际服务方记入最终结果。带工具的模型族请求会跳过纯文本 Agy ACP。 |
@@ -102,7 +103,6 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 | **v2.3.2430** | <ul><li>**Gemini OAuth 长会话 400 修复（插件 1.0.11）**：无签名的工具调用历史补哨兵、伪造/非法/外部（GLM 24位 hex）签名在发送前拦截；带 schema 的客户端 `web_search` 不再被误转成 Google 内置搜索。111 条消息/39 个工具的失败会话重放流式与非流式均 200。</li><li>**Gemini 流式缓存命中统计恢复（插件 1.0.11）**：收尾空文本帧携带的 `cachedContentTokenCount` 与 `finishReason` 不再被整帧丢弃，流式请求的缓存命中/最终 token 数/stop reason 正确记录（实测 ~93k token 提示词缓存命中 91067，此前恒为 0）。</li></ul> |
 | **v2.3.2429** | <ul><li>**Codex 手动用量重置**：卡片展示赠送的重置次数（来自上游），确认弹窗是唯一消耗入口；同步锁拒绝并发重复点击，重试复用幂等键，丢失响应不双花；kiro 0.1.1 随包发布。</li><li>**Gemini 传输与配额修复**：省略 Content-Type 时识别 Code Assist SSE；配额走共享管线；恢复后不再残留失败横幅。</li><li>**精确模型路由修复**：供应商显式暴露的模型 id 短路家族路由，Gemini 的 Claude 模型可按名称直达。</li><li>**Codex 掉登录修复**：剥离 Responses input 中的 thinking 字段（上游 400 根因）；成功输出清除错误残留。</li></ul> |
 | **v2.3.2428** | <ul><li>**配额适配器 gzip 修复**：经代理的配额请求固定 `Accept-Encoding: identity`，避免 undici 未解压 gzip 导致解析失败、卡片不显示用量（智谱等供应商恢复配额展示）。</li></ul> |
-| **v2.3.2427** | <ul><li>**配额窗口过期修复**：重置时间已过的窗口不再被当作当前用量展示，卡片回退到本地 token 统计，不再卡死在旧百分比上。</li></ul> |
 
 > 仅保留最近 10 个版本，更早版本的发布摘要见 [CHANGELOG-archive.md](./CHANGELOG-archive.md)，完整详细变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 

@@ -250,6 +250,50 @@ test("routing: saves serialize; second save uses the revision from the first res
   assert.equal(c.state().snapshot.revision, "rev-3")
 })
 
+test("routing: batch conflict preserves drafts and a retry preserves later edits", async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createRoutingController({ invoke: ipc.fn })
+  c.refresh()
+  ipc.resolve(0, routingSnap()); await flush()
+  const opus = Q.routeKey('opus', 'default')
+  const sonnet = Q.routeKey('sonnet', 'default')
+  c.setTarget(opus, 'beta,b1')
+  c.setTarget(sonnet, 'alpha,a1')
+  c.saveGroups(); c.saveGroups(); c.refresh()
+  assert.equal(ipc.calls.length, 2)
+  ipc.reject(1, 'stale revision'); await flush()
+  assert.deepEqual(plain(c.state().dirtyGroupKeys), [opus, sonnet])
+  assert.equal(c.state().saveError.message, 'stale revision')
+  c.refresh()
+  const fresh = routingSnap({ revision: 'rev-2' })
+  ipc.resolve(2, fresh); await flush()
+  c.saveGroups()
+  const batch = plain(ipc.calls[3].args.changes)
+  assert.ok(batch.every(change => change.revision === 'rev-2'))
+  c.setTarget(opus, 'alpha,a2') // Revert to the old snapshot while the batch is in flight.
+  c.addFallback(sonnet, 'beta,b1')
+  ipc.resolve(3, bumpRev(batch.reduce(applyRoutingChange, fresh))); await flush()
+  assert.deepEqual(plain(c.state().dirtyGroupKeys), [opus, sonnet])
+  assert.equal(c.state().draft(opus).target, 'alpha,a2')
+  assert.deepEqual(plain(c.state().draft(sonnet).fallback), ['beta,b1'])
+});
+
+test("routing: a successful row save clears the old group error but keeps group drafts", async () => {
+  const ipc = fakeInvoke()
+  const c = Q.createRoutingController({ invoke: ipc.fn })
+  const original = routingSnap()
+  c.refresh()
+  ipc.resolve(0, original); await flush()
+  const opus = Q.routeKey('opus', 'default')
+  const global = Q.routeKey('global', 'default')
+  c.setTarget(opus, 'beta,b1'); c.saveGroups()
+  ipc.reject(1, 'Could not save model groups'); await flush()
+  c.setTarget(global, 'alpha,a2'); c.saveRow(global)
+  ipc.resolve(2, bumpRev(applyRoutingChange(original, ipc.calls[2].args.change))); await flush()
+  assert.equal(c.state().saveError, null)
+  assert.deepEqual(plain(c.state().dirtyGroupKeys), [opus])
+});
+
 test("routing: flags payload carries both flags and revision; failure keeps canonical state", async () => {
   const ipc = fakeInvoke()
   const c = Q.createRoutingController({ invoke: ipc.fn })
@@ -334,20 +378,20 @@ test("routing: missing invoke throws (no silent mock)", () => {
 test("usage: normalizeUsageSnapshot whitelists contract fields only", () => {
   const u = Q.normalizeUsageSnapshot({
     period: "7d", totalRequests: 10, successCount: 8, errorCount: 2,
-    inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
+    inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
     avgTtftMs: 812, avgTokensPerSecond: 33.4,
-    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, secret: "sekret" }],
+    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6, secret: "sekret" }],
     byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, cost: 9.9 }],
     byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50 }],
     updatedAt: 123, secret: "x",
   })
   assert.deepEqual(plain(u), {
     period: "7d", totalRequests: 10, successCount: 8, errorCount: 2,
-    inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
+    inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCount: 1,
     avgTtftMs: 812, avgTokensPerSecond: 33.4,
-    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: 5, cacheWriteTokens: 6 }],
-    byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null }],
-    byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null }],
+    byModel: [{ name: "model-a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 111, cacheReadTokens: 5, cacheWriteTokens: 6 }],
+    byProvider: [{ name: "a", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 100, cacheReadTokens: null, cacheWriteTokens: null }],
+    byDay: [{ name: "2026-11-17", requests: 10, inputTokens: 100, outputTokens: 50, effectiveInputTokens: 100, cacheReadTokens: null, cacheWriteTokens: null }],
     updatedAt: 123,
   })
   assert.equal(JSON.stringify(u).includes("cost"), false, "no fabricated cost fields")
@@ -366,17 +410,24 @@ test("usage: period picker loads the requested period; invalid ignored; latest p
   assert.equal(ipc.calls.length, 0, "invalid period never hits IPC")
   c.refresh()
   await flush()
-  assert.deepEqual(plain(ipc.calls[0]), { cmd: "usage_snapshot", args: { period: "today" } })
-  ipc.resolve(0, { period: "today", totalRequests: 1 }); await flush()
+  assert.deepEqual(plain(ipc.calls[0]), { cmd: "usage_snapshot", args: { period: "7d" } })
+  ipc.resolve(0, { period: "7d", totalRequests: 1 }); await flush()
   assert.equal(c.state().snapshot.totalRequests, 1)
-  c.setPeriod("7d"); await flush()
-  assert.deepEqual(plain(ipc.calls[1].args), { period: "7d" })
+  c.setPeriod("today"); await flush()
+  assert.deepEqual(plain(ipc.calls[2].args), { period: "today" })
+  assert.deepEqual(plain(ipc.calls[3].args), { period: "7d", trend: true })
   c.setPeriod("30d"); await flush()
-  ipc.reject(2, new Error("slow"))
-  ipc.resolve(1, { period: "7d", totalRequests: 99 })
+  ipc.reject(4, new Error("slow"))
+  ipc.resolve(5, { period: "30d", byDay: [], updatedAt: "2026-11-02T12:00:00Z" })
+  ipc.reject(3, new Error("old weekly trend error"))
+  ipc.resolve(1, { period: "7d", byDay: [] })
+  ipc.resolve(2, { period: "today", totalRequests: 99 })
   await flush()
-  assert.equal(c.state().snapshot.period, "today", "failed load keeps the last complete snapshot")
+  assert.equal(c.state().snapshot.period, "7d", "failed load keeps the last complete snapshot")
   assert.equal(c.state().error, "slow")
+  assert.equal(c.state().trend.dayCount, 30)
+  assert.equal(c.state().trend.error, null)
+  assert.equal(c.state().trend.rows.length, 30, "summary failure and stale trend replies cannot replace the active trend")
   assert.equal(c.state().period, "30d")
   assert.equal(JSON.stringify(c.state().snapshot).includes("99"), false, "stale period response must not land")
 })
@@ -404,7 +455,7 @@ test("records: normalizeRecord whitelists fields; responseBody/sessionId never r
   const r = Q.normalizeRecord({
     timestamp: "2026-11-17T09:05:03Z", provider: "alpha", model: "m1",
     originalModel: "m0", upstreamModel: "m2", clientType: "claude-code", scenarioType: "think",
-    inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
+    inputTokens: 10, effectiveInputTokens: 13, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
     ttftMs: 300, tokensPerSecond: 42.5, durationMs: 1500,
     status: "error", usageEstimated: true, errorMessage: "boom",
     responseBody: "SECRET-BODY", sessionId: "session-1", apiKey: "k", id: "rec-1",
@@ -412,7 +463,7 @@ test("records: normalizeRecord whitelists fields; responseBody/sessionId never r
   assert.deepEqual(plain(r), {
     timestamp: "2026-11-17T09:05:03Z", provider: "alpha", model: "m1",
     originalModel: "m0", upstreamModel: "m2", clientType: "claude-code", scenarioType: "think",
-    inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
+    inputTokens: 10, effectiveInputTokens: 13, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 2,
     ttftMs: 300, tokensPerSecond: 42.5, durationMs: 1500,
     status: "error", usageEstimated: true, errorMessage: "boom",
   })
@@ -474,8 +525,8 @@ test("records: first load sends page 1 with fixed pageSize; invalid period and m
   assert.equal(ipc.calls.length, 0, "invalid period and empty data never hit IPC")
   c.refresh()
   await flush()
-  assert.deepEqual(plain(ipc.calls[0]), { cmd: "usage_records", args: { period: "today", page: 1, pageSize: 20 } })
-  ipc.resolve(0, { period: "today", page: 1, pageSize: 20, total: 45, records: [{ model: "m1" }] })
+  assert.deepEqual(plain(ipc.calls[0]), { cmd: "usage_records", args: { period: "7d", page: 1, pageSize: 20 } })
+  ipc.resolve(0, { period: "7d", page: 1, pageSize: 20, total: 45, records: [{ model: "m1" }] })
   await flush()
   const s = c.state()
   assert.equal(s.data.total, 45)
@@ -488,24 +539,24 @@ test("records: next/prev walk pages, bounds are no-ops, period switch resets to 
   const ipc = fakeInvoke()
   const c = Q.createRecordsController({ invoke: ipc.fn })
   c.refresh(); await flush()
-  ipc.resolve(0, { period: "today", page: 1, pageSize: 20, total: 45, records: [] }); await flush()
+  ipc.resolve(0, { period: "7d", page: 1, pageSize: 20, total: 45, records: [] }); await flush()
 
   c.prev(); await flush()
   assert.equal(ipc.calls.length, 1, "prev on the first page is a local no-op")
   c.next(); await flush()
-  assert.deepEqual(plain(ipc.calls.at(-1).args), { period: "today", page: 2, pageSize: 20 })
-  ipc.resolve(1, { period: "today", page: 2, pageSize: 20, total: 45, records: [] }); await flush()
+  assert.deepEqual(plain(ipc.calls.at(-1).args), { period: "7d", page: 2, pageSize: 20 })
+  ipc.resolve(1, { period: "7d", page: 2, pageSize: 20, total: 45, records: [] }); await flush()
   assert.equal(c.state().page, 2)
   c.next(); await flush()
-  ipc.resolve(2, { period: "today", page: 3, pageSize: 20, total: 45, records: [] }); await flush()
+  ipc.resolve(2, { period: "7d", page: 3, pageSize: 20, total: 45, records: [] }); await flush()
   assert.equal(c.state().canNext, false, "last page disables next")
   const callsBefore = ipc.calls.length
   c.next(); await flush()
   assert.equal(ipc.calls.length, callsBefore, "next past the last page is a local no-op")
 
-  c.setPeriod("7d"); await flush()
-  assert.deepEqual(plain(ipc.calls.at(-1).args), { period: "7d", page: 1, pageSize: 20 }, "period switch resets to page 1")
-  ipc.resolve(3, { period: "7d", page: 1, pageSize: 20, total: 3, records: [{ model: "m2" }] }); await flush()
+  c.setPeriod("today"); await flush()
+  assert.deepEqual(plain(ipc.calls.at(-1).args), { period: "today", page: 1, pageSize: 20 }, "period switch resets to page 1")
+  ipc.resolve(3, { period: "today", page: 1, pageSize: 20, total: 3, records: [{ model: "m2" }] }); await flush()
   assert.equal(c.state().totalPages, 1)
   assert.equal(c.state().canNext, false)
 
@@ -527,7 +578,7 @@ test("records: transport failure keeps the previous page and surfaces the error"
   const ipc = fakeInvoke()
   const c = Q.createRecordsController({ invoke: ipc.fn })
   c.refresh(); await flush()
-  ipc.resolve(0, { period: "today", page: 1, pageSize: 20, total: 45, records: [{ model: "m1" }] }); await flush()
+  ipc.resolve(0, { period: "7d", page: 1, pageSize: 20, total: 45, records: [{ model: "m1" }] }); await flush()
   c.next(); await flush()
   ipc.reject(1, new Error("网关超时"))
   await flush()

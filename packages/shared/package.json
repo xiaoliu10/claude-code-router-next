@@ -1,6 +1,6 @@
 {
   "name": "@wengine-ai/claude-code-router-shared",
-  "version": "2.3.2436",
+  "version": "2.3.2437",
   "description": "Shared utilities and constants for Claude Code Router",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -35,12 +35,14 @@
   "dependencies": {
     "adm-zip": "^0.5.16",
     "archiver": "^7.0.1",
-    "json5": "^2.2.3"
+    "json5": "^2.2.3",
+    "semver": "^7.8.6"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
     "@types/archiver": "^7.0.0",
     "@types/node": "^24.0.15",
+    "@types/semver": "^7.8.0",
     "esbuild": "^0.25.1",
     "typescript": "^5.8.2",
     "vitest": "^4.1.9"

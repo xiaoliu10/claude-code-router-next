@@ -183,7 +183,7 @@ describe("GET /api/plugins/catalog", () => {
     const res = await getLocal(app);
     const body = res.json();
     expect(body.plugins).toEqual([
-      { name: "@wengine-ai/ccr-provider-codex", description: "scoped npm name", version: "1.1.0", installed: true, installedVersion: "1.0.0", updateAvailable: true },
+      { name: "@wengine-ai/ccr-provider-codex", description: "scoped npm name", version: "1.1.0", installed: true, installedName: "codex", installedVersion: "1.0.0", updateAvailable: true },
     ]);
   });
 
@@ -219,6 +219,7 @@ describe("GET /api/plugins/catalog", () => {
       {
         name: "@wengine-ai/ccr-provider-pinned",
         description: "pinned source",
+        installedName: "pinned",
         version: "1.1.0",
         installed: true,
         installedVersion: "1.0.0",

@@ -38,6 +38,7 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, join, resolve, sep } from "path";
+import { gt, valid } from "semver";
 import { createGunzip } from "zlib";
 
 /** Keep in sync with packages/core/src/provider-plugins/types.ts: the loader
@@ -81,6 +82,17 @@ export interface PluginInstallRecord {
   source?: string;
 }
 
+/** Installed npm sources may include an exact version or range. */
+export function npmSourceName(source: string): string {
+  const at = source.indexOf("@", source.startsWith("@") ? 1 : 0);
+  return at > 0 ? source.slice(0, at) : source;
+}
+
+export interface PinnedPluginInstall {
+  version: string;
+  installed: { name: string; version: string } | null;
+}
+
 /** Manifest fields as they appear on disk, before validation. */
 export interface RawPluginManifest {
   name?: unknown;
@@ -103,6 +115,7 @@ export type PluginInstallErrorCode =
   | "unsafe_archive_member"
   | "extract_failed"
   | "invalid_manifest"
+  | "install_target_changed"
   | "already_installed"
   | "plugins_json_corrupted";
 
@@ -817,6 +830,7 @@ export async function extractPluginArchive(archive: string, destDir: string): Pr
 // ---------------------------------------------------------------------------
 
 export interface NpmPackOptions {
+  version?: string;
   /** Override the registry (tests / hermetic evidence). */
   registry?: string;
   /** Isolate npm's cache from the user profile. */
@@ -886,7 +900,10 @@ export async function npmPackPlugin(spec: string, destDir: string, options: NpmP
     "--no-fund",
   ];
   if (options.registry) args.push("--registry", options.registry);
-  args.push("--pack-destination", destDir, spec);
+  if (options.version !== undefined && !isExactPluginVersion(options.version)) {
+    throw new PluginInstallError("expected an exact npm version", "invalid_spec");
+  }
+  args.push("--pack-destination", destDir, options.version === undefined ? spec : `${spec}@${options.version}`);
   let stdout: string;
   try {
     stdout = await new Promise<string>((resolve, reject) => {
@@ -1009,7 +1026,14 @@ export function validatePayload(payloadDir: string): {
   return { manifest, raw };
 }
 
+// npm's valid() also accepts a leading v or surrounding whitespace. Only pass
+// canonical exact versions (including build metadata) through to npm pack.
+export function isExactPluginVersion(value: unknown): value is string {
+  return typeof value === "string" && value.trim() === value && !value.startsWith("v") && valid(value) !== null;
+}
+
 export interface InstallFromArchiveOptions {
+  pinned?: PinnedPluginInstall;
   configDir: string;
   force?: boolean;
   /** Working area; a fresh mkdtemp under TMPDIR is created when omitted. */
@@ -1019,6 +1043,29 @@ export interface InstallFromArchiveOptions {
   source?: string;
 }
 
+/** Called under the gateway install lock, immediately before the staged swap. */
+function verifyPinnedTarget(configDir: string, source: string | undefined, manifest: PluginManifest, pinned: PinnedPluginInstall): void {
+  const changed = () => new PluginInstallError("confirmed plugin target no longer matches", "install_target_changed");
+  if (!source || manifest.version !== pinned.version) throw changed();
+  const { records, corrupted } = readPluginRecordsChecked(configDir);
+  if (corrupted) throw corruptedRecordsError(configDir);
+  const matches = records.filter(r => r.name === manifest.name || (r.source && npmSourceName(r.source) === source));
+  const target = join(configDir, "plugins", manifest.name);
+  const previous = pinned.installed;
+  if (!previous) {
+    if (matches.length || lstatSyncSafe(target)) throw changed();
+    return;
+  }
+  if (manifest.name !== previous.name || !gt(manifest.version, previous.version)) throw changed();
+  const [record] = matches;
+  if (matches.length !== 1 || record.name !== previous.name || !record.source || npmSourceName(record.source) !== source) {
+    throw changed();
+  }
+  if (!lstatSyncSafe(target) || !lstatSync(target).isDirectory()) throw changed();
+  const current = readPluginManifest(target);
+  if (current.name !== previous.name || current.version !== previous.version) throw changed();
+}
+
 /** Extract + validate + stage a local tarball (CLI local .tgz and the
  *  npm-packed host lane share this). The temp area is always removed when
  *  this call owns it. */
@@ -1026,8 +1073,7 @@ export async function installPluginFromArchive(
   archive: string,
   options: InstallFromArchiveOptions
 ): Promise<{ target: string; manifest: PluginManifest }> {
-  // Extract outside the lock (it can be slow), then take the lock for the
-  // read-modify-write of plugins.json plus the staged directory swap.
+  // The checked target, install records and staged swap share the same lock.
   return withInstallLock(options.configDir, () => installPluginFromArchiveUnlocked(archive, options));
 }
 
@@ -1052,15 +1098,20 @@ async function installPluginFromArchiveUnlocked(
     // release. A stale dist/ otherwise reports success while reinstalling an
     // old version forever. Installed-layout archives may omit package metadata.
     const packageFile = join(packageRoot, "package.json");
-    if (existsSync(packageFile)) {
-      let pkg: { version?: unknown };
+    if (options.pinned || existsSync(packageFile)) {
+      let pkg: { name?: unknown; version?: unknown };
       try { pkg = JSON.parse(readFileSync(packageFile, "utf8")); }
       catch { throw new PluginInstallError("invalid package.json", "invalid_manifest"); }
       if (!pkg || typeof pkg !== "object" || Array.isArray(pkg) || (pkg.version !== undefined && pkg.version !== manifest.version)) {
         throw new PluginInstallError("package.json version does not match plugin.json; rebuild the plugin package", "invalid_manifest");
       }
+      if (options.pinned && (pkg.name !== options.source || pkg.version !== options.pinned.version)) {
+        throw new PluginInstallError("packed package differs from confirmed name or version", "install_target_changed");
+      }
     }
-    const target = stagePluginInstall(payloadDir, manifest, options.configDir, options.force ?? false, options.source);
+    if (options.pinned) verifyPinnedTarget(options.configDir, options.source, manifest, options.pinned);
+    const force = options.pinned ? options.pinned.installed !== null : options.force ?? false;
+    const target = stagePluginInstall(payloadDir, manifest, options.configDir, force, options.source);
     return { target, manifest };
   } finally {
     if (ownsTemp) rmSync(temp, { recursive: true, force: true });
@@ -1115,6 +1166,7 @@ export async function installPluginFromNpm(options: InstallFromNpmOptions): Prom
   const ownsTemp = options.tempRoot === undefined;
   try {
     const archive = await npmPackPlugin(options.spec, join(temp, "pack"), {
+      version: options.pinned?.version,
       registry: options.registry,
       cacheDir: options.cacheDir ?? join(temp, "npm-cache"),
       homeDir: options.homeDir ?? join(temp, "npm-home"),
@@ -1125,6 +1177,7 @@ export async function installPluginFromNpm(options: InstallFromNpmOptions): Prom
       force: options.force,
       tempRoot: temp,
       source: options.spec,
+      pinned: options.pinned,
     });
   } finally {
     if (ownsTemp) rmSync(temp, { recursive: true, force: true });

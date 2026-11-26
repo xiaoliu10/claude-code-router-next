@@ -32,7 +32,7 @@ const CLIENT_IDS: [&str; 5] = ["claudeCode", "codex", "pi", "qwenCode", "opencod
 /// Allowed clients_update actions; each maps to one existing gateway route.
 const CLIENT_ACTIONS: [&str; 3] = ["enable", "disable", "restore"];
 /// Usage periods offered by the panel; anything else is rejected before any request.
-const USAGE_PERIODS: [&str; 3] = ["today", "7d", "30d"];
+
 const MAX_PROVIDER_BUCKETS: usize = 50;
 const MAX_MODEL_BUCKETS: usize = 100;
 const MAX_DAY_BUCKETS: usize = 62;
@@ -62,6 +62,7 @@ const ERR_CLIENTS_LIST: &str = "Client statuses are unavailable";
 const ERR_CLIENT_FAILED: &str = "Client update failed";
 const ERR_CLIENT_SYNC: &str = "Client updated, but project takeover sync failed";
 const ERR_CLIENT_REFRESH: &str = "Client updated, but live statuses could not be refreshed";
+const ERR_CONFIG_RELOAD: &str = "Config reload failed";
 
 // ============================== IPC projections ==============================
 
@@ -99,6 +100,7 @@ pub struct UsageBucket {
     pub name: String,
     pub requests: u64,
     pub input_tokens: u64,
+    pub effective_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
@@ -112,6 +114,7 @@ pub struct UsageSnapshot {
     pub success_count: u64,
     pub error_count: u64,
     pub input_tokens: u64,
+    pub effective_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
@@ -152,6 +155,7 @@ pub struct UsageRecordView {
     pub client_type: Option<String>,
     pub scenario_type: String,
     pub input_tokens: u64,
+    pub effective_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
@@ -219,15 +223,45 @@ impl ControlService {
         &self,
         change: RoutingChange,
     ) -> Result<RoutingSnapshot, String> {
+        self.save_routing_changes(&[change]).await
+    }
+
+    async fn routing_save_groups(
+        &self,
+        changes: Vec<RoutingChange>,
+    ) -> Result<RoutingSnapshot, String> {
+        let mut seen = HashSet::new();
+        if changes.is_empty()
+            || changes.len() > FAMILIES.len() * (SCENARIOS.len() - 1)
+            || changes.iter().any(|change| {
+                let field = change.field.trim();
+                !FAMILIES.contains(&change.scope.as_str())
+                    || field == "background"
+                    || !SCENARIOS.contains(&field)
+                    || !seen.insert((change.scope.as_str(), field))
+            })
+        {
+            return Err("Invalid model group changes".into());
+        }
+        self.save_routing_changes(&changes).await
+    }
+
+    async fn save_routing_changes(
+        &self,
+        changes: &[RoutingChange],
+    ) -> Result<RoutingSnapshot, String> {
         let client = self.client()?;
         let _write = client.write_guard().await;
-        // Always mutate the freshest config; the UI draft's revision must match
-        // it or the whole write is rejected before touching the gateway.
         let mut config = client.config().await?;
-        if change.revision != revision_of(&config) {
+        let revision = revision_of(&config);
+        if changes.iter().any(|change| change.revision != revision) {
             return Err(ERR_STALE.into());
         }
-        let expected = apply_change(&mut config, &change)?;
+        // Validate and apply every edit to the local copy before posting once.
+        let mut expected = Vec::new();
+        for change in changes {
+            expected.extend(apply_change(&mut config, change)?);
+        }
         let verified = client.post_config_and_readback(&config).await?;
         if !expected.iter().all(|check| check.matches(&verified)) {
             return Err(ERR_SAVE_NOT_CONFIRMED.into());
@@ -270,17 +304,28 @@ impl ControlService {
     }
 
     pub(crate) async fn usage_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
-        if !USAGE_PERIODS.contains(&period) {
-            return Err(ERR_PERIOD.into());
-        }
-        let (start, end) = usage_window(period)?;
+        let query = usage_date_query(period)?;
+        let path = if query.is_empty() {
+            "/api/usage/summary".to_string()
+        } else {
+            format!("/api/usage/summary?{query}")
+        };
+        let summary = self.client()?.get_json(&path).await?;
+        usage_snapshot_from(&summary, period)
+    }
+
+    async fn usage_trend_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
+        let (start, end) = usage_trend_window(period, OffsetDateTime::now_utc())?;
         let path = format!(
             "/api/usage/summary?startDate={}&endDate={}",
             encode_query(&start),
             encode_query(&end)
         );
         let summary = self.client()?.get_json(&path).await?;
-        usage_snapshot_from(&summary, period)
+        let mut snapshot = usage_snapshot_from(&summary, period)?;
+        // Anchor chart labels to the instant queried, even across local midnight.
+        snapshot.updated_at = end;
+        Ok(snapshot)
     }
 
     pub(crate) async fn usage_records(
@@ -289,19 +334,17 @@ impl ControlService {
         page: Option<u32>,
         page_size: Option<u32>,
     ) -> Result<UsageRecordsPage, String> {
-        if !USAGE_PERIODS.contains(&period) {
-            return Err(ERR_PERIOD.into());
-        }
+        let query = usage_date_query(period)?;
         let page = page.unwrap_or(DEFAULT_USAGE_PAGE).max(1);
         let page_size = page_size
             .unwrap_or(DEFAULT_USAGE_PAGE_SIZE)
             .clamp(1, MAX_USAGE_PAGE_SIZE);
-        let (start, end) = usage_window(period)?;
-        let path = format!(
-            "/api/usage?startDate={}&endDate={}&page={page}&pageSize={page_size}",
-            encode_query(&start),
-            encode_query(&end)
-        );
+        let prefix = if query.is_empty() {
+            query
+        } else {
+            format!("{query}&")
+        };
+        let path = format!("/api/usage?{prefix}page={page}&pageSize={page_size}");
         let response = self.client()?.get_json(&path).await?;
         usage_records_from(&response, period, page, page_size)
     }
@@ -374,6 +417,34 @@ impl ControlService {
             message,
         })
     }
+
+    /// Hot-reload config.json in the running gateway. The response is the
+    /// fixed {success, restartRequired} contract; transport and non-200
+    /// failures collapse to one safe message, never an upstream body.
+    pub(crate) async fn config_reload(&self) -> Result<Value, String> {
+        let body = self
+            .client()?
+            .post_json_and_parse("/api/config/reload")
+            .await
+            .map_err(|_| ERR_CONFIG_RELOAD.to_string())?;
+        // Project the declared contract only: in external mode the gateway can
+        // be any local process, so extra 200-body fields must never cross IPC.
+        if body.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(ERR_CONFIG_RELOAD.to_string());
+        }
+        let restart_required: Vec<String> = body
+            .get("restartRequired")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(json!({ "success": true, "restartRequired": restart_required }))
+    }
 }
 
 // ============================== Tauri commands ==============================
@@ -398,6 +469,25 @@ pub async fn routing_save(
 }
 
 #[tauri::command]
+pub async fn routing_save_groups(
+    window: WebviewWindow,
+    service: tauri::State<'_, ControlService>,
+    changes: Vec<RoutingChange>,
+) -> Result<RoutingSnapshot, String> {
+    crate::popup::guard(&window)?;
+    service.routing_save_groups(changes).await
+}
+
+#[tauri::command]
+pub async fn config_reload(
+    window: WebviewWindow,
+    service: tauri::State<'_, ControlService>,
+) -> Result<Value, String> {
+    crate::popup::guard(&window)?;
+    service.config_reload().await
+}
+
+#[tauri::command]
 pub async fn routing_flags(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
@@ -416,9 +506,14 @@ pub async fn usage_snapshot(
     window: WebviewWindow,
     service: tauri::State<'_, ControlService>,
     period: String,
+    trend: Option<bool>,
 ) -> Result<UsageSnapshot, String> {
     crate::popup::guard(&window)?;
-    service.usage_snapshot(&period).await
+    if trend.unwrap_or(false) {
+        service.usage_trend_snapshot(&period).await
+    } else {
+        service.usage_snapshot(&period).await
+    }
 }
 
 #[tauri::command]
@@ -821,6 +916,17 @@ fn rfc3339(moment: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
 }
 
+// A fall-back transition can make N local calendar dates span more than N
+// 24-hour days. Fetch one day of headroom; the chart selects exact local keys.
+fn usage_trend_window(period: &str, now: OffsetDateTime) -> Result<(String, String), String> {
+    let days = match period {
+        "7d" => 7,
+        "30d" => 30,
+        _ => return Err(ERR_PERIOD.into()),
+    };
+    Ok((rfc3339(now - time::Duration::days(days + 1)), rfc3339(now)))
+}
+
 /// (startDate, endDate) for the panel periods: today starts at local midnight
 /// rendered in UTC, so the store's string comparisons and its local-day
 /// buckets agree (never UTC midnight masquerading as "today"); 7d/30d are
@@ -836,6 +942,18 @@ fn usage_window(period: &str) -> Result<(String, String), String> {
         _ => return Err(ERR_PERIOD.into()),
     };
     Ok((rfc3339(start.to_offset(time::UtcOffset::UTC)), rfc3339(now)))
+}
+
+fn usage_date_query(period: &str) -> Result<String, String> {
+    if period == "all" {
+        return Ok(String::new());
+    }
+    let (start, end) = usage_window(period)?;
+    Ok(format!(
+        "startDate={}&endDate={}",
+        encode_query(&start),
+        encode_query(&end)
+    ))
 }
 
 fn counter(summary: &Value, key: &str) -> u64 {
@@ -857,6 +975,21 @@ fn optional_counter(value: &Value, key: &str) -> Option<u64> {
         .map(|value| value as u64)
 }
 
+// Gateways predating the inclusive count omit its key. A present null is authoritative.
+fn effective_input_counter(
+    value: &Value,
+    effective: &str,
+    input: &str,
+    read: &str,
+    write: &str,
+) -> Option<u64> {
+    if value.get(effective).is_none() && counter(value, read) == 0 && counter(value, write) == 0 {
+        optional_counter(value, input)
+    } else {
+        optional_counter(value, effective)
+    }
+}
+
 /// Finite-only float metric: missing, non-numeric, or non-finite → None.
 fn optional_metric(value: &Value, key: &str) -> Option<f64> {
     value
@@ -875,6 +1008,13 @@ fn buckets(summary: &Value, key: &str, cap: usize, sort_desc: bool) -> Vec<Usage
             name: name.clone(),
             requests: counter(value, "count"),
             input_tokens: counter(value, "inputTokens"),
+            effective_input_tokens: effective_input_counter(
+                value,
+                "effectiveInputTokens",
+                "inputTokens",
+                "cacheReadInputTokens",
+                "cacheCreationInputTokens",
+            ),
             output_tokens: counter(value, "outputTokens"),
             cache_read_tokens: counter(value, "cacheReadInputTokens"),
             cache_write_tokens: counter(value, "cacheCreationInputTokens"),
@@ -903,13 +1043,29 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
         success_count: counter(summary, "successCount"),
         error_count: counter(summary, "errorCount"),
         input_tokens: counter(summary, "totalInputTokens"),
+        effective_input_tokens: effective_input_counter(
+            summary,
+            "totalEffectiveInputTokens",
+            "totalInputTokens",
+            "totalCacheReadInputTokens",
+            "totalCacheCreationInputTokens",
+        ),
         output_tokens: counter(summary, "totalOutputTokens"),
         cache_read_tokens: counter(summary, "totalCacheReadInputTokens"),
         cache_write_tokens: counter(summary, "totalCacheCreationInputTokens"),
         estimated_count: counter(summary, "estimatedCount"),
         by_model: buckets(summary, "byModel", MAX_MODEL_BUCKETS, true),
         by_provider: buckets(summary, "byProvider", MAX_PROVIDER_BUCKETS, true),
-        by_day: buckets(summary, "byDay", MAX_DAY_BUCKETS, false),
+        by_day: buckets(
+            summary,
+            "byDay",
+            if period == "all" {
+                usize::MAX
+            } else {
+                MAX_DAY_BUCKETS
+            },
+            false,
+        ),
         avg_ttft_ms: optional_counter(summary, "avgTtft"),
         avg_tokens_per_second: optional_metric(summary, "avgTokensPerSecond"),
         updated_at: rfc3339(OffsetDateTime::now_utc()),
@@ -940,6 +1096,13 @@ fn usage_record_view(entry: &Value) -> Option<UsageRecordView> {
         client_type: projected_text(entry.get("clientType")),
         scenario_type: projected_text(entry.get("scenarioType")).unwrap_or_default(),
         input_tokens: counter(entry, "inputTokens"),
+        effective_input_tokens: effective_input_counter(
+            entry,
+            "effectiveInputTokens",
+            "inputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
+        ),
         output_tokens: counter(entry, "outputTokens"),
         cache_read_tokens: counter(entry, "cacheReadInputTokens"),
         cache_write_tokens: counter(entry, "cacheCreationInputTokens"),
@@ -1235,6 +1398,94 @@ mod tests {
         assert_eq!(posted, expected);
     }
 
+    fn group_change(revision: &str, scope: &str, field: &str, target: &str) -> RoutingChange {
+        RoutingChange {
+            revision: revision.into(),
+            scope: scope.into(),
+            field: field.into(),
+            target: Some(target.into()),
+            fallback: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn group_save_posts_once_and_verifies_all_changes() {
+        let original = config();
+        let revision = revision_of(&original);
+        let mut expected = original.clone();
+        expected["Router"]["families"]["opus"]["think"] = json!("alpha,one");
+        expected["Router"]["families"]["opus"]["fallback"]["think"] = json!(["alpha,two"]);
+        expected["Router"]["families"]["sonnet"] = json!({"default": "alpha,two"});
+        let mut opus = group_change(&revision, "opus", "think", "alpha,one");
+        opus.fallback = Some(vec!["alpha,two".into()]);
+        let changes = vec![
+            opus,
+            group_change(&revision, "sonnet", "default", "alpha,two"),
+        ];
+        for readback in [expected.clone(), original.clone()] {
+            let confirmed = readback == expected;
+            let mock = Mock::new(vec![
+                response(original.clone()),
+                response(json!({"success": true})),
+                response(readback),
+            ]);
+            let service = ControlService::new(Some(mock.client()));
+            let result = service.routing_save_groups(changes.clone()).await;
+            if confirmed {
+                assert_eq!(result.unwrap().revision, revision_of(&expected));
+            } else {
+                assert_eq!(result.unwrap_err(), ERR_SAVE_NOT_CONFIRMED);
+            }
+            let requests = mock.finish().await;
+            assert_eq!(requests.len(), 3);
+            assert!(requests[1].starts_with("POST /api/config "));
+            let posted: Value =
+                serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(posted, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn group_save_rejects_invalid_or_stale_batch_without_posting() {
+        let original = config();
+        let revision = revision_of(&original);
+        let valid = group_change(&revision, "opus", "default", "alpha,two");
+        for (other, expected) in [
+            (
+                group_change(&revision, "sonnet", "think", "alpha,missing"),
+                ERR_TARGET_UNAVAILABLE,
+            ),
+            (
+                group_change("stale", "sonnet", "think", "alpha,one"),
+                ERR_STALE,
+            ),
+        ] {
+            let mock = Mock::new(vec![response(original.clone())]);
+            let service = ControlService::new(Some(mock.client()));
+            assert_eq!(
+                service
+                    .routing_save_groups(vec![valid.clone(), other])
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(mock.finish().await.len(), 1);
+        }
+        for other in [
+            valid.clone(),
+            group_change(&revision, "opus", "background", "alpha,two"),
+            group_change(&revision, "global", "default", "alpha,two"),
+        ] {
+            let mock = Mock::new(vec![]);
+            let service = ControlService::new(Some(mock.client()));
+            assert!(service
+                .routing_save_groups(vec![valid.clone(), other])
+                .await
+                .is_err());
+            assert!(mock.finish().await.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn save_updates_fallback_lists_and_is_reflected_in_snapshot() {
         let original = config();
@@ -1434,7 +1685,7 @@ mod tests {
     fn usage_whitelisted_counters_and_sorted_buckets_only() {
         let summary = json!({
             "totalRequests": 12, "successCount": 10, "errorCount": 2,
-            "totalInputTokens": 100.0, "totalOutputTokens": 200,
+            "totalInputTokens": 100.0, "totalEffectiveInputTokens": 170, "totalOutputTokens": 200,
             "totalCacheReadInputTokens": 30, "totalCacheCreationInputTokens": 40,
             "estimatedCount": 3, "avgTtft": 999, "avgTokensPerSecond": 42,
             "byProvider": {
@@ -1443,7 +1694,7 @@ mod tests {
                 "$SECRET": {"count": 1}
             },
             "byDay": {"2026-11-17": {"count": 9}, "2026-11-16": {"count": 3}},
-            "byModel": {"model-a": {"count": 4, "inputTokens": 12, "outputTokens": 3, "cacheReadInputTokens": 9, "cacheCreationInputTokens": 2, "secret": "sekret"}},
+            "byModel": {"model-a": {"count": 4, "inputTokens": 12, "effectiveInputTokens": 12, "outputTokens": 3, "cacheReadInputTokens": 9, "cacheCreationInputTokens": 2, "secret": "sekret"}},
             "byClient": {"secret-client": {"count": 4}}
         });
         let snapshot = usage_snapshot_from(&summary, "7d").unwrap();
@@ -1451,6 +1702,9 @@ mod tests {
         assert_eq!(snapshot.total_requests, 12);
         assert_eq!(snapshot.error_count, 2);
         assert_eq!(snapshot.input_tokens, 100);
+        assert_eq!(snapshot.effective_input_tokens, Some(170));
+        assert_eq!(snapshot.by_model[0].effective_input_tokens, Some(12));
+        assert_eq!(snapshot.by_provider[0].effective_input_tokens, None);
         assert_eq!(snapshot.cache_read_tokens, 30);
         assert_eq!(snapshot.cache_write_tokens, 40);
         assert_eq!(snapshot.estimated_count, 3);
@@ -1515,6 +1769,30 @@ mod tests {
     }
 
     #[test]
+    fn usage_projection_distinguishes_missing_and_null_inclusive_input() {
+        let mut summary = json!({"totalInputTokens":100,"byModel":{"old":{"inputTokens":100},"unknown":{"inputTokens":100,"effectiveInputTokens":null}}});
+        let legacy = usage_snapshot_from(&summary, "7d").unwrap();
+        assert_eq!(legacy.effective_input_tokens, Some(100));
+        assert_eq!(legacy.by_model[0].effective_input_tokens, Some(100));
+        assert_eq!(legacy.by_model[1].effective_input_tokens, None);
+        summary["totalEffectiveInputTokens"] = Value::Null;
+        assert_eq!(
+            usage_snapshot_from(&summary, "7d")
+                .unwrap()
+                .effective_input_tokens,
+            None
+        );
+        for (name, expected) in [("old", Some(100)), ("unknown", None)] {
+            assert_eq!(
+                usage_record_view(&summary["byModel"][name])
+                    .unwrap()
+                    .effective_input_tokens,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn usage_snapshot_optional_metrics_follow_summary_availability() {
         // Absent, null, non-numeric, and negative metrics are all None.
         let snapshot = usage_snapshot_from(
@@ -1556,7 +1834,7 @@ mod tests {
                     "model": "claude-opus-4", "upstreamModel": "claude-opus-4-5",
                     "modelFamily": "opus", "scenarioType": "think",
                     "clientType": "claude-code", "usageEstimated": true,
-                    "inputTokens": 100, "outputTokens": 200.7,
+                    "inputTokens": 100, "effectiveInputTokens": 170, "outputTokens": 200.7,
                     "cacheReadInputTokens": 30, "cacheCreationInputTokens": 40,
                     "ttft": 820, "tokensPerSecond": 55.5, "durationMs": 3600,
                     "status": "success", "responseBody": "LEAK_SECRET_BODY"
@@ -1596,6 +1874,7 @@ mod tests {
         assert_eq!(full.client_type.as_deref(), Some("claude-code"));
         assert_eq!(full.scenario_type, "think");
         assert_eq!(full.input_tokens, 100);
+        assert_eq!(full.effective_input_tokens, Some(170));
         assert_eq!(full.output_tokens, 200);
         assert_eq!(full.cache_read_tokens, 30);
         assert_eq!(full.cache_write_tokens, 40);
@@ -1609,6 +1888,7 @@ mod tests {
         // Null, missing, and non-numeric fields default to None/0.
         let errored = &page.records[1];
         assert_eq!(errored.input_tokens, 0);
+        assert_eq!(errored.effective_input_tokens, None);
         assert_eq!(errored.output_tokens, 0);
         assert_eq!(errored.ttft_ms, None);
         assert_eq!(errored.tokens_per_second, None);
@@ -1640,6 +1920,34 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("GET /api/usage?startDate="));
         assert!(requests[0].contains("&page=1&pageSize=20"));
+    }
+
+    #[tokio::test]
+    async fn all_time_omits_date_filters_and_keeps_older_days_and_pagination() {
+        let days: serde_json::Map<String, Value> = (0..90)
+            .map(|i| {
+                (
+                    (OffsetDateTime::UNIX_EPOCH.date() + time::Duration::days(i)).to_string(),
+                    json!({"count":1}),
+                )
+            })
+            .collect();
+        let mock = Mock::new(vec![
+            response(json!({"byDay":days})),
+            response(json!({"records":[],"total":90})),
+        ]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service.usage_snapshot("all").await.unwrap().by_day.len(),
+            90
+        );
+        service
+            .usage_records("all", Some(2), Some(20))
+            .await
+            .unwrap();
+        let requests = mock.finish().await;
+        assert!(requests[0].starts_with("GET /api/usage/summary HTTP/"));
+        assert!(requests[1].starts_with("GET /api/usage?page=2&pageSize=20 HTTP/"));
     }
 
     #[tokio::test]
@@ -1730,6 +2038,23 @@ mod tests {
             .unwrap_err();
         assert!(!error.contains("LEAK_SECRET"));
         assert_eq!(mock.finish().await.len(), 1);
+    }
+
+    #[test]
+    fn trend_window_covers_the_full_first_date_across_fall_back() {
+        // 23:30 PST on Nov 2; the oldest midnights were still PDT (UTC-7).
+        let now = OffsetDateTime::parse("2026-11-03T07:30:00Z", &Rfc3339).unwrap();
+        for (period, days, midnight) in [
+            ("7d", 7, "2026-10-27T07:00:00Z"),
+            ("30d", 30, "2026-10-04T07:00:00Z"),
+        ] {
+            let first = OffsetDateTime::parse(midnight, &Rfc3339).unwrap();
+            assert!(now - time::Duration::days(days) > first);
+            let (start, end) = usage_trend_window(period, now).unwrap();
+            assert!(OffsetDateTime::parse(&start, &Rfc3339).unwrap() <= first);
+            assert_eq!(OffsetDateTime::parse(&end, &Rfc3339).unwrap(), now);
+        }
+        assert_eq!(usage_trend_window("today", now).unwrap_err(), ERR_PERIOD);
     }
 
     #[test]
@@ -1871,9 +2196,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_reload_returns_the_gateway_contract_json() {
+        let payload = json!({"success": true, "restartRequired": ["PORT"], "extra": "LEAK_SECRET"});
+        let mock = Mock::new(vec![response(payload)]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service.config_reload().await.unwrap(),
+            json!({"success": true, "restartRequired": ["PORT"]})
+        );
+        let requests = mock.finish().await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/config/reload "));
+    }
+
+    #[tokio::test]
+    async fn config_reload_rejects_non_contract_bodies() {
+        for body in [
+            json!(["array"]),
+            json!({"success": false}),
+            json!({"success": "yes"}),
+        ] {
+            let mock = Mock::new(vec![response(body)]);
+            let service = ControlService::new(Some(mock.client()));
+            assert_eq!(
+                service.config_reload().await.unwrap_err(),
+                ERR_CONFIG_RELOAD
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_reload_failures_use_fixed_safe_messages() {
+        // Non-200: the upstream error body must never surface.
+        let mock = Mock::new(vec![(500, "LEAK_SECRET".into())]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service.config_reload().await.unwrap_err(),
+            ERR_CONFIG_RELOAD
+        );
+        assert_eq!(mock.finish().await.len(), 1);
+
+        // Connection refused: release a bound loopback port before calling.
+        let address = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let client = AdminClient::new(crate::settings::ConnectionSettings {
+            base_url: format!("http://{address}"),
+            api_key: Some("test-key".into()),
+        })
+        .unwrap();
+        let service = ControlService::new(Some(client));
+        assert_eq!(
+            service.config_reload().await.unwrap_err(),
+            ERR_CONFIG_RELOAD
+        );
+    }
+
+    #[tokio::test]
     async fn offline_service_reports_fixed_safe_errors() {
         let service = ControlService::new(None);
         assert_eq!(service.routing_snapshot().await.unwrap_err(), ERR_OFFLINE);
+        assert_eq!(service.config_reload().await.unwrap_err(), ERR_OFFLINE);
         assert_eq!(
             service.usage_snapshot("today").await.unwrap_err(),
             ERR_OFFLINE

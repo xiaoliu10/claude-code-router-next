@@ -3,12 +3,12 @@
  * Runs periodic probes to refresh health and quota info without waiting for real traffic
  */
 
-import { getHealthStore, ProviderHealthState } from './provider-health';
+import { getHealthStore } from './provider-health';
 import { captureRateLimitHeaders } from './rate-limit';
 import { getQuotaAdapter } from './quota-adapters';
 import { storeQuotaResult } from './quota-store';
 import { pollPluginQuota } from './plugin-quota';
-import type { LLMProvider } from '../types/llm';
+import type { ConfigProvider, LLMProvider } from '../types/llm';
 import { version as CCR_VERSION } from '../../package.json';
 import { getProxyDispatcher } from './proxy';
 
@@ -582,8 +582,19 @@ export class ActiveProbeService {
     // guard before dispatch is the single empty-case exit.
     const tasks: Array<{ provider: string; models: string[]; type: string; promise: Promise<void> }> = [];
 
+    // Quota credentials stay in config. Registered providers are also returned
+    // by provider APIs and passed to plugins, so only attach the keys at the
+    // point of the quota request. Use the current config after each reload.
+    const quotaConfig = new Map<string, ConfigProvider>();
+    const configuredProviders = this.getConfig?.('providers');
+    if (Array.isArray(configuredProviders)) {
+      for (const entry of configuredProviders) {
+        if (entry?.name) quotaConfig.set(entry.name, entry);
+      }
+    }
+
     for (const provider of providers) {
-      const adapter = getQuotaAdapter(provider.baseUrl);
+      const adapter = getQuotaAdapter(provider.baseUrl, provider);
       const models = Array.isArray(provider.models) ? provider.models : [];
       const proxyUrl = this.resolveProxyUrl?.(provider);
 
@@ -605,12 +616,17 @@ export class ActiveProbeService {
       }
 
       if (adapter) {
+        const entry = adapter.usesVolcengineCredentials ? quotaConfig.get(provider.name) : undefined;
+        const quotaProvider = entry && entry.api_base_url === provider.baseUrl &&
+          typeof entry.quotaAccessKey === 'string' && typeof entry.quotaSecretKey === 'string'
+          ? { ...provider, quotaAccessKey: entry.quotaAccessKey, quotaSecretKey: entry.quotaSecretKey }
+          : provider;
         tasks.push({
           provider: provider.name,
           models,
           type: 'quota-adapter',
           promise: adapter
-            .queryQuota(provider, this.config.probeTimeoutMs, proxyUrl)
+            .queryQuota(quotaProvider, this.config.probeTimeoutMs, proxyUrl)
             .then(result => {
               if (result) {
                 storeQuotaResult(provider.name, result);

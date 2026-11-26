@@ -33,6 +33,8 @@ type UsageRecordRow = {
   client_type: string | null;
   stream: number;
   usage_estimated: number;
+  effective_input_tokens: number | null;
+  effective_input_estimated: number;
   input_tokens: number;
   output_tokens: number;
   cache_read_input_tokens: number;
@@ -63,6 +65,11 @@ export interface UsageRecord {
   clientType?: string; // "claude-code" | "zcode" | "codex" | "pi" | "qwen-code" | "opencode" | "api" | "unknown"
   stream: boolean;
   usageEstimated?: boolean;
+  // Cache-inclusive input total. null when the inclusive count cannot be
+  // confirmed: no usage was reported, or a legacy row whose source protocol is
+  // unknown carries nonzero cache buckets. Never an approximation.
+  effectiveInputTokens: number | null;
+  effectiveInputTokensSource?: "estimated";
   inputTokens: number;
   outputTokens: number;
   cacheReadInputTokens: number;
@@ -75,23 +82,26 @@ export interface UsageRecord {
   responseBody?: string; // Full response body for error cases
 }
 
+type UsageRecordInput = Omit<UsageRecord, "effectiveInputTokens"> & { effectiveInputTokens?: number | null };
+
 export interface UsageSummary {
   estimatedCount: number;
   totalRequests: number;
   successCount: number;
   errorCount: number;
+  totalEffectiveInputTokens: number | null;
   totalInputTokens: number;
   totalOutputTokens: number;
   totalCacheReadInputTokens: number;
   totalCacheCreationInputTokens: number;
   avgTtft: number | null;
   avgTokensPerSecond: number | null;
-  byModel: Record<string, { count: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
-  byProvider: Record<string, { count: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
-  byScenario: Record<string, { count: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
-  byFamily: Record<string, { count: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
-  byDay: Record<string, { count: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
-  byClient: Record<string, { count: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
+  byModel: Record<string, SummaryBucket>;
+  byProvider: Record<string, SummaryBucket>;
+  byScenario: Record<string, SummaryBucket>;
+  byFamily: Record<string, SummaryBucket>;
+  byDay: Record<string, SummaryBucket>;
+  byClient: Record<string, SummaryBucket>;
 }
 
 export interface UsageQueryFilters {
@@ -164,27 +174,28 @@ function getDb(): SqliteDatabase {
     db.exec("ALTER TABLE usage_records ADD COLUMN usage_estimated INTEGER NOT NULL DEFAULT 0");
     db.pragma("user_version = 3");
   }
+  if (currentVersion < 4) {
+    db.transaction(() => {
+      const columns = db.prepare("PRAGMA table_info(usage_records)").all() as { name: string }[];
+      if (!columns.some(column => column.name === "effective_input_tokens")) {
+        db.exec("ALTER TABLE usage_records ADD COLUMN effective_input_tokens INTEGER");
+        // Only pre-column rows are known to be legacy. Later NULLs mean unknown.
+        db.exec(`UPDATE usage_records SET effective_input_tokens = input_tokens
+                 WHERE cache_read_input_tokens = 0 AND cache_creation_input_tokens = 0`);
+      }
+      if (!columns.some(column => column.name === "effective_input_estimated")) {
+        db.exec("ALTER TABLE usage_records ADD COLUMN effective_input_estimated INTEGER NOT NULL DEFAULT 0");
+      }
+      db.pragma("user_version = 4");
+    })();
+  }
   migrateLegacyUsageJsonl(db);
   pruneExpiredRecords(db, true);
 
   // NOTE: legacy databases may still carry codex_account_id/codex_account_email
   // columns from the removed account management feature. They are intentionally
   // left in place (no destructive migration) and simply never written or read.
-  insertStatement = db.prepare(`
-    INSERT INTO usage_records (
-      id, timestamp, session_id, provider, original_model, model, upstream_model, model_family,
-      scenario_type, client_type,
-      stream, usage_estimated, input_tokens, output_tokens, cache_read_input_tokens,
-      cache_creation_input_tokens, ttft, tokens_per_second, duration_ms,
-      status, error_message, response_body
-    ) VALUES (
-      @id, @timestamp, @session_id, @provider, @original_model, @model, @upstream_model,
-      @model_family, @scenario_type, @client_type,
-      @stream, @usage_estimated, @input_tokens, @output_tokens,
-      @cache_read_input_tokens, @cache_creation_input_tokens, @ttft,
-      @tokens_per_second, @duration_ms, @status, @error_message, @response_body
-    )
-  `);
+  insertStatement = getInsertStatement(db);
 
   dbInstance = db;
   return dbInstance;
@@ -302,13 +313,13 @@ function getInsertStatement(db: SqliteDatabase, insertMode = "INSERT"): SqliteSt
     ${insertMode} INTO usage_records (
       id, timestamp, session_id, provider, original_model, model, upstream_model, model_family,
       scenario_type, client_type,
-      stream, usage_estimated, input_tokens, output_tokens, cache_read_input_tokens,
+      stream, usage_estimated, effective_input_tokens, effective_input_estimated, input_tokens, output_tokens, cache_read_input_tokens,
       cache_creation_input_tokens, ttft, tokens_per_second, duration_ms,
       status, error_message, response_body
     ) VALUES (
       @id, @timestamp, @session_id, @provider, @original_model, @model, @upstream_model,
       @model_family, @scenario_type, @client_type,
-      @stream, @usage_estimated, @input_tokens, @output_tokens,
+      @stream, @usage_estimated, @effective_input_tokens, @effective_input_estimated, @input_tokens, @output_tokens,
       @cache_read_input_tokens, @cache_creation_input_tokens, @ttft,
       @tokens_per_second, @duration_ms, @status, @error_message, @response_body
     )
@@ -326,7 +337,7 @@ function calculateUsageTokensPerSecond(outputTokens: number, durationMs: number 
   return Math.round(outputTokens / decodeDurationSeconds);
 }
 
-function normalizeUsageRecord(record: UsageRecord): UsageRecord {
+function normalizeUsageRecord<T extends UsageRecordInput>(record: T): T {
   const outputTokens = Number(record.outputTokens) || 0;
   const rawDurationMs = Number(record.durationMs);
   const durationMs = Number.isFinite(rawDurationMs) ? rawDurationMs : null;
@@ -362,8 +373,13 @@ function normalizeStatus(value: unknown): UsageStatus {
   return value === "success" ? "success" : "error";
 }
 
-function toDbRow(record: UsageRecord): UsageRecordRow {
+function toDbRow(record: UsageRecordInput): UsageRecordRow {
   const normalized = normalizeUsageRecord(record);
+  const cacheRead = Math.trunc(normalizeNumber(normalized.cacheReadInputTokens));
+  const cacheWrite = Math.trunc(normalizeNumber(normalized.cacheCreationInputTokens));
+  const input = Math.trunc(normalizeNumber(normalized.inputTokens));
+  const effectiveInput = normalized.effectiveInputTokens === undefined && cacheRead === 0 && cacheWrite === 0
+    ? input : normalized.effectiveInputTokens;
   return {
     id: normalizeString(normalized.id),
     timestamp: normalizeString(normalized.timestamp),
@@ -377,10 +393,12 @@ function toDbRow(record: UsageRecord): UsageRecordRow {
     client_type: normalizeOptionalString(normalized.clientType) ?? null,
     stream: normalized.stream ? 1 : 0,
     usage_estimated: normalized.usageEstimated === true ? 1 : 0,
-    input_tokens: Math.trunc(normalizeNumber(normalized.inputTokens)),
+    effective_input_tokens: effectiveInput == null ? null : Math.trunc(normalizeNumber(effectiveInput)),
+    effective_input_estimated: normalized.effectiveInputTokensSource === "estimated" ? 1 : 0,
+    input_tokens: input,
     output_tokens: Math.trunc(normalizeNumber(normalized.outputTokens)),
-    cache_read_input_tokens: Math.trunc(normalizeNumber(normalized.cacheReadInputTokens)),
-    cache_creation_input_tokens: Math.trunc(normalizeNumber(normalized.cacheCreationInputTokens)),
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheWrite,
     ttft: parseNumericTokenSpeedValue(normalized.ttft),
     tokens_per_second: parseNumericTokenSpeedValue(normalized.tokensPerSecond),
     duration_ms: Math.trunc(normalizeNumber(normalized.durationMs)),
@@ -391,7 +409,7 @@ function toDbRow(record: UsageRecord): UsageRecordRow {
 }
 
 function toUsageRecord(row: UsageRecordRow): UsageRecord {
-  return normalizeUsageRecord({
+  return normalizeUsageRecord<UsageRecord>({
     id: row.id,
     timestamp: row.timestamp,
     sessionId: row.session_id,
@@ -404,6 +422,8 @@ function toUsageRecord(row: UsageRecordRow): UsageRecord {
     clientType: row.client_type ?? undefined,
     stream: row.stream === 1,
     ...(row.usage_estimated === 1 ? { usageEstimated: true } : {}),
+    effectiveInputTokens: row.effective_input_tokens,
+    ...(row.effective_input_estimated === 1 || row.usage_estimated === 1 ? { effectiveInputTokensSource: "estimated" } : {}),
     inputTokens: row.input_tokens,
     outputTokens: row.output_tokens,
     cacheReadInputTokens: row.cache_read_input_tokens,
@@ -483,8 +503,17 @@ function buildWhereClause(filters: UsageQueryFilters): QueryWhereClause {
 // synchronous. COUNT/SUM/AVG/GROUP BY keep this work inside SQLite and return
 // only tiny result sets. Semantics intentionally mirror the old JS version:
 // tokens are counted for successful requests only.
+// Aggregates propagate NULL: if any successful row in scope has an unconfirmable
+// inclusive input, the whole bucket/total is NULL rather than a partial sum.
+const EFFECTIVE_INPUT_SUM_SQL = `
+  CASE
+    WHEN SUM(CASE WHEN status = 'success' AND effective_input_tokens IS NULL THEN 1 ELSE 0 END) > 0 THEN NULL
+    ELSE COALESCE(SUM(CASE WHEN status = 'success' THEN effective_input_tokens ELSE 0 END), 0)
+  END
+`;
 const SUMMARY_BUCKET_AGGREGATES = `
   COUNT(*) AS count,
+  ${EFFECTIVE_INPUT_SUM_SQL} AS effectiveInputTokens,
   COALESCE(SUM(CASE WHEN status = 'success' THEN input_tokens ELSE 0 END), 0) AS inputTokens,
   COALESCE(SUM(CASE WHEN status = 'success' THEN output_tokens ELSE 0 END), 0) AS outputTokens,
   COALESCE(SUM(CASE WHEN status = 'success' THEN cache_read_input_tokens ELSE 0 END), 0) AS cacheReadInputTokens,
@@ -492,6 +521,7 @@ const SUMMARY_BUCKET_AGGREGATES = `
 `;
 
 type SummaryBucket = {
+  effectiveInputTokens: number | null;
   count: number;
   inputTokens: number;
   outputTokens: number;
@@ -531,6 +561,7 @@ function readSummaryBuckets(
     if (row.key == null) continue;
     map[String(row.key)] = {
       count: row.count,
+      effectiveInputTokens: row.effectiveInputTokens,
       inputTokens: row.inputTokens,
       outputTokens: row.outputTokens,
       cacheReadInputTokens: row.cacheReadInputTokens,
@@ -547,6 +578,7 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
     .prepare(`
       SELECT
         COUNT(*) AS totalRequests,
+        ${EFFECTIVE_INPUT_SUM_SQL} AS totalEffectiveInputTokens,
         COALESCE(SUM(usage_estimated), 0) AS estimatedCount,
         COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS successCount,
         COALESCE(SUM(CASE WHEN status = 'success' THEN input_tokens ELSE 0 END), 0) AS totalInputTokens,
@@ -561,6 +593,7 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
     estimatedCount: number;
     totalRequests: number;
     successCount: number;
+    totalEffectiveInputTokens: number | null;
     totalInputTokens: number;
     totalOutputTokens: number;
     totalCacheReadInputTokens: number;
@@ -571,6 +604,7 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
 
   return {
     estimatedCount: totals.estimatedCount,
+    totalEffectiveInputTokens: totals.totalEffectiveInputTokens,
     totalRequests: totals.totalRequests,
     successCount: totals.successCount,
     errorCount: totals.totalRequests - totals.successCount,
@@ -604,7 +638,7 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
   };
 }
 
-export function append(record: UsageRecord): void {
+export function append(record: UsageRecordInput): void {
   const db = getDb();
   const normalized = normalizeUsageRecord(record);
   // Use the cached prepared statement for hot-path performance.

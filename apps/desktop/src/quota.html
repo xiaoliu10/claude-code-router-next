@@ -6,7 +6,9 @@
   <title>CCR 控制中心</title>
   <link rel="stylesheet" href="quota.css">
   <!-- CSP is enforced by tauri.conf.json (script-src 'self'): external scripts only, no inline script/handlers. -->
+  <script src="general-settings.js" defer></script>
   <script src="projects.js" defer></script>
+  <script src="plugins.js" defer></script>
   <script src="quota.js" defer></script>
 </head>
 <body>
@@ -32,10 +34,13 @@
       <span class="spacer"></span>
       <button id="service-start" class="btn" type="button" title="启动桌面托管的网关服务">启动</button>
       <button id="service-stop" class="btn" type="button" title="停止由桌面启动的网关服务">停止</button>
+      <button id="service-reload" class="btn" type="button" title="重新读取 config.json 并热应用，不重启服务">重载配置</button>
       <button id="service-refresh" class="btn btn-icon" type="button" aria-label="刷新服务状态" title="刷新服务状态">
         <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/><path d="M13.4 1.6v3h-3"/></svg>
       </button>
     </div>
+
+    <div id="service-reload-msg" class="banner" role="status" aria-live="polite" hidden></div>
 
     <nav id="tabs" class="tabs" role="tablist" aria-label="控制中心页签">
       <button id="tab-quota" class="tab" type="button" role="tab" aria-selected="true" aria-controls="panel-quota">额度</button>
@@ -43,16 +48,48 @@
       <button id="tab-usage" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-usage" tabindex="-1">用量</button>
       <button id="tab-clients" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-clients" tabindex="-1">客户端</button>
       <button id="tab-projects" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-projects" tabindex="-1">项目</button>
+      <button id="tab-plugins" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-plugins" tabindex="-1">插件</button>
+      <button id="tab-settings" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" tabindex="-1">设置</button>
     </nav>
 
     <section id="panel-quota" class="panel" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
-      <div class="heading"><h1>额度</h1><span id="provider-count" class="count">正在读取…</span></div>
+      <div class="panel-head">
+        <h1>额度</h1><span id="provider-count" class="count">正在读取…</span><span class="spacer"></span>
+        <button id="provider-add-open" class="btn" type="button" aria-expanded="false" aria-controls="provider-add-form">添加供应商</button>
+      </div>
       <p class="hint">读取服务端额度快照，不会重置任何额度。</p>
+      <form id="provider-add-form" class="provider-form card" aria-labelledby="provider-form-title" autocomplete="off" novalidate hidden>
+        <h2 id="provider-form-title">添加供应商</h2>
+        <label>供应商名称<input id="provider-name" class="route-input" type="text" placeholder="example.com" required></label>
+        <label>API 地址<input id="provider-base-url" class="route-input" type="url" placeholder="https://example.com/v1/chat/completions" spellcheck="false" required></label>
+        <label>API 密钥<input id="provider-api-key" class="route-input" type="password" autocomplete="new-password" spellcheck="false" required></label>
+        <label>模型 ID（用换行或逗号分隔）<textarea id="provider-models" class="route-input" rows="2" spellcheck="false" required></textarea></label>
+        <fieldset id="provider-transformers" class="provider-transformers">
+          <legend>转换器</legend>
+          <div id="provider-transformer-protected" hidden>
+            <p id="provider-transformer-summary"></p>
+            <button id="provider-transformer-replace" class="btn" type="button">替换供应商转换器链</button>
+            <div id="provider-transformer-confirm" hidden>
+              <p>保存后将替换此供应商的转换器和参数。各模型的转换器配置会保留。</p>
+              <button id="provider-transformer-keep" class="btn" type="button">保留现有配置</button>
+              <button id="provider-transformer-confirm-replace" class="btn" type="button">确认替换</button>
+            </div>
+          </div>
+          <div id="provider-transformer-rows"></div>
+          <button id="provider-transformer-add" class="btn" type="button">添加转换器</button>
+        </fieldset>
+        <div class="provider-form-actions">
+          <span id="provider-add-error" class="inline-msg" role="alert"></span>
+          <button id="provider-add-cancel" class="btn" type="button">取消</button>
+          <button id="provider-add-save" class="btn btn-primary" type="submit">保存</button>
+        </div>
+      </form>
+      <div id="provider-add-status" class="hint" role="status"></div>
       <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
       <ul id="list" class="list" aria-label="提供方额度列表" aria-busy="false" tabindex="0">
         <li id="empty" class="empty" hidden>
           <p class="empty-title">暂无已配置的提供方</p>
-          <p class="empty-note">在 config.json 中配置提供方后，这里会显示额度信息。</p>
+          <p class="empty-note">点击「添加供应商」配置 API 接入信息。</p>
         </li>
       </ul>
     </section>
@@ -62,6 +99,7 @@
         <h1>路由</h1>
         <span id="routing-revision" class="count"></span>
         <span class="spacer"></span>
+        <button id="routing-save-groups" class="btn btn-primary" type="button" disabled hidden>保存模型组</button>
         <button id="routing-refresh" class="btn" type="button" title="重新读取路由配置；未保存的修改会保留">刷新</button>
       </div>
       <p class="hint">修改后需点击保存才会写入配置；回退按顺序依次尝试。</p>
@@ -96,9 +134,10 @@
         <button id="usage-refresh" class="btn" type="button" title="重新读取用量统计">刷新</button>
       </div>
       <div id="usage-periods" class="periods" role="group" aria-label="统计周期">
-        <button class="period-btn" type="button" data-period="today" aria-pressed="true">今天</button>
-        <button class="period-btn" type="button" data-period="7d" aria-pressed="false">近 7 天</button>
+        <button class="period-btn" type="button" data-period="today" aria-pressed="false">今天</button>
+        <button class="period-btn" type="button" data-period="7d" aria-pressed="true">近 7 天</button>
         <button class="period-btn" type="button" data-period="30d" aria-pressed="false">近 30 天</button>
+        <button class="period-btn" type="button" data-period="all" aria-pressed="false">全部</button>
       </div>
       <div id="usage-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <div id="usage-body" class="list" aria-live="polite" aria-busy="false"></div>
@@ -110,6 +149,10 @@
         <span class="spacer"></span>
         <button id="clients-refresh" class="btn" type="button" title="重新读取客户端接入状态">刷新</button>
       </div>
+      <div class="flags" role="group" aria-label="桌面客户端配置">
+        <label class="flag"><input id="desktop-autostart" class="switch" type="checkbox" role="switch" disabled><span>开机启动（登录后）</span></label>
+        <span id="desktop-autostart-msg" class="inline-msg" role="status"></span>
+      </div>
       <p class="hint">将 Claude Code、Codex、Pi 等接入 CCR。各客户端单独操作，恢复前会先确认。</p>
       <div id="clients-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <ul id="clients-list" class="list" aria-label="客户端列表" aria-busy="false"></ul>
@@ -119,8 +162,165 @@
       <div class="panel-head"><h1>项目</h1><span id="projects-count" class="count"></span><span class="spacer"></span><button id="projects-refresh" class="btn" type="button" title="刷新列表；保留未保存的修改">刷新</button></div>
       <p class="hint">项目路由独立保存；接管客户端需单独应用。</p>
       <div id="projects-msg" class="banner" role="status" aria-live="polite" hidden></div>
-      <div class="projects-picker"><label for="projects-select">当前项目</label><select id="projects-select" class="route-input" aria-label="选择项目"></select></div>
+      <div class="projects-picker"><label for="projects-select">当前项目</label>
+        <div class="project-combo"><input id="projects-select" class="route-input" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="projects-options" autocomplete="off" placeholder="搜索项目名或路径">
+          <div class="project-popup" id="projects-popup" hidden><div id="projects-options" role="listbox" aria-label="项目列表"></div><div id="projects-no-match" role="status" hidden>没有匹配的项目</div></div>
+        </div>
+      </div>
       <div id="projects-body" class="list"></div>
+    </section>
+
+    <section id="panel-plugins" class="panel" role="tabpanel" aria-labelledby="tab-plugins" tabindex="-1" hidden>
+      <div class="panel-head">
+        <h1>插件</h1><span class="spacer"></span>
+        <button id="plugins-refresh" class="btn" type="button" title="重新读取当前插件列表">刷新</button>
+      </div>
+      <div class="scopes" role="group" aria-label="插件视图">
+        <button id="plugins-installed" class="scope-btn" type="button" aria-pressed="true" aria-controls="plugins-list">已安装</button>
+        <button id="plugins-market" class="scope-btn" type="button" aria-pressed="false" aria-controls="plugins-list">插件市场</button>
+      </div>
+      <p id="plugins-advanced" class="hint">桌面仅提供插件支持的基础操作。授权登录、站点和账号管理、模型管理等高级操作请使用主窗口。</p>
+      <div id="plugins-feedback" class="banner" role="status" hidden></div>
+      <div id="plugins-restart" class="banner" data-tone="warn" role="status" hidden></div>
+      <div id="plugins-read-status" class="banner" role="status" hidden></div>
+      <div id="plugins-confirm" class="plugins-confirm card" role="group" aria-labelledby="plugins-confirm-text" hidden>
+        <p id="plugins-confirm-text" class="card-message"></p>
+        <div class="plugins-actions">
+          <button id="plugins-cancel" class="btn" type="button">取消</button>
+          <button id="plugins-confirm-button" class="btn btn-primary" type="button">确认</button>
+        </div>
+      </div>
+      <ul id="plugins-list" class="list" aria-label="已安装插件列表" aria-busy="false" tabindex="0"></ul>
+    </section>
+
+    <section id="panel-settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" tabindex="-1" hidden>
+      <div class="panel-head">
+        <h1>设置</h1>
+        <span id="settings-revision" class="count"></span>
+        <span class="spacer"></span>
+        <button id="settings-save" class="btn btn-primary" type="button" disabled hidden>保存设置</button>
+        <button id="settings-refresh" class="btn" type="button" title="重新读取最新配置并保留草稿">刷新</button>
+      </div>
+      <p class="hint">点击「保存设置」后才会写入配置。需要重启时，请先结束正在进行的请求。外部网关由其管理者重启。修改地址、端口或密钥后，请重新打开桌面并检查客户端连接。</p>
+      <div id="settings-msg" class="banner" role="status" aria-live="polite" hidden></div>
+
+      <div id="settings-body" class="settings-body list" role="form" aria-label="通用设置" hidden>
+        <div class="settings-group" role="group" aria-label="通用行为">
+          <p class="settings-group-title">通用行为</p>
+          <div class="settings-rows">
+            <label class="flag settings-flag"><input id="set-log" data-setting="LOG" class="switch" type="checkbox" role="switch"><span>请求日志（LOG）</span></label>
+            <label class="flag settings-flag"><input id="set-statusline" data-setting="statusLineEnabled" class="switch" type="checkbox" role="switch"><span>状态栏（StatusLine）</span></label>
+            <label class="flag settings-flag"><input id="set-token-speed" data-setting="tokenSpeedEnabled" class="switch" type="checkbox" role="switch"><span>令牌速度统计（token-speed）</span></label>
+            <label class="flag settings-flag"><input id="set-attribution" data-setting="disableAttributionHeader" class="switch" type="checkbox" role="switch"><span>去除客户端 attribution 头</span></label>
+            <div class="settings-field">
+              <label for="set-log-level">日志级别（LOG_LEVEL）</label>
+              <select id="set-log-level" data-setting="LOG_LEVEL" class="route-input">
+                <option value="fatal">fatal</option>
+                <option value="error">error</option>
+                <option value="warn">warn</option>
+                <option value="info">info</option>
+                <option value="debug">debug</option>
+                <option value="trace">trace</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="路由与并发">
+          <p class="settings-group-title">路由与并发</p>
+          <div class="settings-rows">
+            <label class="flag settings-flag"><input id="set-concurrency" data-setting="enableConcurrencyPriority" class="switch" type="checkbox" role="switch"><span>并发优先路由</span></label>
+            <div class="settings-field">
+              <label for="set-concurrency-threshold">并发阈值</label>
+              <input id="set-concurrency-threshold" data-setting="concurrencyThreshold" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+              <p class="settings-note">主模型并发达到阈值后，新会话溢出到回退模型。</p>
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="定时唤醒">
+          <p class="settings-group-title">定时唤醒</p>
+          <div class="settings-rows">
+            <label class="flag settings-flag"><input id="set-wakeup" data-setting="WAKEUP_ENABLED" class="switch" type="checkbox" role="switch"><span>定时唤醒探测</span></label>
+            <div class="settings-field">
+              <label for="set-wakeup-time">唤醒时间</label>
+              <input id="set-wakeup-time" data-setting="WAKEUP_TIME" class="route-input" type="time">
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="网关连接">
+          <p class="settings-group-title">网关连接</p>
+          <div class="settings-grid">
+            <div class="settings-field">
+              <label for="set-host">监听地址（HOST）</label>
+              <input id="set-host" data-setting="HOST" class="route-input" type="text" autocomplete="off">
+              <p class="settings-note">留空使用网关默认监听地址。</p>
+              <label id="settings-host-repair" hidden><input id="set-host-repair" type="checkbox">删除配置中已有的空 HOST，恢复默认监听地址</label>
+            </div>
+            <div class="settings-field">
+              <label for="set-port">端口（PORT）</label>
+              <input id="set-port" data-setting="PORT" class="route-input" type="number" min="1" max="65535" step="1" inputmode="numeric">
+              <p id="settings-port-status" class="settings-note" hidden>端口由环境变量配置。留空保留，输入端口号可替换。</p>
+            </div>
+            <div class="settings-field">
+              <label for="set-timeout">请求超时（API_TIMEOUT_MS，毫秒）</label>
+              <input id="set-timeout" data-setting="API_TIMEOUT_MS" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+            </div>
+            <div class="settings-field">
+              <label for="set-context-window">上下文窗口（ContextWindow）</label>
+              <input id="set-context-window" data-setting="ContextWindow" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+            </div>
+            <div class="settings-field">
+              <label for="set-claude-path">Claude 可执行文件路径（CLAUDE_PATH）</label>
+              <input id="set-claude-path" data-setting="CLAUDE_PATH" class="route-input" type="text" autocomplete="off">
+            </div>
+            <div class="settings-field">
+              <label for="set-custom-router">自定义路由文件（CUSTOM_ROUTER_PATH）</label>
+              <input id="set-custom-router" data-setting="CUSTOM_ROUTER_PATH" class="route-input" type="text" autocomplete="off" placeholder="绝对路径，.js/.cjs/.mjs">
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="连通性探测">
+          <p class="settings-group-title">连通性探测</p>
+          <div class="settings-grid">
+            <div class="settings-field">
+              <label for="set-probe-timeout">探测超时（PROBE_TIMEOUT_MS，毫秒）</label>
+              <input id="set-probe-timeout" data-setting="PROBE_TIMEOUT_MS" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+            </div>
+            <div class="settings-field">
+              <label for="set-probe-slow">慢网络阈值（PROBE_SLOW_THRESHOLD_MS，毫秒）</label>
+              <input id="set-probe-slow" data-setting="PROBE_SLOW_THRESHOLD_MS" class="route-input" type="number" min="1" step="1" inputmode="numeric">
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="代理">
+          <p class="settings-group-title">代理</p>
+          <div class="settings-rows">
+            <label class="flag settings-flag"><input id="set-proxy-global" data-setting="PROXY_GLOBAL_ENABLED" class="switch" type="checkbox" role="switch"><span>代理作用于全部提供方</span></label>
+            <div class="settings-field">
+              <label for="set-proxy-url-action">代理地址（PROXY_URL）</label>
+              <select id="set-proxy-url-action" class="route-input" aria-describedby="settings-proxy-status">
+                <option value="keep">保持不变</option><option value="replace">替换</option><option value="clear">清除</option>
+              </select>
+              <label for="set-proxy-url" id="set-proxy-url-label" hidden>新代理地址</label>
+              <input id="set-proxy-url" class="route-input" type="password" autocomplete="new-password" spellcheck="false" hidden>
+              <p id="settings-proxy-status" class="settings-note" role="status"></p>
+            </div>
+          </div>
+        </div>
+        <div class="settings-group" role="group" aria-label="访问密钥">
+          <p class="settings-group-title">访问密钥</p>
+          <div class="settings-rows">
+            <div class="settings-field">
+              <label for="set-apikey-action">密钥（APIKEY）</label>
+              <select id="set-apikey-action" class="route-input" aria-describedby="settings-key-status">
+                <option value="keep">保持不变</option><option value="replace">替换</option><option value="clear">清除</option>
+              </select>
+              <label for="set-apikey" id="set-apikey-label" hidden>新密钥</label>
+              <input id="set-apikey" class="route-input" type="password" autocomplete="new-password" spellcheck="false" hidden>
+              <p id="settings-key-status" class="settings-note" role="status"></p>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <footer class="footer">

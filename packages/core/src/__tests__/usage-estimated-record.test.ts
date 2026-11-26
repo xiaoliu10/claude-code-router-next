@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -72,6 +72,8 @@ describe("usage store estimated flag", () => {
     close();
     // Recreate a genuine v2 table: no provenance column, user_version=2.
     const legacy = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
+    legacy.exec("ALTER TABLE usage_records DROP COLUMN effective_input_tokens");
+    legacy.exec("ALTER TABLE usage_records DROP COLUMN effective_input_estimated");
     legacy.exec("ALTER TABLE usage_records DROP COLUMN usage_estimated");
     legacy.pragma("user_version = 2");
     legacy.close();
@@ -88,6 +90,44 @@ describe("usage store estimated flag", () => {
     close();
     expect(query({ sessionId: "session-est" }).records).toEqual(rows);
     expect(querySummary().estimatedCount).toBe(0);
+  });
+
+  it("migrates v3 cached rows to a null inclusive count, never an approximation", () => {
+    clear();
+    append(makeRecord({ id: "v3", inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7, effectiveInputTokens: 70 }));
+    append(makeRecord({ id: "v3-no-cache", inputTokens: 7 }));
+    close();
+    const db = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
+    db.exec("ALTER TABLE usage_records DROP COLUMN effective_input_tokens");
+    db.exec("ALTER TABLE usage_records DROP COLUMN effective_input_estimated");
+    db.pragma("user_version = 3");
+    db.close();
+    const { records } = query({ sessionId: "session-est" });
+    expect(records.find(row => row.id === "v3-no-cache")?.effectiveInputTokens).toBe(7);
+    const cached = records.find(row => row.id === "v3")!;
+    expect(cached.effectiveInputTokens).toBeNull();
+    expect(cached.effectiveInputTokensSource).toBeUndefined();
+    expect(querySummary().totalEffectiveInputTokens).toBeNull();
+    close();
+    const reopened = openSqliteDatabase(join(tempHome, "data", "usage.sqlite")).db;
+    expect(reopened.pragma("user_version", { simple: true })).toBe(4);
+    reopened.close();
+  });
+
+  it("imports legacy cached JSONL rows as null inclusive counts", () => {
+    clear(); close();
+    mkdirSync(join(tempHome, "data"), { recursive: true });
+    const fixtures = [
+      makeRecord({ id: "jsonl-cached", inputTokens: 2, cacheReadInputTokens: 60, cacheCreationInputTokens: 7 }),
+      makeRecord({ id: "jsonl-no-cache", inputTokens: 7 }),
+      makeRecord({ id: "jsonl-unknown", inputTokens: 7, effectiveInputTokens: null }),
+    ];
+    writeFileSync(join(tempHome, "data", "usage.jsonl"), fixtures.map(row => JSON.stringify(row)).join("\n"));
+    const { records } = query({ sessionId: "session-est" });
+    expect(Object.fromEntries(records.map(row => [row.id, row.effectiveInputTokens]))).toEqual({
+      "jsonl-cached": null, "jsonl-no-cache": 7, "jsonl-unknown": null,
+    });
+    expect(querySummary().totalEffectiveInputTokens).toBeNull();
   });
 
   afterAll(() => {

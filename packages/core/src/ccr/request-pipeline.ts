@@ -21,6 +21,7 @@
  * The pipeline is registered by createCcrServer AFTER admin routes and BEFORE
  * namespace registration + listen, so all hooks are in deterministic order.
  */
+import { captureInputUsage, effectiveInputUsage, type InputUsageCapture, type UsageFormat } from "./effective-input-usage";
 import { EventEmitter } from "node:events";
 import { performance } from "node:perf_hooks";
 import JSON5 from "json5";
@@ -99,7 +100,7 @@ function getRequestModel(req: any): string {
 // usage and the upstream model. Fastify hands onSend a serialized string or
 // Buffer, so callers must use this parsed body (not the raw payload) for any
 // field lookup — otherwise non-stream responses never populate req.upstreamModel.
-function extractNonStreamMeta(payload: any): { usage?: any; model?: string; choices?: any[] } | undefined {
+function extractNonStreamMeta(payload: any, capture: InputUsageCapture): { usage?: any; model?: string; choices?: any[] } | undefined {
   if (!payload) return undefined;
 
   let body = payload;
@@ -116,6 +117,7 @@ function extractNonStreamMeta(payload: any): { usage?: any; model?: string; choi
 
   if (!body || typeof body !== "object") return undefined;
 
+  captureInputUsage(capture, body.usage ?? body.response?.usage);
   // Anthropic /v1/messages non-stream response.
   const usage = body.usage
     ? normalizeUsagePayload(body.usage)
@@ -278,9 +280,11 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     if (chat && reply.statusCode < 400 && req.provider) {
       ensureClientContext(req, config);
       if (payload instanceof ReadableStream) {
+        chat.inputUsage = { format: "chat", usage: {} };
         return done(null, payload.pipeThrough(captureChatStream(chat, req.requestStartTime)));
       }
-      const meta = extractNonStreamMeta(payload);
+      chat.inputUsage = { format: "chat", usage: {} };
+      const meta = extractNonStreamMeta(payload, chat.inputUsage);
       chat.finished = Array.isArray(meta?.choices) && meta.choices.length > 0 && meta.choices.every(hasChatFinishReason);
       chat.usage = meta?.usage;
       if (isRealUpstreamModel(meta?.model)) chat.model = meta.model;
@@ -291,6 +295,10 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
     const isChatCompletion = !!req.chatCompletionCapture;
     if (isMessages || isResponses || isChatCompletion) {
       ensureClientContext(req, config);
+      const format: UsageFormat = isResponses || req.isCodexOnMessagesEndpoint ? "responses" : isChatCompletion ? "chat" :
+        serverInstance.providerService?.getProvider?.(req.provider)?.cacheMode === "inclusive" ? "anthropic-inclusive" : "anthropic";
+      const inputUsage: InputUsageCapture = { format, usage: {} };
+      req.wireInputUsage = inputUsage;
       const usageSessionId = getUsageSessionId(req);
       const usageCacheKey = getUsageCacheKey(req);
       if (payload instanceof ReadableStream) {
@@ -308,6 +316,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
           // Store Anthropic format message body, distinguishing text and tool types
           return done(null, rewriteStream(eventStream, async (data, controller) => {
             try {
+              captureInputUsage(inputUsage, data?.data?.usage ?? data?.data?.message?.usage);
               // Detect tool call start
               if (data.event === 'content_block_start' && data?.data?.content_block?.name) {
                 const agent = req.agents.find((name: string) => agentsManager.getAgent(name)?.tools.get(data.data.content_block.name))
@@ -457,6 +466,8 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
 
 
               // Capture usage from Anthropic SSE (message_delta, message_start)
+              const messageUsage = data?.usage ?? data?.message?.usage;
+              captureInputUsage(inputUsage, messageUsage);
               if (data?.usage) {
                 const existingUsage = sessionUsageCache.get(usageCacheKey) || {};
                 const normalizedUsage = normalizeUsagePayload(data.usage);
@@ -489,6 +500,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
 
               // Capture usage from Responses API SSE (response.usage)
               if (data?.response?.usage) {
+                captureInputUsage(inputUsage, data.response.usage);
                 const respUsage = normalizeUsagePayload(data.response.usage);
                 // Responses usage is emitted on the trailing response.completed
                 // event, so it is NOT a "first event" sentinel like Anthropic's
@@ -526,56 +538,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         req.usageCapturePromise = read(clonedStream);
         return done(null, originalStream)
       }
-      // Streaming request WITHOUT agent tools — the common case (Codex, Pi, any
-      // plain Claude Code turn). No usage reader ran on this path: the agent
-      // branch above owns the only one, so a healthy streamed turn was recorded
-      // with output_tokens 0. That zero is what made working subscription
-      // responses look like empty answers in the usage UI. Read a tee'd branch so
-      // the client still receives an untouched stream, and merge usage in stream
-      // order so the trailing frame (message_delta / response.completed) stays
-      // authoritative over the leading message_start zero.
-      if (payload instanceof ReadableStream) {
-        const [passthroughStream, usageStream] = payload.tee();
-        req.usageCapturePromise = (async () => {
-          const reader = usageStream
-            .pipeThrough(new TextDecoderStream())
-            .pipeThrough(new SSEParserTransform() as any)
-            .getReader();
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              const event = (value as any).event;
-              const frdata = (value as any).data;
-              if (event === 'message_start' && frdata?.message?.model) {
-                if (isRealUpstreamModel(frdata?.message?.model)) req.upstreamModel = frdata.message.model;
-              }
-              if (event === 'response.completed' && frdata?.response?.model) {
-                if (isRealUpstreamModel(frdata?.response?.model)) req.upstreamModel = frdata.response.model;
-              }
-              const frame = frdata?.usage ?? frdata?.response?.usage;
-              if (frame) {
-                const normalized = normalizeUsagePayload(frame);
-                const existing = sessionUsageCache.get(usageCacheKey) || {};
-                // message_start resets the base (it opens a new answer); every
-                // other frame merges, so a trailing real count is never
-                // overwritten by a leading zero.
-                const merged = mergeUsageCapture(existing, normalized, event === 'message_start');
-                sessionUsageCache.put(usageCacheKey, merged);
-              }
-            }
-          } catch (readError: any) {
-            if (readError?.name !== 'AbortError' && readError?.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
-              req.log?.warn?.({ phase: 'usage_capture_plain_stream', err: String(readError) });
-            }
-          } finally {
-            reader.releaseLock();
-          }
-        })();
-        return done(null, passthroughStream);
-      }
-
-      const nonStreamMeta = extractNonStreamMeta(payload);
+      const nonStreamMeta = extractNonStreamMeta(payload, inputUsage);
       if (nonStreamMeta?.usage) {
         if (isChatCompletion) req.chatCompletionCapture.usage = mergeUsageCapture(req.chatCompletionCapture.usage, nonStreamMeta.usage, false);
         else sessionUsageCache.put(usageCacheKey, nonStreamMeta.usage);
@@ -738,13 +701,14 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
       // deduction, so we infer the cache hit from the difference between the
       // pre-cache tokenCount (computed by the router) and the reported input_tokens.
       let cacheReadInputTokens = usage?.cache_read_input_tokens ?? 0;
+      const hasReportedCacheRead = typeof usage?.cache_read_input_tokens === "number";
       // input_tokens of 0 is not a valid "no data" sentinel (providers report real
       // zero only in degenerate cases). Use the router's tokenCount estimate when
       // usage.input_tokens is missing OR zero, so a zeroed usage frame can't wipe
       // out the input token count for the whole request.
       const reportedInputTokens = usage?.input_tokens || 0;
       const rawInputTokens = reportedInputTokens || (chat ? 0 : req.tokenCount) || 0;
-      if (!chat && !usage?.usage_estimated && !cacheReadInputTokens && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
+      if (!chat && !usage?.usage_estimated && !hasReportedCacheRead && req.tokenCount && usage?.input_tokens && usage.input_tokens < req.tokenCount) {
         cacheReadInputTokens = req.tokenCount - usage.input_tokens;
         if (cacheReadInputTokens) {
           console.log('[Usage] Inferred cache tokens:', {
@@ -770,6 +734,7 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         });
       }
 
+      const inputCapture = hardFailed ? undefined : req.sourceInputUsage ?? chat?.inputUsage ?? req.wireInputUsage;
       appendUsage({
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         timestamp: new Date().toISOString(),
@@ -782,12 +747,13 @@ export function registerRequestPipeline(serverInstance: any, config: any): void 
         // matches what the client was told. `unknown` in the UI looked like a
         // routing bug rather than a missing upstream echo.
         upstreamModel: chat?.model || req.upstreamModel || model || undefined,
-        ...(usage?.usage_estimated === true ? { usageEstimated: true } : {}),
+        ...(usage?.usage_estimated === true || inputCapture?.usage.estimated ? { usageEstimated: true } : {}),
         modelFamily: req.modelFamily || "",
         scenarioType: req.scenarioType || "default",
         clientType: req.clientType || detectClientType(req),
         stream: req.body?.stream ?? false,
         inputTokens: rawInputTokens,
+        ...effectiveInputUsage(inputCapture),
         outputTokens,
         cacheReadInputTokens,
         cacheCreationInputTokens: usage?.cache_creation_input_tokens || 0,

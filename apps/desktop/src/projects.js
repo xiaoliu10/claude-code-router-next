@@ -360,11 +360,22 @@
     // Refresh never rebases dirty drafts onto a newer revision. Only an
     // acknowledged mutation for that same project advances its draft revision.
     function adopt(result, acknowledgedId) {
+      // Compare drafts to their previous snapshot before adopting external edits.
+      var cleanClients = new Set();
+      drafts.forEach(function (draft, id) {
+        // The outstanding write has changed the baseline for this project.
+        // Compare its latest edits with the acknowledged response below.
+        if (id === acknowledgedId) return;
+        var previous = findProject(id);
+        if (isClean(id)) drafts.delete(id);
+        else if (previous && sameSet(draft.clients, previous.takeoverClients)) cleanClients.add(id);
+      });
       snapshot = normalizeProjectsSnapshot(result);
       error = null;
       Array.from(drafts.keys()).forEach(function (id) {
         var p = findProject(id), d = drafts.get(id);
         if (!p) { d.staleExternally = true; return; }
+        if (cleanClients.has(id)) d.clients = p.takeoverClients.slice();
         if (isClean(id)) { drafts.delete(id); return; }
         if (id === acknowledgedId) d.baseRev = p.revision;
         d.staleExternally = p.revision !== d.baseRev;
@@ -944,6 +955,10 @@
       if (text != null) n.textContent = text;
       return n;
     }
+    // Disabled-in-preview hint: projects using the global router render a
+    // read-only mirror, so every locked control explains why and how to edit.
+    var GLOBAL_PREVIEW_HINT = '使用全局路由：此处为全局配置预览；取消勾选「使用全局路由」后可编辑';
+    var hintWhen = function (locked, node) { if (locked) node.title = GLOBAL_PREVIEW_HINT; return node; };
     function button(text, fn, disabled, cls) {
       var n = el('button', cls || 'btn', text); n.type = 'button'; n.disabled = !!disabled;
       n.addEventListener('click', fn); return n;
@@ -964,17 +979,84 @@
     function tempInput(label, key, disabled) {
       return input(label, buffers.get(key) || '', function (v) { buffers.set(key, v); }, disabled, key);
     }
+    var popup = doc.getElementById('projects-popup'), options = doc.getElementById('projects-options');
+    var noMatch = doc.getElementById('projects-no-match');
+    var activeId = null, matches = [];
+    function updatePicker(s) {
+      var projects = s && s.snapshot ? s.snapshot.projects : [];
+      picker.disabled = !projects.length;
+      if (picker.disabled) popup.hidden = true;
+      picker.setAttribute('aria-expanded', String(!popup.hidden));
+      picker.removeAttribute('aria-activedescendant');
+      var dirty = new Set(s ? s.dirtyIds : []);
+      function label(p) { return p.path + (dirty.has(p.id) ? ' · 未保存' : ''); }
+      if (popup.hidden) {
+        options.textContent = '';
+        matches = [];
+        var current = projects.find(function (p) { return p.id === s.selectedId; });
+        picker.value = current ? label(current) : '';
+        return;
+      }
+      var query = picker.value.trim().toLowerCase();
+      var results = projects.filter(function (p) { return p.path.toLowerCase().includes(query); });
+      // Refresh can arrive between mousedown and mouseup on the same option.
+      if (results.length !== matches.length || results.some(function (p, i) { return p.id !== matches[i].id; })) {
+        options.textContent = '';
+        results.forEach(function (p, index) {
+          var row = el('div');
+          row.setAttribute('role', 'option'); row.setAttribute('id', 'project-option-' + index);
+          row.addEventListener('mousedown', function (event) { event.preventDefault(); });
+          row.addEventListener('click', function () { choose(p.id); });
+          options.appendChild(row);
+        });
+      }
+      matches = results;
+      if (!matches.some(function (p) { return p.id === activeId; })) activeId = matches.length ? matches[0].id : null;
+      noMatch.hidden = !!matches.length;
+      matches.forEach(function (p, index) {
+        var active = activeId === p.id, row = options.children[index], text = label(p);
+        if (row.textContent !== text) row.textContent = text;
+        row.className = active ? 'project-option active' : 'project-option';
+        row.setAttribute('aria-selected', String(s.selectedId === p.id));
+        if (active) picker.setAttribute('aria-activedescendant', row.getAttribute('id'));
+      });
+    }
+    function openPicker() {
+      if (!popup.hidden || picker.disabled) return;
+      popup.hidden = false; picker.value = ''; activeId = controller.state().selectedId;
+      updatePicker(controller.state());
+    }
+    function closePicker() { popup.hidden = true; updatePicker(controller && controller.state()); }
+    function choose(id) { closePicker(); localError = ''; controller.select(id); }
+    picker.addEventListener('focus', openPicker);
+    picker.addEventListener('click', openPicker);
+    picker.addEventListener('blur', closePicker);
+    picker.addEventListener('input', function () {
+      popup.hidden = false; activeId = null; updatePicker(controller.state());
+    });
+    picker.addEventListener('keydown', function (event) {
+      if (event.isComposing || event.keyCode === 229 || picker.disabled) return;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault(); openPicker();
+        var index = matches.findIndex(function (p) { return p.id === activeId; });
+        if (index < 0) return;
+        var next = Math.max(0, Math.min(matches.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
+        activeId = matches[next].id; updatePicker(controller.state());
+        var row = options.children[next];
+        if (row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+      } else if (event.key === 'Escape' && !popup.hidden) {
+        event.preventDefault(); closePicker();
+        picker.setSelectionRange(0, picker.value.length);
+      } else if (event.key === 'Enter' && !popup.hidden) {
+        event.preventDefault(); if (activeId !== null) choose(activeId);
+      }
+    });
     function render() {
       var s = controller && controller.state();
       refresh.disabled = !s || s.loading || !!s.pending;
       count.textContent = s && s.snapshot ? '已配置 ' + s.snapshot.projects.length + ' 个项目' : s && s.loading ? '正在读取…' : '';
       var projects = s && s.snapshot ? s.snapshot.projects : [];
-      picker.textContent = '';
-      projects.forEach(function (p) {
-        var option = el('option', '', p.path + (s.dirtyIds.indexOf(p.id) !== -1 ? ' · 未保存' : ''));
-        option.value = p.id; picker.appendChild(option);
-      });
-      picker.value = s && s.selectedId || ''; picker.disabled = !projects.length;
+      updatePicker(s);
       var p = s && projects.find(function (x) { return x.id === s.selectedId; });
       var d = p && s.draft(p.id), router = p && s.effectiveRouter(p.id);
       var global = p && (d ? d.useGlobal : p.useGlobal);
@@ -1075,7 +1157,7 @@
         Object.keys(obj || {}).forEach(function (alias) {
           var card = el('div', 'route'); card.appendChild(el('div', 'route-name', alias));
           var n = routeInput(alias, obj[alias], alias); card.appendChild(n);
-          card.appendChild(button('移除别名', function () { controller.removeAlias(id, alias); }, global)); body.appendChild(card);
+          card.appendChild(hintWhen(global, button('移除别名', function () { controller.removeAlias(id, alias); }, global))); body.appendChild(card);
         });
         if (!global) {
           var aliasCard = el('div', 'card');
@@ -1091,27 +1173,28 @@
         }
       } else if (!obj) {
         var absent = el('div', 'card'); absent.appendChild(el('p', 'project-note', '该家族尚未配置，将使用项目路由。'));
-        absent.appendChild(button('添加家族配置', function () { controller.addFamily(id, scope); }, global)); body.appendChild(absent);
+        absent.appendChild(hintWhen(global, button('添加家族配置', function () { controller.addFamily(id, scope); }, global))); body.appendChild(absent);
       } else {
         var flags = el('div', 'card project-settings');
         var labels = { enableFamilyRouting: '家族路由', enableFallback: '回退', enableExtendedContext: '扩展上下文' };
         (scope === 'root' ? PROJECT_FLAGS : FAMILY_FLAGS).forEach(function (k) {
           var row = el('div', 'project-setting');
-          row.appendChild(check(labels[k], obj[k], function (v) { controller.setFlag(id, scope, k, v); }, global));
+          row.appendChild(hintWhen(global, check(labels[k], obj[k], function (v) { controller.setFlag(id, scope, k, v); }, global)));
           row.appendChild(el('span', 'count', Object.prototype.hasOwnProperty.call(obj, k) ? '' : '未设置'));
           if (!global && Object.prototype.hasOwnProperty.call(obj, k)) row.appendChild(button('使用默认', function () { controller.setFlag(id, scope, k, null); }));
           flags.appendChild(row);
         });
         PROJECT_THRESHOLDS.forEach(function (k) {
-          var n = input(THRESHOLD_LABELS[k], obj[k], function (v) { controller.setThreshold(id, scope, k, v); }, global, id + '|' + scope + '|' + k, 'number');
+          var n = hintWhen(global, input(THRESHOLD_LABELS[k], obj[k], function (v) { controller.setThreshold(id, scope, k, v); }, global, id + '|' + scope + '|' + k, 'number'));
           n.min = '1'; n.step = '1'; n.placeholder = k === 'longContextThreshold' ? '默认 60000' : '默认 200000';
           refs.push({ node: n, scope: scope, field: k }); flags.appendChild(labeled(THRESHOLD_LABELS[k] + '（留空使用默认值）', n));
         });
-        if (scope !== 'root') flags.appendChild(button('移除家族配置', function () { controller.removeFamily(id, scope); }, global, 'btn btn-danger-quiet'));
+        if (scope !== 'root') flags.appendChild(hintWhen(global, button('移除家族配置', function () { controller.removeFamily(id, scope); }, global, 'btn btn-danger-quiet')));
         body.appendChild(flags);
         var grid = el('div', 'project-routes');
         var labelsByScenario = { default: '默认', background: '后台', think: '思考', longContext: '长上下文', extendedContext: '扩展上下文', webSearch: '网页搜索', image: '图像' };
         PROJECT_SCENARIOS.forEach(function (scenario) {
+          if (scope !== 'root' && scenario === 'background') return;
           var label = labelsByScenario[scenario], card = el('div', 'route'); card.dataset.scenario = scenario;
           card.appendChild(el('div', 'route-name', label));
           card.appendChild(routeInput(label + ' 目标', obj[scenario], scenario));
@@ -1119,9 +1202,9 @@
           var list = el('ol', 'fallback-list'), entries = obj.fallback && obj.fallback[scenario] || [];
           entries.forEach(function (name, i) {
             var row = el('li', 'fallback-item'); row.appendChild(el('span', 'fallback-order', (i + 1) + '.')); row.appendChild(el('span', 'fallback-name', name));
-            var up = button('↑', function () { controller.moveFallback(id, scope, scenario, i, -1); }, global || i === 0); up.setAttribute('aria-label', label + ' 上移回退 ' + name);
-            var down = button('↓', function () { controller.moveFallback(id, scope, scenario, i, 1); }, global || i === entries.length - 1); down.setAttribute('aria-label', label + ' 下移回退 ' + name);
-            var remove = button('移除', function () { controller.removeFallback(id, scope, scenario, i); }, global); remove.setAttribute('aria-label', label + ' 移除回退 ' + name);
+            var up = hintWhen(global, button('↑', function () { controller.moveFallback(id, scope, scenario, i, -1); }, global || i === 0)); up.setAttribute('aria-label', label + ' 上移回退 ' + name);
+            var down = hintWhen(global, button('↓', function () { controller.moveFallback(id, scope, scenario, i, 1); }, global || i === entries.length - 1)); down.setAttribute('aria-label', label + ' 下移回退 ' + name);
+            var remove = hintWhen(global, button('移除', function () { controller.removeFallback(id, scope, scenario, i); }, global)); remove.setAttribute('aria-label', label + ' 移除回退 ' + name);
             row.appendChild(up); row.appendChild(down); row.appendChild(remove); list.appendChild(row);
           }); card.appendChild(list);
           if (!global) {
@@ -1138,7 +1221,7 @@
         }); body.appendChild(grid);
       }
       function routeInput(label, value, field) {
-        var n = input(label, value, function (v) { controller.setTarget(id, scope, field, v); }, global, id + '|' + scope + '|' + field);
+        var n = hintWhen(global, input(label, value, function (v) { controller.setTarget(id, scope, field, v); }, global, id + '|' + scope + '|' + field));
         n.setAttribute('list', 'project-route-choices'); n.placeholder = '提供方,模型（留空清除）';
         refs.push({ node: n, scope: scope, field: field }); return n;
       }
@@ -1161,7 +1244,6 @@
       if (apply) apply.disabled = busy || sameSet(d ? d.clients : p.takeoverClients, p.takeoverClients);
     }
     refresh.addEventListener('click', function () { if (controller) { localError = ''; controller.refresh(); } });
-    picker.addEventListener('change', function () { if (controller) { localError = ''; controller.select(picker.value); } });
     if (controller) controller.subscribe(render);
     render();
   }

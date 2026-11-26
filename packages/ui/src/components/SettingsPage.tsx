@@ -8,6 +8,7 @@ import { Switch } from "@/components/ui/switch";
 import { Combobox } from "@/components/ui/combobox";
 import { MultiCombobox } from "@/components/ui/multi-combobox";
 import { useConfig } from "./ConfigProvider";
+import { mergeClientConfig } from "@/utils/config-draft";
 import { StatusLineConfigDialog } from "./StatusLineConfigDialog";
 import { UsageStats } from "./UsageStats";
 import { PluginCardArea } from "./PluginCardArea";
@@ -51,7 +52,7 @@ export function SettingsPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
-  const { config, setConfig } = useConfig();
+  const { config, saveDraft, setConfig, refreshConfig, error } = useConfig();
   const [isStatusLineConfigOpen, setIsStatusLineConfigOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -127,26 +128,11 @@ export function SettingsPage() {
     [providers]
   );
 
-  const syncClientResponse = useCallback((response: ClientApplyResponse) => {
+  const syncClientResponse = useCallback(async (response: ClientApplyResponse) => {
     setClients(response.clients || []);
     setSelectedClientIds((response.clients || []).filter((client) => client.enabled || client.managed).map((client) => client.id));
-    if (response.config) {
-      setConfig((current) => {
-        if (!current) return response.config;
-        return {
-          ...current,
-          Clients: response.config.Clients,
-          Router: {
-            ...(current.Router || {}),
-            models: {
-              ...(current.Router?.models || {}),
-              ...(response.config.Router?.models || {}),
-            },
-          },
-        };
-      });
-    }
-  }, [setConfig]);
+    await refreshConfig(mergeClientConfig);
+  }, [refreshConfig]);
 
   // Keep a ref to the latest translator so loadClients itself can have a
   // stable identity. Depending on `t` directly would recreate the callback on
@@ -175,10 +161,13 @@ export function SettingsPage() {
     loadClients();
   }, [loadClients]);
 
+  const [proxyValidationErrors, setProxyValidationErrors] = useState<Array<{ key: string; error: string }>>([]);
+  const [pendingSaveAction, setPendingSaveAction] = useState<"save" | "saveAndRestart" | null>(null);
+
   if (!config) {
     return (
       <div className="h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-gray-500">Loading...</div>
+        <div className="text-gray-500">{error?.message ?? "Loading..."}</div>
       </div>
     );
   }
@@ -277,6 +266,7 @@ export function SettingsPage() {
 
   const handleStatusLineEnabledChange = (checked: boolean) => {
     const newStatusLineConfig: StatusLineConfig = {
+      ...config.StatusLine,
       enabled: checked,
       currentStyle: config.StatusLine?.currentStyle || "default",
       default: config.StatusLine?.default || { modules: [] },
@@ -298,7 +288,7 @@ export function SettingsPage() {
     setIsApplyingClients(true);
     try {
       const response = await api.applyClients(selectedClientIds);
-      syncClientResponse(response);
+      await syncClientResponse(response);
       if (response.success) {
         setToast({ message: t("clients.apply_success"), type: 'success' });
       } else {
@@ -319,7 +309,7 @@ export function SettingsPage() {
     setRestoringClientId(id);
     try {
       const response = await api.restoreClient(id);
-      syncClientResponse(response);
+      await syncClientResponse(response);
       if (response.success) {
         setToast({ message: t("clients.restore_success"), type: 'success' });
       } else {
@@ -334,7 +324,7 @@ export function SettingsPage() {
   };
 
 
-  const checkForUpdates = useCallback(async () => {
+  const checkForUpdates = async () => {
     setIsCheckingUpdate(true);
     try {
       const updateInfo = await api.checkForUpdates();
@@ -349,10 +339,7 @@ export function SettingsPage() {
     } finally {
       setIsCheckingUpdate(false);
     }
-  }, [t]);
-
-  const [proxyValidationErrors, setProxyValidationErrors] = useState<Array<{ key: string; error: string }>>([]);
-  const [pendingSaveAction, setPendingSaveAction] = useState<"save" | "saveAndRestart" | null>(null);
+  };
 
   // Pre-flight check: returns the list of invalid proxy URL entries in the
   // current config. When non-empty, a confirmation dialog is shown before the
@@ -393,7 +380,7 @@ export function SettingsPage() {
     if (managedProviderBusy) return;
     setIsSaving(true);
     try {
-      const response = await api.updateConfig(config);
+      const response = await saveDraft(config);
       if (response.success) {
         setToast({ message: response.message || t('app.config_saved_success'), type: 'success' });
       } else {
@@ -410,7 +397,7 @@ export function SettingsPage() {
     if (managedProviderBusy) return;
     setIsRestarting(true);
     try {
-      const response = await api.updateConfig(config);
+      const response = await saveDraft(config);
       if (!response.success) {
         setToast({ message: response.message || t('app.config_saved_failed'), type: 'error' });
         return;
@@ -420,7 +407,7 @@ export function SettingsPage() {
         setToast({ message: t('app.config_saved_restart_success'), type: 'success' });
       }
     } catch (error) {
-      setToast({ message: t('app.config_saved_restart_failed'), type: 'error' });
+      setToast({ message: t('app.config_saved_restart_failed') + ': ' + (error as Error).message, type: 'error' });
     } finally {
       setIsRestarting(false);
     }

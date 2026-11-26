@@ -9,6 +9,7 @@ import {
   setCcrTakeover,
   writeProjectConfig,
 } from "@wengine-ai/claude-code-router-shared";
+import { readConfigFileRaw, writeConfigFile } from "../ccr/config";
 import Server from "../server";
 import { registerAdminRoutes } from "../ccr/admin-routes";
 import { sessionUsageCache } from "../utils/cache";
@@ -27,6 +28,7 @@ vi.mock("../ccr/config", async (importOriginal) => {
     ...actual,
     backupConfigFile: vi.fn().mockResolvedValue(null),
     readConfigFile: readConfigFileMock,
+    readConfigFileRaw: vi.fn().mockResolvedValue(null),
     writeConfigFile: vi.fn().mockResolvedValue(undefined),
   };
 });
@@ -50,6 +52,7 @@ async function buildAdminRuntime() {
     initialConfig: {
       providers: config.Providers,
       Router: config.Router,
+      ACTIVE_PROBE_ENABLED: false,
       HOST: "127.0.0.1",
       PORT: 0,
     },
@@ -75,6 +78,24 @@ describe("POST /api/config proxy URL validation", () => {
     await closeProxyDispatchers();
     if (server) {
       await server.app.close();
+    }
+  });
+
+  it("preserves raw Coding Plan credentials on stale form saves, including after rotation or clear", async () => {
+    ({ server } = await buildAdminRuntime());
+    const entry = { name: "plan", api_base_url: "https://ark.cn-beijing.volces.com/api/coding/v3", models: [] };
+    const keys = { quotaAccessKey: "$PLAN_AK", quotaSecretKey: "$PLAN_SK" };
+    for (const [stored, submitted, protectedSave, expected] of [
+      [keys, {}, true, keys], [keys, { quotaAccessKey: "test-key", quotaSecretKey: "sekret" }, true, keys],
+      [{}, keys, true, {}], [keys, {}, false, {}],
+    ] as const) {
+      vi.mocked(readConfigFileRaw).mockResolvedValue({ Providers: [{ ...entry, ...stored }] });
+      const response = await server.app.inject({ method: "POST", url: "/api/config",
+        headers: protectedSave ? { "x-ccr-preserve-quota-credentials": "1" } : {},
+        payload: { Providers: [{ ...entry, ...submitted }] },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(writeConfigFile).mock.lastCall?.[0].Providers[0]).toEqual({ ...entry, ...expected });
     }
   });
 
@@ -160,9 +181,7 @@ describe("POST /api/config proxy URL validation", () => {
         },
       });
 
-      // 400 would mean the validator rejected the value; anything else means
-      // it passed (write/reload errors are tolerated and surface as 200).
-      expect(res.statusCode, `proxyUrl=${proxyUrl}`).not.toBe(400);
+      expect(res.statusCode, `proxyUrl=${proxyUrl}`).toBe(200);
     }
   });
 

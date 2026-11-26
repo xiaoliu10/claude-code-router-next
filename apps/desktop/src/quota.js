@@ -67,6 +67,25 @@
     var s = w && typeof w === 'object' ? w : {};
     return { label: toStr(s.label), used: toNum(s.used), limit: toNum(s.limit), remaining: toNum(s.remaining), unit: toStr(s.unit), resetAt: toStr(s.resetAt) };
   }
+  function normalizeStepPlan(s) {
+    var state = ['known', 'partial', 'stale'].includes(s.state) ? s.state : 'unavailable';
+    if (state === 'unavailable') s = {};
+    var family = ['coding', 'token'].includes(s.family) ? s.family : 'none';
+    return {
+      state: state, family: family, name: toStr(s.name), observedAt: toNum(s.observedAt),
+      allowed: typeof s.allowed === 'boolean' ? s.allowed : null,
+      windows: family === 'coding' && Array.isArray(s.windows) ? s.windows.filter(function (w) {
+        return w && ['five_hour', 'weekly'].includes(w.id) && typeof w.limited === 'boolean';
+      }).map(function (w) {
+        return { id: w.id, limited: w.limited, usedPercent: toNum(w.usedPercent), resetsAt: toNum(w.resetsAt) };
+      }) : [],
+      creditBuckets: family === 'token' && Array.isArray(s.creditBuckets) ? s.creditBuckets.filter(function (b) {
+        return b && ['subscription', 'topup'].includes(b.type);
+      }).map(function (b) {
+        return { type: b.type, total: toStr(b.total), remaining: toStr(b.remaining), usedPercent: toNum(b.usedPercent), resetsAt: toNum(b.resetsAt), expiresAt: toNum(b.expiresAt) };
+      }) : [],
+    };
+  }
   function normalizeProvider(p) {
     var s = p && typeof p === 'object' ? p : {};
     return {
@@ -75,6 +94,7 @@
       plan: toStr(s.plan),
       status: typeof s.status === 'string' ? s.status : null,
       message: toStr(s.message),
+      ...(s.stepPlan ? { stepPlan: normalizeStepPlan(s.stepPlan) } : {}),
       windows: Array.isArray(s.windows) ? s.windows.map(normalizeWindow) : [],
       updatedAt: toNum(s.updatedAt),
     };
@@ -195,15 +215,18 @@
     }
 
     function applyMerged(result) {
-
-
       var next = normalizeSnapshot(result);
       var prev = snapshot;
+      // Rust serializes refreshes, but IPC responses can land in a different order.
+      if (prev && next.updatedAt !== null && prev.updatedAt !== null && next.updatedAt < prev.updatedAt &&
+          next.providers.some(function (p) { return p.stepPlan; })) return;
       if (prev) {
         next.providers = next.providers.map(function (p) {
           var f = flags.get(p.name);
 
-          return f && f.loading ? (findProvider(prev.providers, p.name) || p) : p;
+          if (!f || !f.loading) return p;
+          var old = findProvider(prev.providers, p.name);
+          return old && !old.stepPlan && !p.stepPlan ? old : p;
         });
       }
       snapshot = next;
@@ -233,8 +256,17 @@
       return allPromise;
     }
 
-    function refreshProvider(name) {
-      if (!snapshot || loadingAll) return Promise.resolve();
+    function refreshProvider(name, newlyAdded) {
+      if (newlyAdded && loadingAll) return allPromise.then(function () { return refreshProvider(name, true); });
+      if ((!snapshot && !newlyAdded) || loadingAll) return Promise.resolve();
+      if (newlyAdded) {
+        // Earlier card snapshots predate the config change and can omit the new row.
+        flags.forEach(function (flag, key) {
+          if (!flag.loading) return;
+          seq.set(key, (seq.get(key) || 0) + 1);
+          flags.set(key, { loading: false, error: null });
+        });
+      }
       var f = flags.get(name);
       if (f && f.loading) return Promise.resolve();
       var my = (seq.get(name) || 0) + 1;
@@ -254,6 +286,37 @@
     return { subscribe: subscribe, state: state, refreshAll: refreshAll, refreshProvider: refreshProvider };
   }
 
+
+  function safeVersionQuery(endpoint) {
+    var start = endpoint.indexOf('?');
+    if (start < 0) return true;
+    var query = endpoint.slice(start + 1);
+    if (/^version=\d{1,3}(?:\.\d{1,3}){0,2}$/.test(query)) return true;
+    var match = /^api-version=(\d{4}-\d{2}-\d{2})(?:-preview)?$/.exec(query);
+    if (!match) return false;
+    var date = new Date(match[1] + 'T00:00:00Z');
+    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === match[1];
+  }
+
+  function providerInputError(provider, editing) {
+    function validText(value, maxBytes) {
+      return typeof value === 'string' && value.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+        && new TextEncoder().encode(value.trim()).length <= maxBytes;
+    }
+    function validId(value) { return validText(value, 256) && !value.includes(','); }
+    if (!provider || !validId(provider.name)) return 'name';
+    if (!validText(provider.baseUrl, 2048)) return 'baseUrl';
+    var endpoint = provider.baseUrl.trim();
+    var authority = /^https?:\/\/([^/?#]+)/i.exec(endpoint);
+    if (!safeVersionQuery(endpoint) || !authority || authority[1].includes('@') || /[\\#\s]/.test(endpoint)) return 'baseUrl';
+    try { if (!new URL(endpoint).hostname) return 'baseUrl'; } catch { return 'baseUrl'; }
+    var keepKey = editing && (provider.apiKey === undefined || provider.apiKey === '');
+    if (!keepKey && !validText(provider.apiKey, 4096)) return 'apiKey';
+    var models = provider.models;
+    if (!Array.isArray(models) || !models.length || models.length > 256 || !models.every(validId)) return 'models';
+    if (new Set(models.map(function (m) { return m.trim(); })).size !== models.length) return 'models';
+    return null;
+  }
 
   // ---- Coding Plan quota credentials (quota tab) -------------------------
   // quota_credentials_status() / quota_credentials_save({name, accessKey?, secretKey?})
@@ -305,8 +368,17 @@
       if (openName !== null && !known(openName)) { openName = null; saveError = null; savedFlash = null; }
     }
 
-    function refresh() {
-      if (loading || saving) return;
+    var refreshQueued = false;
+    function drainRefresh() {
+      if (!refreshQueued || loading || saving) return;
+      refreshQueued = false;
+      refresh();
+    }
+    function refresh(afterConfigChange) {
+      if (loading || saving) {
+        if (afterConfigChange === true) refreshQueued = true;
+        return;
+      }
       loading = true;
       error = null;
       emit();
@@ -321,7 +393,7 @@
         loading = false;
         error = errorMessage(err);
         emit();
-      });
+      }).then(drainRefresh);
     }
 
     function open(name) {
@@ -362,7 +434,7 @@
         saving = false;
         saveError = errorMessage(err);
         emit();
-      });
+      }).then(drainRefresh);
     }
 
     function save(name, values) {
@@ -399,11 +471,15 @@
   //             familyRouting, fallbackEnabled, revision}
   // save    = routing_save({change:{revision,scope,field,target:string|null,fallback:[string]|null}})
   //           null fallback preserves it; null/empty target clears the override.
+  // groups  = routing_save_groups({changes:[...]}) uses one revision and one write.
   // flags   = routing_flags({revision,familyRouting,fallbackEnabled})
 
   var ROUTING_SCOPES = ['global', 'opus', 'sonnet', 'haiku', 'models'];
+  var MODEL_GROUPS = ['opus', 'sonnet', 'haiku'];
   var ROUTING_SCENARIOS = ['default', 'background', 'think', 'longContext', 'extendedContext', 'webSearch', 'image'];
-  var USAGE_PERIODS = ['today', '7d', '30d'];
+  var USAGE_PERIOD_LABELS = { today: '今天', '7d': '近 7 天', '30d': '近 30 天', all: '全部' };
+  var USAGE_PERIODS = Object.keys(USAGE_PERIOD_LABELS);
+  var DEFAULT_USAGE_PERIOD = '7d';
   var SCOPE_LABELS = { global: '全局', opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', models: '模型别名' };
   var SCENARIO_LABELS = { default: '默认', background: '后台', think: '思考', longContext: '长上下文', extendedContext: '扩展上下文', webSearch: '网页搜索', image: '图像' };
 
@@ -411,6 +487,11 @@
   function splitKey(key) {
     var i = String(key).indexOf('|');
     return { scope: i === -1 ? String(key) : String(key).slice(0, i), field: i === -1 ? '' : String(key).slice(i + 1) };
+  }
+  function isModelGroup(scope) { return MODEL_GROUPS.indexOf(scope) !== -1; }
+  function isModelGroupKey(key) {
+    var parts = splitKey(key);
+    return isModelGroup(parts.scope) && parts.field !== 'background' && ROUTING_SCENARIOS.indexOf(parts.field) !== -1;
   }
   function routeLabel(scope, field) {
     if (scope === 'models') return field || '(空别名)';
@@ -466,6 +547,7 @@
     var snapshot = null, loading = false, error = null;
     var flagsSaving = false, flagsError = null;
     var savingKey = null, saveQueue = [], saveError = null, savedFlash = null;
+    var savingGroups = false, groupSaveMessage = '';
     var drafts = new Map(); // key -> {target, fallback, fallbackDirty}
     var epoch = 0;
     var listeners = new Set();
@@ -488,6 +570,8 @@
         flagsSaving: flagsSaving, flagsError: flagsError,
         savingKey: savingKey, queued: saveQueue.slice(),
         saveError: saveError, savedFlash: savedFlash,
+        savingGroups: savingGroups, groupSaveMessage: groupSaveMessage,
+        dirtyGroupKeys: dirtyKeys.filter(isModelGroupKey),
         dirtyKeys: dirtyKeys, isClean: isClean,
         draftKeys: Array.from(drafts.keys()),
         draft: function (key) { return drafts.get(key) || null; },
@@ -495,14 +579,23 @@
     }
     function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
     function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
-    function clearFlash(key) { if (savedFlash && savedFlash.key === key) savedFlash = null; }
+    function clearFlash(key) {
+      if (savedFlash && savedFlash.key === key) savedFlash = null;
+      if (isModelGroupKey(key)) groupSaveMessage = '';
+    }
 
     // Adopt a server snapshot: drafts whose values now match the server are
     // dropped; drafts that still differ survive refreshes and saves.
     function adopt(result) {
       snapshot = normalizeRoutingSnapshot(result);
       error = null;
-      Array.from(drafts.keys()).forEach(function (k) { if (isClean(k)) drafts.delete(k); });
+      drafts.forEach(function (draft, key) {
+        if (isClean(key)) drafts.delete(key);
+        else if (!draft.fallbackDirty) {
+          var parts = splitKey(key);
+          draft.fallback = canonicalFallback(snapshot, parts.scope, parts.field);
+        }
+      });
     }
 
     function ensureDraft(key) {
@@ -519,7 +612,7 @@
     }
 
     function refresh() {
-      if (loading || savingKey || flagsSaving) return;
+      if (loading || savingKey || savingGroups || flagsSaving) return;
       loading = true;
       error = null;
       emit();
@@ -587,13 +680,14 @@
     }
 
     function resetDraft(key) {
-      if (!snapshot) return;
+      if (!snapshot || (savingGroups && isModelGroupKey(key))) return;
       drafts.delete(key);
       clearFlash(key);
       emit();
     }
 
     function createAlias(field, target) {
+      if (savingGroups) return { ok: false, message: '正在保存模型组，请稍后重试' };
       if (!snapshot) return { ok: false, message: '路由配置尚未读取' };
       var name = String(field == null ? '' : field).trim();
       if (!name) return { ok: false, message: '请输入模型别名' };
@@ -609,6 +703,43 @@
       return { ok: true };
     }
 
+    function routeChange(key, draft) {
+      var parts = splitKey(key);
+      return {
+        revision: snapshot.revision,
+        scope: parts.scope,
+        field: parts.field,
+        target: draft.target.trim() || null,
+        fallback: draft.fallbackDirty ? draft.fallback.slice() : null,
+      };
+    }
+
+    function saveGroups() {
+      if (!snapshot || loading || flagsSaving || savingKey || savingGroups || saveQueue.length) return;
+      var keys = state().dirtyGroupKeys;
+      if (!keys.length) return;
+      var targets = keys.map(function (key) { return drafts.get(key).target; });
+      var changes = keys.map(function (key) { return routeChange(key, drafts.get(key)); });
+      savingGroups = true;
+      saveError = null;
+      groupSaveMessage = '';
+      emit();
+      invoke('routing_save_groups', { changes: changes }).then(function (response) {
+        keys.forEach(function (key, index) {
+          var draft = drafts.get(key);
+          if (draft && draft.target === targets[index]) draft.target = changes[index].target || '';
+        });
+        adopt(response);
+        savingGroups = false;
+        groupSaveMessage = '已保存 ' + keys.length + ' 项模型组修改';
+        emit();
+      }, function (err) {
+        savingGroups = false;
+        saveError = { message: errorMessage(err) };
+        emit();
+      });
+    }
+
     // Saves run one at a time so every change carries the latest known
     // revision; the server rejects stale revisions instead of merging.
     function pump() {
@@ -617,26 +748,17 @@
       var d = drafts.get(key);
       if (!d || isClean(key)) { pump(); return; }
       savingKey = key;
-      emit();
-      var parts = splitKey(key);
       var submittedTarget = d.target;
-      var t = String(submittedTarget).trim();
-      var change = {
-        revision: snapshot ? snapshot.revision : '',
-        scope: parts.scope,
-        field: parts.field,
-        target: t === '' ? null : t,
-        // Null fallback preserves the server list; only an edited list is sent.
-        fallback: d.fallbackDirty ? d.fallback.slice() : null,
-      };
+      var change = routeChange(key, d);
+      emit();
       var my = ++epoch;
       invoke('routing_save', { change: change }).then(function (resp) {
         if (my !== epoch) return;
         savingKey = null;
-        var hadError = saveError && saveError.key === key;
+        var hadError = saveError && (!saveError.key || saveError.key === key);
         var currentDraft = drafts.get(key);
         // Normalize only the submitted target; newer typing remains a draft.
-        if (currentDraft && currentDraft.target === submittedTarget) currentDraft.target = t;
+        if (currentDraft && currentDraft.target === submittedTarget) currentDraft.target = change.target || '';
         adopt(resp);
         if (isClean(key)) {
           drafts.delete(key);
@@ -654,7 +776,7 @@
       });
     }
     function saveRow(key) {
-      if (!snapshot || loading || flagsSaving) return;
+      if (!snapshot || loading || flagsSaving || savingGroups) return;
       if (savingKey === key || saveQueue.indexOf(key) !== -1) return;
       if (isClean(key)) return;
       saveQueue.push(key);
@@ -663,7 +785,7 @@
     }
 
     function setFlag(name, value) {
-      if (!snapshot || flagsSaving || savingKey || loading) return false;
+      if (!snapshot || flagsSaving || savingKey || savingGroups || loading) return false;
       if (typeof value !== 'boolean') return false;
       if (name !== 'familyRouting' && name !== 'fallbackEnabled') return false;
       var payload = {
@@ -693,13 +815,13 @@
       subscribe: subscribe, state: state, refresh: refresh,
       setTarget: setTarget, addFallback: addFallback, removeFallback: removeFallback,
       moveFallback: moveFallback, resetDraft: resetDraft,
-      saveRow: saveRow, setFlag: setFlag, createAlias: createAlias,
+      saveRow: saveRow, saveGroups: saveGroups, setFlag: setFlag, createAlias: createAlias,
     };
   }
 
 
   // ---- Usage tab ---------------------------------------------------------
-  // usage_snapshot({period:'today'|'7d'|'30d'}) -> totals + byModel/byProvider/byDay.
+  // usage_snapshot({period:'today'|'7d'|'30d'|'all'}) -> totals + byModel/byProvider/byDay.
   // Numbers come from the server summary only; no currency/cost is shown.
 
   function usageRow(x) {
@@ -708,6 +830,7 @@
       name: toStr(o.name) || '—',
       requests: toNum(o.requests),
       inputTokens: toNum(o.inputTokens),
+      effectiveInputTokens: inclusiveInputTokens(o),
       outputTokens: toNum(o.outputTokens),
       cacheReadTokens: toNum(o.cacheReadTokens),
       cacheWriteTokens: toNum(o.cacheWriteTokens),
@@ -721,6 +844,7 @@
       successCount: toNum(s.successCount),
       errorCount: toNum(s.errorCount),
       inputTokens: toNum(s.inputTokens),
+      effectiveInputTokens: inclusiveInputTokens(s),
       outputTokens: toNum(s.outputTokens),
       cacheReadTokens: toNum(s.cacheReadTokens),
       cacheWriteTokens: toNum(s.cacheWriteTokens),
@@ -734,15 +858,32 @@
     };
   }
 
+  // Core's SQLite buckets use date(timestamp, 'localtime'). Step through local
+  // calendar dates so UTC offsets and daylight-saving transitions match them.
+  function usageDayKey(end, daysAgo) {
+    var date = new Date(end.getFullYear(), end.getMonth(), end.getDate() - daysAgo, 12);
+    return date.getFullYear() + '-' + pad2(date.getMonth() + 1) + '-' + pad2(date.getDate());
+  }
+
+  function usageTrendRows(rows, dayCount, end) {
+    var byDate = new Map(rows.map(function (row) { return [row.name, row]; }));
+    var days = [];
+    for (var i = dayCount - 1; i >= 0; i--) {
+      var name = usageDayKey(end, i);
+      days.push(byDate.get(name) || { name: name, inputTokens: 0, outputTokens: 0 });
+    }
+    return days;
+  }
+
   function createUsageController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createUsageController: 需要 invoke 函数');
-    var snapshot = null, loading = false, error = null, period = 'today';
-    var epoch = 0;
+    var snapshot = null, loading = false, error = null, period = DEFAULT_USAGE_PERIOD;
+    var epoch = 0, trend = null;
     var listeners = new Set();
 
     function state() {
-      return { snapshot: snapshot, loading: loading, error: error, period: period };
+      return { snapshot: snapshot, loading: loading, error: error, period: period, trend: trend };
     }
     function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
     function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
@@ -752,8 +893,10 @@
       period = p;
       loading = true;
       error = null;
-      emit();
       var my = ++epoch;
+      var dayCount = p === 'today' || p === '7d' ? 7 : p === '30d' ? 30 : 0;
+      trend = dayCount ? { dayCount: dayCount, rows: null, error: null } : null;
+      emit();
       invoke('usage_snapshot', { period: p }).then(function (r) {
         if (my !== epoch) return;
         snapshot = normalizeUsageSnapshot(r);
@@ -765,6 +908,19 @@
         error = errorMessage(err);
         emit();
       });
+      if (trend) {
+        invoke('usage_snapshot', { period: dayCount + 'd', trend: true }).then(function (r) {
+          if (my !== epoch) return;
+          var end = new Date(r.updatedAt);
+          if (!Number.isFinite(end.getTime())) throw new Error('趋势时间无效');
+          trend.rows = usageTrendRows(r.byDay.map(usageRow), dayCount, end);
+          emit();
+        }).catch(function (err) {
+          if (my !== epoch) return;
+          trend.error = errorMessage(err);
+          emit();
+        });
+      }
     }
 
     return {
@@ -776,7 +932,7 @@
 
 
   // ---- Usage records -----------------------------------------------------
-  // usage_records({period:'today'|'7d'|'30d',page,pageSize}) -> paged,
+  // usage_records({period:'today'|'7d'|'30d'|'all',page,pageSize}) -> paged,
   // whitelisted projections of individual calls. The server never sends
   // responseBody/sessionId/keys; normalizeRecord re-enforces that whitelist
   // on the client before anything renders.
@@ -798,6 +954,7 @@
       clientType: toStr(o.clientType),
       scenarioType: toStr(o.scenarioType) || 'default',
       inputTokens: toNum(o.inputTokens),
+      effectiveInputTokens: inclusiveInputTokens(o),
       outputTokens: toNum(o.outputTokens),
       cacheReadTokens: toNum(o.cacheReadTokens),
       cacheWriteTokens: toNum(o.cacheWriteTokens),
@@ -836,18 +993,17 @@
     return out.join(' → ');
   }
   // byModel arrives sorted by request count; charts rank by total tokens.
-  // Effective input mirrors the Web UsageStats heuristic (computeEffectiveInputTokens):
-  // some upstreams report inputTokens inclusive of cache read/write (then input
-  // ~= cache sum within a tolerance), others report net input. Never double-count.
-  function effectiveInputTokens(input, cacheRead, cacheWrite) {
-    if (input === null) return null;
-    var cacheTotal = (toNum(cacheRead) || 0) + (toNum(cacheWrite) || 0);
-    if (cacheTotal <= 0) return input;
-    var tolerance = Math.max(500, input * 0.02);
-    return Math.abs(input - cacheTotal) <= tolerance ? input : input + cacheTotal;
+  function inclusiveInputTokens(row) {
+    if (row.effectiveInputTokens !== undefined) return toNum(row.effectiveInputTokens);
+    // Legacy raw input is unambiguous only with no recorded cache activity.
+    return row.cacheReadTokens || row.cacheWriteTokens ? null : toNum(row.inputTokens);
+  }
+  function cacheMissInputTokens(row) {
+    var input = inclusiveInputTokens(row);
+    return input == null ? null : input - (row.cacheReadTokens || 0);
   }
   function rowTotalTokens(row) {
-    var input = effectiveInputTokens(row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens);
+    var input = inclusiveInputTokens(row);
     if (input === null || row.outputTokens === null) return null;
     return input + row.outputTokens;
   }
@@ -855,8 +1011,8 @@
   function topModelsByTotal(rows, limit) {
     var list = (Array.isArray(rows) ? rows : []).slice();
     list.sort(function (a, b) {
-      var ta = rowTotalTokens(a) || 0;
-      var tb = rowTotalTokens(b) || 0;
+      var ta = rowTotalTokens(a) ?? -1;
+      var tb = rowTotalTokens(b) ?? -1;
       return tb - ta;
     });
     return typeof limit === 'number' ? list.slice(0, limit) : list;
@@ -865,7 +1021,7 @@
   function createRecordsController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createRecordsController: 需要 invoke 函数');
-    var period = 'today', page = 1, pageSize = RECORDS_PAGE_SIZE;
+    var period = DEFAULT_USAGE_PERIOD, page = 1, pageSize = RECORDS_PAGE_SIZE;
     var data = null, loading = false, error = null;
     var epoch = 0;
     var listeners = new Set();
@@ -1145,8 +1301,36 @@
   // In-memory fixtures covering every contract command, so the panel is fully
   // browsable outside Tauri. Never used when window.__TAURI__ is present.
 
+  function bindAutostart(invoke, toggle, message) {
+    var pending = false;
+    async function sync(requested) {
+      if (!invoke || pending) return;
+      pending = true;
+      toggle.disabled = true;
+      var writeFailed = false;
+      if (typeof requested === 'boolean') {
+        try { await invoke('login_start_set', { enabled: requested }); }
+        catch { writeFailed = true; }
+      }
+      try {
+        toggle.checked = await invoke('login_start_status');
+        toggle.indeterminate = false;
+        toggle.disabled = false;
+        message.textContent = writeFailed || (typeof requested === 'boolean' && toggle.checked !== requested)
+          ? '未能更改开机启动设置' : '';
+      } catch {
+        toggle.indeterminate = true;
+        message.textContent = '无法读取开机启动状态，请点击刷新重试';
+      } finally { pending = false; }
+    }
+    toggle.addEventListener('change', function () { return sync(toggle.checked); });
+    return function () { return sync(); };
+  }
+
   function createPreviewInvoke() {
+    var loginStart = false;
     var projectsPreview = typeof ProjectsUI !== 'undefined' ? ProjectsUI.createPreviewProjects() : null;
+    var settingsPreview = typeof GeneralSettingsUI !== 'undefined' ? GeneralSettingsUI.preview() : null;
     var rev = 1;
     var routing = {
       providers: [
@@ -1165,55 +1349,61 @@
       fallbackEnabled: true,
       revision: 'rev-1',
     };
+    var previewDay = new Date();
     var usage = {
       today: {
         period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
-        inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
+        inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
         avgTtftMs: 842, avgTokensPerSecond: 36.2,
         byProvider: [
-          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
-          { name: 'beta.example.com', requests: 32, inputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
+          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, effectiveInputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
+          { name: 'beta.example.com', requests: 32, inputTokens: 202100, effectiveInputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
         ],
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
-        byDay: [{ name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
+        byDay: [{ name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
         updatedAt: Date.now() - 3000,
       },
       '7d': {
         period: '7d', totalRequests: 902, successCount: 890, errorCount: 12,
-        inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
+        inputTokens: 6210000, effectiveInputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
         avgTtftMs: 905, avgTokensPerSecond: 33.8,
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, effectiveInputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
-          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
+          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, effectiveInputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
+          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, effectiveInputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
-          { name: '2026-11-15', requests: 155, inputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
-          { name: '2026-11-14', requests: 132, inputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
-          { name: '2026-11-13', requests: 147, inputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
-          { name: '2026-11-12', requests: 101, inputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
-          { name: '2026-11-11', requests: 99, inputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
+          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, effectiveInputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: usageDayKey(previewDay, 2), requests: 155, inputTokens: 950000, effectiveInputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
+          { name: usageDayKey(previewDay, 3), requests: 132, inputTokens: 720000, effectiveInputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
+          { name: usageDayKey(previewDay, 4), requests: 147, inputTokens: 880000, effectiveInputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
+          { name: usageDayKey(previewDay, 5), requests: 101, inputTokens: 520000, effectiveInputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
+          { name: usageDayKey(previewDay, 6), requests: 99, inputTokens: 498000, effectiveInputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
         ],
         updatedAt: Date.now() - 3000,
       },
       '30d': {
         period: '30d', totalRequests: 4120, successCount: 4044, errorCount: 76,
-        inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
+        inputTokens: 28600000, effectiveInputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
         avgTtftMs: 878, avgTokensPerSecond: 34.9,
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
+        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, effectiveInputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
         byProvider: [
-          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
-          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
+          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, effectiveInputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
+          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, effectiveInputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
         ],
         byDay: [
-          { name: '2026-11-17', requests: 128, inputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: '2026-11-16', requests: 140, inputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
+          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
+          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, effectiveInputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
         ],
         updatedAt: Date.now() - 3000,
       },
     };
+    var olderDay = { name: '2026-09-01', requests: 1, inputTokens: 1000, effectiveInputTokens: 1000, outputTokens: 250, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    usage.all = Object.assign({}, usage['30d'], {
+      period: 'all', totalRequests: 4121, successCount: 4045, inputTokens: 28601000, effectiveInputTokens: 28601000, outputTokens: 7100250,
+      byDay: [olderDay].concat(usage['30d'].byDay),
+    });
     var clients = {
       clients: [
         { id: 'claudeCode', name: 'Claude Code', enabled: true, managed: true, exists: true, activeModel: 'claude-sonnet-4-5', modelAlias: 'claude-sonnet-4-5' },
@@ -1240,7 +1430,7 @@
       { original: 'claude-opus-4-5', model: 'glm-5', upstream: 'glm-5-air' },
       { original: 'gpt-5-codex', model: 'gpt-5-codex', upstream: null },
     ];
-    var RECORD_COUNTS = { today: 45, '7d': 132, '30d': 260 };
+    var RECORD_COUNTS = { today: 45, '7d': 132, '30d': 260, all: 320 };
     function previewRecords(period) {
       var n = RECORD_COUNTS[period] || 45;
       var records = [];
@@ -1256,6 +1446,7 @@
           clientType: RECORD_CLIENTS[i % RECORD_CLIENTS.length],
           scenarioType: i % 4 === 0 ? 'background' : 'default',
           inputTokens: 1200 + (i % 7) * 350,
+          effectiveInputTokens: 1200 + (i % 7) * 350 + (i % 3) * 900 + (i % 2) * 400,
           outputTokens: 300 + (i % 5) * 120,
           cacheReadTokens: (i % 3) * 900,
           cacheWriteTokens: (i % 2) * 400,
@@ -1271,17 +1462,18 @@
     }
     var recordsCache = null;
     function recordsFor(period) {
-      if (!recordsCache) recordsCache = { today: previewRecords('today'), '7d': previewRecords('7d'), '30d': previewRecords('30d') };
+      if (!recordsCache) recordsCache = { today: previewRecords('today'), '7d': previewRecords('7d'), '30d': previewRecords('30d'), all: previewRecords('all') };
       return recordsCache[period] || recordsCache.today;
     }
 
     function copy(v) { return JSON.parse(JSON.stringify(v)); }
     function delay(v) { return new Promise(function (resolve) { setTimeout(function () { resolve(v); }, 120); }); }
+    var pluginsPreview = typeof PluginsUI !== 'undefined' ? PluginsUI.createPreviewPlugins(function (v) { return delay(copy(v)); }) : null;
     function bump() { rev += 1; routing.revision = 'rev-' + rev; }
 
-    function quotaSnapshot(now) {
+    function previewQuotaProviders(now) {
       var h = function (n) { return new Date(now + n * 3600e3).toISOString(); };
-      var all = [
+      return [
         { name: 'alpha.example.com', enabled: true, plan: 'Pro', status: 'ready', message: null, updatedAt: now - 5e3, windows: [
           { label: '五小时', used: 12.3, limit: 45, remaining: 32.7, unit: '次', resetAt: h(3) },
           { label: '每周', used: 210, limit: 1000, remaining: 790, unit: '次', resetAt: h(74) },
@@ -1298,15 +1490,89 @@
           { label: '五小时', used: null, limit: null, remaining: null, unit: null, resetAt: null }] },
         { name: '火山agent plan', enabled: true, plan: null, status: 'unavailable', message: '未提供可用额度数据（来源未声明查询能力）', windows: [], updatedAt: null },
       ];
-      return { providers: all, updatedAt: now - 2e3, online: true, error: null };
+    }
+    var quotaProviders = previewQuotaProviders(Date.now());
+    var providerDetails = new Map(quotaProviders.map(function (row) {
+      var route = routing.providers.find(function (p) { return p.name === row.name; });
+      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: false, transformer: null, transformerProtected: false }];
+    }));
+
+    var previewCatalog = { names: ['OpenAI', 'customparams'], parameterizedNames: ['customparams'] };
+
+    function applyPreviewRoute(change) {
+      var idx = routing.routes.findIndex(function (route) {
+        return route.scope === change.scope && route.field === change.field;
+      });
+      var target = typeof change.target === 'string' ? change.target.trim() || null : null;
+      var fallback = Array.isArray(change.fallback)
+        ? change.fallback.map(function (f) { return typeof f === 'string' ? f.trim() : ''; }).filter(Boolean)
+        : (idx !== -1 ? routing.routes[idx].fallback : []);
+      var entry = { scope: change.scope, field: change.field, target: target, fallback: fallback };
+      if (!target && !fallback.length) {
+        if (idx !== -1) routing.routes.splice(idx, 1);
+      } else if (idx === -1) routing.routes.push(entry);
+      else routing.routes[idx] = entry;
     }
 
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
+      if (cmd.indexOf('general_settings_') === 0 && settingsPreview) return settingsPreview(cmd, args);
       if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
+      if (cmd.indexOf('plugin_') === 0 && pluginsPreview) return pluginsPreview.invoke(cmd, a);
+      if (cmd === 'login_start_status') return Promise.resolve(loginStart);
+      if (cmd === 'login_start_set') {
+        loginStart = a.enabled;
+        return Promise.resolve();
+      }
       if (cmd === 'quota_snapshot') {
-        return new Promise(function (resolve) { setTimeout(function () { resolve(quotaSnapshot(Date.now())); }, 250); });
+        return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
+      }
+      if (cmd === 'provider_transformers') return delay(copy(previewCatalog));
+      if (cmd === 'provider_get') {
+        var detail = providerDetails.get(a.name);
+        if (detail && detail.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
+        return detail ? delay(copy(detail)) : Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
+      }
+      if (cmd === 'provider_add' || cmd === 'provider_update') {
+        var editing = cmd === 'provider_update';
+        var provider = a.provider;
+        if (providerInputError(provider, editing)) return Promise.reject(new Error('PROVIDER_INVALID'));
+        var name = provider.name.trim();
+        var previous = editing && providerDetails.get(a.name);
+        if (editing && !previous) return Promise.reject(new Error('PROVIDER_UNAVAILABLE'));
+        if (previous && previous.managed) return Promise.reject(new Error('PROVIDER_MANAGED'));
+        if (editing && name !== a.name) return Promise.reject(new Error('PROVIDER_INVALID'));
+        var row = editing && quotaProviders.find(function (p) { return p.name === a.name; });
+        if (quotaProviders.some(function (p) { return p !== row && p.name.toLowerCase() === name.toLowerCase(); })) {
+          return Promise.reject(new Error('PROVIDER_DUPLICATE'));
+        }
+        var models = provider.models.map(function (m) { return m.trim(); });
+        var managed = name === 'ccr' || (provider.apiKey || '').trim().startsWith('ccr-managed-');
+        var transformer = previous ? previous.transformer : null;
+        var transformerProtected = previous ? previous.transformerProtected : false;
+        if (provider.transformer !== undefined) {
+          var chain = provider.transformer === null ? [] : provider.transformer.use;
+          var validName = function (value) {
+            return typeof value === 'string' && value.trim() && Array.from(value.trim()).length <= 64 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+          };
+          if (provider.transformer === null ? !editing :
+              Object.keys(provider.transformer).length !== 1 || !Array.isArray(chain) || !chain.length || chain.length > 8 || chain.some(function (item) {
+                if (!Array.isArray(item)) return !validName(item);
+                return item.length !== 2 || !validName(item[0]) || !previewCatalog.parameterizedNames.includes(item[0].trim()) ||
+                  !item[1] || typeof item[1] !== 'object' || Array.isArray(item[1]) || new TextEncoder().encode(JSON.stringify(item[1])).length > 2048;
+              })) return Promise.reject(new Error('PROVIDER_INVALID'));
+          transformerProtected = chain.some(Array.isArray);
+          transformer = chain.length ? { use: chain.map(function (item) { return (Array.isArray(item) ? item[0] : item).trim(); }) } : null;
+        }
+        providerDetails.set(name, { name: name, baseUrl: provider.baseUrl.trim(), models: models, managed: managed,
+          transformer: transformer, transformerProtected: transformerProtected });
+        if (!row) quotaProviders.push({ name: name, enabled: true, plan: null, status: 'unsupported', message: null, updatedAt: null, windows: [] });
+        var route = editing && routing.providers.find(function (p) { return p.name === a.name; });
+        if (route) route.models = models;
+        else if (!row || row.enabled) routing.providers.push({ name: name, models: models });
+        bump();
+        return delay({ name: name });
       }
       if (cmd === 'routing_snapshot') return delay(copy(routing));
       if (cmd === 'routing_save') {
@@ -1314,20 +1580,26 @@
         if (change.revision !== routing.revision) return Promise.reject(new Error(STALE_MSG));
         if (ROUTING_SCOPES.indexOf(change.scope) === -1) return Promise.reject(new Error('路由范围无效'));
         if (typeof change.field !== 'string' || !change.field) return Promise.reject(new Error('路由字段无效'));
-        var target = typeof change.target === 'string' && change.target ? change.target : null;
-        var idx = -1;
-        for (var i = 0; i < routing.routes.length; i++) {
-          if (routing.routes[i].scope === change.scope && routing.routes[i].field === change.field) { idx = i; break; }
+        applyPreviewRoute(change);
+        bump();
+        return delay(copy(routing));
+      }
+      if (cmd === 'routing_save_groups') {
+        var changes = Array.isArray(a.changes) ? a.changes : [];
+        var seen = new Set();
+        if (!changes.length || changes.some(function (change) {
+          if (!change || typeof change.field !== 'string') return true;
+          var key = routeKey(change.scope, change.field.trim());
+          if (!isModelGroupKey(key) || seen.has(key)) return true;
+          seen.add(key);
+          return false;
+        })) return Promise.reject(new Error('模型组修改无效'));
+        if (changes.some(function (change) { return change.revision !== routing.revision; })) {
+          return Promise.reject(new Error(STALE_MSG));
         }
-        if (target === null) {
-          if (idx !== -1) routing.routes.splice(idx, 1); // null/empty target clears the override
-        } else {
-          var fallback = Array.isArray(change.fallback)
-            ? change.fallback.filter(function (f) { return typeof f === 'string' && f; })
-            : (idx !== -1 ? routing.routes[idx].fallback : []); // null fallback preserves
-          var entry = { scope: change.scope, field: change.field, target: target, fallback: fallback };
-          if (idx === -1) routing.routes.push(entry); else routing.routes[idx] = entry;
-        }
+        changes.forEach(function (change) {
+          applyPreviewRoute(Object.assign({}, change, { field: change.field.trim() }));
+        });
         bump();
         return delay(copy(routing));
       }
@@ -1340,7 +1612,9 @@
       }
       if (cmd === 'usage_snapshot') {
         var period = USAGE_PERIODS.indexOf(a.period) !== -1 ? a.period : 'today';
-        return delay(copy(usage[period]));
+        var result = copy(usage[period]);
+        if (a.trend) result.updatedAt = previewDay.getTime();
+        return delay(result);
       }
       if (cmd === 'usage_records') {
         // Mirrors the native contract: invalid period is a fixed error, page
@@ -1381,6 +1655,7 @@
             return Promise.reject(new Error('服务已在运行或启动中'));
           }
           service = { mode: 'owned', running: true, message: '' };
+          if (pluginsPreview) pluginsPreview.start();
           return delay(copy(service));
         }
         if (a.action === 'stop') {
@@ -1391,6 +1666,7 @@
         }
         return Promise.reject(new Error('服务操作无效'));
       }
+      if (cmd === 'config_reload') return delay({ success: true, restartRequired: [] });
       return Promise.resolve(null);
     };
   }
@@ -1427,7 +1703,7 @@
     SERVICE_MODES: SERVICE_MODES, normalizeServiceState: normalizeServiceState,
     serviceView: serviceView, quitTitleFor: quitTitleFor, createServiceController: createServiceController,
     // preview fixtures (complete contracts, ?preview=1 only)
-    createPreviewInvoke: createPreviewInvoke,
+    createPreviewInvoke: createPreviewInvoke, bindAutostart: bindAutostart,
   };
   if (typeof globalThis !== 'undefined') globalThis.QuotaUI = QuotaUI;
 
@@ -1482,6 +1758,9 @@
     creds.textContent = '用量凭证';
     creds.title = '配置火山 Coding Plan 用量查询凭证（AK/SK）';
     creds.hidden = true;
+    var edit = el('button', 'btn card-edit', '编辑');
+    edit.type = 'button';
+    edit.setAttribute('aria-controls', 'provider-add-form');
     var refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.className = 'btn btn-icon card-refresh';
@@ -1489,6 +1768,7 @@
     refresh.appendChild(icon(REFRESH_PATHS));
     actions.appendChild(status);
     actions.appendChild(creds);
+    actions.appendChild(edit);
     actions.appendChild(refresh);
     head.appendChild(title);
     head.appendChild(actions);
@@ -1499,7 +1779,7 @@
     var credsPanel = buildCredsPanel();
     var loading = el('p', 'card-loading'); loading.hidden = true;
     li.appendChild(head); li.appendChild(message); li.appendChild(error); li.appendChild(credsNote); li.appendChild(windows); li.appendChild(credsPanel.root); li.appendChild(loading);
-    return { li: li, name: name, badges: badges, status: status, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
+    return { li: li, name: name, badges: badges, status: status, edit: edit, refresh: refresh, creds: creds, credsNote: credsNote, credsPanel: credsPanel.root, credsAk: credsPanel.ak, credsSk: credsPanel.sk, credsMsg: credsPanel.msg, credsSave: credsPanel.saveBtn, credsClear: credsPanel.clearBtn, credsCancel: credsPanel.cancelBtn, credsWasOpen: false, credsFlashStamp: null, message: message, error: error, windows: windows, loading: loading };
   }
 
   // Inline AK/SK editor in the client-confirm style; buttons are wired by
@@ -1539,10 +1819,13 @@
   }
 
   function buildWindow(win) {
-    var li = el('li', 'window');
     var label = toStr(win.label) || '用量';
     var pct = computePercent(win);
-    var pctText = formatPercent(pct);
+    return buildQuotaMeter(label, pct, formatPercent(pct) || '', describeWindow(win));
+  }
+
+  function buildQuotaMeter(label, pct, pctText, meta) {
+    var li = el('li', 'window');
     var top = el('div', 'window-top');
     top.appendChild(el('span', 'window-label', label));
     top.appendChild(el('span', 'window-pct', pctText || ''));
@@ -1551,14 +1834,341 @@
       var meter = document.createElement('progress');
       meter.className = 'meter';
       meter.setAttribute('max', '100');
-      meter.setAttribute('value', String(Math.round(pct * 100) / 100));
+      meter.setAttribute('value', String(pct));
       meter.setAttribute('data-level', pct >= 90 ? 'high' : 'normal');
-      meter.setAttribute('aria-label', label + ' 已用 ' + pctText);
+      meter.setAttribute('aria-label', label + ' 已用');
       li.appendChild(meter);
     }
-    var meta = describeWindow(win);
     if (meta) li.appendChild(el('div', 'window-meta', meta));
     return li;
+  }
+
+  function mountTransformerEditor() {
+    var section = document.getElementById('provider-transformers');
+    var rows = document.getElementById('provider-transformer-rows');
+    var add = document.getElementById('provider-transformer-add');
+    var protectedPanel = document.getElementById('provider-transformer-protected');
+    var summary = document.getElementById('provider-transformer-summary');
+    var replace = document.getElementById('provider-transformer-replace');
+    var confirmPanel = document.getElementById('provider-transformer-confirm');
+    var keep = document.getElementById('provider-transformer-keep');
+    var confirmReplace = document.getElementById('provider-transformer-confirm-replace');
+    var names = [], parameterizedNames = [], originalChain = [], keepProtected = false, confirmedReplacement = false;
+
+    function input(label, cls) {
+      var field = el('input', 'route-input ' + cls);
+      field.setAttribute('aria-label', label);
+      field.placeholder = label;
+      return field;
+    }
+    function select(label, cls, options) {
+      var field = el('select', 'route-input ' + cls);
+      field.setAttribute('aria-label', label);
+      options.forEach(function (value) {
+        var option = el('option', null, value);
+        option.value = value;
+        field.appendChild(option);
+      });
+      return field;
+    }
+    function addParam(params) {
+      var pair = el('div', 'transformer-param');
+      var key = input('参数名', 'param-key');
+      pair.appendChild(key);
+      pair.appendChild(select('参数值类型', 'param-type', ['文本', 'JSON']));
+      var value = input('参数值', 'param-value');
+      value.setAttribute('autocomplete', 'off');
+      value.spellcheck = false;
+      pair.appendChild(value);
+      pair.appendChild(mkBtn('移除', '移除参数', function () { pair.remove(); }));
+      params.appendChild(pair);
+      key.focus();
+    }
+    function addRow(name) {
+      var row = el('div', 'transformer-row');
+      var field = names.length && (!name || names.includes(name))
+        ? select('转换器名称', 'transformer-name', names) : input('转换器名称', 'transformer-name');
+      field.value = name || names[0] || '';
+      row.appendChild(field);
+      row.appendChild(mkBtn('移除', '移除转换器', function () { row.remove(); }));
+      var params = el('div', 'transformer-params');
+      row.appendChild(params);
+      var addParameter = mkBtn('添加参数', null, function () { addParam(params); });
+      function syncParameterButton() { addParameter.disabled = !parameterizedNames.includes(field.value.trim()); }
+      field.addEventListener('input', syncParameterButton);
+      field.addEventListener('change', syncParameterButton);
+      syncParameterButton();
+      row.appendChild(addParameter);
+      rows.appendChild(row);
+      return field;
+    }
+    function reset() {
+      rows.textContent = summary.textContent = '';
+      protectedPanel.hidden = true;
+      confirmPanel.hidden = true;
+      replace.hidden = false;
+      keepProtected = false;
+      add.hidden = false;
+      add.disabled = true;
+      names = [];
+      parameterizedNames = [];
+      originalChain = [];
+      confirmedReplacement = false;
+    }
+    add.addEventListener('click', function () { addRow('').focus(); });
+    replace.addEventListener('click', function () {
+      replace.hidden = true;
+      confirmPanel.hidden = false;
+      keep.focus();
+    });
+    keep.addEventListener('click', function () {
+      confirmPanel.hidden = true;
+      replace.hidden = false;
+      replace.focus();
+    });
+    confirmReplace.addEventListener('click', function () {
+      keepProtected = false;
+      confirmedReplacement = true;
+      protectedPanel.hidden = true;
+      add.hidden = false;
+      add.focus();
+    });
+    function prefill(entry) {
+      var chain = entry.transformer && entry.transformer.use || [];
+      if (!Array.isArray(chain) || !chain.every(function (name) { return typeof name === 'string'; })) throw new Error();
+      originalChain = chain;
+      keepProtected = entry.transformerProtected === true;
+      if (keepProtected) {
+        summary.textContent = '已保留现有转换器和参数。' + chain.join(' → ');
+        protectedPanel.hidden = false;
+        add.hidden = true;
+      } else chain.forEach(addRow);
+    }
+    function writeTo(provider, editing, error) {
+      if (keepProtected) return true;
+      function invalid(field, message) { error.textContent = message; field.focus(); return false; }
+      var use = [];
+      for (var row of rows.children) {
+        var field = row.querySelector('.transformer-name');
+        var name = field.value.trim();
+        if (!name) return invalid(field, '请输入转换器名称。');
+        var params = Object.create(null);
+        var pairs = row.querySelectorAll('.transformer-param');
+        if (pairs.length && !parameterizedNames.includes(name)) return invalid(field, '此转换器不支持参数，请移除参数或选择其他转换器。');
+        for (var pair of pairs) {
+          var key = pair.querySelector('.param-key');
+          var paramName = key.value.trim();
+          if (!paramName || paramName in params) return invalid(key, '请输入唯一的参数名。');
+          var value = pair.querySelector('.param-value');
+          if (pair.querySelector('.param-type').value === 'JSON') {
+            try { params[paramName] = JSON.parse(value.value); }
+            catch { return invalid(value, '请输入有效的 JSON 值。'); }
+          } else params[paramName] = value.value;
+        }
+        use.push(Object.keys(params).length ? [name, params] : name);
+      }
+      if (editing && !confirmedReplacement && use.length === originalChain.length && use.every(function (item, i) { return item === originalChain[i]; })) return true;
+      if (use.length) provider.transformer = { use: use };
+      else if (editing) provider.transformer = null;
+      return true;
+    }
+    return {
+      reset: reset, prefill: prefill, writeTo: writeTo,
+      disable: function (disabled) { section.disabled = disabled; },
+      setNames: function (result) {
+        names = result && Array.isArray(result.names) ? result.names.filter(function (n) { return typeof n === 'string' && n.trim(); }) : [];
+        parameterizedNames = result && Array.isArray(result.parameterizedNames) ? result.parameterizedNames.filter(function (n) { return names.includes(n); }) : [];
+        add.disabled = false;
+      },
+    };
+  }
+
+  function mountProviderForm(invoke, onSaved) {
+    var open = document.getElementById('provider-add-open');
+    var form = document.getElementById('provider-add-form');
+    var title = document.getElementById('provider-form-title');
+    var cancel = document.getElementById('provider-add-cancel');
+    var save = document.getElementById('provider-add-save');
+    var error = document.getElementById('provider-add-error');
+    var status = document.getElementById('provider-add-status');
+    var fields = {
+      name: document.getElementById('provider-name'), baseUrl: document.getElementById('provider-base-url'),
+      apiKey: document.getElementById('provider-api-key'), models: document.getElementById('provider-models'),
+    };
+    var invalidMessages = {
+      name: '请输入供应商名称，不能包含逗号或控制字符。',
+      baseUrl: '请输入完整的 HTTP 或 HTTPS 地址，不能包含账号、密码或片段；查询参数仅支持版本号。',
+      apiKey: '请输入有效的 API 密钥。', models: '请输入 1 至 256 个有效的模型 ID。',
+    };
+    var saving = false, loading = false, managed = false, editName = null;
+    var trigger = open, readId = 0;
+    var transformers = mountTransformerEditor();
+    var managedNote = '系统托管的供应商请在对应插件卡片中管理';
+
+    function close(restoreFocus) {
+      if (form.hidden) return;
+      Object.values(fields).forEach(function (field) { field.value = ''; });
+      error.textContent = '';
+      transformers.reset();
+      form.hidden = true;
+      trigger.setAttribute('aria-expanded', 'false');
+      if (restoreFocus) trigger.focus();
+      trigger = open;
+      editName = null;
+      loading = managed = false;
+      readId++;
+    }
+    function syncControls() {
+      Object.values(fields).forEach(function (field) { field.disabled = saving || loading || managed; });
+      transformers.disable(saving || loading || managed);
+      form.setAttribute('aria-busy', String(saving || loading));
+      open.disabled = !invoke || saving;
+      cancel.disabled = saving;
+      save.disabled = saving || loading || managed;
+      save.textContent = saving ? '正在保存…' : editName !== null ? '保存修改' : '保存';
+    }
+    function show(name, button) {
+      close(false);
+      editName = name;
+      loading = name !== null;
+      trigger = button;
+      title.textContent = loading ? '编辑供应商' : '添加供应商';
+      fields.name.readOnly = loading;
+      fields.name.title = loading ? '名称用于路由，创建后不可修改。' : '';
+      fields.apiKey.required = !loading;
+      fields.apiKey.placeholder = loading ? '已保存，留空则不修改' : '';
+      status.textContent = '';
+      form.hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      transformers.reset();
+      syncControls();
+      var id = ++readId;
+      return invoke('provider_transformers').catch(function () { return null; }).then(function (result) {
+        if (id === readId) transformers.setNames(result);
+      });
+    }
+    async function edit(name, button) {
+      if (!invoke || saving) return;
+      var catalog = show(name, button);
+      var id = readId;
+      try {
+        var results = await Promise.all([invoke('provider_get', { name: name }), catalog]);
+        var entry = results[0];
+        if (id !== readId) return;
+        if (entry && entry.managed === true) throw new Error('PROVIDER_MANAGED');
+        if (!entry || entry.name !== name || typeof entry.baseUrl !== 'string' || !safeVersionQuery(entry.baseUrl) || !Array.isArray(entry.models)
+            || !entry.models.every(function (m) { return typeof m === 'string'; }) || typeof entry.managed !== 'boolean') throw new Error();
+        fields.name.value = entry.name;
+        fields.baseUrl.value = entry.baseUrl;
+        fields.models.value = entry.models.join('\n');
+        transformers.prefill(entry);
+        loading = false;
+        syncControls();
+        fields.baseUrl.focus();
+      } catch (err) {
+        if (id !== readId) return;
+        if ((typeof err === 'string' ? err : err && err.message) === 'PROVIDER_MANAGED') {
+          managed = true;
+          loading = false;
+          syncControls();
+          error.textContent = managedNote;
+          cancel.focus();
+          return;
+        }
+        close(true);
+        status.textContent = '暂时无法读取供应商，请刷新后重试。';
+      }
+    }
+    open.disabled = !invoke;
+    open.addEventListener('click', function () {
+      if (!form.hidden && editName === null) { close(true); return; }
+      show(null, open);
+      fields.name.focus();
+    });
+    cancel.addEventListener('click', function () { close(true); });
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      if (!invoke || saving || loading || managed || form.hidden) return;
+      var editing = editName !== null;
+      var models = fields.models.value.split(/[\r\n,]/).map(function (m) { return m.trim(); }).filter(Boolean);
+      var provider = {
+        name: editing ? editName : fields.name.value.trim(), baseUrl: fields.baseUrl.value.trim(),
+        models: Array.from(new Set(models)),
+      };
+      if (!editing || fields.apiKey.value !== '') provider.apiKey = fields.apiKey.value;
+      var invalid = providerInputError(provider, editing);
+      if (invalid) {
+        error.textContent = invalidMessages[invalid];
+        fields[invalid].focus();
+        return;
+      }
+      if (!transformers.writeTo(provider, editing, error)) return;
+      if (provider.apiKey !== undefined) provider.apiKey = provider.apiKey.trim();
+      error.textContent = '';
+      saving = true;
+      syncControls();
+      var name = provider.name;
+      var saved;
+      try {
+        var request = editing ? invoke('provider_update', { name: editName, provider: provider }) : invoke('provider_add', { provider: provider });
+        provider = null;
+        saved = await request;
+        if (!saved || saved.name !== name) throw new Error('PROVIDER_SAVE_UNCONFIRMED');
+      } catch (err) {
+        saving = false;
+        var code = typeof err === 'string' ? err : err && err.message;
+        var duplicate = code === 'PROVIDER_DUPLICATE';
+        var message = editing ? '更新供应商失败，请检查输入后重试。' : '添加供应商失败，请检查输入后重试。';
+        if (duplicate) message = editing ? '供应商名称已存在，请先解决配置中的重复名称。' : '供应商名称已存在，请使用其他名称。';
+        if (code === 'PROVIDER_INVALID') message = '供应商信息无效，请检查输入后重试。';
+        if (code === 'PROVIDER_SAVE_UNCONFIRMED') message = editing ? '暂时无法确认保存结果，请刷新后再决定是否重试' : '暂时无法确认保存结果，请刷新供应商列表后再决定是否重试。';
+        if (editing && code === 'PROVIDER_MANAGED') { managed = !form.hidden; message = managedNote; fields.apiKey.value = ''; }
+        syncControls();
+        if (form.hidden) status.textContent = message;
+        else {
+          error.textContent = message;
+          if (!editing && (duplicate || code === 'PROVIDER_INVALID')) fields.name.focus();
+          else (managed ? cancel : save).focus();
+        }
+        return;
+      }
+      saving = false;
+      syncControls();
+      close(true);
+      status.textContent = editing ? '已更新供应商' : '供应商已添加。';
+      onSaved(saved.name);
+    });
+    // A tray window can be hidden and reused without unloading its document.
+    window.addEventListener('blur', function () { fields.apiKey.value = ''; });
+    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') close(false); });
+    return {
+      close: close,
+      edit: edit,
+      escape: function () {
+        if (form.hidden) return false;
+        if (!saving) close(true);
+        return true;
+      },
+    };
+  }
+
+  function renderStepPlanWindows(list, plan) {
+    function append(label, pct, unlimited, details, resetsAt, expiresAt) {
+      var resets = formatTimestamp(resetsAt), expires = formatTimestamp(expiresAt);
+      if (resets) details.push('重置 ' + resets);
+      if (expires) details.push('到期 ' + expires);
+      var usage = unlimited ? '无限额' : pct === null ? '—' : '已用 ' + pct + '%';
+      list.appendChild(buildQuotaMeter(label, unlimited ? null : pct, usage, details.join(' · ')));
+    }
+    plan.windows.forEach(function (w) {
+      append(w.id === 'five_hour' ? '5 小时' : '7 天', w.usedPercent, !w.limited, [], w.resetsAt, null);
+    });
+    var topups = 0;
+    plan.creditBuckets.forEach(function (b) {
+      var label = b.type === 'subscription' ? '月度订阅 Credit' : '加油包 ' + (++topups) + ' Credit';
+      var details = ['剩余 ' + (b.remaining || '—') + ' / 总量 ' + (b.total || '—') + ' Credit'];
+      append(label, b.usedPercent, false, details, b.resetsAt, b.expiresAt);
+    });
   }
 
   function detectTauri() {
@@ -1606,9 +2216,12 @@
       serviceText: document.getElementById('service-text'),
       serviceStart: document.getElementById('service-start'),
       serviceStop: document.getElementById('service-stop'),
+      serviceReload: document.getElementById('service-reload'),
+      serviceReloadMsg: document.getElementById('service-reload-msg'),
       serviceRefresh: document.getElementById('service-refresh'),
       routingRevision: document.getElementById('routing-revision'),
       routingRefresh: document.getElementById('routing-refresh'),
+      routingSaveGroups: document.getElementById('routing-save-groups'),
       flagFamily: document.getElementById('flag-family'),
       flagFallback: document.getElementById('flag-fallback'),
       routingFlagsMsg: document.getElementById('routing-flags-msg'),
@@ -1632,6 +2245,8 @@
     };
     var projectsCtrl = mode === 'missing' ? null : ProjectsUI.createProjectsController({ invoke: invoke });
     ProjectsUI.mount(document, projectsCtrl);
+    var pluginsPanel = PluginsUI.mount(document, invoke);
+    var settings = GeneralSettingsUI.mount(document, invoke);
     var cards = new Map();
 
     function safeCommand(cmd) {
@@ -1654,7 +2269,7 @@
       var tone = null, text = null;
       if (mode === 'missing') { tone = 'error'; text = '无法访问桌面 IPC（window.__TAURI__ 不可用），额度数据不可用。'; }
       else if (state.fullError) { tone = 'error'; text = '刷新失败，正在显示最后已知数据：' + state.fullError; }
-      else if (state.snapshot && !state.snapshot.online) { tone = 'warn'; text = '网关离线 · 显示最后已知数据'; }
+      else if (state.snapshot && !state.snapshot.online) { tone = 'warn'; text = state.snapshot.error || '网关离线 · 显示最后已知数据'; }
       else if (state.snapshot && state.snapshot.error) { tone = 'warn'; text = '部分数据获取失败：' + state.snapshot.error; }
       setBanner(els.banner, text, tone);
     }
@@ -1667,23 +2282,36 @@
       refs.li.setAttribute('aria-busy', String(row.loading));
       if (refs.name.textContent !== p.name) refs.name.textContent = p.name;
       refs.badges.textContent = '';
-      if (p.plan) refs.badges.appendChild(el('span', 'badge badge-plan', p.plan));
+      var plan = p.stepPlan;
+      var planName = plan ? plan.name || 'Step Plan' : p.plan;
+      if (planName) refs.badges.appendChild(el('span', 'badge badge-plan', planName));
       if (!p.enabled) refs.badges.appendChild(el('span', 'badge badge-off', '已停用'));
       if (row.stale) refs.badges.appendChild(el('span', 'badge badge-stale', '可能过期'));
       var meta = statusMeta(p.status);
+      if (plan && plan.state === 'partial') meta = { label: '部分数据', tone: 'warn' };
+      if (plan && plan.state === 'stale') meta = { label: '数据已陈旧', tone: 'warn' };
       refs.status.className = 'status tone-' + meta.tone;
       refs.status.textContent = meta.label;
-      refs.message.hidden = !p.message;
-      refs.message.textContent = p.message || '';
+      var message = p.message;
+      if (plan) {
+        var details = [];
+        if (plan.allowed !== null) details.push(plan.allowed ? '账户可用' : '账户不可用');
+        if (plan.observedAt !== null) details.push('观测于 ' + formatTimestamp(plan.observedAt));
+        message = details.join(' · ');
+      }
+      refs.message.hidden = !message;
+      refs.message.textContent = message || '';
       refs.error.hidden = !row.cardError;
       refs.error.textContent = row.cardError ? '刷新失败：' + row.cardError : '';
       refs.windows.textContent = '';
-      p.windows.forEach(function (w) { refs.windows.appendChild(buildWindow(w)); });
+      if (plan) renderStepPlanWindows(refs.windows, plan);
+      else p.windows.forEach(function (w) { refs.windows.appendChild(buildWindow(w)); });
       refs.loading.hidden = !row.loading;
       refs.loading.textContent = row.loading ? '读取中…' : '';
       refs.refresh.disabled = row.loading || (controller && controller.state().loadingAll) || mode === 'missing';
       refs.refresh.setAttribute('aria-label', '刷新 ' + p.name);
       refs.refresh.title = '刷新 ' + p.name;
+      refs.edit.setAttribute('aria-label', '编辑 ' + p.name);
       syncCardCredentials(refs, p.name, credentialsCtrl ? credentialsCtrl.state() : null);
     }
 
@@ -1767,7 +2395,26 @@
 
     // ---- service bar ------------------------------------------------------
 
+    // Reload-config feedback lives in its own toast node; renderService keeps
+    // exclusive ownership of the chip. An epoch guard retires stale auto-hide
+    // timers so a newer message is never hidden by an older timer.
+    var reloadPending = false;
+    var reloadMsgEpoch = 0;
+    var RELOAD_MSG_TIMEOUT_MS = 5000;
+    function showReloadMsg(text, tone) {
+      var my = ++reloadMsgEpoch;
+      setBanner(els.serviceReloadMsg, text, tone);
+      if (text) setTimeout(function () {
+        if (my === reloadMsgEpoch) setBanner(els.serviceReloadMsg, null, null);
+      }, RELOAD_MSG_TIMEOUT_MS);
+    }
+
+    function reloadableService(service) {
+      return !!service && service.running === true && (service.mode === 'owned' || service.mode === 'external');
+    }
+
     function renderService(sState) {
+      pluginsPanel.serviceChanged(sState);
       var view = serviceView(sState.service);
       var busy = !!sState.pending || sState.loading;
       if (sState.error) {
@@ -1784,6 +2431,7 @@
       els.serviceStart.title = view.startTitle;
       els.serviceStop.disabled = mode === 'missing' || !view.canStop || busy;
       els.serviceStop.title = view.stopTitle;
+      els.serviceReload.disabled = mode === 'missing' || !reloadableService(sState.service) || busy || reloadPending;
       els.serviceRefresh.disabled = mode === 'missing' || sState.loading || !!sState.pending;
       els.quit.title = quitTitleFor(sState.service);
       els.quit.querySelector('span').textContent = sState.service && sState.service.mode === 'owned'
@@ -1827,7 +2475,9 @@
           if (p.scope === 'models' && p.field && !seen[p.field]) keys.push(k);
         });
       } else {
-        ROUTING_SCENARIOS.forEach(function (f) { keys.push(routeKey(scope, f)); });
+        ROUTING_SCENARIOS.forEach(function (field) {
+          if (scope === 'global' || field !== 'background') keys.push(routeKey(scope, field));
+        });
       }
       return keys;
     }
@@ -1891,10 +2541,13 @@
       refs.unset.hidden = targetVal !== '';
       var isDirty = !!draft && !s.isClean(key);
       var saving = s.savingKey === key;
-      refs.saveBtn.disabled = !isDirty || saving || s.flagsSaving || s.loading || mode === 'missing';
-      refs.saveBtn.textContent = saving ? '保存中…' : '保存';
-      refs.saveBtn.setAttribute('aria-busy', String(saving));
+      if (refs.saveBtn) {
+        refs.saveBtn.disabled = !isDirty || saving || s.savingGroups || s.flagsSaving || s.loading || mode === 'missing';
+        refs.saveBtn.textContent = saving ? '保存中…' : '保存';
+        refs.saveBtn.setAttribute('aria-busy', String(saving));
+      }
       refs.resetBtn.hidden = !isDirty;
+      refs.resetBtn.disabled = s.savingGroups && isModelGroupKey(key);
       refs.root.setAttribute('data-dirty', String(isDirty));
       var list = draft ? draft.fallback : canonicalF;
       var sig = JSON.stringify(list);
@@ -1956,10 +2609,13 @@
       foot.appendChild(msg);
       foot.appendChild(el('span', 'spacer'));
       var resetBtn = mkBtn('撤销', '撤销未保存的修改', function () { routingCtrl.resetDraft(key); });
-      var saveBtn = mkBtn('保存', '保存 ' + labelText, function () { routingCtrl.saveRow(key); });
-      saveBtn.className = 'btn btn-primary route-save';
       foot.appendChild(resetBtn);
-      foot.appendChild(saveBtn);
+      var saveBtn = null;
+      if (!isModelGroup(parts.scope)) {
+        saveBtn = mkBtn('保存', '保存 ' + labelText, function () { routingCtrl.saveRow(key); });
+        saveBtn.className = 'btn btn-primary route-save';
+        foot.appendChild(saveBtn);
+      }
       root.appendChild(foot);
 
       function submitAdd() {
@@ -2012,20 +2668,28 @@
     }
 
     function renderRouting(s) {
-      els.routingRefresh.disabled = mode === 'missing' || s.loading || !!s.savingKey || s.flagsSaving;
+      var busy = mode === 'missing' || s.loading || !!s.savingKey || s.savingGroups || s.flagsSaving;
+      els.routingRefresh.disabled = busy;
       var snap = s.snapshot;
+      var groupCount = (s.dirtyGroupKeys || []).length;
+      els.routingSaveGroups.hidden = !isModelGroup(activeScope) && !groupCount && !s.savingGroups;
+      els.routingSaveGroups.disabled = busy || !snap || !groupCount;
+      els.routingSaveGroups.setAttribute('aria-busy', String(!!s.savingGroups));
+      els.routingSaveGroups.textContent = s.savingGroups ? '保存模型组…' : '保存模型组' + (groupCount ? '（' + groupCount + ' 项）' : '');
+      els.aliasAddBtn.disabled = !!s.savingGroups;
       els.routingRevision.textContent = snap ? '修订 ' + (snap.revision || '—') : '';
       if (snap && !s.flagsSaving) {
         els.flagFamily.checked = snap.familyRouting;
         els.flagFallback.checked = snap.fallbackEnabled;
       }
-      var flagsBlocked = mode === 'missing' || !snap || s.flagsSaving || !!s.savingKey || s.loading;
+      var flagsBlocked = busy || !snap;
       els.flagFamily.disabled = flagsBlocked;
       els.flagFallback.disabled = flagsBlocked;
       els.routingFlagsMsg.textContent = s.flagsError || '';
       var banner = null, tone = null;
       if (s.error) { banner = '路由配置读取失败：' + s.error; tone = 'error'; }
       else if (s.saveError) { banner = s.saveError.message + '（未保存的修改已保留）'; tone = 'error'; }
+      else if (s.groupSaveMessage) { banner = s.groupSaveMessage; tone = 'ok'; }
       setBanner(els.routingMsg, banner, tone);
       els.aliasAdd.hidden = activeScope !== 'models' || mode === 'missing';
       if (!snap) { rebuildRouting(); els.routingBody.setAttribute('aria-busy', String(s.loading)); return; }
@@ -2042,8 +2706,9 @@
 
     // ---- usage tab --------------------------------------------------------
 
-    function usageNumCell(label, value, fullValue) {
+    function usageNumCell(metric, label, value, fullValue) {
       var cell = el('div', 'usage-cell');
+      cell.dataset.metric = metric;
       var num = el('span', 'usage-num', value === null ? '—' : String(value));
       if (fullValue != null) num.title = fullValue;
       cell.appendChild(num);
@@ -2092,57 +2757,87 @@
       els.usageUpdated.textContent = ts ? '更新于 ' + ts : (s.loading ? '正在读取…' : '');
       setBanner(els.usageMsg, s.error ? '用量读取失败：' + s.error : null, s.error ? 'error' : null);
       var body = els.usageBody;
+      // Capture scroll/focus from the live scroller before teardown: the
+      // browser resets them when the nodes are detached, and these programmatic
+      // resets do not fire scroll/focus events to update an anchor.
+      captureRecordsState();
       body.textContent = '';
       body.setAttribute('aria-busy', String(s.loading));
       if (!s.snapshot) {
         // No snapshot yet: never fabricate an empty state.
         body.appendChild(noteEl(s.loading ? '正在读取用量…' : (s.error ? '用量读取失败：' + s.error : '尚未读取用量数据')));
+        if (s.trend) body.appendChild(buildUsageTrend(s.trend));
         renderRecords(recordsCtrl ? recordsCtrl.state() : null);
         return;
       }
       var u = s.snapshot;
       var totals = el('div', 'usage-card');
-      totals.appendChild(el('div', 'usage-title', '汇总 · ' + (u.period === 'today' ? '今天' : u.period === '7d' ? '近 7 天' : '近 30 天')));
+      totals.appendChild(el('div', 'usage-title', '汇总 · ' + USAGE_PERIOD_LABELS[u.period]));
       var grid = el('div', 'usage-grid');
-      grid.appendChild(usageNumCell('请求', formatInt(u.totalRequests)));
-      grid.appendChild(usageNumCell('成功', formatInt(u.successCount)));
-      grid.appendChild(usageNumCell('失败', formatInt(u.errorCount)));
-      grid.appendChild(usageNumCell('成功率', formatSuccessRate(u.successCount, u.totalRequests)));
+      grid.appendChild(usageNumCell('requests', '请求', formatInt(u.totalRequests)));
+      grid.appendChild(usageNumCell('success', '成功', formatInt(u.successCount)));
+      grid.appendChild(usageNumCell('errors', '失败', formatInt(u.errorCount)));
+      grid.appendChild(usageNumCell('rate', '成功率', formatSuccessRate(u.successCount, u.totalRequests)));
+      var input = cacheMissInputTokens(u);
+      var inclusive = inclusiveInputTokens(u);
       var totalTokens = rowTotalTokens(u);
-      var totalCell = usageNumCell('总 tokens', formatCompact(totalTokens), formatInt(totalTokens));
-      totalCell.title = '有效输入 + 输出；上游 inputTokens 已含缓存时直接采用，否则加计缓存读/写';
-      grid.appendChild(totalCell);
-      grid.appendChild(usageNumCell('输入 tokens', formatCompact(u.inputTokens), formatInt(u.inputTokens)));
-      grid.appendChild(usageNumCell('输出 tokens', formatCompact(u.outputTokens), formatInt(u.outputTokens)));
-      grid.appendChild(usageNumCell('缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
-      grid.appendChild(usageNumCell('缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
-      grid.appendChild(usageNumCell('估算条目', formatInt(u.estimatedCount)));
-      grid.appendChild(usageNumCell('平均 TTFT', formatMs(u.avgTtftMs)));
-      grid.appendChild(usageNumCell('生成速度', formatSpeed(u.avgTokensPerSecond)));
+      var estimated = u.estimatedCount > 0;
+      function summaryTokenCell(metric, label, count) {
+        var cell = recordsTokenCell(count, estimated);
+        return usageNumCell(metric, label, cell.text, cell.title);
+      }
+      grid.appendChild(summaryTokenCell('total', '总 tokens', totalTokens));
+      grid.appendChild(summaryTokenCell('input', '输入（未命中）', input));
+      grid.appendChild(summaryTokenCell('output', '输出 tokens', u.outputTokens));
+      grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
+      grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
+      var hitRate = inclusive > 0 && u.cacheReadTokens !== null
+        ? (estimated ? '≈' : '') + (u.cacheReadTokens / inclusive * 100).toFixed(1) + '%' : null;
+      var cacheHitCell = usageNumCell('cache-hit', '缓存命中率', hitRate);
+      cacheHitCell.title = '缓存读取 tokens ÷ 有效输入 tokens';
+      grid.appendChild(cacheHitCell);
+      grid.appendChild(usageNumCell('ttft', '平均 TTFT', formatMs(u.avgTtftMs)));
+      grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
       body.appendChild(totals);
-      totals.appendChild(noteEl('总 tokens = 有效输入 + 输出；缓存按上游口径折算，不重复计数。'));
-      body.appendChild(buildDayChart(u.byDay));
+      totals.appendChild(noteEl('总 tokens = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。'));
+      if (s.trend) {
+        body.appendChild(buildUsageTrend(s.trend));
+      } else {
+        body.appendChild(buildDayChart(u.byDay, u.period === 'all'));
+      }
       body.appendChild(buildModelChart(topModelsByTotal(u.byModel, 10)));
       function tokenRow(m) {
         var rowTotal = rowTotalTokens(m);
+        var input = cacheMissInputTokens(m);
         return [{ text: m.name }, { text: formatInt(m.requests) || '—' },
-          { text: formatCompact(m.inputTokens) || '—', title: formatInt(m.inputTokens) },
+          { text: formatCompact(input) || '—', title: formatInt(input) },
           { text: formatCompact(m.outputTokens) || '—', title: formatInt(m.outputTokens) },
-          { text: (formatCompact(m.cacheReadTokens) || '—') + ' / ' + (formatCompact(m.cacheWriteTokens) || '—'),
-            title: '缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—') },
+          { text: formatCompact(m.cacheReadTokens) || '—', title: formatInt(m.cacheReadTokens) },
+          { text: formatCompact(m.cacheWriteTokens) || '—', title: formatInt(m.cacheWriteTokens) },
           { text: formatCompact(rowTotal) || '—', title: formatInt(rowTotal) }];
       }
-      var tokenHeaders = ['请求', '输入', '输出', '缓存（读 / 写）', '总 tokens'];
+      var tokenHeaders = ['请求', '输入（未命中）', '输出', '缓存读', '缓存写', '总 tokens'];
       body.appendChild(usageTable('按模型', ['模型'].concat(tokenHeaders), u.byModel.map(tokenRow), 1));
       body.appendChild(usageTable('按提供方', ['提供方'].concat(tokenHeaders), u.byProvider.map(tokenRow), 1));
       body.appendChild(usageTable('按日期', ['日期'].concat(tokenHeaders), u.byDay.map(tokenRow), 1));
       renderRecords(recordsCtrl ? recordsCtrl.state() : null);
     }
 
+    function buildUsageTrend(trend) {
+      var title = '每日用量 · 近 ' + trend.dayCount + ' 天（有效输入 + 输出）';
+      var card = trend.rows ? buildDayChart(trend.rows) : el('div', 'usage-card');
+      if (trend.rows) card.querySelector('.usage-title').textContent = title;
+      else {
+        card.appendChild(el('div', 'usage-title', title));
+        card.appendChild(noteEl(trend.error ? '趋势读取失败：' + trend.error : '正在读取趋势…'));
+      }
+      return card;
+    }
+
     // Charts are plain divs; per-bar sizes go through CSSOM writes because the
     // CSP (style-src 'self') blocks inline style attributes.
-    function buildDayChart(rows) {
+    function buildDayChart(rows, compact) {
       var card = el('div', 'usage-card');
       card.appendChild(el('div', 'usage-title', '每日用量（有效输入 + 输出）'));
       var days = (Array.isArray(rows) ? rows : []).slice().sort(function (a, b) {
@@ -2152,27 +2847,57 @@
         card.appendChild(noteEl('该周期暂无调用记录'));
         return card;
       }
-      var totals = days.map(function (d) { return rowTotalTokens(d) || 0; });
-      var max = Math.max.apply(null, totals);
+      if (days.length === 1) {
+        var day = days[0];
+        var single = el('div', 'usage-day-summary');
+        single.appendChild(el('div', 'usage-day-date', String(day.name)));
+        var singleTotal = rowTotalTokens(day);
+        var totalValue = el('div', 'usage-day-total', (formatCompact(singleTotal) || '—') + ' tokens');
+        if (singleTotal !== null) totalValue.title = formatInt(singleTotal) + ' tokens';
+        single.appendChild(totalValue);
+        single.appendChild(el('div', 'usage-day-caption', '当日总量 · 有效输入 + 输出'));
+        card.appendChild(single);
+        return card;
+      }
+      var totals = days.map(function (d) { return rowTotalTokens(d); });
+      var max = Math.max.apply(null, totals.map(function (v) { return v === null ? 0 : v; }));
+      var scroll = el('div', compact ? 'usage-days-compact' : 'usage-days-scroll');
+      if (!compact) scroll.tabIndex = 0;
+      scroll.setAttribute('role', 'region');
+      scroll.setAttribute('aria-label', compact ? '每日用量，全部历史' : '每日用量，日期较多时可横向滚动');
       var bars = el('div', 'usage-bars');
       days.forEach(function (d, i) {
         var v = totals[i];
-        var pct = v > 0 && max > 0 ? Math.max(4, Math.round((v / max) * 100)) : 4;
+        var pct = v > 0 && max > 0 ? Math.max(1, Math.round((v / max) * 100)) : 0;
         var col = el('div', 'usage-bar-col');
+        if (!compact) {
+          var value = el('div', 'usage-day-value', formatCompact(v) || '—');
+          if (v !== null) value.title = formatInt(v) + ' tokens';
+          col.appendChild(value);
+        }
+        var track = el('div', 'usage-day-track');
         var bar = el('div', 'usage-bar');
         bar.style.height = pct + '%';
-        bar.title = d.name + ' · 输入 ' + (formatCompact(d.inputTokens) || '—') + '（' + (formatInt(d.inputTokens) || '—') + '）'
+        bar.hidden = v === null;
+        var input = cacheMissInputTokens(d);
+        bar.title = d.name + ' · 输入（未命中） ' + (formatCompact(input) || '—') + '（' + (formatInt(input) || '—') + '）'
+          + ' · 缓存读 ' + (formatInt(d.cacheReadTokens) || '—')
           + ' · 输出 ' + (formatCompact(d.outputTokens) || '—') + '（' + (formatInt(d.outputTokens) || '—') + '）'
           + ' · 总量 ' + (formatCompact(v) || '—') + '（' + (formatInt(v) || '—') + '）';
-        col.appendChild(bar);
+        track.appendChild(bar);
+        col.appendChild(track);
+        col.title = bar.title;
+        if (!compact) col.appendChild(el('div', 'usage-day-date', String(d.name)));
         bars.appendChild(col);
       });
-      card.appendChild(bars);
-      var axis = el('div', 'usage-chart-axis');
-      axis.appendChild(el('span', null, String(days[0].name)));
-      axis.appendChild(el('span', 'spacer'));
-      axis.appendChild(el('span', null, String(days[days.length - 1].name)));
-      card.appendChild(axis);
+      scroll.appendChild(bars);
+      if (compact) {
+        var axis = el('div', 'usage-day-range');
+        axis.appendChild(el('span', 'usage-day-date', days[0].name));
+        axis.appendChild(el('span', 'usage-day-date', days[days.length - 1].name));
+        scroll.appendChild(axis);
+      }
+      card.appendChild(scroll);
       return card;
     }
 
@@ -2190,13 +2915,13 @@
       });
       var list = el('div', 'usage-hbar');
       models.forEach(function (m) {
-        var total = rowTotalTokens(m) || 0;
+        var total = rowTotalTokens(m);
         // Visible bars floor at 1% so a tiny-but-nonzero total still renders.
         var pct = total > 0 && max > 0 ? Math.max(1, Math.round((total / max) * 1000) / 10) : 0;
         var row = el('div', 'usage-hbar-row');
         var name = el('span', 'usage-hbar-name', m.name);
         name.title = m.name + ' · 请求 ' + (formatInt(m.requests) || '—')
-          + ' · 输入 ' + (formatInt(m.inputTokens) || '—') + ' · 输出 ' + (formatInt(m.outputTokens) || '—')
+          + ' · 输入（未命中） ' + (formatInt(cacheMissInputTokens(m)) || '—') + ' · 输出 ' + (formatInt(m.outputTokens) || '—')
           + ' · 缓存读 ' + (formatInt(m.cacheReadTokens) || '—') + ' / 缓存写 ' + (formatInt(m.cacheWriteTokens) || '—');
         var track = el('div', 'usage-hbar-track');
         var fill = el('div', 'usage-hbar-fill');
@@ -2219,11 +2944,11 @@
       var t = new Date(s);
       return Number.isNaN(t.getTime()) ? s : formatClock(t.getTime());
     }
-    var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
+    var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入（未命中）', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
     function recordsTokenCell(value, estimated) {
       return {
-        text: (estimated ? '≈' : '') + (formatCompact(value) || '—'),
-        title: formatInt(value) == null ? null : formatInt(value),
+        text: value == null ? '—' : (estimated ? '≈' : '') + formatCompact(value),
+        title: value == null ? null : (estimated ? '≈' : '') + formatInt(value),
       };
     }
     function recordsNumCell(cell) {
@@ -2255,7 +2980,7 @@
         modelTd.title = chain;
         tr.appendChild(modelTd);
         tr.appendChild(el('td', null, clientLabel(r.clientType)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.inputTokens, r.usageEstimated)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(cacheMissInputTokens(r), r.usageEstimated)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.outputTokens, r.usageEstimated)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheReadTokens, false)));
         tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheWriteTokens, false)));
@@ -2287,8 +3012,14 @@
       pager.appendChild(info);
       pager.appendChild(next);
       root.appendChild(pager);
+      // The horizontal scroller lives in a sticky wrapper so its scrollbar
+      // floats at the bottom of the visible list instead of only at the end
+      // of a tall record set. refs.scroll keeps pointing at the actual
+      // scroller so every existing append/clear call is unchanged.
+      var sticky = el('div', 'records-scroll-sticky');
       var scroll = el('div', 'records-scroll');
-      root.appendChild(scroll);
+      sticky.appendChild(scroll);
+      root.appendChild(sticky);
       return { root: root, prev: prev, info: info, next: next, scroll: scroll };
     }
 
@@ -2327,14 +3058,46 @@
     }
 
     var recordsRefs = null;
+    // Synchronously captured UI state, read BEFORE the usage body is torn
+    // down. Real browsers reset scrollLeft (and drop button focus) when the
+    // scroller is detached or its panel hidden, and programmatic changes do
+    // not reliably fire scroll/focus events — so the anchors must be captured
+    // directly from the live nodes rather than maintained by event listeners.
+    var pendingRecordsScroll = 0;
+    var pendingPagerFocus = null;
+    var keepScrollAcrossHide = false;
+    function captureRecordsState() {
+      if (!recordsRefs || !recordsRefs.root.parentNode) return;
+      // While the panel is hidden the browser already reports scrollLeft 0;
+      // keep the value selectTab captured before hiding instead.
+      var visible = recordsRefs.scroll.offsetParent !== null;
+      if (!keepScrollAcrossHide && visible) pendingRecordsScroll = recordsRefs.scroll.scrollLeft;
+      pendingPagerFocus = document.activeElement === recordsRefs.next ? 'next'
+        : document.activeElement === recordsRefs.prev ? 'prev' : null;
+    }
     function renderRecords(rs) {
       // renderUsage rebuilds usage-body on every emit, so the records card is
       // re-appended after it; records-only updates sync the existing card.
-      if (!recordsRefs || !recordsRefs.root.parentNode) {
+      var attached = !!(recordsRefs && recordsRefs.root.parentNode);
+      var preservedScroll = attached ? recordsRefs.scroll.scrollLeft : pendingRecordsScroll;
+      var restoreFocus = attached ? null : pendingPagerFocus;
+      if (!attached) {
         recordsRefs = buildRecordsCard();
         els.usageBody.appendChild(recordsRefs.root);
       }
       syncRecordsCard(recordsRefs, rs);
+      if (preservedScroll > 0) recordsRefs.scroll.scrollLeft = preservedScroll;
+      // Restore keyboard focus to the rebuilt pager when the user had a pager
+      // button focused before the rebuild, unless focus moved elsewhere.
+      if (restoreFocus) {
+        var target = restoreFocus === 'next' ? recordsRefs.next : recordsRefs.prev;
+        var focusElsewhere = document.activeElement &&
+          document.activeElement !== target && document.activeElement !== document.body;
+        if (target && !target.disabled && !focusElsewhere) target.focus();
+      }
+      pendingRecordsScroll = 0;
+      pendingPagerFocus = null;
+      keepScrollAcrossHide = false;
     }
 
     // ---- clients tab ------------------------------------------------------
@@ -2483,34 +3246,92 @@
 
     // ---- tabs -------------------------------------------------------------
 
-    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects'];
+    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects', 'plugins', 'settings'];
     var tabButtons = {};
     var panels = {};
     TAB_IDS.forEach(function (id) {
       tabButtons[id] = document.getElementById('tab-' + id);
       panels[id] = document.getElementById('panel-' + id);
     });
+    var refreshAutostart = bindAutostart(invoke, document.getElementById('desktop-autostart'), document.getElementById('desktop-autostart-msg'));
     var activeTab = 'quota';
     var loadedTabs = { quota: true };
+    var providerForm = mountProviderForm(invoke, function (name) {
+      controller.refreshProvider(name, true);
+      credentialsCtrl.refresh(true);
+      if (!loadedTabs.routing) return;
+      // A snapshot taken before the addition can still be in flight. Wait for
+      // the current routing read/write to finish so its result cannot win.
+      function busy(s) { return s.loading || s.savingKey || s.flagsSaving; }
+      if (!busy(routingCtrl.state())) { routingCtrl.refresh(); return; }
+      var unsubscribe = routingCtrl.subscribe(function (s) {
+        if (busy(s)) return;
+        unsubscribe();
+        routingCtrl.refresh();
+      });
+    });
+
+    // While the usage tab stays open, periodically refresh snapshot + records
+    // so long sessions see fresh totals. Entering the tab always loads once;
+    // leaving clears the timer. Tests/preview can shorten the interval via
+    // window.__CCR_USAGE_REFRESH_MS__.
+    var usageTimer = null;
+    function stopUsageAutoRefresh() {
+      if (usageTimer) { clearInterval(usageTimer); usageTimer = null; }
+    }
+    function startUsageAutoRefresh() {
+      stopUsageAutoRefresh();
+      if (!usageCtrl || !recordsCtrl) return;
+      var ms = 30000;
+      if (typeof window !== 'undefined' && window.__CCR_USAGE_REFRESH_MS__ > 0) ms = Number(window.__CCR_USAGE_REFRESH_MS__);
+      usageTimer = setInterval(function () { usageCtrl.refresh(); recordsCtrl.refresh(); }, ms);
+      // Tests/embedded runs must not be kept alive by the polling timer.
+      if (usageTimer && typeof usageTimer.unref === 'function') usageTimer.unref();
+    }
 
     function maybeLoadTab(name) {
-      if (mode === 'missing' || loadedTabs[name]) return;
+      if (mode === 'missing') return;
+      if (name === 'projects') { projectsCtrl.refresh(); return; }
+      if (loadedTabs[name]) return;
       loadedTabs[name] = true;
       if (name === 'routing') routingCtrl.refresh();
-      if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); }
       if (name === 'clients') clientsCtrl.refresh();
-      if (name === 'projects') projectsCtrl.refresh();
+      if (name === 'plugins') pluginsPanel.load();
+      if (name === 'settings') settings.reload();
     }
 
     function selectTab(name) {
       if (TAB_IDS.indexOf(name) === -1) return;
+      if (name !== 'quota') providerForm.close(false);
+      if (name !== 'plugins') pluginsPanel.cancel(false);
+      // Before hiding the current panel, capture the usage scroller while it
+      // is still visible: once display:none applies, the browser reports
+      // scrollLeft 0, so a read after hiding cannot preserve the position.
+      if (activeTab === 'usage' && name !== 'usage' && recordsRefs && recordsRefs.root.parentNode) {
+        pendingRecordsScroll = recordsRefs.scroll.scrollLeft;
+        keepScrollAcrossHide = true;
+      }
       activeTab = name;
+      // Show the target panel before refreshing: reading layout/scroll state
+      // while a panel is display:none is unreliable in real browsers.
       TAB_IDS.forEach(function (id) {
         var on = id === name;
         tabButtons[id].setAttribute('aria-selected', String(on));
         tabButtons[id].tabIndex = on ? 0 : -1;
         panels[id].hidden = !on;
       });
+      // Polling lifecycle lives here, not in maybeLoadTab (which early-returns
+      // once a tab has loaded): re-entering the tab must both resume the
+      // timer and reload immediately, so the panel never shows stale data
+      // for up to one interval.
+      if (name === 'usage' && usageCtrl && recordsCtrl) {
+        usageCtrl.refresh();
+        recordsCtrl.refresh();
+        startUsageAutoRefresh();
+      } else {
+        stopUsageAutoRefresh();
+      }
+      if (name === 'clients') refreshAutostart();
       maybeLoadTab(name);
     }
 
@@ -2548,6 +3369,7 @@
       if (routingCtrl) routingCtrl.setFlag('fallbackEnabled', els.flagFallback.checked);
     });
     els.routingRefresh.addEventListener('click', function () { if (routingCtrl) routingCtrl.refresh(); });
+    els.routingSaveGroups.addEventListener('click', function () { if (routingCtrl) routingCtrl.saveGroups(); });
     els.aliasAddBtn.addEventListener('click', function () {
       if (!routingCtrl) return;
       var r = routingCtrl.createAlias(els.aliasName.value, els.aliasTarget.value);
@@ -2574,15 +3396,40 @@
       if (usageCtrl) usageCtrl.refresh();
       if (recordsCtrl) recordsCtrl.refresh();
     });
-    els.clientsRefresh.addEventListener('click', function () { if (clientsCtrl) clientsCtrl.refresh(); });
+    els.clientsRefresh.addEventListener('click', function () { refreshAutostart(); if (clientsCtrl) clientsCtrl.refresh(); });
     els.serviceStart.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('start'); });
     els.serviceStop.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.action('stop'); });
     els.serviceRefresh.addEventListener('click', function () { if (serviceCtrl) serviceCtrl.refresh(); });
+    els.serviceReload.addEventListener('click', function () {
+      if (!invoke || reloadPending || !serviceCtrl) return;
+      var s = serviceCtrl.state();
+      if (!reloadableService(s.service) || s.loading || s.pending) return;
+      reloadPending = true;
+      showReloadMsg(null, null);
+      renderService(s);
+      invoke('config_reload').then(function (r) {
+        var keys = r && Array.isArray(r.restartRequired)
+          ? r.restartRequired.filter(function (k) { return typeof k === 'string' && k; })
+          : [];
+        reloadPending = false;
+        showReloadMsg(keys.length
+          ? '配置已重载；' + keys.join('/') + ' 变更需停止后重新启动服务才能生效'
+          : '配置已重载', keys.length ? 'warn' : null);
+        renderService(serviceCtrl.state());
+      }, function (err) {
+        reloadPending = false;
+        showReloadMsg('重载配置失败：' + errorMessage(err), 'error');
+        renderService(serviceCtrl.state());
+      });
+    });
 
     if (controller) {
       controller.subscribe(render);
       render(controller.state());
-      els.refreshAll.addEventListener('click', function () { controller.refreshAll(); });
+      els.refreshAll.addEventListener('click', function () {
+        controller.refreshAll();
+        if (activeTab === 'projects' && projectsCtrl) projectsCtrl.refresh();
+      });
       els.list.addEventListener('click', function (event) {
         var target = event.target && event.target.closest ? event.target : null;
         if (!target) return;
@@ -2592,10 +3439,12 @@
           if (card && card.dataset.provider) controller.refreshProvider(card.dataset.provider);
           return;
         }
+        var providerCard = target.closest('.card');
+        if (!providerCard || !providerCard.dataset.provider) return;
+        var name = providerCard.dataset.provider;
+        var edit = target.closest('.card-edit');
+        if (edit) { providerForm.edit(name, edit); return; }
         if (!credentialsCtrl) return;
-        var credsCard = target.closest('.card');
-        if (!credsCard || !credsCard.dataset.provider) return;
-        var name = credsCard.dataset.provider;
         if (target.closest('[data-creds-open]')) credentialsCtrl.open(name);
         else if (target.closest('[data-creds-cancel]')) credentialsCtrl.close();
         else if (target.closest('[data-creds-save]')) {
@@ -2630,7 +3479,7 @@
     if (usageCtrl) {
       usageCtrl.subscribe(renderUsage);
       renderUsage(usageCtrl.state());
-    } else renderUsage({ snapshot: null, loading: false, error: null, period: 'today' });
+    } else renderUsage({ snapshot: null, loading: false, error: null, period: DEFAULT_USAGE_PERIOD });
     if (recordsCtrl) {
       recordsCtrl.subscribe(renderRecords);
       renderRecords(recordsCtrl.state());
@@ -2643,12 +3492,15 @@
     els.openUi.addEventListener('click', function () { safeCommand('quota_open_ui'); });
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') safeCommand('quota_hide');
+      if (event.key === 'Escape' && !event.isComposing && !event.defaultPrevented) {
+        if (providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
+        else safeCommand('quota_hide');
+      }
     });
-    // Focus refreshes service status and quota data only; route drafts and
-    // usage/client state must survive native select popups and tab changes.
+    // The web UI can change project settings while the desktop is unfocused.
     window.addEventListener('focus', function () {
       if (serviceCtrl) serviceCtrl.refresh();
+      if (activeTab === 'projects' && projectsCtrl) projectsCtrl.refresh();
       if (activeTab === 'quota' && controller) controller.refreshAll();
       if (activeTab === 'quota' && credentialsCtrl) credentialsCtrl.refresh();
     });

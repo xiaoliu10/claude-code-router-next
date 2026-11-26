@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getQuotaAdapter,
   parseAliyunTokenPlanUsage,
+  parseLitellmUserBudgetUsage,
+  parseOneApiBillingUsage,
 } from "../services/quota-adapters";
 import type { LLMProvider } from "../types/llm";
 
@@ -157,6 +159,31 @@ describe("parseAliyunTokenPlanUsage", () => {
       successResponse: true,
     });
     expect(result).toBeNull();
+  });
+
+  it("hints at a stale cookie when the gateway answers NotLogined", () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    try {
+      const payload = {
+        code: "200",
+        data: {
+          success: false,
+          errorCode: "BailianGateway.Login.NotLogined",
+          errorMsg: "BailianGateway.Login.NotLogined",
+        },
+        successResponse: true,
+      };
+      expect(parseAliyunTokenPlanUsage(payload)).toBeNull();
+      expect(debug).toHaveBeenCalledTimes(1);
+      expect(String(debug.mock.calls[0]?.[0])).toContain("not-logined");
+      expect(String(debug.mock.calls[0]?.[0])).not.toMatch(/cookie=/i);
+
+      debug.mockClear();
+      parseAliyunTokenPlanUsage({ code: "200", data: {}, successResponse: true });
+      expect(debug).not.toHaveBeenCalled();
+    } finally {
+      debug.mockRestore();
+    }
   });
 
   it("returns null when no recognised quota fields are present", () => {
@@ -728,5 +755,248 @@ describe("ZhipuQuotaAdapter quota fetch (gzip/identity regression)", () => {
     const adapter = getQuotaAdapter("https://api.deepseek.com/chat/completions");
     await adapter!.queryQuota({ name: "ds", baseUrl: "https://api.deepseek.com/chat/completions", apiKey: "k", models: [] } as LLMProvider, 5000);
     expect((capturedInit!.headers as Record<string, string>)["Accept-Encoding"]).toBe("identity");
+  });
+});
+describe("parseLitellmUserBudgetUsage", () => {
+  const base = {
+    spend: 3.25,
+    max_budget: 100,
+    budget_duration: "1mo",
+    budget_reset_at: "2026-12-01T00:00:00Z",
+  };
+
+  it("reads the nested user_info row and projects the balance window", () => {
+    expect(parseLitellmUserBudgetUsage({ user_id: "u1", user_info: base, keys: [], teams: [] })).toEqual({
+      totalBalance: 100,
+      currency: "USD",
+      usedBalance: 3.25,
+      resetTime7d: "2026-12-01T00:00:00Z",
+    });
+  });
+
+  it("accepts a flat row and camelCase keys", () => {
+    expect(parseLitellmUserBudgetUsage({ maxBudget: 40, spend: 0, budgetResetAt: "2026-11-01T00:00:00Z" })).toEqual({
+      totalBalance: 40,
+      currency: "USD",
+      usedBalance: 0,
+      resetTime7d: "2026-11-01T00:00:00Z",
+    });
+  });
+
+  it("keeps the limit without spend or an invalid reset", () => {
+    expect(parseLitellmUserBudgetUsage({ max_budget: 10 })).toEqual({
+      totalBalance: 10,
+      currency: "USD",
+    });
+    expect(
+      parseLitellmUserBudgetUsage({ max_budget: 10, spend: 2, budget_reset_at: "not-a-date" })
+    ).toEqual({ totalBalance: 10, currency: "USD", usedBalance: 2 });
+    expect(
+      parseLitellmUserBudgetUsage({ max_budget: 10, spend: -1, budget_reset_at: 42 })
+    ).toEqual({ totalBalance: 10, currency: "USD" });
+  });
+
+  it("returns null without a positive max_budget", () => {
+    expect(parseLitellmUserBudgetUsage(null)).toBeNull();
+    expect(parseLitellmUserBudgetUsage({ user_info: { spend: 5 } })).toBeNull();
+    expect(parseLitellmUserBudgetUsage({ user_info: { max_budget: 0, spend: 0 } })).toBeNull();
+  });
+});
+
+describe("getQuotaAdapter LiteLLM field dispatch", () => {
+  const relay = "https://relay.example.com/v1/messages";
+
+  it("matches only when the provider carries a LiteLLM quota token", () => {
+    expect(getQuotaAdapter(relay)).toBeNull();
+    expect(getQuotaAdapter(relay, makeProvider({ baseUrl: relay, quotaToken: undefined }))).toBeNull();
+    const snake = makeProvider({ baseUrl: relay, quotaToken: undefined });
+    (snake as unknown as Record<string, unknown>).quota_litellm_token = "  pat-token  ";
+    expect(getQuotaAdapter(relay, snake)).not.toBeNull();
+    expect(
+      getQuotaAdapter(relay, makeProvider({ baseUrl: relay, quotaToken: undefined, quotaLitellmToken: "pat" }))
+    ).not.toBeNull();
+  });
+
+  it("the LiteLLM field dispatch wins over a baseUrl hostname match", () => {
+    const withToken = makeProvider({
+      baseUrl: "https://api.deepseek.com/chat/completions",
+      quotaToken: undefined,
+      quotaLitellmToken: "pat",
+    });
+    const hostOnly = getQuotaAdapter(withToken.baseUrl);
+    expect(hostOnly).not.toBeNull();
+    expect(getQuotaAdapter(withToken.baseUrl, withToken)).not.toBe(hostOnly);
+  });
+});
+
+describe("LitellmUserBudgetQuotaAdapter", () => {
+  function provider(): LLMProvider {
+    const p = makeProvider({
+      name: "relay",
+      baseUrl: "https://relay.example.com/v1/messages",
+      apiKey: "sk-virtual-key",
+      quotaToken: undefined,
+      quotaLitellmToken: "  pat-token  ",
+    });
+    return p;
+  }
+
+  it("queries the relay /user/info with the LiteLLM token and parses the budget", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          user_id: "u1",
+          user_info: { spend: 3.25, max_budget: 100, budget_duration: "1mo", budget_reset_at: "2026-12-01T00:00:00Z" },
+          keys: [],
+          teams: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const p = provider();
+    const adapter = getQuotaAdapter(p.baseUrl, p);
+    expect(adapter).not.toBeNull();
+    expect(await adapter!.queryQuota(p, 1000)).toEqual({
+      totalBalance: 100,
+      currency: "USD",
+      usedBalance: 3.25,
+      resetTime7d: "2026-12-01T00:00:00Z",
+    });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(String(url)).toBe("https://relay.example.com/user/info");
+    // The padded paste artifact must be trimmed before reaching the header.
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer pat-token");
+    expect((init.headers as Record<string, string>)["Accept-Encoding"]).toBe("identity");
+  });
+
+  it("returns null when the relay rejects the budget query or the payload has no budget", async () => {
+    globalThis.fetch = vi.fn(async () => new Response("{}", { status: 403 })) as unknown as typeof fetch;
+    const p = provider();
+    const adapter = getQuotaAdapter(p.baseUrl, p)!;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ user_id: "u1", user_info: { spend: 5 } }), { status: 200 })
+    ) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+  });
+});
+
+describe("parseOneApiBillingUsage", () => {
+  it("combines subscription and usage into a USD balance window", () => {
+    expect(
+      parseOneApiBillingUsage(
+        { object: "billing_subscription", hard_limit_usd: 42.5, access_until: 1798761600, has_payment_method: true },
+        { object: "list", total_usage: 1250 }
+      )
+    ).toEqual({
+      totalBalance: 42.5,
+      currency: "USD",
+      usedBalance: 12.5,
+      resetTime7d: new Date(1798761600 * 1000).toISOString(),
+    });
+  });
+
+  it("treats an unlimited fallback cap as unqueryable at the cutoff", () => {
+    expect(parseOneApiBillingUsage({ hard_limit_usd: 20000000 }, { total_usage: 300 })).toBeNull();
+    expect(parseOneApiBillingUsage({ hard_limit_usd: 9999999.99 }, { total_usage: 300 })).toEqual({
+      totalBalance: 9999999.99,
+      currency: "USD",
+      usedBalance: 3,
+    });
+  });
+
+  it("returns null without a usable cap", () => {
+    expect(parseOneApiBillingUsage(null, null)).toBeNull();
+    expect(parseOneApiBillingUsage({ hard_limit_usd: -1 }, { total_usage: "x" })).toBeNull();
+    // The parse layer tolerates a missing usage payload (cap-only); the
+    // adapter-level guard rejects one-sided failures before calling it.
+    expect(parseOneApiBillingUsage({ hard_limit_usd: 10 }, null)).toEqual({
+      totalBalance: 10,
+      currency: "USD",
+    });
+  });
+});
+
+describe("getQuotaAdapter framework dispatch", () => {
+  const relay = "https://relay.example.com/v1/messages";
+
+  it("selects the litellm adapter via quota_framework", () => {
+    expect(getQuotaAdapter(relay, makeProvider({ baseUrl: relay, quotaFramework: "litellm" }))).not.toBeNull();
+  });
+
+  it("selects the OpenAI-billing adapter for newapi and one-api aliases", () => {
+    for (const framework of ["newapi", "new-api", "oneapi", "One-API"]) {
+      expect(getQuotaAdapter(relay, makeProvider({ baseUrl: relay, quotaFramework: framework }))).not.toBeNull();
+    }
+  });
+
+  it("the framework selector wins over a hostname match, unknown values fall through", () => {
+    const host = "https://api.deepseek.com/chat/completions";
+    const hostOnly = getQuotaAdapter(host);
+    expect(hostOnly).not.toBeNull();
+    expect(getQuotaAdapter(host, makeProvider({ baseUrl: host, quotaFramework: "oneapi" }))).not.toBe(hostOnly);
+    expect(getQuotaAdapter(host, makeProvider({ baseUrl: host, quotaFramework: "unknown-relay" }))).toBe(hostOnly);
+  });
+});
+
+describe("OpenAiBillingQuotaAdapter", () => {
+  function billingProvider(): LLMProvider {
+    return makeProvider({
+      name: "relay",
+      baseUrl: "https://relay.example.com/v1/messages",
+      apiKey: "sk-relay-key",
+      quotaToken: undefined,
+      quotaFramework: "newapi",
+    });
+  }
+
+  it("queries subscription and usage with the relay key and combines the window", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ hard_limit_usd: 42.5, access_until: 1798761600 }),
+        { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ total_usage: 1250 }), { status: 200 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const p = billingProvider();
+    const adapter = getQuotaAdapter(p.baseUrl, p);
+    expect(adapter).not.toBeNull();
+    expect(await adapter!.queryQuota(p, 1000)).toEqual({
+      totalBalance: 42.5,
+      currency: "USD",
+      usedBalance: 12.5,
+      resetTime7d: new Date(1798761600 * 1000).toISOString(),
+    });
+    const [subUrl, subInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const [usageUrl] = fetchMock.mock.calls[1] as unknown as [string];
+    expect(String(subUrl)).toBe("https://relay.example.com/v1/dashboard/billing/subscription");
+    expect(String(usageUrl)).toBe("https://relay.example.com/v1/dashboard/billing/usage?start_date=2000-01-01&end_date=2037-12-31");
+    expect((subInit.headers as Record<string, string>).Authorization).toBe("Bearer sk-relay-key");
+  });
+
+  it("returns null unless BOTH billing endpoints succeed, keeping the last full sample", async () => {
+    const p = billingProvider();
+    const adapter = getQuotaAdapter(p.baseUrl, p)!;
+    const ok = (body: unknown) =>
+      new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    const subscription = { hard_limit_usd: 10, access_until: 1798761600 };
+    // Both fail → null.
+    globalThis.fetch = vi.fn(async () => new Response("{}", { status: 404 })) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+    // Cap arrives but usage fails → null (never a spend-less exhausted reset).
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce(ok(subscription))
+      .mockResolvedValueOnce(new Response("{}", { status: 503 })) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+    // Usage arrives but the cap fails → null.
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 503 }))
+      .mockResolvedValueOnce(ok({ total_usage: 100 })) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
+    // A 200 usage body without a numeric total_usage is incomplete → null.
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce(ok(subscription))
+      .mockResolvedValueOnce(ok({ object: "list", daily_costs: [] })) as unknown as typeof fetch;
+    expect(await adapter.queryQuota(p, 1000)).toBeNull();
   });
 });

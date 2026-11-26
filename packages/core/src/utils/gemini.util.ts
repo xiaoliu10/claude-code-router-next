@@ -1,4 +1,5 @@
-import { UnifiedChatRequest, UnifiedMessage } from "../types/llm";
+import { builtinWebSearch, UnifiedChatRequest, UnifiedMessage } from "../types/llm";
+import { createApiError } from "../api/middleware";
 import { Content, ContentListUnion, Part, ToolListUnion } from "@google/genai";
 
 export function cleanupParameters(obj: any, keyName?: string): void {
@@ -239,37 +240,78 @@ export function tTool(tool: any): any {
   return tool;
 }
 
+// A unified thinking block may carry a local stream marker or a foreign
+// provider's ID. Only byte-transportable signatures belong on Gemini parts.
+function replaySignature(value: unknown): string | undefined {
+  if (typeof value !== "string" || /^(?:ccr_|rs_)/.test(value) || /^[a-f0-9]{24}$/i.test(value)) return;
+  const match = /^([A-Za-z0-9+/_-]+)(={0,2})$/.exec(value);
+  if (!match) return;
+  const remainder = match[1].length % 4;
+  const padding = match[2].length;
+  if (remainder !== 1 && (!padding || padding === (4 - remainder) % 4)) return value;
+}
+
+function invalidToolChoice(message: string) {
+  return createApiError(message, 400, "invalid_gemini_tool_choice", "invalid_request_error");
+}
+
+function buildGeminiTools(request: UnifiedChatRequest) {
+  const declarations = (request.tools ?? [])
+    .filter(tool => !tool[builtinWebSearch])
+    .map(({ function: fn }) => ({
+      name: fn.name,
+      description: fn.description,
+      parametersJsonSchema: fn.parameters,
+    }));
+  const hasSearch = request.tools?.some(tool => tool[builtinWebSearch]);
+  // The Responses normalizer leaves tool_choice in its flat wire shape.
+  const choice = request.tool_choice as UnifiedChatRequest["tool_choice"]
+    | { type: "function"; name: string } | { type: "web_search" };
+  let mode: "AUTO" | "NONE" | "ANY" | "VALIDATED" | undefined;
+  let allowedFunctionNames: string[] | undefined;
+  if (choice == null || choice === "auto") {
+    if (hasSearch && declarations.length) mode = "VALIDATED";
+    else if (choice === "auto" && declarations.length) mode = "AUTO";
+  } else if (choice === "none") {
+    if (declarations.length) mode = "NONE";
+  } else if (choice === "required" || choice === "any") {
+    if (!declarations.length) {
+      throw invalidToolChoice("Gemini requires a declared client function for a required tool choice.");
+    }
+    mode = "ANY";
+  } else if (typeof choice === "object" && choice.type === "function") {
+    const name = "function" in choice ? choice.function?.name : choice.name;
+    if (!name || !declarations.some(fn => fn.name === name)) {
+      throw invalidToolChoice(`Gemini cannot force '${name}': tool_choice must name a declared client function.`);
+    }
+    mode = "ANY";
+    allowedFunctionNames = [name];
+  } else {
+    throw invalidToolChoice("Gemini supports forcing a declared client function only.");
+  }
+
+  // ANY and NONE constrain function declarations only. With a restrictive
+  // choice, omit Google Search so it cannot execute independently.
+  const tools = [];
+  if (declarations.length) tools.push({ functionDeclarations: declarations });
+  if (hasSearch && (choice == null || choice === "auto")) tools.push({ googleSearch: {} });
+  return {
+    tools: tools.length ? tools : undefined,
+    ...(mode && {
+      toolConfig: {
+        ...(mode === "VALIDATED" && { includeServerSideToolInvocations: true }),
+        functionCallingConfig: { mode, ...(allowedFunctionNames && { allowedFunctionNames }) },
+      },
+    }),
+  };
+}
+
 export function buildRequestBody(
   request: UnifiedChatRequest
 ): Record<string, any> {
-  const tools = [];
-  const functionDeclarations = request.tools
-    ?.filter((tool) => tool.function.name !== "web_search")
-    ?.map((tool) => {
-      return {
-        name: tool.function.name,
-        description: tool.function.description,
-        parametersJsonSchema: tool.function.parameters,
-      };
-    });
-  if (functionDeclarations?.length) {
-    tools.push(
-      tTool({
-        functionDeclarations,
-      })
-    );
-  }
-  const webSearch = request.tools?.find(
-    (tool) => tool.function.name === "web_search"
-  );
-  if (webSearch) {
-    tools.push({
-      googleSearch: {},
-    });
-  }
-
   const contents: any[] = [];
   const toolResponses = request.messages.filter((item) => item.role === "tool");
+  const strictToolSignatures = /(?:^|\/)gemini-[34](?:[.-]|$)/i.test(request.model);
 
 
   request.messages
@@ -284,10 +326,12 @@ export function buildRequestBody(
         role = "user"; // Default to user if role is not recognized
       }
       const parts: any[] = [];
+      const signature = role === "model" ? replaySignature(message.thinking?.signature) : undefined;
+      const strictCalls = strictToolSignatures && !!message.tool_calls?.length;
       if (typeof message.content === "string") {
         const part: any = { text: message.content };
-        if (message.thinking?.signature) {
-          part.thoughtSignature = message.thinking.signature;
+        if (signature && !strictCalls) {
+          part.thoughtSignature = signature;
         }
         parts.push(part);
       } else if (Array.isArray(message.content)) {
@@ -330,7 +374,7 @@ export function buildRequestBody(
 
       if (Array.isArray(message.tool_calls)) {
         parts.push(
-          ...message.tool_calls.map((toolCall) => {
+          ...message.tool_calls.map((toolCall, index) => {
             const part: any = {
               functionCall: {
                 id:
@@ -340,8 +384,12 @@ export function buildRequestBody(
                 args: JSON.parse(toolCall.function.arguments || "{}"),
               },
             };
-            if (message.thinking?.signature) {
-              part.thoughtSignature = message.thinking.signature;
+            if (signature && (!strictCalls || index === 0)) {
+              part.thoughtSignature = signature;
+            } else if (role === "model" && index === 0 && (strictCalls || message.thinking?.signature)) {
+              // Gemini 3/4 require a signature on the first call of each step.
+              // Use Google’s documented placeholder for imported unsigned history.
+              part.thoughtSignature = "skip_thought_signature_validator";
             }
             return part;
           })
@@ -410,32 +458,11 @@ export function buildRequestBody(
     }
   }
 
-  const body = {
+  return {
     contents,
-    tools: tools.length ? tools : undefined,
+    ...buildGeminiTools(request),
     generationConfig,
   };
-
-  if (request.tool_choice) {
-    const toolConfig = {
-      functionCallingConfig: {},
-    };
-    if (request.tool_choice === "auto") {
-      toolConfig.functionCallingConfig.mode = "auto";
-    } else if (request.tool_choice === "none") {
-      toolConfig.functionCallingConfig.mode = "none";
-    } else if (request.tool_choice === "required") {
-      toolConfig.functionCallingConfig.mode = "any";
-    } else if (request.tool_choice?.function?.name) {
-      toolConfig.functionCallingConfig.mode = "any";
-      toolConfig.functionCallingConfig.allowedFunctionNames = [
-        request.tool_choice?.function?.name,
-      ];
-    }
-    body.toolConfig = toolConfig;
-  }
-
-  return body;
 }
 
 export function transformRequestOut(

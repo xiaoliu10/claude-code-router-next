@@ -17,7 +17,10 @@ const byLabel = (h, label) => h.id('projects-body').querySelectorAll('input').fi
 const button = (h, text) => h.id('projects-body').querySelectorAll('button').find(n => n.textContent === text);
 function toggle(h, label, value) { const n = byLabel(h, label); n.checked = value; n.fire('change'); }
 function type(h, label, value) { const n = byLabel(h, label); n.focus(); n.value = value; n.fire('input'); return n; }
-function select(h, id) { h.id('projects-select').value = id; h.id('projects-select').fire('change'); }
+function select(h, id) {
+  h.id('projects-select').fire('click');
+  h.id('projects-options').children.find(option => option.textContent.includes(id === 'a' ? '/Alpha' : '/Beta')).fire('click');
+}
 async function start(overrides = {}) {
   const state = fixture();
   const h = harness({ projects_snapshot: () => structuredClone(state), ...overrides }); await flush();
@@ -28,13 +31,64 @@ async function start(overrides = {}) {
 
 test('projects interaction: first activation lists real snapshot projects and global preview is readonly', async () => {
   const { h } = await start();
-  assert.equal(h.id('projects-select').children.length, 2);
+  assert.equal(h.id('projects-select').value, '/real/Alpha');
+  h.id('projects-select').fire('focus');
+  assert.equal(h.id('projects-options').children.length, 2);
   assert.match(h.id('projects-count').textContent, /2/);
   assert.match(h.id('projects-body').textContent, /\/real\/Alpha/);
   assert.equal(byLabel(h, '默认 目标').disabled, true);
   assert.equal(byLabel(h, '默认 目标').value, 'alpha,one');
   assert.match(h.id('projects-body').textContent, /默认接管 Claude Code/);
   assert.equal(byLabel(h, 'Codex'), undefined);
+});
+
+test('project search filters paths, preserves selection on cancel, handles IME and commits only on confirmation', async () => {
+  const { h } = await start();
+  const picker = h.id('projects-select');
+  function search(query) { picker.fire('click'); picker.value = query; picker.fire('input'); }
+  search('REAL/bE');
+  assert.deepEqual(h.id('projects-options').children.map(n => n.textContent), ['/real/Beta']);
+  picker.fire('keydown', { key: 'Enter', isComposing: true });
+  assert.match(h.id('projects-body').textContent, /real\/Alpha/);
+  picker.fire('keydown', { key: 'Escape' });
+  assert.equal(picker.value, '/real/Alpha');
+  search('does-not-match'); picker.fire('keydown', { key: 'Enter' });
+  assert.equal(h.id('projects-no-match').hidden, false);
+  picker.fire('blur'); assert.equal(picker.value, '/real/Alpha');
+  picker.fire('focus'); picker.fire('keydown', { key: 'ArrowDown' }); picker.fire('keydown', { key: 'Enter' });
+  assert.equal(picker.value, '/real/Beta'); assert.equal(h.id('projects-popup').hidden, true);
+});
+
+test('project picker keeps a pressed option through refresh and updates changed results', async () => {
+  const { h, state } = await start();
+  const picker = h.id('projects-select'), options = h.id('projects-options');
+  picker.fire('focus');
+  const pressed = options.children[1];
+  pressed.fire('mousedown');
+  h.id('projects-refresh').fire('click'); await flush();
+  assert.ok(options.children[1] === pressed, 'refresh must preserve the pointer target');
+  pressed.fire('click');
+  assert.equal(picker.value, '/real/Beta');
+
+  picker.fire('focus');
+  state.projects.shift(); state.projects[0].path = '/renamed/Beta';
+  h.id('projects-refresh').fire('click'); await flush();
+  assert.deepEqual(options.children.map(n => n.textContent), ['/renamed/Beta']);
+  assert.equal(options.children[0].getAttribute('aria-selected'), 'true');
+});
+
+test('project picker Escape cancels only the open search and selects the label for fresh typing', async () => {
+  const { h } = await start();
+  const picker = h.id('projects-select');
+  picker.focus(); picker.fire('focus'); picker.value = 'bet'; picker.fire('input');
+  picker.fire('keydown', { key: 'Escape' });
+  assert.equal(h.id('projects-popup').hidden, true);
+  assert.equal(h.doc.activeElement, picker);
+  assert.equal(picker.value, '/real/Alpha');
+  assert.deepEqual([picker.selectionStart, picker.selectionEnd], [0, picker.value.length]);
+  assert.equal(h.calls.filter(c => c.cmd === 'quota_hide').length, 0);
+  picker.fire('keydown', { key: 'Escape' });
+  assert.equal(h.calls.filter(c => c.cmd === 'quota_hide').length, 1);
 });
 
 test('projects interaction: local-only edits, refresh, focus and switching retain independent route and takeover drafts', async () => {
@@ -53,8 +107,31 @@ test('projects interaction: failed save retains draft; late save cannot select a
   const { h } = await start({ projects_save: () => new Promise((_, reject) => { rejectSave = reject; }) });
   toggle(h, '使用全局路由', false); type(h, '默认 目标', 'alpha,two'); button(h, '保存项目路由').click(); await flush(); select(h, 'b');
   rejectSave(new Error('private upstream error')); await flush();
-  assert.equal(h.id('projects-select').value, 'b'); assert.doesNotMatch(h.id('projects-msg').textContent, /private|失败/);
+  assert.match(h.id('projects-select').value, /Beta/); assert.doesNotMatch(h.id('projects-msg').textContent, /private|失败/);
   select(h, 'a'); assert.match(h.id('projects-msg').textContent, /操作失败/); assert.equal(byLabel(h, '默认 目标').value, 'alpha,two');
+});
+
+test('external web takeover changes appear on focus, tab re-entry and refresh all', async () => {
+  const { h, state } = await start();
+  const pi = () => byLabel(h, 'Pi').checked;
+  const external = enabled => { state.projects[0].takeoverClients = enabled ? ['claudeCode', 'pi'] : ['claudeCode']; };
+  assert.equal(pi(), false);
+  // A draft that the operator returned to its original state is clean.
+  toggle(h, 'Pi', true); toggle(h, 'Pi', false);
+  external(true); h.focusWindow(); await flush(); assert.equal(pi(), true);
+  h.id('tab-routing').click(); external(false); h.id('tab-projects').click(); await flush(); assert.equal(pi(), false);
+  external(true); h.id('refresh-all').click(); await flush(); assert.equal(pi(), true);
+  assert.equal(h.calls.filter(c => ['projects_takeover', 'projects_save'].includes(c.cmd)).length, 0);
+});
+
+test('external takeover changes appear alongside a dirty route draft and preserve the conflict warning', async () => {
+  const { h, state } = await start();
+  toggle(h, '使用全局路由', false); type(h, '默认 目标', 'alpha,two');
+  state.projects[0].takeoverClients.push('pi'); state.projects[0].revision = 'a2';
+  h.focusWindow(); await flush();
+  assert.equal(byLabel(h, 'Pi').checked, true);
+  assert.equal(byLabel(h, '默认 目标').value, 'alpha,two');
+  assert.match(h.id('projects-msg').textContent, /外部更新/);
 });
 
 test('projects interaction: restore global and takeover each require their explicit action', async () => {
@@ -84,11 +161,30 @@ test('projects interaction: fallback ordering, family thresholds and deletion co
   let first = h.id('projects-body').querySelector('.route');
   first.querySelectorAll('.fallback-item')[1].querySelector('button').click();
   first = h.id('projects-body').querySelector('.route'); assert.match(first.querySelector('.fallback-item').textContent, /alpha,one/);
-  button(h, 'Opus').click(); button(h, '添加家族配置').click(); type(h, '长上下文阈值', '12345');
+  assert.ok(byLabel(h, '后台 目标'));
+  button(h, 'Opus').click(); button(h, '添加家族配置').click();
+  assert.ok(byLabel(h, '默认 目标'));
+  assert.equal(byLabel(h, '后台 目标'), undefined);
+  type(h, '长上下文阈值', '12345');
   button(h, '项目路由').click(); button(h, 'Opus').click(); assert.equal(byLabel(h, '长上下文阈值').value, '12345');
   button(h, '移除项目配置').click(); assert.match(h.id('projects-body').textContent, /移除 CCR 项目配置，不删除项目文件/);
   assert.equal(h.calls.some(c => c.cmd === 'projects_delete'), false); button(h, '取消').click();
   button(h, '移除项目配置').click(); button(h, '确认移除').click(); await flush();
   assert.equal(h.calls.filter(c => c.cmd === 'projects_delete').length, 1);
-  assert.equal(h.id('projects-select').value, 'b');
+  assert.match(h.id('projects-select').value, /Beta/);
+});
+
+test('projects interaction: global preview locks carry an editable hint, custom routes stay clean', async () => {
+  const { h } = await start();
+  select(h, 'a'); await flush();
+  const locked = byLabel(h, '默认 目标');
+  assert.equal(locked.disabled, true);
+  assert.match(locked.title, /使用全局路由/);
+  assert.match(h.id('projects-body').querySelectorAll('.fallback-item')[0].querySelectorAll('button')[0].title, /使用全局路由/);
+  const lockedButtons = h.id('projects-body').querySelectorAll('button').filter(b => b.disabled && (b.textContent === '移除别名' || b.textContent === '添加家族配置'));
+  for (const b of lockedButtons) assert.match(b.title, /使用全局路由/, b.textContent);
+  select(h, 'b'); await flush();
+  const editable = byLabel(h, '默认 目标');
+  assert.equal(editable.disabled, false);
+  assert.equal(editable.title || '', '');
 });
