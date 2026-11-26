@@ -1,6 +1,6 @@
 use crate::{
     api::{AdminClient, TraySnapshot},
-    lifecycle::{self, OwnedGateway, RuntimeBundle, ServiceAction, ServiceState},
+    lifecycle::{self, GatewayStop, OwnedGateway, RuntimeBundle, ServiceAction, ServiceState},
     settings::ConnectionSettings,
 };
 use std::collections::hash_map::DefaultHasher;
@@ -72,11 +72,38 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn stop_slot(slot: &Mutex<Option<Child>>) -> Option<bool> {
+fn stop_slot(slot: &Mutex<Option<Child>>) -> Option<GatewayStop> {
     let mut guard = lock(slot);
     let result = lifecycle::stop_owned_gateway(guard.as_mut()?);
     guard.take();
     Some(result)
+}
+
+async fn install_with_gateway_stopped(
+    operation: &AsyncMutex<()>,
+    slot: Arc<Mutex<Option<Child>>>,
+    shutting_down: &AtomicBool,
+    install: impl FnOnce() -> Result<(), String> + Send + 'static,
+    restore: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    let operation = operation.lock().await;
+    let stopped = tauri::async_runtime::spawn_blocking(move || stop_slot(&slot))
+        .await
+        .map_err(|_| "UPDATE_INSTALL_FAILED")?;
+    if stopped == Some(GatewayStop::Failed) {
+        return Err("UPDATE_INSTALL_FAILED".into());
+    }
+    let result = tauri::async_runtime::spawn_blocking(install)
+        .await
+        .unwrap_or_else(|_| Err("UPDATE_INSTALL_FAILED".into()));
+    drop(operation);
+    if result.is_err()
+        && stopped == Some(GatewayStop::Stopped)
+        && !shutting_down.load(Ordering::SeqCst)
+    {
+        restore.await;
+    }
+    result
 }
 
 /// Quit wording reflects ownership: only an owned gateway is stopped on exit.
@@ -622,22 +649,16 @@ impl Controller {
         self: &Arc<Self>,
         install: impl FnOnce() -> Result<(), String> + Send + 'static,
     ) -> Result<(), String> {
-        let operation = self.operation.lock().await;
-        let slot = Arc::clone(&self.launcher);
-        let stopped = tauri::async_runtime::spawn_blocking(move || stop_slot(&slot))
-            .await
-            .map_err(|_| "UPDATE_INSTALL_FAILED")?;
-        if stopped == Some(false) {
-            return Err("UPDATE_INSTALL_FAILED".into());
-        }
-        let result = tauri::async_runtime::spawn_blocking(install)
-            .await
-            .unwrap_or_else(|_| Err("UPDATE_INSTALL_FAILED".into()));
-        drop(operation);
-        if result.is_err() && stopped == Some(true) && !self.stopped.load(Ordering::SeqCst) {
-            let _ = self.action_start().await;
-        }
-        result
+        install_with_gateway_stopped(
+            &self.operation,
+            Arc::clone(&self.launcher),
+            &self.stopped,
+            install,
+            async {
+                let _ = self.action_start().await;
+            },
+        )
+        .await
     }
 
     /// Service state for the control center header. No lock is held across the
@@ -662,7 +683,7 @@ impl Controller {
 
     async fn action_stop(self: &Arc<Self>) -> Result<ServiceState, String> {
         let slot = Arc::clone(&self.launcher);
-        let stopped_cleanly = tauri::async_runtime::spawn_blocking(move || {
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
             // Keep the child in its shared ownership slot until termination
             // completes. Quit waits on this same mutex, including during kill.
             stop_slot(&slot)
@@ -671,7 +692,7 @@ impl Controller {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Only a gateway started by this desktop can be stopped here. External services must be stopped by their own owner.".to_string())?;
         self.update(|v| {
-            v.status = if stopped_cleanly {
+            v.status = if outcome != GatewayStop::Failed {
                 "Gateway stopped".into()
             } else {
                 "Gateway stop did not complete cleanly".into()
@@ -862,7 +883,10 @@ mod tests {
         stopped.store(true, Ordering::SeqCst);
         let child = lock(&slot).take();
         if let Some(mut child) = child {
-            assert!(lifecycle::stop_owned_gateway(&mut child));
+            assert_eq!(
+                lifecycle::stop_owned_gateway(&mut child),
+                GatewayStop::Stopped
+            );
         }
         assert!(settled.load(Ordering::SeqCst));
         assert!(lock(&slot).is_none());
@@ -918,7 +942,10 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let mut guard = lock(&worker_slot);
             ready_tx.send(()).unwrap();
-            assert!(lifecycle::stop_owned_gateway(guard.as_mut().unwrap()));
+            assert_eq!(
+                lifecycle::stop_owned_gateway(guard.as_mut().unwrap()),
+                GatewayStop::Stopped
+            );
             guard.take();
         });
         ready_rx
@@ -929,6 +956,47 @@ mod tests {
         assert!(lock(&slot).take().is_none());
         worker.join().unwrap();
         assert_eq!(stop_slot(&slot), None);
+    }
+
+    async fn failed_install_restores_child(already_exited: bool) -> bool {
+        // sort waits on our pipe. Closing it lets the fixture exit on its own.
+        let mut child = std::process::Command::new("sort")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        if already_exited {
+            drop(child.stdin.take());
+            child.wait().unwrap();
+        }
+        let slot = Arc::new(Mutex::new(Some(child)));
+        let install_slot = Arc::clone(&slot);
+        let mut restored = false;
+        let result = install_with_gateway_stopped(
+            &AsyncMutex::new(()),
+            slot,
+            &AtomicBool::new(false),
+            move || {
+                assert!(lock(&install_slot).is_none());
+                Err("fixture installer failed".into())
+            },
+            async {
+                restored = true;
+            },
+        )
+        .await;
+        assert_eq!(result, Err("fixture installer failed".into()));
+        restored
+    }
+
+    #[tokio::test]
+    async fn failed_install_leaves_previously_exited_gateway_stopped() {
+        assert!(!failed_install_restores_child(true).await);
+    }
+
+    #[tokio::test]
+    async fn failed_install_restores_live_gateway_stopped_for_install() {
+        assert!(failed_install_restores_child(false).await);
     }
 
     #[test]
