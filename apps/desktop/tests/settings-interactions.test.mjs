@@ -10,7 +10,7 @@ const src = name => readFileSync(new URL('../src/' + name, import.meta.url), 'ut
 const sandbox = { URL, setTimeout };
 vm.runInNewContext(src('general-settings.js') + src('quota.js'), sandbox);
 const defaults = {
-  LOG: false, LOG_LEVEL: 'error', statusLineEnabled: false, tokenSpeedEnabled: false,
+  LOG: true, LOG_LEVEL: 'error', statusLineEnabled: false, tokenSpeedEnabled: false,
   disableAttributionHeader: true, enableConcurrencyPriority: false, concurrencyThreshold: 3,
   WAKEUP_ENABLED: false, WAKEUP_TIME: '06:00', CLAUDE_PATH: '', HOST: '', PORT: 3456,
   API_TIMEOUT_MS: 600000, PROBE_TIMEOUT_MS: 15000, PROBE_SLOW_THRESHOLD_MS: 3000,
@@ -27,7 +27,7 @@ const saves = h => h.calls.filter(c => c.cmd === 'general_settings_save');
 const reads = h => h.calls.filter(c => c.cmd === 'general_settings_snapshot');
 
 function setup(overrides = {}) {
-  const fixture = { revision: 'r1', values: { ...defaults }, portFromEnv: false, apiKeyConfigured: true, proxyConfigured: true };
+  const fixture = { revision: 'r1', values: { ...defaults }, portFromEnv: false, hostIsEmpty: false, apiKeyConfigured: true, proxyConfigured: true };
   const h = harness({
     general_settings_snapshot: () => plain(fixture),
     general_settings_save: ({ revision, changes }) => {
@@ -38,6 +38,7 @@ function setup(overrides = {}) {
         else {
           fixture.values[key] = value;
           if (key === 'PORT') fixture.portFromEnv = false;
+          if (key === 'HOST') fixture.hostIsEmpty = false;
         }
       }
       fixture.revision += '+';
@@ -56,7 +57,7 @@ async function open(h) {
   assert.equal(reads(h).length, 1);
 }
 
-test('settings: every supported scalar has a labeled control and a Web default in the keyboard-accessible panel', async () => {
+test('settings: every supported scalar has a labeled control and a gateway default in the keyboard-accessible panel', async () => {
   const { h } = setup();
   await open(h);
   const body = h.id('settings-body');
@@ -79,7 +80,7 @@ test('settings: every supported scalar has a labeled control and a Web default i
 test('settings: drafts survive focus, tab changes and explicit reload, then save all scalar types in one request', async () => {
   const { h, fixture } = setup();
   await open(h);
-  const changes = { LOG: true, LOG_LEVEL: 'trace', statusLineEnabled: true, tokenSpeedEnabled: true,
+  const changes = { LOG: false, LOG_LEVEL: 'trace', statusLineEnabled: true, tokenSpeedEnabled: true,
     disableAttributionHeader: false, enableConcurrencyPriority: true, concurrencyThreshold: 4, WAKEUP_ENABLED: true,
     WAKEUP_TIME: '07:45', CLAUDE_PATH: '/opt/tools/claude', HOST: 'localhost', PORT: 4100,
     API_TIMEOUT_MS: 80000, PROBE_TIMEOUT_MS: 16000, PROBE_SLOW_THRESHOLD_MS: 4000, ContextWindow: 180000,
@@ -136,8 +137,8 @@ test('settings: environment port is preserved on unrelated saves and can be repl
   write(h, 'set-port', '3456');
   write(h, 'set-port', '');
   assert.equal(save.disabled, true);
-  write(h, 'set-log', true); save.click(); await flush();
-  assert.deepEqual(plain(saves(h)[0].args.changes), { LOG: true });
+  write(h, 'set-log', false); save.click(); await flush();
+  assert.deepEqual(plain(saves(h)[0].args.changes), { LOG: false });
   assert.equal(port.value, '');
   assert.equal(status.hidden, false);
 
@@ -152,6 +153,24 @@ test('settings: environment port is preserved on unrelated saves and can be repl
   assert.deepEqual(plain(saves(h)[2].args), { revision: 'r2', changes: { PORT: 3456 } });
   assert.equal(port.value, '3456');
   assert.equal(status.hidden, true);
+  assert.equal(save.disabled, true);
+});
+
+test('settings: an existing empty HOST can be kept or explicitly repaired', async () => {
+  const { h, fixture } = setup();
+  fixture.hostIsEmpty = true;
+  await open(h);
+  const save = h.id('settings-save'), repair = h.id('set-host-repair');
+  assert.equal(save.disabled, true);
+  assert.equal(h.id('settings-host-repair').hidden, false);
+  write(h, 'set-log', false); save.click(); await flush();
+  assert.deepEqual(plain(saves(h)[0].args.changes), { LOG: false });
+  write(h, 'set-host-repair', true);
+  h.id('settings-refresh').click(); await flush();
+  assert.equal(repair.checked, true);
+  save.click(); await flush();
+  assert.deepEqual(plain(saves(h)[1].args.changes), { HOST: '' });
+  assert.equal(h.id('settings-host-repair').hidden, true);
   assert.equal(save.disabled, true);
 });
 
@@ -181,7 +200,14 @@ for (const [key, id, testValue] of [['APIKEY', 'set-apikey', 'fixture-value'], [
     assert.equal(field.getAttribute('type'), 'password');
     write(h, id + '-action', 'replace'); h.id('settings-save').click();
     assert.equal(saves(h).length, 0, 'empty replacement is distinct from a clear');
-    if (key === 'PROXY_URL') {
+    if (key === 'APIKEY') {
+      for (const value of ['$UNSET', 'prefix-${VAR}', '${broken', 'tail$', ' key', 'test\u0085', '示例口令', 'a'.repeat(4097)]) {
+        write(h, id, value); h.id('settings-save').click();
+        assert.equal(saves(h).length, 0);
+        assert.match(h.id('settings-msg').textContent, /APIKEY.*ASCII/);
+        assert.ok(!h.id('settings-msg').textContent.includes(value));
+      }
+    } else {
       write(h, id, 'socks://example.invalid'); h.id('settings-save').click();
       assert.equal(saves(h).length, 0);
       assert.ok(!h.id('settings-msg').textContent.includes('example.invalid'));
@@ -203,6 +229,7 @@ test('settings: preview supports revisioned save and reload without returning wr
   const invoke = sandbox.QuotaUI.createPreviewInvoke();
   const before = await invoke('general_settings_snapshot');
   assert.deepEqual(plain(before.values), defaults);
+  await assert.rejects(invoke('general_settings_save', { revision: before.revision, changes: { APIKEY: '$UNSET' } }), /APIKEY.*ASCII/);
   const result = await invoke('general_settings_save', { revision: before.revision, changes: { PORT: 4567, APIKEY: 'fixture-value', PROXY_URL: '$PROXY' } });
   assert.deepEqual(plain(result.values), { ...defaults, PORT: 4567 });
   assert.equal(result.proxyConfigured, true); assert.equal(result.apiKeyConfigured, true);

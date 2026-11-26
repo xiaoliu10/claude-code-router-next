@@ -1,10 +1,9 @@
 (function () {
   'use strict';
 
-  // Native snapshots contain effective scalar values. The preview uses the
-  // same defaults as the General tab in SettingsPage.tsx.
+  // Keep preview defaults in sync with the native gateway projection.
   const defaults = {
-    LOG: false, LOG_LEVEL: 'error', statusLineEnabled: false, tokenSpeedEnabled: false,
+    LOG: true, LOG_LEVEL: 'error', statusLineEnabled: false, tokenSpeedEnabled: false,
     disableAttributionHeader: true, enableConcurrencyPriority: false, concurrencyThreshold: 3,
     WAKEUP_ENABLED: false, WAKEUP_TIME: '06:00', CLAUDE_PATH: '', HOST: '', PORT: 3456,
     API_TIMEOUT_MS: 600000, PROBE_TIMEOUT_MS: 15000, PROBE_SLOW_THRESHOLD_MS: 3000,
@@ -14,6 +13,10 @@
   const owns = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
   function validationError(key, value) {
+    if (key === 'APIKEY') {
+      return typeof value === 'string' && value.length <= 4096 && !/[^\x20-\x7e]|\$/.test(value) && value === value.trim()
+        ? '' : '请输入不超过 4096 个可打印 ASCII 字符的密钥，不支持 $、环境变量或首尾空格';
+    }
     if (typeof defaults[key] === 'number') {
       const max = key === 'PORT' ? 65535 : 2147483647;
       return Number.isInteger(value) && value >= 1 && value <= max ? '' : '请输入 1 到 ' + max + ' 之间的整数';
@@ -30,7 +33,7 @@
   }
 
   function preview() {
-    const state = { values: { ...defaults }, portFromEnv: false, apiKeyConfigured: false, proxyConfigured: false };
+    const state = { values: { ...defaults }, portFromEnv: false, hostIsEmpty: false, apiKeyConfigured: false, proxyConfigured: false };
     let revision = 1;
     const snapshot = () => ({ ...state, values: { ...state.values }, revision: String(revision) });
     return async function (command, args) {
@@ -39,6 +42,11 @@
       if (args.revision !== String(revision)) throw new Error('Settings draft is stale; refresh the panel and retry');
       const changes = Object.entries(args.changes);
       for (const [key, value] of changes) {
+        if (key === 'APIKEY') {
+          const error = validationError(key, value);
+          if (error) throw new Error('APIKEY：' + error);
+          continue;
+        }
         const type = owns(secretFlags, key) ? 'string' : typeof defaults[key];
         if ((!owns(defaults, key) && !owns(secretFlags, key)) || typeof value !== type || validationError(key, value)) {
           throw new Error('Invalid general settings changes');
@@ -56,7 +64,7 @@
   function mount(doc, invoke) {
     const id = key => doc.getElementById(key);
     const form = id('settings-body'), saveButton = id('settings-save'), refreshButton = id('settings-refresh');
-    const message = id('settings-msg');
+    const message = id('settings-msg'), hostRepair = id('set-host-repair');
     const fields = Array.from(form.querySelectorAll('[data-setting]'));
     const secrets = [['APIKEY', 'set-apikey', 'settings-key-status'], ['PROXY_URL', 'set-proxy-url', 'settings-proxy-status']].map(([key, inputId, status]) => ({
       key, input: id(inputId), action: id(inputId + '-action'), label: id(inputId + '-label'), status: id(status),
@@ -76,13 +84,16 @@
       return field.value;
     }
     function dirtyFields() {
-      return snapshot ? fields.filter(field => valueOf(field) !== snapshot.values[field.dataset.setting]) : [];
+      return snapshot ? fields.filter(field => valueOf(field) !== snapshot.values[field.dataset.setting] ||
+        (field.dataset.setting === 'HOST' && snapshot.hostIsEmpty && hostRepair.checked)) : [];
     }
     function updateControls() {
       const locked = !invoke || busy || !snapshot;
       form.hidden = !snapshot;
       form.setAttribute('aria-busy', String(busy));
       refreshButton.disabled = !invoke || busy;
+      hostRepair.disabled = locked || id('set-host').value !== '';
+      if (id('set-host').value !== '') hostRepair.checked = false;
       fields.forEach(field => { field.disabled = locked; });
       for (const {key, action, input, label, status} of secrets) {
         action.disabled = locked;
@@ -103,11 +114,13 @@
     }
     function adopt(next, keep) {
       if (!next || typeof next.revision !== 'string' || !next.revision || !next.values ||
-        typeof next.portFromEnv !== 'boolean' ||
+        typeof next.portFromEnv !== 'boolean' || typeof next.hostIsEmpty !== 'boolean' ||
         fields.some(({dataset: {setting}}) => setting === 'PORT' && next.portFromEnv
           ? owns(next.values, 'PORT') : typeof next.values[setting] !== typeof defaults[setting]) ||
         typeof next.apiKeyConfigured !== 'boolean' || typeof next.proxyConfigured !== 'boolean') throw new Error('Invalid projection');
       snapshot = next;
+      id('settings-host-repair').hidden = !next.hostIsEmpty;
+      if (!next.hostIsEmpty || !keep.has(id('set-host'))) hostRepair.checked = false;
       id('settings-port-status').hidden = !next.portFromEnv;
       if (next.portFromEnv) id('set-port').setAttribute('aria-describedby', 'settings-port-status');
       else id('set-port').removeAttribute('aria-describedby');
@@ -185,6 +198,7 @@
       });
       input.addEventListener('input', edited);
     }
+    hostRepair.addEventListener('change', edited);
     saveButton.addEventListener('click', save);
     refreshButton.addEventListener('click', reload);
     if (!invoke) feedback('桌面 IPC 不可用。', 'error');

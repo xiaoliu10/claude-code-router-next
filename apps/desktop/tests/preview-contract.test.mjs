@@ -44,6 +44,14 @@ const SERVICE_KEYS = ["mode", "running", "message"]
 const SERVICE_MODES = ["owned", "external", "stopped", "starting", "error"]
 const FIVE_IDS = CLIENT_IDS
 
+test('both native login commands guard the calling webview before registration', () => {
+  const source = readFileSync(path.join(here, '..', 'src-tauri', 'src', 'autostart.rs'), 'utf8')
+  for (const command of ['login_start_status', 'login_start_set']) {
+    const body = source.split(`fn ${command}(`)[1].split('\n}')[0]
+    assert.match(body, /^window: WebviewWindow[^{}]*\{\s*crate::popup::guard\(&window\)\?;\s*registration\(/)
+  }
+})
+
 test('login startup reads the OS setting, confirms writes and recovers after failure', async () => {
   const preview = Q.createPreviewInvoke()
   const calls = []
