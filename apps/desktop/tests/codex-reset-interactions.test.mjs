@@ -88,6 +88,15 @@ for (const [outcome, feedback] of [['reset', 'Codex 订阅额度已重置。'], 
   });
 }
 
+test('An older plugin prompts for an upgrade without repeating the consumption request', async () => {
+  const h = await start({ codex_reset_consume: () => { throw Error('codex_reset_upgrade_required'); } });
+  const panel = h.panel();
+  button(panel, '重置用量').click(); button(panel, '确认使用 1 张').click(); await flush();
+  assert.match(panel.textContent, /请先更新 Codex 订阅插件/);
+  assert.equal(button(panel, '重置用量').disabled, true);
+  assert.equal(h.callsFor('codex_reset_consume').length, 1);
+});
+
 test('An uncertain consume requires a fresh read and confirmation, without automatic retries', async () => {
   const h = await start({ codex_reset_consume: () => { throw Error('timeout'); } });
   const panel = h.panel();

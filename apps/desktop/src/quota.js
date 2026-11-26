@@ -1961,8 +1961,15 @@
           case 'no_credit': feedback.textContent = '没有可用的重置卡。'; count = 0; break;
           default: throw new Error();
         }
-      } catch {
-        if (generation === current) feedback.textContent = '无法确认是否已使用重置卡。请先重查张数并核对额度。';
+      } catch (err) {
+        if (generation === current) {
+          switch (errorMessage(err)) {
+            case 'codex_reset_upgrade_required': feedback.textContent = '请先更新 Codex 订阅插件，再使用重置卡。'; break;
+            case 'codex_reset_no_credit': feedback.textContent = '所选重置卡已不可用，请重新查询。'; break;
+            case 'codex_reset_busy': feedback.textContent = '正在处理另一项操作，请稍后重新查询。'; break;
+            default: feedback.textContent = '无法确认是否已使用重置卡。请先重查张数并核对额度。';
+          }
+        }
       } finally {
         consuming = false;
         render();
