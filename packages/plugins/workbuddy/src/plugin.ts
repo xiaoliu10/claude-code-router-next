@@ -32,7 +32,7 @@ import type { PluginContext } from "./core-types";
 
 export const manifest = {
   name: "workbuddy",
-  version: "1.0.3",
+  version: "1.0.4",
   coreApi: "1",
   description: "WorkBuddy (CN + international) managed subscription provider: dual-site account pools, browser login, desktop import, model sync, multi-account failover and admin routes.",
 };
