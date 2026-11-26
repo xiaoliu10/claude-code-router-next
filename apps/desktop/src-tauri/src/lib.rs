@@ -15,12 +15,15 @@ use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // Must be first so a second launch never starts another desktop/gateway.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let handle = app.clone();
             let _ = app.run_on_main_thread(move || tray::open_window(&handle));
-        }))
+        }));
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+    let app = builder
         .invoke_handler(tauri::generate_handler![
             popup::quota_snapshot,
             popup::quota_hide,

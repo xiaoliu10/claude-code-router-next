@@ -3,9 +3,21 @@ use crate::{
     quota::{QuotaService, QuotaSnapshot},
     tray,
 };
-use tauri::{
-    Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-};
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+#[cfg(not(target_os = "macos"))]
+use tauri::{PhysicalPosition, PhysicalSize};
+
+#[cfg(target_os = "macos")]
+tauri_nspanel::tauri_panel! {
+    panel!(QuotaPanel {
+        config: {
+            can_become_key_window: true,
+            can_become_main_window: false,
+            is_floating_panel: true
+        }
+    })
+}
 
 pub const LABEL: &str = "quota";
 const WIDTH: f64 = 440.0;
@@ -30,7 +42,7 @@ pub(crate) fn guard(window: &WebviewWindow) -> Result<(), String> {
     }
 }
 pub fn install(app: &tauri::AppHandle) -> tauri::Result<()> {
-    WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("quota.html".into()))
+    let _window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("quota.html".into()))
         .title("CCR 控制中心")
         .inner_size(WIDTH, HEIGHT)
         .visible(false)
@@ -41,10 +53,39 @@ pub fn install(app: &tauri::AppHandle) -> tauri::Result<()> {
         .on_navigation(trusted_url)
         .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
         .build()?;
+    #[cfg(target_os = "macos")]
+    configure_macos_spaces(&_window)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_spaces(window: &WebviewWindow) -> tauri::Result<()> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSStatusWindowLevel, NSWindowCollectionBehavior as Behavior, NSWindowStyleMask,
+    };
+    use tauri_nspanel::WebviewWindowExt;
+
+    let Some(_main_thread) = MainThreadMarker::new() else {
+        return Err(tauri::Error::FailedToReceiveMessage);
+    };
+    let panel = window.to_panel::<QuotaPanel>()?;
+    panel
+        .set_style_mask(NSWindowStyleMask::NonactivatingPanel)
+        .map_err(std::io::Error::other)?;
+    panel.set_hides_on_deactivate(false);
+
+    // Keep the popup with the menu bar across Spaces, including another app's
+    // native full-screen Space. The ordinary control-center window is unaffected.
+    panel.set_collection_behavior(
+        Behavior::CanJoinAllSpaces | Behavior::IgnoresCycle | Behavior::FullScreenAuxiliary,
+    );
+    panel.as_panel().setLevel(NSStatusWindowLevel);
     Ok(())
 }
 /// Clamp physical popup geometry to the work area; small monitors shrink the
 /// popup, and negative monitor origins remain valid. Prefer below the tray.
+#[cfg(any(test, not(target_os = "macos")))]
 fn placement(
     anchor: (f64, f64, f64, f64),
     work: (f64, f64, f64, f64),
@@ -62,10 +103,23 @@ fn placement(
         height.floor() as u32,
     )
 }
-pub fn show(app: &tauri::AppHandle, rect: tauri::Rect) {
+pub fn show(app: &tauri::AppHandle, _rect: tauri::Rect) {
     let Some(window) = app.get_webview_window(LABEL) else {
         return;
     };
+    #[cfg(target_os = "macos")]
+    show_macos_popup(&window);
+    #[cfg(not(target_os = "macos"))]
+    {
+        position_popup(&window, _rect);
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    spawn_dismiss_watch(app.clone());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn position_popup(window: &WebviewWindow, rect: tauri::Rect) {
     let scale = window.scale_factor().unwrap_or(1.0);
     let position = rect.position.to_physical::<f64>(scale);
     let size = rect.size.to_physical::<f64>(scale);
@@ -84,18 +138,55 @@ pub fn show(app: &tauri::AppHandle, rect: tauri::Rect) {
         let _ = window.set_size(PhysicalSize::new(width, height));
         let _ = window.set_position(PhysicalPosition::new(x, y));
     }
-    let _ = window.show();
-    let _ = window.set_focus();
-    spawn_dismiss_watch(app.clone());
+}
+
+#[cfg(target_os = "macos")]
+fn show_macos_popup(window: &WebviewWindow) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSEvent, NSScreen};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use tauri_nspanel::ManagerExt;
+
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return;
+    };
+    let Ok(panel) = window.app_handle().get_webview_panel(LABEL) else {
+        return;
+    };
+    // AppKit mouse and screen coordinates are both in global points. The tray
+    // event rectangle uses pixels and may use a different display's scale.
+    let cursor = NSEvent::mouseLocation();
+    let screens = NSScreen::screens(main_thread);
+    let screen = screens.iter().find(|screen| {
+        let frame = screen.frame();
+        cursor.x >= frame.origin.x
+            && cursor.x < frame.origin.x + frame.size.width
+            && cursor.y >= frame.origin.y
+            && cursor.y < frame.origin.y + frame.size.height
+    });
+    if let Some(screen) = screen {
+        let work = screen.visibleFrame();
+        let width = WIDTH.min(work.size.width);
+        let height = HEIGHT.min(work.size.height);
+        let x =
+            (cursor.x - width / 2.0).clamp(work.origin.x, work.origin.x + work.size.width - width);
+        let y = (cursor.y - 12.0 - height)
+            .clamp(work.origin.y, work.origin.y + work.size.height - height);
+        panel.as_panel().setFrame_display(
+            NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)),
+            false,
+        );
+    }
+    // Tauri's set_focus activates the application, which can switch Spaces.
+    panel.show_and_make_key();
 }
 
 /// Blur-based dismissal relies on `WindowEvent::Focused(false)`, which macOS
 /// only fires if the panel actually became key. Activation can be silently
-/// declined (set_focus is best-effort), leaving a permanently stuck panel —
-/// so a watchdog polls focus while visible: once focus has been observed,
-/// losing it hides the panel; if focus never lands, one re-focus is attempted
-/// and a still-unfocused panel is dismissed on its own (it cannot receive Esc
-/// or clicks-outside anyway). Idempotent with the Focused(false) handler.
+/// declined, leaving a stuck panel. The watchdog hides the panel after it
+/// loses focus or fails to acquire focus within the grace period. On macOS
+/// a focus retry would activate the app and can move it out of the current
+/// Space. Idempotent with the Focused(false) handler.
 fn spawn_dismiss_watch(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let shown = std::time::Instant::now();
@@ -124,12 +215,11 @@ fn spawn_dismiss_watch(app: tauri::AppHandle) {
                 }
                 return;
             }
-            // One re-focus attempt after 4s without any observed focus; if it
-            // lands, the poll keeps watching (poll-based dismissal stays live
-            // even when the Focused event path is dead) — the panel hides on
-            // the first real focus loss below.
+            // Give the OS one final chance to grant focus before hiding an
+            // unfocused panel. Only retry explicitly on non-macOS targets.
             if !refocused && shown.elapsed() >= std::time::Duration::from_millis(4000) {
                 refocused = true;
+                #[cfg(not(target_os = "macos"))]
                 let _ = window.set_focus();
                 std::thread::sleep(std::time::Duration::from_millis(800));
                 if window.is_focused().unwrap_or(false) {
