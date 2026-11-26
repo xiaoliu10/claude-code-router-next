@@ -64,12 +64,22 @@ fs.rmSync(stagedResources, { recursive: true, force: true });
 const bundleDir = path.join(srcTauriDir, "target", "release", "bundle", "nsis");
 fs.rmSync(bundleDir, { recursive: true, force: true });
 const signing = process.argv.includes("--signed-update");
-const options = signing ? ["--config", "tauri.updater.conf.json"] : ["--no-sign"];
+const releaseConfig = path.join(srcTauriDir, "target", "desktop-signing.conf.json");
+const options = signing ? ["--config", releaseConfig] : ["--no-sign"];
 if (signing) {
-  const config = JSON.parse(fs.readFileSync(path.join(srcTauriDir, options[1]), "utf8"));
-  if (!config.plugins.updater.pubkey.trim() || !process.env.TAURI_SIGNING_PRIVATE_KEY) {
-    throw new Error("Signed updates require the pinned release public key and the signing private key");
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(path.join(srcTauriDir, "tauri.updater.conf.json"), "utf8"));
+  } catch (cause) {
+    throw new Error("Cannot read the Desktop signing configuration", { cause });
   }
+  const publicKey = process.env.DESKTOP_UPDATE_PUBLIC_KEY?.trim();
+  if (!publicKey || !process.env.TAURI_SIGNING_PRIVATE_KEY) {
+    throw new Error("Configure DESKTOP_UPDATE_PUBLIC_KEY and TAURI_SIGNING_PRIVATE_KEY for the signed build");
+  }
+  config.plugins.updater.pubkey = publicKey;
+  fs.mkdirSync(path.dirname(releaseConfig), { recursive: true });
+  fs.writeFileSync(releaseConfig, JSON.stringify(config));
 }
 run("cargo", ["tauri", "build", "--bundles", "nsis", ...options], { cwd: srcTauriDir });
 

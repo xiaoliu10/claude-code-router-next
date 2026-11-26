@@ -87,6 +87,7 @@ jobs:
         working-directory: apps/desktop
         env:
           CI: 'true'
+          DESKTOP_UPDATE_PUBLIC_KEY: ${{ vars.DESKTOP_UPDATE_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: node scripts/build-standalone-windows.mjs --signed-update

@@ -5,7 +5,7 @@ Windows x64 NSIS 客户端读取本仓库最新正式 Release 的 `desktop-updat
 ## 建立签名密钥
 
 1. 在受信任的发布机安装与 CI 一致的 Tauri CLI 2.12.2。运行 `cargo tauri signer generate -w <仓库外的私钥路径>`，按提示设置口令。备份私钥及口令到发布团队的密码库。
-2. 将生成的 `.pub` 文件的完整单行内容填入 `apps/desktop/src-tauri/tauri.updater.conf.json` 的 `plugins.updater.pubkey`，经审查后提交。基础 `tauri.conf.json` 的公钥保持空。签名配置只在 `--signed-update` 构建生效。
+2. 将生成的 `.pub` 文件的完整单行内容存入官方仓库的 Actions 变量 `DESKTOP_UPDATE_PUBLIC_KEY`。签名构建把该公钥固定在安装包中，上传前用同一构建配置校验产物签名。开发构建保持独立。
 3. 在官方仓库配置 Actions secrets `TAURI_SIGNING_PRIVATE_KEY`（私钥文件内容）和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。保护签名用的项目标签，只从已审查的提交构建。开发者和外部 PR 可直接运行测试。测试夹具仅包含一次性公钥和签名，私钥已销毁。
 
 Tauri 更新签名覆盖安装包及其 Desktop 版本。Windows Authenticode 和 SmartScreen 声誉需要单独的代码签名证书。密钥丢失或轮换时，通过官方 Release 提供带新公钥的手动安装包及迁移说明。

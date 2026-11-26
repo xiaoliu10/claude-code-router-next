@@ -145,7 +145,8 @@ fn verify_staged_release() {
     let signature = std::fs::read_to_string(dir.join(format!("{file}.sig"))).unwrap();
     assert_eq!(manifest["platforms"][TARGET]["signature"], signature.trim());
     let release: serde_json::Value =
-        serde_json::from_str(include_str!("../../tauri.updater.conf.json")).unwrap();
+        serde_json::from_slice(&std::fs::read("target/desktop-signing.conf.json").unwrap())
+            .unwrap();
     let updater = mock_updater(release["plugins"]["updater"]["pubkey"].as_str().unwrap());
     let update = checked_update(&updater, manifest).unwrap().unwrap();
     update
