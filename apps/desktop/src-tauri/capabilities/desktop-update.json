@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-update",
+  "description": "Check and confirm signed Desktop updates from the local main control center",
+  "windows": ["main"],
+  "permissions": [
+    "allow-desktop-update-status",
+    "allow-desktop-update-check",
+    "allow-desktop-update-install",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

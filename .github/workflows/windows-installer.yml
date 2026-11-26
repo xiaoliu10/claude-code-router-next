@@ -2,8 +2,25 @@ name: Windows installer
 
 on:
   workflow_dispatch:
+    inputs:
+      signed_release:
+        description: Build and attach signed Desktop assets to the draft release for this tag
+        type: boolean
+        default: false
+      notes:
+        description: Desktop release notes shown before installation
+        type: string
+  pull_request:
+    paths:
+      - 'apps/desktop/src-tauri/**'
+      - 'apps/desktop/scripts/*windows*'
+      - 'apps/desktop/scripts/desktop-update-release.mjs'
+      - '.github/workflows/windows-installer.yml'
   push:
     branches: [ci/windows-installer]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -42,18 +59,81 @@ jobs:
         working-directory: apps/desktop/src-tauri
         run: cargo test --locked --lib autostart::platform::isolated_registry_round_trip -- --exact --test-threads=1
 
+      - name: Test updater with loopback manifests and a signed test payload
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked --lib update::tests
+
+      - name: Test release manifest staging
+        run: node --test apps/desktop/tests/desktop-update-release.test.mjs
+
       - name: Install tauri-cli
-        run: cargo install tauri-cli --locked
+        run: cargo install tauri-cli --version 2.12.2 --locked
 
       - name: Build NSIS installer
+        if: inputs.signed_release != true
         working-directory: apps/desktop
         env:
           CI: "true"
         run: node scripts/build-standalone-windows.mjs
 
+      - name: Require an official project tag for signing
+        if: inputs.signed_release
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'xiaoliu10/claude-code-router-next' -or $env:GITHUB_REF -notmatch '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Dispatch the workflow on the official release tag' }
+
+      - name: Build signed NSIS installer
+        if: inputs.signed_release && github.ref_type == 'tag' && github.repository == 'xiaoliu10/claude-code-router-next'
+        working-directory: apps/desktop
+        env:
+          CI: 'true'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: node scripts/build-standalone-windows.mjs --signed-update
+
+      - name: Stage release assets
+        if: inputs.signed_release
+        env:
+          DESKTOP_NOTES: ${{ inputs.notes }}
+        run: node apps/desktop/scripts/desktop-update-release.mjs
+
+      - name: Verify the staged installer with the release public key
+        if: inputs.signed_release
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked --lib update::tests::verify_staged_release -- --exact --ignored
+
+      - name: Upload verified update assets
+        if: inputs.signed_release
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release
+          path: apps/desktop/src-tauri/target/desktop-release/
+          if-no-files-found: error
+
       - name: Upload installer artifact
+        if: inputs.signed_release != true
         uses: actions/upload-artifact@v4
         with:
           name: ccr-desktop-windows-x64
           path: apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
+
+  attach:
+    if: inputs.signed_release && github.ref_type == 'tag' && github.repository == 'xiaoliu10/claude-code-router-next'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-release
+          path: assets
+      - name: Attach verified assets to the matching draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release upload "$GITHUB_REF_NAME" assets/*.exe assets/*.sig --repo "$GITHUB_REPOSITORY"
+          gh release upload "$GITHUB_REF_NAME" assets/desktop-update.json --repo "$GITHUB_REPOSITORY"

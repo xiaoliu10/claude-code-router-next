@@ -61,7 +61,17 @@ if (!staged) {
 const stagedResources = path.join(srcTauriDir, "target", "release", "runtime");
 fs.rmSync(stagedResources, { recursive: true, force: true });
 
-run("cargo", ["tauri", "build", "--bundles", "nsis", "--no-sign"], { cwd: srcTauriDir });
+const bundleDir = path.join(srcTauriDir, "target", "release", "bundle", "nsis");
+fs.rmSync(bundleDir, { recursive: true, force: true });
+const signing = process.argv.includes("--signed-update");
+const options = signing ? ["--config", "tauri.updater.conf.json"] : ["--no-sign"];
+if (signing) {
+  const config = JSON.parse(fs.readFileSync(path.join(srcTauriDir, options[1]), "utf8"));
+  if (!config.plugins.updater.pubkey.trim() || !process.env.TAURI_SIGNING_PRIVATE_KEY) {
+    throw new Error("Signed updates require the pinned release public key and the signing private key");
+  }
+}
+run("cargo", ["tauri", "build", "--bundles", "nsis", ...options], { cwd: srcTauriDir });
 
 // Deterministic presence gate: tauri-build stages the resources mapping into
 // target/release before the installer packs it. If the tree collapsed (a
@@ -74,7 +84,6 @@ for (const rel of required) {
   }
 }
 
-const bundleDir = path.join(srcTauriDir, "target", "release", "bundle", "nsis");
 const installers = fs
   .readdirSync(bundleDir)
   .filter((name) => name.endsWith(".exe"))

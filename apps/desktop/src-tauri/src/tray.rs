@@ -598,9 +598,9 @@ impl Controller {
         self.wake.notify_one();
         let deadline = std::time::Instant::now() + SHUTDOWN_RACE_WAIT;
         loop {
-            let child = lock(&self.launcher).take();
-            if let Some(mut child) = child {
-                lifecycle::stop_owned_gateway(&mut child);
+            // The installer handoff and the regular exit hook can race. Keep the slot
+            // locked through termination so both paths observe a reaped child.
+            if stop_slot(&self.launcher).is_some() {
                 return;
             }
             // A startup in flight publishes the child synchronously at spawn;
@@ -614,6 +614,30 @@ impl Controller {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+    }
+
+    /// Hold off new starts until NSIS takes over. If Windows declines the launch,
+    /// restore service only when we stopped this desktop's own child.
+    pub async fn install_verified_update(
+        self: &Arc<Self>,
+        install: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<(), String> {
+        let operation = self.operation.lock().await;
+        let slot = Arc::clone(&self.launcher);
+        let stopped = tauri::async_runtime::spawn_blocking(move || stop_slot(&slot))
+            .await
+            .map_err(|_| "UPDATE_INSTALL_FAILED")?;
+        if stopped == Some(false) {
+            return Err("UPDATE_INSTALL_FAILED".into());
+        }
+        let result = tauri::async_runtime::spawn_blocking(install)
+            .await
+            .unwrap_or_else(|_| Err("UPDATE_INSTALL_FAILED".into()));
+        drop(operation);
+        if result.is_err() && stopped == Some(true) && !self.stopped.load(Ordering::SeqCst) {
+            let _ = self.action_start().await;
+        }
+        result
     }
 
     /// Service state for the control center header. No lock is held across the

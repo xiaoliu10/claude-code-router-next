@@ -35,6 +35,9 @@ fn main() {
             "service_snapshot",
             "service_action",
             "config_reload",
+            "desktop_update_status",
+            "desktop_update_check",
+            "desktop_update_install",
         ]),
     ))
     .expect("desktop build failed");
