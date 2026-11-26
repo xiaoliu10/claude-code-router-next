@@ -11,6 +11,8 @@
     "allow-quota-hide",
     "allow-quota-open-ui",
     "allow-quota-quit",
+    "allow-general-settings-snapshot",
+    "allow-general-settings-save",
     "allow-routing-snapshot",
     "allow-routing-save",
     "allow-routing-flags",

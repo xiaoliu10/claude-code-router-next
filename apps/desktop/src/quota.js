@@ -1278,6 +1278,7 @@
 
   function createPreviewInvoke() {
     var projectsPreview = typeof ProjectsUI !== 'undefined' ? ProjectsUI.createPreviewProjects() : null;
+    var settingsPreview = typeof GeneralSettingsUI !== 'undefined' ? GeneralSettingsUI.preview() : null;
     var rev = 1;
     var routing = {
       providers: [
@@ -1463,6 +1464,7 @@
     var STALE_MSG = '路由配置已被其他程序修改，请刷新后重试';
     return function (cmd, args) {
       var a = args && typeof args === 'object' ? args : {};
+      if (cmd.indexOf('general_settings_') === 0 && settingsPreview) return settingsPreview(cmd, args);
       if (cmd.indexOf('projects_') === 0 && projectsPreview) return projectsPreview(cmd, args);
       if (cmd.indexOf('plugin_') === 0 && pluginsPreview) return pluginsPreview.invoke(cmd, a);
       if (cmd === 'quota_snapshot') {
@@ -2162,6 +2164,7 @@
     var projectsCtrl = mode === 'missing' ? null : ProjectsUI.createProjectsController({ invoke: invoke });
     ProjectsUI.mount(document, projectsCtrl);
     var pluginsPanel = PluginsUI.mount(document, invoke);
+    var settings = GeneralSettingsUI.mount(document, invoke);
     var cards = new Map();
 
     function safeCommand(cmd) {
@@ -3081,7 +3084,7 @@
 
     // ---- tabs -------------------------------------------------------------
 
-    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects', 'plugins'];
+    var TAB_IDS = ['quota', 'routing', 'usage', 'clients', 'projects', 'plugins', 'settings'];
     var tabButtons = {};
     var panels = {};
     TAB_IDS.forEach(function (id) {
@@ -3132,6 +3135,7 @@
       if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); startUsageAutoRefresh(); }
       if (name === 'clients') clientsCtrl.refresh();
       if (name === 'plugins') pluginsPanel.load();
+      if (name === 'settings') settings.reload();
     }
 
     function selectTab(name) {

@@ -5,6 +5,8 @@ fn main() {
             "quota_hide",
             "quota_open_ui",
             "quota_quit",
+            "general_settings_snapshot",
+            "general_settings_save",
             "routing_snapshot",
             "routing_save",
             "routing_flags",

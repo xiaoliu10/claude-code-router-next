@@ -3,10 +3,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-const projectsJs = readFileSync(new URL('../src/projects.js', import.meta.url), 'utf8');
-const pluginsJs = readFileSync(new URL('../src/plugins.js', import.meta.url), 'utf8');
-const js = readFileSync(new URL('../src/quota.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../src/quota.html', import.meta.url), 'utf8');
+const scripts = [...html.matchAll(/<script src="([^"]+)" defer><\/script>/g)].map(([, src]) =>
+  readFileSync(new URL('../src/' + src, import.meta.url), 'utf8')).join('\n');
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 
 class Element {
@@ -114,7 +113,7 @@ export function harness(overrides = {}) {
     calls.push({ cmd, args });
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };
-  vm.runInNewContext(projectsJs + pluginsJs + js, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout,
+  vm.runInNewContext(scripts, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout,
     setInterval: (fn, ms) => { intervals.push([fn, ms]); return setInterval(fn, ms); },
     clearInterval: (t) => { cleared.push(t); clearInterval(t); } });
   doc.events.DOMContentLoaded();
