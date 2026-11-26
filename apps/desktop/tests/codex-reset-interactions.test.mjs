@@ -113,16 +113,142 @@ test('Removing eligibility invalidates an open confirmation even on a same-name 
   assert.equal(h.callsFor('codex_reset_consume').length, 0);
 });
 
+const creditList = (id, availableCount = 1) => ({ availableCount, credits: [{ id, status: 'available' }] });
+const quotaRow = (row, used, updatedAt) => ({ ...row, updatedAt, windows: [{ label: '5 小时', used, limit: 100 }] });
+const cardFor = (h, name) => h.id('list').querySelectorAll('.card').find(card => card.dataset.provider === name);
+function pending() {
+  let resolve, reject;
+  const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+for (const trigger of ['focus', 'refresh-all', 'card-refresh', 'focus on another tab']) {
+  test(`A same-name account change requires a new list and confirmation after ${trigger}`, async () => {
+    const freshQuota = pending(), freshList = pending();
+    let quotaReads = 0, listReads = 0;
+    const h = await start({
+      quota_snapshot: () => ++quotaReads === 1 ? snapshot() : freshQuota.promise,
+      codex_reset_credits: () => ++listReads === 1 ? creditList('account-a') : freshList.promise,
+      codex_reset_consume: () => ({ outcome: 'no_credit' }),
+    });
+    const panel = h.panel(), confirm = button(panel, '确认使用 1 张');
+    button(panel, '重置用量').click();
+    if (trigger === 'focus') h.focusWindow();
+    if (trigger === 'refresh-all') h.id('refresh-all').click();
+    if (trigger === 'card-refresh') cardFor(h, provider.name).querySelector('.card-refresh').click();
+    if (trigger === 'focus on another tab') {
+      h.id('tab-routing').click(); h.focusWindow(); h.id('tab-quota').click();
+    }
+    assert.equal(panel.querySelector('.client-confirm').hidden, true);
+    confirm.fire('click');
+    assert.equal(h.panel(), null);
+    assert.equal(h.callsFor('codex_reset_credits').length, 1);
+    freshQuota.resolve(snapshot()); await flush();
+    assert.equal(h.callsFor('codex_reset_credits').length, 2);
+    assert.equal(button(h.panel(), '重置用量').disabled, true);
+    freshList.resolve(creditList('account-b', 3)); await flush();
+    assert.match(h.panel().textContent, /3 张/);
+    confirm.fire('click');
+    assert.equal(h.callsFor('codex_reset_consume').length, 0);
+    button(h.panel(), '重置用量').click(); confirm.click(); await flush();
+    assert.deepEqual(h.callsFor('codex_reset_consume').map(c => c.args.creditId), ['account-b']);
+  });
+}
+
+test('Focus supersedes both a pending credit list and a pre-focus full snapshot', async () => {
+  const oldList = pending(), oldQuota = pending(), newQuota = pending();
+  const reads = [snapshot(), oldQuota.promise, newQuota.promise], lists = [oldList.promise, creditList('new', 2)];
+  const h = await start({ quota_snapshot: () => reads.shift(), codex_reset_credits: () => lists.shift(),
+    codex_reset_consume: () => ({ outcome: 'no_credit' }) });
+  h.id('refresh-all').click(); h.focusWindow(); await flush();
+  oldQuota.resolve(snapshot()); await flush();
+  assert.equal(h.panel(), null);
+  assert.equal(h.callsFor('codex_reset_credits').length, 1);
+  newQuota.resolve(snapshot()); await flush();
+  button(h.panel(), '重置用量').click();
+  oldList.resolve(creditList('obsolete', 8)); await flush();
+  assert.match(h.panel().textContent, /2 张/);
+  button(h.panel(), '确认使用 1 张').click(); await flush();
+  assert.deepEqual(h.callsFor('codex_reset_consume').map(c => c.args.creditId), ['new']);
+});
+
+test('A failed targeted read or a removed provider blocks redemption until eligibility is read again', async () => {
+  const failed = pending(), recovery = pending();
+  const reads = [snapshot(), failed.promise, { ...snapshot(), providers: [] }, recovery.promise];
+  const h = await start({ quota_snapshot: () => reads.shift(), codex_reset_credits: listing });
+  const panel = h.panel(), confirm = button(panel, '确认使用 1 张');
+  button(panel, '重置用量').click();
+  cardFor(h, provider.name).querySelector('.card-refresh').click();
+  assert.equal(h.panel(), null);
+  await flush(); failed.reject(Error('Provider is no longer configured')); await flush();
+  assert.match(cardFor(h, provider.name).querySelector('.card-error').textContent, /no longer configured/);
+  assert.equal(h.panel(), null);
+  confirm.fire('click');
+  h.id('refresh-all').click(); await flush();
+  assert.equal(cardFor(h, provider.name), undefined);
+  confirm.fire('click');
+  h.id('refresh-all').click(); await flush();
+  assert.equal(h.callsFor('codex_reset_credits').length, 1);
+  recovery.resolve(snapshot()); await flush();
+  assert.equal(button(h.panel(), '重置用量').disabled, false);
+  assert.equal(h.panel().querySelector('.client-confirm').hidden, true);
+  assert.equal(h.callsFor('codex_reset_credits').length, 2);
+  assert.equal(h.callsFor('codex_reset_consume').length, 0);
+});
+
+test('Reverse delivery preserves newer Codex eligibility, metadata and independent provider observations', async () => {
+  const alpha = { name: 'alpha' }, beta = { name: 'beta' };
+  const data = (stamp, eligible, a, b) => ({ online: true, updatedAt: stamp, providers: [
+    { ...provider, codexResetEligible: eligible }, quotaRow(alpha, a, a), quotaRow(beta, b, b),
+  ] });
+  const older = pending(), newer = pending();
+  const h = await start({ quota_snapshot: ({ provider: name }) => name === 'alpha' ? older.promise
+    : name === 'beta' ? newer.promise : data(1000, false, 1, 1) });
+  cardFor(h, 'alpha').querySelector('.card-refresh').click(); cardFor(h, 'beta').querySelector('.card-refresh').click();
+  newer.resolve(data(3000, true, 1, 22)); await flush();
+  const timestamp = h.id('updated-at').textContent;
+  button(h.panel(), '重置用量').click();
+  older.resolve(data(2000, false, 11, 1)); await flush();
+  assert.equal(h.id('updated-at').textContent, timestamp);
+  assert.equal(cardFor(h, 'alpha').querySelector('.window-pct').textContent, '11%');
+  assert.equal(cardFor(h, 'beta').querySelector('.window-pct').textContent, '22%');
+  assert.equal(h.panel().querySelector('.client-confirm').hidden, false);
+  assert.equal(h.callsFor('codex_reset_credits').length, 1);
+  assert.equal(h.callsFor('codex_reset_consume').length, 0);
+});
+
+test('A newer merged snapshot also retires a confirmation opened between parallel reads', async () => {
+  const first = pending(), second = pending();
+  const data = updatedAt => ({ online: true, updatedAt, providers: [provider, { name: 'a' }, { name: 'b' }] });
+  const lists = [creditList('initial'), creditList('a'), creditList('b')];
+  const h = await start({ quota_snapshot: ({ provider: name }) => name === 'a' ? first.promise
+    : name === 'b' ? second.promise : data(1), codex_reset_credits: () => lists.shift(),
+    codex_reset_consume: () => ({ outcome: 'no_credit' }) });
+  cardFor(h, 'a').querySelector('.card-refresh').click(); cardFor(h, 'b').querySelector('.card-refresh').click();
+  first.resolve(data(2)); await flush();
+  button(h.panel(), '重置用量').click();
+  second.resolve(data(3)); await flush();
+  assert.equal(h.panel().querySelector('.client-confirm').hidden, true);
+  button(h.panel(), '确认使用 1 张').fire('click');
+  assert.equal(h.callsFor('codex_reset_consume').length, 0);
+  button(h.panel(), '重置用量').click(); button(h.panel(), '确认使用 1 张').click(); await flush();
+  assert.deepEqual(h.callsFor('codex_reset_consume').map(c => c.args.creditId), ['b']);
+});
+
 test('A successful reset queues a fresh targeted quota read behind an older full snapshot', async () => {
   let quotaReads = 0, resolveFull, resolveConsume;
   const h = await start({
-    quota_snapshot: () => ++quotaReads === 2 ? new Promise(resolve => { resolveFull = resolve; }) : snapshot(),
+    quota_snapshot: ({ provider: name }) => ++quotaReads === 2 ? new Promise(resolve => { resolveFull = resolve; })
+      : snapshot(quotaRow(provider, name ? 0 : 93, quotaReads)),
     codex_reset_consume: () => new Promise(resolve => { resolveConsume = resolve; }),
   });
   button(h.panel(), '重置用量').click(); button(h.panel(), '确认使用 1 张').click();
+  const percent = () => cardFor(h, provider.name).querySelector('.window-pct').textContent;
+  assert.equal(percent(), '93%');
   h.id('refresh-all').click(); await flush();
   resolveConsume({ outcome: 'reset', windowsReset: 1 }); await flush();
   assert.equal(quotaReads, 2);
-  resolveFull(snapshot()); await flush();
+  resolveFull(snapshot(quotaRow(provider, 93, 2))); await flush();
+  assert.equal(percent(), '0%');
   assert.deepEqual(h.callsFor('quota_snapshot').map(c => c.args.provider), [null, null, provider.name]);
 });

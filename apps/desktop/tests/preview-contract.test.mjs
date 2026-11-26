@@ -597,7 +597,7 @@ test("wiring: quota tab keeps its original contract surface", () => {
 })
 
 test("wiring: focus-triggered refresh is quota-only (drafts must survive focus changes)", () => {
-  assert.match(js, /if \(activeTab === 'quota' && controller\) controller\.refreshAll\(\);/)
+  assert.match(js, /if \(activeTab === 'quota' && controller\) controller\.refreshAll\(true\);/)
   const syncRouteRow = js.slice(js.indexOf("function syncRouteRow"), js.indexOf("function buildRouteRow"))
   assert.match(syncRouteRow, /document\.activeElement !== refs\.target/, "focused routing inputs are never rewritten")
 })
