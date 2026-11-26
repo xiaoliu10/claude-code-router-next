@@ -2988,12 +2988,13 @@
     }
 
     function maybeLoadTab(name) {
-      if (mode === 'missing' || loadedTabs[name]) return;
+      if (mode === 'missing') return;
+      if (name === 'projects') { projectsCtrl.refresh(); return; }
+      if (loadedTabs[name]) return;
       loadedTabs[name] = true;
       if (name === 'routing') routingCtrl.refresh();
       if (name === 'usage') { usageCtrl.refresh(); recordsCtrl.refresh(); startUsageAutoRefresh(); }
       if (name === 'clients') clientsCtrl.refresh();
-      if (name === 'projects') projectsCtrl.refresh();
       if (name === 'plugins') pluginsPanel.load();
     }
 
@@ -3083,7 +3084,10 @@
     if (controller) {
       controller.subscribe(render);
       render(controller.state());
-      els.refreshAll.addEventListener('click', function () { controller.refreshAll(); });
+      els.refreshAll.addEventListener('click', function () {
+        controller.refreshAll();
+        if (activeTab === 'projects' && projectsCtrl) projectsCtrl.refresh();
+      });
       els.list.addEventListener('click', function (event) {
         var target = event.target && event.target.closest ? event.target : null;
         if (!target) return;
@@ -3151,10 +3155,10 @@
         else safeCommand('quota_hide');
       }
     });
-    // Focus refreshes service status and quota data only; route drafts and
-    // usage/client state must survive native select popups and tab changes.
+    // The web UI can change project settings while the desktop is unfocused.
     window.addEventListener('focus', function () {
       if (serviceCtrl) serviceCtrl.refresh();
+      if (activeTab === 'projects' && projectsCtrl) projectsCtrl.refresh();
       if (activeTab === 'quota' && controller) controller.refreshAll();
       if (activeTab === 'quota' && credentialsCtrl) credentialsCtrl.refresh();
     });

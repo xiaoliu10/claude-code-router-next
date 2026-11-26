@@ -57,6 +57,29 @@ test('projects interaction: failed save retains draft; late save cannot select a
   select(h, 'a'); assert.match(h.id('projects-msg').textContent, /操作失败/); assert.equal(byLabel(h, '默认 目标').value, 'alpha,two');
 });
 
+test('external web takeover changes appear on focus, tab re-entry and refresh all', async () => {
+  const { h, state } = await start();
+  const pi = () => byLabel(h, 'Pi').checked;
+  const external = enabled => { state.projects[0].takeoverClients = enabled ? ['claudeCode', 'pi'] : ['claudeCode']; };
+  assert.equal(pi(), false);
+  // A draft that the operator returned to its original state is clean.
+  toggle(h, 'Pi', true); toggle(h, 'Pi', false);
+  external(true); h.focusWindow(); await flush(); assert.equal(pi(), true);
+  h.id('tab-routing').click(); external(false); h.id('tab-projects').click(); await flush(); assert.equal(pi(), false);
+  external(true); h.id('refresh-all').click(); await flush(); assert.equal(pi(), true);
+  assert.equal(h.calls.filter(c => ['projects_takeover', 'projects_save'].includes(c.cmd)).length, 0);
+});
+
+test('external takeover changes appear alongside a dirty route draft and preserve the conflict warning', async () => {
+  const { h, state } = await start();
+  toggle(h, '使用全局路由', false); type(h, '默认 目标', 'alpha,two');
+  state.projects[0].takeoverClients.push('pi'); state.projects[0].revision = 'a2';
+  h.focusWindow(); await flush();
+  assert.equal(byLabel(h, 'Pi').checked, true);
+  assert.equal(byLabel(h, '默认 目标').value, 'alpha,two');
+  assert.match(h.id('projects-msg').textContent, /外部更新/);
+});
+
 test('projects interaction: restore global and takeover each require their explicit action', async () => {
   const state = fixture();
   const { h } = await start({
