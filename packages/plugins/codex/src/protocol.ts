@@ -690,13 +690,17 @@ export interface CodexResetConsumeResult {
   windowsReset: number;
 }
 
+export function isCodexResetCreditId(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 256 && !!value.trim() && !/[\x00-\x1f\x7f-\x9f]/.test(value);
+}
+
 const RESET_CREDIT_TITLES: Record<string, string> = {
   codex_rate_limits: "Full reset",
 };
 
 function parseResetCredit(raw: any): CodexResetCredit | null {
   if (!raw || typeof raw !== "object") return null;
-  if (typeof raw.id !== "string" || !raw.id || raw.id.length > 256) return null;
+  if (!isCodexResetCreditId(raw.id)) return null;
   if (typeof raw.status !== "string" || !raw.status || raw.status.length > 32) return null;
   const expires = typeof raw.expires_at === "string" && raw.expires_at ? Date.parse(raw.expires_at) : NaN;
   const title = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim().slice(0, 200)

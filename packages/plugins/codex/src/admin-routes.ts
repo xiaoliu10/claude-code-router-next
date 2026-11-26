@@ -1,5 +1,5 @@
 /**
- * Codex subscription — ten local-only, explicit user-action admin routes
+ * Codex subscription — local-only, explicit user-action admin routes
  * under the `/api/codex` namespace (the manifest name is `codex`, and the UI
  * bridge builds `/api` + `/codex${path}`).
  *
@@ -13,6 +13,9 @@
  *  POST /disconnect      {}
  *  POST /models/hide     {model}            (blacklist one model)
  *  POST /models/restore  {model?}           (no model = restore ALL)
+ *  GET  /reset-credits
+ *  POST /reset-credits/consume {creditId?}
+ *  POST /reset-credits/consume-confirmed {creditId}
  *
  * Guard shape is identical to the gemini-oauth / workbuddy plugins: the loopback
  * socket address is the only trustworthy identity, plus a Host/Origin allowlist
@@ -26,7 +29,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import type { CodexAuthService } from "./auth-service";
-import { codexAdminError, isCodexModelId } from "./protocol";
+import { codexAdminError, isCodexModelId, isCodexResetCreditId } from "./protocol";
 
 export interface CodexAdminRouteDeps {
   /** Resolved per request so tests and late wiring stay race-free. */
@@ -325,9 +328,7 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
   });
 
   /**
-   * Consume ONE gifted reset credit — the only mutating reset path, invoked
-   * exclusively from the card's confirmation dialog. Never called by mount,
-   * polling or quota refresh.
+   * Legacy card confirmation: omitted creditId allows upstream selection.
    */
   app.post("/api/codex/reset-credits/consume", async (req: any, reply: any) => {
     try {
@@ -347,6 +348,23 @@ export function registerCodexAdminRoutes(app: FastifyInstance, deps: CodexAdminR
       return { ok: true, success: true, ...result };
     } catch (error: any) {
       return codexRouteError(error, reply, "reset-credits/consume", "codex_reset_failed");
+    }
+  });
+
+  app.post("/api/codex/reset-credits/consume-confirmed", async (req, reply) => {
+    try {
+      assertLocalCodexRequest(req);
+      const service = deps.getService();
+      if (!service) {
+        reply.status(503);
+        return { ok: false, success: false, error: "codex_request_failed" };
+      }
+      const creditId = (req.body as { creditId?: unknown } | null)?.creditId;
+      if (!isCodexResetCreditId(creditId)) throw codexAdminError("codex_reset_invalid", 422);
+      const result = await service.consumeConfirmedResetCredit(creditId);
+      return { ok: true, success: true, ...result };
+    } catch (error: any) {
+      return codexRouteError(error, reply, "reset-credits/consume-confirmed", "codex_reset_failed");
     }
   });
 

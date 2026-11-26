@@ -20,8 +20,8 @@ import {
   CodexAuthService, CodexCredentialStore,
 } from "../src/auth-service";
 import {
-  CODEX_CHATGPT_ORIGIN, CODEX_RESET_CONSUME_PATH, CODEX_RESET_CREDITS_PATH,
-  consumeCodexResetCredit, fetchCodexResetCredits, parseCodexResetCredits,
+  CODEX_CHATGPT_ORIGIN, CODEX_FETCH_TIMEOUT_MS, CODEX_RESET_CONSUME_PATH, CODEX_RESET_CREDITS_PATH,
+  CODEX_TOKEN_PATH, CODEX_WHAM_USAGE_PATH, consumeCodexResetCredit, fetchCodexResetCredits, parseCodexResetCredits,
 } from "../src/protocol";
 import { parseCodexResetConsume, parseCodexResetCredits as parseCardCredits } from "../src/card-types";
 import { codexLocales } from "../src/locales";
@@ -149,26 +149,31 @@ afterEach(async () => {
 async function connected(opts: {
   consume?: (body: any) => Response | Promise<Response>;
   listing?: () => Response | Promise<Response>;
+  usage?: () => Response | Promise<Response>;
+  refresh?: () => Response | Promise<Response>;
+  now?: () => number;
 } = {}) {
   const dir = await fs.mkdtemp(join(tmpdir(), "codex-reset-"));
   dirs.push(dir);
   const store = new CodexCredentialStore(join(dir, "codex-credentials.json"));
+  const now = opts.now?.() ?? Date.now();
   await store.save({
     version: 1, kind: "codex-subscription",
     account: {
       accessToken: freshAccess(), refreshToken: "rt", idToken: jwt({}),
       accountId: "acct_1", email: "u@example.invalid", plan: "pro",
       connectedAt: new Date().toISOString(),
-      accessExp: Date.now() + 7_200_000, lastError: null,
+      accessExp: now + 7_200_000, lastError: null,
     },
     models: [], hiddenModels: [],
   } as any);
-  const calls: Array<{ url: string; method: string; body?: any }> = [];
-  let listingCount = opts.listing ? 0 : 0;
+  const calls: Array<{ url: string; method: string; body?: any; headers: Record<string, string> }> = [];
+  let listingCount = 0;
   const impl = vi.fn(async (url: string, init?: any) => {
     const method = init?.method ?? "GET";
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-    calls.push({ url, method, body });
+    calls.push({ url, method, body, headers: init?.headers });
+    if (url.endsWith(CODEX_TOKEN_PATH) && opts.refresh) return opts.refresh();
     if (url.endsWith(CODEX_RESET_CREDITS_PATH)) {
       listingCount += 1;
       return opts.listing ? opts.listing() : json(LISTING);
@@ -176,7 +181,7 @@ async function connected(opts: {
     if (url.endsWith(CODEX_RESET_CONSUME_PATH)) {
       return opts.consume ? opts.consume(body) : json({ code: "reset", windows_reset: 2 });
     }
-    if (url.includes("/wham/usage")) return json({ plan_type: "pro", rate_limit: {} });
+    if (url.endsWith(CODEX_WHAM_USAGE_PATH)) return opts.usage ? opts.usage() : json({ plan_type: "pro", rate_limit: {} });
     throw new Error(`unexpected upstream call: ${method} ${url}`);
   });
   const host = {
@@ -187,12 +192,25 @@ async function connected(opts: {
     getDirectDispatcher: vi.fn(() => ({})),
   };
   const service = new CodexAuthService({
-    configDir: dir, host: host as any, fetchImpl: impl, store,
+    configDir: dir, host: host as any, fetchImpl: impl, store, now: opts.now,
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
   });
   services.push(service);
   const consumeCalls = () => calls.filter(c => c.url.endsWith(CODEX_RESET_CONSUME_PATH));
-  return { service, calls, consumeCalls, impl, listingReads: () => listingCount };
+  const switchAccount = async () => {
+    const before = (await store.load())!;
+    await store.save({ ...before, account: {
+      ...before.account, accountId: "acct_2", accessToken: jwt({ fixture: "second-account" }),
+      refreshToken: "rt2", connectedAt: new Date(Date.parse(before.account.connectedAt) + 1000).toISOString(),
+    } });
+  };
+  return { service, calls, consumeCalls, impl, store, switchAccount, listingReads: () => listingCount };
+}
+
+function responseGate() {
+  let release!: (response: Response) => void;
+  const promise = new Promise<Response>(resolve => { release = resolve; });
+  return { promise, release };
 }
 
 describe("reset credits — service", () => {
@@ -300,7 +318,7 @@ describe("reset credits — service", () => {
     await h.service.disconnect();
     expect((h.service as any).spentResetCredits.size).toBe(0);
     expect((h.service as any).resetCache).toBeNull();
-    expect((h.service as any).pendingReset).toBeNull();
+    expect((h.service as any).pendingReset.size).toBe(0);
   });
 
   it("locally spent credit cannot be re-consumed after a lost response", async () => {
@@ -344,6 +362,183 @@ describe("reset credits — service", () => {
     await expect(h.service.consumeResetCredit()).rejects.toMatchObject({ code: "codex_reauth_required", statusCode: 422 });
     await h.service.disconnect();
     await expect(h.service.consumeResetCredit()).rejects.toMatchObject({ code: "codex_not_connected", statusCode: 409 });
+  });
+});
+
+describe("consumeConfirmedResetCredit", () => {
+  const beforeExpiry = Date.parse("2026-11-30T23:59:59Z");
+
+  it("rereads upstream even within the 60s display TTL and rejects an expired selection", async () => {
+    let now = beforeExpiry;
+    const h = await connected({ now: () => now });
+    expect((await h.service.getResetCredits())?.credits[0].status).toBe("available");
+    now += 2_000;
+    expect((await h.service.getResetCredits())?.credits[0].status).toBe("available");
+    expect(h.listingReads()).toBe(1);
+    await expect(h.service.consumeConfirmedResetCredit("credit-old")).rejects.toMatchObject({ code: "codex_reset_no_credit" });
+    expect(h.listingReads()).toBe(2);
+    expect(h.consumeCalls()).toHaveLength(0);
+  });
+
+  it.each([
+    ["count without the selected ID", { available_count: 1, credits: [] }, 200, "codex_reset_no_credit"],
+    ["duplicate selected ID", { ...LISTING, credits: [LISTING.credits[0], LISTING.credits[0]] }, 200, "codex_reset_no_credit"],
+    ["unreadable listing", { error: "upstream unavailable" }, 503, "codex_reset_unavailable"],
+  ] as const)("fails closed on %s", async (_label, listing, status, code) => {
+    const h = await connected({ listing: () => json(listing, status), now: () => beforeExpiry });
+    await expect(h.service.consumeConfirmedResetCredit("credit-old")).rejects.toMatchObject({ code });
+    expect(h.consumeCalls()).toHaveLength(0);
+  });
+
+  it("uses one refreshed token and account for GET and POST, then returns without a recount", async () => {
+    const rotated = jwt({ exp: beforeExpiry / 1000 + 7200, fixture: "rotated" });
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const h = await connected({ now: () => beforeExpiry, refresh: () => json({
+      access_token: rotated, refresh_token: "rotated", id_token: jwt({}),
+    }) });
+    const data = (await h.store.load())!;
+    await h.store.save({ ...data, account: { ...data.account, accessExp: beforeExpiry } });
+    const result = await h.service.consumeConfirmedResetCredit("credit-old");
+    expect(result).toEqual({ outcome: "reset", windowsReset: 2 });
+    expect(h.calls.map(c => [c.method, new URL(c.url).pathname])).toEqual([
+      ["POST", CODEX_TOKEN_PATH], ["GET", CODEX_RESET_CREDITS_PATH], ["POST", CODEX_RESET_CONSUME_PATH],
+    ]);
+    expect(timeout.mock.calls).toEqual(Array.from({ length: 3 }, () => [CODEX_FETCH_TIMEOUT_MS]));
+    const [, listing, consume] = h.calls;
+    expect(listing.headers.Authorization).toBe(`Bearer ${rotated}`);
+    expect(listing.headers["chatgpt-account-id"]).toBe("acct_1");
+    expect(consume.headers.Authorization).toBe(listing.headers.Authorization);
+    expect(consume.headers["chatgpt-account-id"]).toBe(listing.headers["chatgpt-account-id"]);
+    expect(consume.body.credit_id).toBe("credit-old");
+    await h.service.getResetCredits();
+    expect(h.listingReads()).toBe(2);
+  });
+
+  it("shares the synchronous consume latch with the legacy route during fresh validation", async () => {
+    const gate = responseGate();
+    const h = await connected({ listing: () => gate.promise, now: () => beforeExpiry });
+    const first = h.service.consumeConfirmedResetCredit("credit-old");
+    await vi.waitFor(() => expect(h.listingReads()).toBe(1));
+    await expect(h.service.consumeResetCredit()).rejects.toMatchObject({ code: "codex_reset_busy" });
+    await expect(h.service.consumeConfirmedResetCredit("credit-new")).rejects.toMatchObject({ code: "codex_reset_busy" });
+    expect(h.consumeCalls()).toHaveLength(0);
+    gate.release(json(LISTING));
+    expect((await first).outcome).toBe("reset");
+    expect(h.consumeCalls()).toHaveLength(1);
+  });
+
+  it("keeps the same key after an unknown POST and retries only if fresh listing verifies the ID", async () => {
+    let listing: unknown = LISTING;
+    let status = 200;
+    let failed = false;
+    const h = await connected({
+      listing: () => json(listing, status), now: () => beforeExpiry,
+      consume: () => {
+        if (!failed) { failed = true; throw new Error("connection lost"); }
+        return json({ code: "already_redeemed", windows_reset: 0 });
+      },
+    });
+    await expect(h.service.consumeConfirmedResetCredit("credit-old")).rejects.toMatchObject({ code: "codex_reset_unavailable" });
+    listing = { available_count: 1, credits: [LISTING.credits[1]] };
+    await expect(h.service.consumeConfirmedResetCredit("credit-old")).rejects.toMatchObject({ code: "codex_reset_unavailable" });
+    status = 503;
+    await expect(h.service.consumeConfirmedResetCredit("credit-old")).rejects.toMatchObject({ code: "codex_reset_unavailable" });
+    expect(h.consumeCalls()).toHaveLength(1);
+    status = 200;
+    listing = LISTING;
+    expect((await h.service.consumeConfirmedResetCredit("credit-old")).outcome).toBe("already_redeemed");
+    expect(h.listingReads()).toBe(4);
+    expect(h.consumeCalls()[1].body).toEqual(h.consumeCalls()[0].body);
+  });
+
+  it("does not reuse an unsettled redeem key on another account", async () => {
+    let failed = false;
+    const h = await connected({ now: () => beforeExpiry, consume: () => {
+      if (!failed) { failed = true; return json({ code: "unknown" }); }
+      return json({ code: "reset", windows_reset: 2 });
+    } });
+    await expect(h.service.consumeConfirmedResetCredit("credit-old")).rejects.toMatchObject({ code: "codex_reset_unavailable" });
+    await h.switchAccount();
+    expect((await h.service.consumeConfirmedResetCredit("credit-old")).outcome).toBe("reset");
+    const [old, current] = h.consumeCalls();
+    expect(old.headers["chatgpt-account-id"]).toBe("acct_1");
+    expect(current.headers["chatgpt-account-id"]).toBe("acct_2");
+    expect(current.body.redeem_request_id).not.toBe(old.body.redeem_request_id);
+  });
+
+  it("does not consume after switching accounts while validation is in flight", async () => {
+    const gate = responseGate();
+    const h = await connected({ listing: () => gate.promise, now: () => beforeExpiry });
+    const result = h.service.consumeConfirmedResetCredit("credit-old");
+    const rejected = expect(result).rejects.toMatchObject({ code: "codex_not_connected" });
+    await vi.waitFor(() => expect(h.listingReads()).toBe(1));
+    await h.switchAccount();
+    gate.release(json(LISTING));
+    await rejected;
+    expect(h.consumeCalls()).toHaveLength(0);
+  });
+
+  it("cannot apply an old account POST outcome to the new account's cached allowance", async () => {
+    const gate = responseGate();
+    let consumeStarted = false;
+    const h = await connected({ now: () => beforeExpiry, consume: () => {
+      if (!consumeStarted) { consumeStarted = true; return gate.promise; }
+      return json({ code: "reset", windows_reset: 1 });
+    } });
+    const result = h.service.consumeConfirmedResetCredit("credit-old");
+    const rejected = expect(result).rejects.toMatchObject({ code: "codex_not_connected" });
+    await vi.waitFor(() => expect(h.consumeCalls()).toHaveLength(1));
+    await h.switchAccount();
+    const currentListing = await h.service.getResetCredits();
+    gate.release(json({ code: "reset", windows_reset: 2 }));
+    await rejected;
+    expect(await h.service.getResetCredits()).toEqual(currentListing);
+    expect(h.listingReads()).toBe(2);
+    expect((await h.service.consumeConfirmedResetCredit("credit-old")).outcome).toBe("reset");
+  });
+
+  it("discards an old listing response after a new account has populated its cache", async () => {
+    const gate = responseGate();
+    let reads = 0;
+    const h = await connected({ listing: () => ++reads === 1 ? gate.promise : json({ available_count: 0, credits: [] }) });
+    const oldListing = h.service.getResetCredits();
+    await vi.waitFor(() => expect(h.listingReads()).toBe(1));
+    await h.switchAccount();
+    expect(await h.service.getResetCredits()).toEqual({ availableCount: 0, credits: [] });
+    gate.release(json(LISTING));
+    expect(await oldListing).toBeNull();
+    expect(await h.service.getResetCredits()).toEqual({ availableCount: 0, credits: [] });
+    expect(h.listingReads()).toBe(2);
+  });
+
+  it("detaches late usage and listing flights when upstream confirms the reset", async () => {
+    const lateUsage = responseGate();
+    const lateListing = responseGate();
+    let usageReads = 0;
+    let listingReads = 0;
+    const h = await connected({ now: () => beforeExpiry,
+      usage: () => ++usageReads === 1 ? lateUsage.promise : json({ plan_type: "pro" }),
+      listing: () => {
+        listingReads++;
+        if (listingReads === 1) return lateListing.promise;
+        return json(listingReads === 2 ? LISTING : { available_count: 0, credits: [] });
+      },
+    });
+    const oldUsage = h.service.getUsage();
+    const oldListing = h.service.getResetCredits();
+    await vi.waitFor(() => expect([usageReads, listingReads]).toEqual([1, 1]));
+    expect(await h.service.consumeConfirmedResetCredit("credit-old")).toEqual({ outcome: "reset", windowsReset: 2 });
+    expect(listingReads).toBe(2);
+    expect(await h.service.getUsage()).toEqual({ plan: "pro" });
+    expect(await h.service.getResetCredits()).toEqual({ availableCount: 0, credits: [] });
+    lateUsage.release(json({ plan_type: "old" }));
+    lateListing.release(json(LISTING));
+    expect(await oldUsage).toBeNull();
+    expect(await oldListing).toBeNull();
+    expect(await h.service.getUsage()).toEqual({ plan: "pro" });
+    expect(await h.service.getResetCredits()).toEqual({ availableCount: 0, credits: [] });
+    expect([usageReads, listingReads]).toEqual([2, 3]);
+    expect((await h.store.load())?.account.plan).toBe("pro");
   });
 });
 
