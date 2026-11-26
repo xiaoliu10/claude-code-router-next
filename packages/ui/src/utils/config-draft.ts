@@ -16,3 +16,16 @@ export function refreshConfigDraft(current: ConfigDraft, server: ConfigSnapshot,
   // unrelated fields in the latest GET, so keep the original precondition.
   return merge ? { ...current, config: merge(current.config, server.config) } : current;
 }
+
+// Takeover actions update client settings and may add model aliases. Other
+// fields still belong to the open draft until the user saves or reloads it.
+export function mergeClientConfig(current: Config, server: Config): Config {
+  return {
+    ...current,
+    Clients: server.Clients,
+    Router: {
+      ...current.Router,
+      models: { ...current.Router?.models, ...server.Router?.models },
+    },
+  };
+}

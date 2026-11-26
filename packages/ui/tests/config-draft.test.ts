@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Config } from '../src/types.ts';
-import { openConfigDraft, refreshConfigDraft } from '../src/utils/config-draft.ts';
+import { mergeClientConfig, openConfigDraft, refreshConfigDraft } from '../src/utils/config-draft.ts';
 
 Object.assign(globalThis, {
   localStorage: { getItem: () => null },
@@ -75,3 +75,40 @@ test('only a clean draft adopts a full background snapshot and its revision toge
   const dirty = { ...clean, config: { ...original, PORT: 5000 } };
   assert.equal(refreshConfigDraft(dirty, latest), dirty);
 });
+
+for (const dirty of [false, true]) {
+  test(`client takeover refresh reconciles a ${dirty ? 'dirty' : 'clean'} draft before ordinary save`, async (t) => {
+    const base = openConfigDraft({ config: original, revision: revisionA });
+    const server = {
+      ...original, HOST: 'changed-on-server', Clients: { codex: { enabled: true } },
+      Router: { default: 'server,default', models: { codex: 'server,alias' } },
+    };
+    const current = dirty ? {
+      ...base, config: { ...original, PORT: 5000, Router: { default: 'local,default', models: { local: 'local,alias' } } },
+    } : base;
+    const client = new ApiClient();
+    let writes = 0;
+    t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+      if (init.method === 'GET') return Response.json(server, { headers: { 'X-CCR-Config-Revision': revisionB } });
+      assert.equal(init.method, 'PUT');
+      const { config, revision } = JSON.parse(init.body as string);
+      assert.equal(config.LOG, true);
+      assert.deepEqual(config.Clients, server.Clients);
+      assert.equal(revision, dirty ? revisionA : revisionB);
+      writes++;
+      if (dirty) {
+        assert.equal(config.PORT, 5000);
+        assert.equal(config.HOST, original.HOST);
+        assert.deepEqual(config.Router, { default: 'local,default', models: { local: 'local,alias', codex: 'server,alias' } });
+        return Response.json({ success: false }, { status: 409 });
+      }
+      assert.deepEqual(config, { ...server, LOG: true });
+      return Response.json({ success: true });
+    });
+    const refreshed = refreshConfigDraft(current, await client.getConfigSnapshot(), mergeClientConfig);
+    const save = client.updateConfig({ ...refreshed.config, LOG: true }, refreshed.base.revision);
+    if (dirty) await assert.rejects(save, { status: 409 });
+    else assert.equal((await save).success, true);
+    assert.equal(writes, 1);
+  });
+}

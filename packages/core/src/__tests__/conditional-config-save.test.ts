@@ -103,6 +103,28 @@ describe("conditional /api/config save", () => {
     expect(configIO.readConfigFile).not.toHaveBeenCalled();
   });
 
+  it("keeps the Web route when a credential PUT uses its earlier GET revision", async () => {
+    const initialEntry = {
+      ...initial.Providers[0], api_base_url: "https://ark.cn-beijing.volces.com/api/coding/v3",
+      models: ["test", "other"], quotaSecretKey: "$QUOTA_TEST_KEY",
+    };
+    writeFileSync(file, JSON.stringify({ ...initial, Providers: [initialEntry] }));
+    const get = await server.app.inject({ method: "GET", url });
+    const revision = get.headers["x-ccr-config-revision"];
+    const config = get.json();
+    const web = { ...config, Router: { default: "sample,other" } };
+    const credentials = { ...config, Providers: [{ ...initialEntry, quotaSecretKey: "fixture-rotation" }] };
+    const webSave = await server.app.inject({
+      method: "PUT", url, headers: { "x-ccr-preserve-quota-credentials": "1" }, payload: { config: web, revision },
+    });
+    expect(webSave.statusCode).toBe(200);
+    const staleSave = await server.app.inject({ method: "PUT", url, payload: { config: credentials, revision } });
+    expect(staleSave.statusCode).toBe(409);
+    expect(readRaw()).toEqual(web);
+    expect(configIO.writeConfigFile).toHaveBeenCalledOnce();
+    expect(configIO.backupConfigFile).toHaveBeenCalledOnce();
+  });
+
   it("hot-reloads the committed revision when a save is already in progress", async () => {
     const get = await server.app.inject({ method: "GET", url });
     const revision = get.headers["x-ccr-config-revision"];
