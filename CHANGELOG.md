@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.3.2440] - 2026-11-27
+
+### English
+
+Windows x64 Desktop 0.1.4 is available as a signed update to 0.1.3. Open Settings to check for the update, then choose Update now.
+
+### 中文
+
+Windows x64 桌面客户端 0.1.4 提供从 0.1.3 升级的签名更新。在设置里检查更新后，点击「立即更新」即可安装。
+
 ## [2.3.2439] - 2026-11-27
 
 ### English
