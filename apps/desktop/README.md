@@ -67,6 +67,10 @@ node --test apps/desktop/tests/runtime-staging.test.mjs   # 脚本纯函数测�
 
 桌面编辑器使用供应商名称定位配置。为保留全局及项目路由对该名称的引用，现有供应商的名称只读。可修改地址、密钥、模型及供应商级转换器；留空密钥或保持转换器不变会保留最新配置。只有网关目录明确支持参数的转换器可配置参数。地址查询仅支持数字版本（如 `?version=1`）或日期版本（如 `?api-version=2024-10-21`，可带 `-preview`）。系统托管的供应商由对应插件管理。
 
+## Codex 订阅重置卡
+
+在桌面主窗口的「额度」页打开 Codex 订阅卡，可查看账号可用的重置卡。需要恢复订阅限额时，选择重置用量并确认使用一张。若有多张，优先使用最早到期的一张。重置成功后，卡片会重新读取剩余次数和订阅额度。
+
 ## Coding Plan 用量凭证
 
 额度页中 `api_base_url` 命中 `ark.cn-beijing.volces.com` 且路径含 `/api/coding/` 的提供方（与 core 火山 Coding Plan adapter 同一条件）会显示「用量凭证」按钮；未配置时卡片提示「未配置 AK/SK，无法查询套餐用量」。内联面板提供两个 password 输入（AccessKey ID / Secret AccessKey），已保存的凭证不回显：留空保存=不修改，「清除凭证」显式清空。

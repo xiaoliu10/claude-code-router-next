@@ -86,6 +86,11 @@
       }) : [],
     };
   }
+  var CODEX_PROVIDER_NAME = 'codex-subscription';
+  var RESET_UPGRADE_MESSAGE = '请先更新 Codex 订阅插件，再使用重置卡。';
+  function isAccountRevision(value) {
+    return typeof value === 'string' && value.length === 36 && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
+  }
   function normalizeProvider(p) {
     var s = p && typeof p === 'object' ? p : {};
     return {
@@ -94,6 +99,7 @@
       plan: toStr(s.plan),
       status: typeof s.status === 'string' ? s.status : null,
       message: toStr(s.message),
+      ...(s.codexResetEligible === true && s.enabled === true && s.name === CODEX_PROVIDER_NAME ? { codexResetEligible: true } : {}),
       ...(s.stepPlan ? { stepPlan: normalizeStepPlan(s.stepPlan) } : {}),
       windows: Array.isArray(s.windows) ? s.windows.map(normalizeWindow) : [],
       updatedAt: toNum(s.updatedAt),
@@ -174,6 +180,7 @@
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createController: 需要 invoke 函数');
     var snapshot = null, fullError = null, loadingAll = false, allPromise = null, epoch = 0;
+    var requestId = 0, codexResetFresh = false;
     var seq = new Map();
     var flags = new Map(); // name -> { loading, error }
     var listeners = new Set();
@@ -183,7 +190,7 @@
         var f = flags.get(p.name) || {};
         return { provider: p, stale: !snapshot.online || fullError !== null, loading: f.loading === true, cardError: toStr(f.error) };
       }) : [];
-      return { snapshot: snapshot, rows: rows, count: snapshot ? snapshot.providers.length : null, loadingAll: loadingAll, fullError: fullError };
+      return { snapshot: snapshot, rows: rows, count: snapshot ? snapshot.providers.length : null, loadingAll: loadingAll, fullError: fullError, codexResetFresh: codexResetFresh };
     }
     function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
     function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
@@ -202,9 +209,17 @@
       });
     }
 
+    function olderSnapshot(next, prev) {
+      return prev && next.updatedAt !== null && prev.updatedAt !== null && next.updatedAt < prev.updatedAt;
+    }
+    function newerObservation(row, old) {
+      return row.updatedAt !== null && (old.updatedAt === null || row.updatedAt > old.updatedAt);
+    }
     function applyFull(result) {
-
-      snapshot = normalizeSnapshot(result);
+      var next = normalizeSnapshot(result);
+      if (olderSnapshot(next, snapshot)) return;
+      snapshot = next;
+      codexResetFresh = true;
       fullError = null;
       var names = [];
       snapshot.providers.forEach(function (p) { names.push(p.name); });
@@ -214,35 +229,47 @@
       });
     }
 
-    function applyMerged(result) {
+    function applyMerged(result, name) {
       var next = normalizeSnapshot(result);
       var prev = snapshot;
       // Rust serializes refreshes, but IPC responses can land in a different order.
-      if (prev && next.updatedAt !== null && prev.updatedAt !== null && next.updatedAt < prev.updatedAt &&
-          next.providers.some(function (p) { return p.stepPlan; })) return;
+      if (olderSnapshot(next, prev)) {
+        // A late individual read may still carry a newer quota observation for its own row.
+        // Membership, account projections and snapshot metadata belong to the newer snapshot.
+        var row = findProvider(next.providers, name), current = findProvider(prev.providers, name);
+        if (row && current && name !== CODEX_PROVIDER_NAME && !row.stepPlan && !current.stepPlan &&
+            row.enabled === current.enabled && newerObservation(row, current)) {
+          snapshot = { ...prev, providers: prev.providers.map(function (p) { return p === current ? row : p; }) };
+        }
+        return;
+      }
       if (prev) {
         next.providers = next.providers.map(function (p) {
           var f = flags.get(p.name);
 
           if (!f || !f.loading) return p;
           var old = findProvider(prev.providers, p.name);
-          return old && !old.stepPlan && !p.stepPlan ? old : p;
+          if (!old || old.stepPlan || p.stepPlan || p.name === CODEX_PROVIDER_NAME || p.enabled !== old.enabled) return p;
+          if (olderSnapshot(prev, next) && newerObservation(p, old)) return p;
+          return old;
         });
       }
       snapshot = next;
+      codexResetFresh = true;
       fullError = null;
       var names = [];
       snapshot.providers.forEach(function (p) { names.push(p.name); });
       syncFlags(names);
     }
 
-    function refreshAll() {
-      if (loadingAll) return allPromise;
+    function refreshAll(afterFocus) {
+      if (loadingAll && !afterFocus) return allPromise;
       loadingAll = true;
+      codexResetFresh = false;
       fullError = null;
       var my = ++epoch;
 
-      Array.from(seq.keys()).forEach(function (k) { seq.set(k, (seq.get(k) || 0) + 1); });
+      seq.clear();
       flags.forEach(function (f, k) { if (f.loading) flags.set(k, { loading: false, error: null }); });
       emit();
       allPromise = invoke('quota_snapshot', { provider: null }).then(function (r) {
@@ -263,20 +290,21 @@
         // Earlier card snapshots predate the config change and can omit the new row.
         flags.forEach(function (flag, key) {
           if (!flag.loading) return;
-          seq.set(key, (seq.get(key) || 0) + 1);
+          seq.delete(key);
           flags.set(key, { loading: false, error: null });
         });
       }
       var f = flags.get(name);
       if (f && f.loading) return Promise.resolve();
-      var my = (seq.get(name) || 0) + 1;
+      var my = ++requestId;
+      codexResetFresh = false;
       seq.set(name, my);
       flags.set(name, { loading: true, error: null });
       emit();
       return invoke('quota_snapshot', { provider: name }).then(function (r) {
         if (seq.get(name) !== my) return;
         flags.set(name, { loading: false, error: null });
-        applyMerged(r);
+        applyMerged(r, name);
       }, function (err) {
         if (seq.get(name) !== my) return;
         flags.set(name, { loading: false, error: errorMessage(err) });
@@ -1493,10 +1521,15 @@
     }
     var codexPreviewTier = 'follow';
     var quotaProviders = previewQuotaProviders(Date.now());
-    quotaProviders.push({ name: 'codex-subscription', enabled: true, plan: 'Plus', status: 'ready', windows: [], updatedAt: null });
+    var codexQuota = { name: CODEX_PROVIDER_NAME, enabled: true, codexResetEligible: true, plan: 'Plus', status: 'ready',
+      windows: [{ label: '5 小时', used: 80, limit: 100, remaining: 20, unit: '%' }], updatedAt: Date.now() };
+    quotaProviders.push(codexQuota);
+    var resetAccountRevision = 'fa5f9800-4e33-42cd-a3b0-6094ca8702d3';
+    var resetCredit = { id: 'preview-credit', status: 'available', expiresAt: Date.now() + 7 * 86400e3 };
+
     var providerDetails = new Map(quotaProviders.map(function (row) {
       var route = routing.providers.find(function (p) { return p.name === row.name; });
-      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: row.name === 'codex-subscription', transformer: null, transformerProtected: false }];
+      return [row.name, { name: row.name, baseUrl: 'https://example.com/v1', models: route ? route.models.slice() : ['model'], managed: row === codexQuota, transformer: null, transformerProtected: false }];
     }));
 
     var previewCatalog = { names: ['OpenAI', 'customparams'], parameterizedNames: ['customparams'] };
@@ -1535,6 +1568,18 @@
       }
       if (cmd === 'quota_snapshot') {
         return delay({ providers: copy(quotaProviders), updatedAt: Date.now() - 2e3, online: true, error: null });
+      }
+      if (cmd === 'codex_reset_credits') return delay({ accountRevision: resetAccountRevision, availableCount: resetCredit.status === 'available' ? 1 : 0, credits: [copy(resetCredit)] });
+      if (cmd === 'codex_reset_consume') {
+        if (Object.keys(a).length !== 2 || !isAccountRevision(a.accountRevision) || typeof a.creditId !== 'string' ||
+            !a.creditId.trim() || a.creditId.length > 256 || /[\x00-\x1f\x7f-\x9f]/.test(a.creditId)) return Promise.reject(new Error('codex_reset_invalid'));
+        if (a.accountRevision !== resetAccountRevision) return Promise.reject(new Error('codex_reset_account_changed'));
+        if (a.creditId !== resetCredit.id || resetCredit.status !== 'available') return delay({ outcome: 'no_credit', windowsReset: 0 });
+        resetCredit.status = 'redeemed';
+        codexQuota.windows[0].used = 0;
+        codexQuota.windows[0].remaining = 100;
+        codexQuota.updatedAt = Date.now();
+        return delay({ outcome: 'reset', windowsReset: 1, availableCount: 0 });
       }
       if (cmd === 'provider_transformers') return delay(copy(previewCatalog));
       if (cmd === 'provider_get') {
@@ -1772,7 +1817,7 @@
     var refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.className = 'btn btn-icon card-refresh';
-    refresh.dataset.refresh = '1';
+    refresh.setAttribute('data-refresh', '1');
     refresh.appendChild(icon(REFRESH_PATHS));
     actions.appendChild(status);
     actions.appendChild(creds);
@@ -1824,6 +1869,154 @@
     actions.appendChild(saveBtn); actions.appendChild(clearBtn); actions.appendChild(cancelBtn);
     root.appendChild(actions);
     return { root: root, ak: ak, sk: sk, msg: msg, saveBtn: saveBtn, clearBtn: clearBtn, cancelBtn: cancelBtn };
+  }
+
+  function createCodexResetPanel(invoke, refreshQuota) {
+    var root = el('div', 'codex-reset');
+    var summary = el('p', 'card-message');
+    summary.setAttribute('role', 'status');
+    var actions = el('div', 'codex-reset-actions');
+    var recheck = mkBtn('重查张数', null, function () {
+      if (reading || consuming || confirmation) return;
+      feedback.textContent = '';
+      readCredits();
+    });
+    var open = mkBtn('重置用量', null, function () {
+      if (!eligibleProvider || !target || reading || consuming || confirmation) return;
+      confirmation = target;
+      feedback.textContent = '';
+      render();
+      cancel.focus();
+    });
+    var prompt = el('div', 'client-confirm');
+    prompt.setAttribute('role', 'group');
+    prompt.setAttribute('aria-label', '确认使用重置卡');
+    prompt.appendChild(el('span', null, '使用 1 张重置卡恢复 Codex 订阅额度？'));
+    var promptActions = el('div', 'client-confirm-actions');
+    var cancel = mkBtn('取消', null, function () { cancelConfirm(true); });
+    var confirm = mkBtn('确认使用 1 张', null, consume);
+    confirm.className = 'btn btn-primary';
+    var feedback = el('p', 'card-message');
+    feedback.setAttribute('role', 'status');
+    actions.appendChild(recheck);
+    actions.appendChild(open);
+    promptActions.appendChild(cancel);
+    promptActions.appendChild(confirm);
+    prompt.appendChild(promptActions);
+    root.appendChild(summary);
+    root.appendChild(actions);
+    root.appendChild(prompt);
+    root.appendChild(feedback);
+
+    var card = null, eligibleProvider = null, generation = 0, count = null, target = null;
+    var reading = false, consuming = false, confirmation = null, upgradeRequired = false;
+    function render() {
+      var text = upgradeRequired ? RESET_UPGRADE_MESSAGE : '无法读取重置卡张数。';
+      if (reading) text = '正在查询重置卡…';
+      else if (consuming) text = '正在提交重置请求…';
+      else if (count !== null) {
+        text = '可用重置卡：' + count + ' 张';
+        if (target && target.expiresAt) text += ' · 优先使用的卡将于 ' + formatTimestamp(target.expiresAt) + ' 到期';
+        if (count > 0 && !target) text += ' · 暂无可选择的卡，请重查';
+      }
+      summary.textContent = text;
+      recheck.disabled = reading || consuming || !!confirmation;
+      open.disabled = !target || reading || consuming || !!confirmation;
+      prompt.hidden = !confirmation;
+      confirm.disabled = !confirmation;
+      feedback.hidden = !feedback.textContent;
+    }
+    function cancelConfirm(restoreFocus) {
+      if (!confirmation) return false;
+      confirmation = null;
+      render();
+      if (restoreFocus) open.focus();
+      return true;
+    }
+    async function readCredits() {
+      if (!eligibleProvider || reading || consuming || confirmation) return;
+      var current = generation;
+      reading = true;
+      upgradeRequired = false;
+      target = null;
+      count = null;
+      render();
+      try {
+        var list = await invoke('codex_reset_credits');
+        if (current !== generation) return;
+        if (!list || !Number.isSafeInteger(list.availableCount) || list.availableCount < 0 || !Array.isArray(list.credits)) return;
+        if (!isAccountRevision(list.accountRevision)) {
+          upgradeRequired = list.accountRevision === undefined;
+          return;
+        }
+        count = list.availableCount;
+        // Same ordering as the Web card: first expiring available credit, undated last.
+        if (count > 0) list.credits.forEach(function (credit) {
+          if (!credit || credit.status !== 'available' || !toStr(credit.id) || !credit.id.trim()) return;
+          var expiry = toNum(credit.expiresAt);
+          if (!(expiry > 0 && Number.isFinite(new Date(expiry).getTime()))) expiry = null;
+          if (!target || (expiry !== null && (target.expiresAt === null || expiry < target.expiresAt))) {
+            target = { creditId: credit.id, accountRevision: list.accountRevision, expiresAt: expiry };
+          }
+        });
+      } catch (err) {
+        if (current === generation) upgradeRequired = errorMessage(err) === 'codex_reset_upgrade_required';
+      } finally {
+        if (current === generation) { reading = false; render(); }
+      }
+    }
+    async function consume() {
+      if (!eligibleProvider || !confirmation || consuming) return;
+      var current = generation, selected = confirmation;
+      consuming = true;
+      confirmation = null;
+      target = null;
+      count = null;
+      render();
+      var relist = false;
+      try {
+        var result = await invoke('codex_reset_consume', { creditId: selected.creditId, accountRevision: selected.accountRevision });
+        var sameGeneration = generation === current;
+        if (result?.outcome === 'reset' || result?.outcome === 'already_redeemed') refreshQuota();
+        if (!sameGeneration) return;
+        switch (result?.outcome) {
+          case 'reset': feedback.textContent = 'Codex 订阅额度已重置。'; relist = true; break;
+          case 'already_redeemed': feedback.textContent = '这张重置卡此前已使用。'; relist = true; break;
+          case 'nothing_to_reset': feedback.textContent = '当前订阅额度无需重置。'; relist = true; break;
+          case 'no_credit': feedback.textContent = '没有可用的重置卡。'; count = 0; break;
+          default: throw new Error();
+        }
+      } catch (err) {
+        if (generation === current) {
+          switch (errorMessage(err)) {
+            case 'codex_reset_upgrade_required': feedback.textContent = RESET_UPGRADE_MESSAGE; break;
+            case 'codex_reset_account_changed': feedback.textContent = 'Codex 账号已切换。请重查张数，再确认使用当前账号的卡。'; break;
+            case 'codex_reset_no_credit': feedback.textContent = '所选重置卡已不可用，请重新查询。'; break;
+            case 'codex_reset_busy': feedback.textContent = '正在处理另一项操作，请稍后重新查询。'; break;
+            default: feedback.textContent = '无法确认是否已使用重置卡。请先重查张数并核对额度。';
+          }
+        }
+      } finally {
+        consuming = false;
+        render();
+        if (relist || generation !== current) readCredits();
+      }
+    }
+    function attach(next, provider) {
+      if (card === next && eligibleProvider === provider) return;
+      generation++;
+      // Keep the redemption verdict across its own quota read on the same card.
+      if (card !== next || !provider || eligibleProvider) feedback.textContent = '';
+      card = next;
+      eligibleProvider = provider;
+      root.remove();
+      confirmation = null;
+      reading = false;
+      count = target = null;
+      render();
+      if (eligibleProvider) { card.appendChild(root); readCredits(); }
+    }
+    return { attach: attach, cancel: cancelConfirm };
   }
 
   function buildWindow(win) {
@@ -2261,7 +2454,23 @@
       updates = SoftwareUpdateUI.mount(document, updateApi);
     }
     var cards = new Map();
-    var tierPanel = (mode === 'preview' || tauri?.window?.getCurrentWindow?.().label === 'main')
+    var mainWindow = mode === 'preview';
+    if (tauri) {
+      try { mainWindow = tauri.window?.getCurrentWindow?.()?.label === 'main'; }
+      catch { mainWindow = false; }
+    }
+    var codexReset = mainWindow ? createCodexResetPanel(invoke, function refreshCodexQuota() {
+      // An in-flight snapshot may predate the redemption. Queue a targeted read behind it.
+      function busy(state) { return state.loadingAll || state.rows.some(function (r) { return r.provider.name === CODEX_PROVIDER_NAME && r.loading; }); }
+      if (!busy(controller.state())) return controller.refreshProvider(CODEX_PROVIDER_NAME);
+      var unsubscribe = controller.subscribe(function (state) {
+        if (!busy(state)) {
+          unsubscribe();
+          controller.refreshProvider(CODEX_PROVIDER_NAME);
+        }
+      });
+    }) : null;
+    var tierPanel = mainWindow
       ? CodexServiceTierUI.mount(invoke) : null;
 
     function syncCodexTier(refresh) {
@@ -2407,6 +2616,11 @@
       cards.forEach(function (refs, name) {
         if (!seen.has(name)) { refs.li.remove(); cards.delete(name); }
       });
+      if (codexReset) {
+        var eligible = state.rows.find(function (row) { return row.provider.codexResetEligible === true && !row.stale && !row.cardError; });
+        var fresh = !!eligible && state.codexResetFresh && !eligible.loading && !refreshQuotaOnReturn;
+        codexReset.attach(eligible ? cards.get(eligible.provider.name).li : null, fresh ? eligible.provider : null);
+      }
       state.rows.forEach(function (row) { els.list.insertBefore(cards.get(row.provider.name).li, els.empty); });
       syncCodexTier();
       // A missing snapshot or an offline gateway is NOT an empty state; keep
@@ -3276,7 +3490,7 @@
       panels[id] = document.getElementById('panel-' + id);
     });
     var refreshAutostart = bindAutostart(invoke, document.getElementById('desktop-autostart'), document.getElementById('desktop-autostart-msg'));
-    var activeTab = 'quota';
+    var activeTab = 'quota', refreshQuotaOnReturn = false;
     var loadedTabs = { quota: true };
     var providerForm = mountProviderForm(invoke, function (name) {
       controller.refreshProvider(name, true);
@@ -3324,7 +3538,7 @@
 
     function selectTab(name) {
       if (TAB_IDS.indexOf(name) === -1) return;
-      if (name !== 'quota') providerForm.close(false);
+      if (name !== 'quota') { providerForm.close(false); if (codexReset) codexReset.cancel(false); }
       if (name !== 'plugins') pluginsPanel.cancel(false);
       if (updates) updates.showSettings(name === 'settings');
       // Before hiding the current panel, capture the usage scroller while it
@@ -3356,6 +3570,10 @@
         stopUsageAutoRefresh();
       }
       if (name === 'clients') refreshAutostart();
+      if (name === 'quota' && refreshQuotaOnReturn) {
+        refreshQuotaOnReturn = false;
+        controller.refreshAll(true);
+      }
       maybeLoadTab(name);
     }
 
@@ -3517,7 +3735,7 @@
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
       if (event.key === 'Escape' && !event.isComposing && !event.defaultPrevented) {
-        if (providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
+        if ((codexReset && codexReset.cancel(true)) || providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
         else safeCommand('quota_hide');
       }
     });
@@ -3526,7 +3744,11 @@
       if (serviceCtrl) serviceCtrl.refresh();
       if (activeTab === 'projects' && projectsCtrl) projectsCtrl.refresh();
       syncCodexTier(true);
-      if (activeTab === 'quota' && controller) controller.refreshAll();
+      if (activeTab === 'quota' && controller) controller.refreshAll(true);
+      else if (codexReset) {
+        refreshQuotaOnReturn = true;
+        codexReset.attach(null, null);
+      }
       if (activeTab === 'quota' && credentialsCtrl) credentialsCtrl.refresh();
     });
   }

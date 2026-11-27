@@ -192,6 +192,7 @@ export type CodexAdminCode =
   | "codex_credential_unreadable"
   | "codex_config_write_failed"
   | "codex_model_invalid"
+  | "codex_reset_account_changed"
   | "codex_reset_busy"
   | "codex_reset_no_credit"
   | "codex_reset_unavailable"
@@ -690,13 +691,21 @@ export interface CodexResetConsumeResult {
   windowsReset: number;
 }
 
+export function isCodexResetCreditId(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 256 && !!value.trim() && !/[\x00-\x1f\x7f-\x9f]/.test(value);
+}
+
+export function isCodexAccountRevision(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
 const RESET_CREDIT_TITLES: Record<string, string> = {
   codex_rate_limits: "Full reset",
 };
 
 function parseResetCredit(raw: any): CodexResetCredit | null {
   if (!raw || typeof raw !== "object") return null;
-  if (typeof raw.id !== "string" || !raw.id || raw.id.length > 256) return null;
+  if (!isCodexResetCreditId(raw.id)) return null;
   if (typeof raw.status !== "string" || !raw.status || raw.status.length > 32) return null;
   const expires = typeof raw.expires_at === "string" && raw.expires_at ? Date.parse(raw.expires_at) : NaN;
   const title = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim().slice(0, 200)
@@ -705,7 +714,7 @@ function parseResetCredit(raw: any): CodexResetCredit | null {
   return {
     id: raw.id,
     status: raw.status,
-    ...(Number.isFinite(expires) && expires > 0 ? { expiresAt: expires } : {}),
+    ...(Number.isFinite(expires) ? { expiresAt: expires } : {}),
     ...(title ? { title } : {}),
     ...(description ? { description } : {}),
   };
