@@ -171,6 +171,12 @@ body {
 .provider-transformers { min-width: 0; margin: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
 .transformer-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; margin-bottom: 8px; }
 .transformer-params { grid-column: 1 / -1; }
+.transformer-picker { min-width: 0; }
+.transformer-picker .route-input { width: 100%; }
+.transformer-options { max-height: min(180px, 30vh); overflow-y: auto; margin-top: 3px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.transformer-option, .transformer-options .hint { padding: 4px 8px; }
+.transformer-option { cursor: pointer; overflow-wrap: anywhere; }
+.transformer-option:hover, .transformer-option[aria-selected="true"] { background: var(--accent); color: white; }
 .transformer-row > .btn:last-child { justify-self: start; }
 .transformer-param { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.5fr) auto; gap: 4px; margin-top: 4px; }
 .provider-form-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; }
