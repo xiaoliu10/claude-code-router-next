@@ -2798,9 +2798,8 @@
       var input = cacheMissInputTokens(u);
       var inclusive = inclusiveInputTokens(u);
       var totalTokens = rowTotalTokens(u);
-      var estimated = u.estimatedCount > 0;
       function summaryTokenCell(metric, label, count) {
-        var cell = recordsTokenCell(count, estimated);
+        var cell = recordsTokenCell(count);
         return usageNumCell(metric, label, cell.text, cell.title);
       }
       grid.appendChild(summaryTokenCell('total', '总 tokens', totalTokens));
@@ -2809,7 +2808,7 @@
       grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
       grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
       var hitRate = inclusive > 0 && u.cacheReadTokens !== null
-        ? (estimated ? '≈' : '') + (u.cacheReadTokens / inclusive * 100).toFixed(1) + '%' : null;
+        ? (u.cacheReadTokens / inclusive * 100).toFixed(1) + '%' : null;
       var cacheHitCell = usageNumCell('cache-hit', '缓存命中率', hitRate);
       cacheHitCell.title = '缓存读取 tokens ÷ 有效输入 tokens';
       grid.appendChild(cacheHitCell);
@@ -2962,10 +2961,10 @@
       return Number.isNaN(t.getTime()) ? s : formatClock(t.getTime());
     }
     var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入（未命中）', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
-    function recordsTokenCell(value, estimated) {
+    function recordsTokenCell(value) {
       return {
-        text: value == null ? '—' : (estimated ? '≈' : '') + formatCompact(value),
-        title: value == null ? null : (estimated ? '≈' : '') + formatInt(value),
+        text: value == null ? '—' : formatCompact(value),
+        title: value == null ? null : formatInt(value),
       };
     }
     function recordsNumCell(cell) {
@@ -2997,10 +2996,10 @@
         modelTd.title = chain;
         tr.appendChild(modelTd);
         tr.appendChild(el('td', null, clientLabel(r.clientType)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(cacheMissInputTokens(r), r.usageEstimated)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.outputTokens, r.usageEstimated)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheReadTokens, false)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheWriteTokens, false)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(cacheMissInputTokens(r))));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.outputTokens)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheReadTokens)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheWriteTokens)));
         tr.appendChild(recordsNumCell({ text: formatMs(r.durationMs) || '—' }));
         tr.appendChild(recordsNumCell({ text: formatMs(r.ttftMs) || '—' }));
         tr.appendChild(recordsNumCell({ text: formatSpeed(r.tokensPerSecond) || '—' }));

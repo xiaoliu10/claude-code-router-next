@@ -371,7 +371,7 @@ test('interaction: ambiguous legacy cache leaves derived totals, inputs and hit 
   assert.equal(body.querySelector('.usage-hbar-total').textContent, '—');
   const rows = recordsCard(body).querySelector('tbody').children;
   assert.equal(rows[0].children[4].textContent, '—');
-  assert.equal(rows[1].children[4].textContent, '≈130');
+  assert.equal(rows[1].children[4].textContent, '130');
 });
 
 test('interaction: restore is local confirmation then single individual IPC; usage uses safe text', async () => {
@@ -572,11 +572,10 @@ test('interaction: records table never echoes responseBody/sessionId and keeps X
   assert.equal(errorCell.textContent.includes('上游提供方返回 429'), false, 'error message stays a tooltip');
   const successCell = statusCells.find(td => td.querySelector('.record-dot').getAttribute('data-tone') === 'ok');
   assert.equal(successCell.title, '成功');
-  // Estimated record: ≈ prefix on cells and their tooltips.
-  const estimatedRow = rows.find(r => r.children[4].textContent.startsWith('≈'));
-  assert.ok(estimatedRow, 'estimated row carries the ≈ prefix');
-  assert.equal(estimatedRow.children[5].textContent.startsWith('≈'), true);
-  assert.match(estimatedRow.children[4].title, /^≈\d/, 'tooltip also marks the estimated count');
+  const estimatedRow = rows[3];
+  assert.match(estimatedRow.children[4].textContent, /^\d/);
+  assert.match(estimatedRow.children[5].textContent, /^\d/);
+  assert.match(estimatedRow.children[4].title, /^\d/);
   // Model chain column: originalModel/routed model chain in text, full chain as title.
   const modelCell = rows[0].children[2];
   assert.equal(modelCell.className.includes('cell-truncate'), true);
