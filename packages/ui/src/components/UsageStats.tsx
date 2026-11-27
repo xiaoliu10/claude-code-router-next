@@ -58,6 +58,7 @@ interface UsageRecord {
 }
 
 interface ModelDayData {
+  historicalInputTokens?: number | null;
   count: number;
   inputTokens: number;
   effectiveInputTokens?: number | null;
@@ -73,6 +74,7 @@ interface UsageSummary {
   errorCount: number;
   totalInputTokens: number;
   totalEffectiveInputTokens?: number | null;
+  totalHistoricalInputTokens?: number | null;
   totalOutputTokens: number;
   totalCacheReadInputTokens: number;
   totalCacheCreationInputTokens: number;
@@ -288,15 +290,16 @@ export function UsageStats() {
     .sort(([a], [b]) => a.localeCompare(b))
     : [];
   // Keep a single unit within each chart when historical totals are unknown.
-  const dailyUsesOutput = dailyData.some(([, d]) => usageTokens(d).total === null);
+  const dailyUsesOutput = dailyData.some(([, d]) => displayedUsageTotal(d) === null);
   const maxDailyTokens = Math.max(1, ...dailyData.map(([, d]) =>
-    dailyUsesOutput ? d.outputTokens : usageTokens(d).total!
+    dailyUsesOutput ? d.outputTokens : displayedUsageTotal(d)!
   ));
-  const modelUsesRecorded = Object.values(summary?.byModel ?? {}).some(d => usageTokens(d).total === null);
+  const modelUsesRecorded = Object.values(summary?.byModel ?? {}).some(d => displayedUsageTotal(d) === null);
 
   const modelData = Object.entries(summary?.byModel ?? {})
     .map(([model, data]) => {
-      const { cacheMissInput, total } = usageTokens(data);
+      const { cacheMissInput } = usageTokens(data);
+      const total = displayedUsageTotal(data);
       return { model, data, cacheMissInput, total, chartTokens: modelUsesRecorded ? (data.cacheReadInputTokens ?? 0) + data.outputTokens : total! };
     })
     .sort((a, b) => b.chartTokens - a.chartTokens)
@@ -432,6 +435,7 @@ export function UsageStats() {
             const counts = {
               inputTokens: summary.totalInputTokens,
               effectiveInputTokens: summary.totalEffectiveInputTokens,
+              historicalInputTokens: summary.totalHistoricalInputTokens,
               cacheReadInputTokens: summary.totalCacheReadInputTokens,
               cacheCreationInputTokens: summary.totalCacheCreationInputTokens,
               outputTokens: summary.totalOutputTokens,
@@ -465,7 +469,7 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.total_output_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
-                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal.value)}</div>
+                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-emerald-50 p-2 text-center">
@@ -521,8 +525,8 @@ export function UsageStats() {
               </div>
               <div className="flex items-end gap-1 h-14">
                 {dailyData.map(([day, data]) => {
-                  const { cacheMissInput, total } = usageTokens(data);
-                  const shown = displayedUsageTotal(data);
+                  const { cacheMissInput } = usageTokens(data);
+                  const total = displayedUsageTotal(data);
                   const amount = dailyUsesOutput ? data.outputTokens : total!;
                   const height = amount > 0 ? Math.max(4, (amount / maxDailyTokens) * 100) : 0;
                   return (
@@ -537,7 +541,7 @@ export function UsageStats() {
                         <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
                         <div>{t("usage.cache_read")}: {formatTokens(data.cacheReadInputTokens ?? 0)}</div>
                         <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
-                        <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(shown.value)}</div>
+                        <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(total)}</div>
                       </TooltipContent>
                     </Tooltip>
                   );
@@ -558,8 +562,7 @@ export function UsageStats() {
               <h2 className="mb-2 text-sm font-semibold text-gray-700">{t(modelUsesRecorded ? "usage.recorded_model_ranking" : "usage.total_tokens")}</h2>
               {modelData.length > 0 ? (
                 <div className="space-y-2">
-                  {modelData.map(({ model, data, cacheMissInput, chartTokens }) => {
-                    const shown = displayedUsageTotal(data);
+                  {modelData.map(({ model, data, cacheMissInput, total, chartTokens }) => {
                     const width = chartTokens > 0 ? (chartTokens / maxModelTokens) * 100 : 0;
                     const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
                     return (
@@ -586,7 +589,7 @@ export function UsageStats() {
                           <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
                           <div>{t("usage.cache_read")}: {formatTokens(data.cacheReadInputTokens ?? 0)}</div>
                           <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
-                          <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(shown.value)}</div>
+                          <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(total)}</div>
                         </TooltipContent>
                       </Tooltip>
                     );

@@ -1,6 +1,7 @@
 interface UsageTokenCounts {
   inputTokens: number;
   effectiveInputTokens?: number | null;
+  historicalInputTokens?: number | null;
   outputTokens: number;
   cacheReadInputTokens?: number | null;
   cacheCreationInputTokens?: number | null;
@@ -32,20 +33,13 @@ interface SummaryCoverage {
 
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
-// Estimate a whole-window count on legacy gateways assuming raw input excludes
-// cached tokens. Keep it distinct from partial coverage used for the hit rate.
-export function historicalWindowTotal(raw: number, read: number, write: number, output: number) {
-  if (![raw, read, write, output].every(isCount)) return null;
-  const sum = raw + read + write + output;
-  return Number.isSafeInteger(sum) ? sum : null;
-}
-
+// Only the gateway can distinguish inclusive and net input within a mixed bucket.
 export function displayedUsageTotal(row: UsageTokenCounts) {
   const { total } = usageTokens(row);
-  if (total !== null) return { value: total, estimated: false };
-  const value = row.cacheReadInputTokens == null || row.cacheCreationInputTokens == null
-    ? null : historicalWindowTotal(row.inputTokens, row.cacheReadInputTokens, row.cacheCreationInputTokens, row.outputTokens);
-  return { value, estimated: value !== null };
+  if (total !== null) return total;
+  if (!isCount(row.historicalInputTokens) || !isCount(row.outputTokens)) return null;
+  const historicalTotal = row.historicalInputTokens + row.outputTokens;
+  return isCount(historicalTotal) ? historicalTotal : null;
 }
 
 // Legacy gateways only expose a normalized sum for fully accounted day buckets.
