@@ -2255,6 +2255,11 @@
     ProjectsUI.mount(document, projectsCtrl);
     var pluginsPanel = PluginsUI.mount(document, invoke);
     var settings = GeneralSettingsUI.mount(document, invoke);
+    var updates = null;
+    if (mode === 'preview' || tauri?.window?.getCurrentWindow?.()?.label === 'main') {
+      var updateApi = mode === 'preview' ? SoftwareUpdateUI.preview() : { invoke: invoke, listen: tauri.event?.listen };
+      updates = SoftwareUpdateUI.mount(document, updateApi);
+    }
     var cards = new Map();
     var tierPanel = (mode === 'preview' || tauri?.window?.getCurrentWindow?.().label === 'main')
       ? CodexServiceTierUI.mount(invoke) : null;
@@ -3321,6 +3326,7 @@
       if (TAB_IDS.indexOf(name) === -1) return;
       if (name !== 'quota') providerForm.close(false);
       if (name !== 'plugins') pluginsPanel.cancel(false);
+      if (updates) updates.showSettings(name === 'settings');
       // Before hiding the current panel, capture the usage scroller while it
       // is still visible: once display:none applies, the browser reports
       // scrollLeft 0, so a read after hiding cannot preserve the position.

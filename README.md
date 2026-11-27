@@ -93,6 +93,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2439** | Windows x64 版 CCR Desktop 0.1.3 新增签名更新。首次需要手动安装，之后控制中心可检查新版，并提示下载安装。 |
 | **v2.3.2438** | CCR Desktop 0.1.2 和 Codex 插件 1.0.16 在 Codex 订阅卡片新增服务层级选择。默认跟随请求，选择「快速（Fast）」后，后续订阅请求会发送 `priority`。选择「标准」可使用上游默认层级。 |
 | **v2.3.2437** | CCR Desktop 新增 Windows x64 安装包、登录启动、通用设置、供应商与插件管理、项目搜索及用量自动刷新。本版也更新了额度展示、用量统计和 Gemini、Codex 的请求处理。 |
 | **v2.3.2436** | Agy ACP 供应商支持工具调用：插件把调用方的工具通过只监听 127.0.0.1 的本地 MCP 服务发布给 agent，调用方收到 `tool_calls`，带回结果的后续请求续跑同一个 ACP 回合；agent 不执行任何工具，桥的凭据只传给 agent 子进程。卡片补全连接/断开/模型同步/模型隐藏闭环，并支持 agy 首次使用自动安装与 Google 账号登录。用量记录保留上游稳定错误码，Chat Completions 的最终结果按实际服务方记入。 |
@@ -102,7 +103,6 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 | **v2.3.2432** | <ul><li>**Gemini 独立配额池（Argon / Hydrogen / Claude，插件 1.0.13）**：供应商卡片按模型家族分池展示配额，不再只看汇总——Argon 池耗尽一眼可见（此前周汇总 71% 却 429 的迷惑场景消除）。</li><li>**PID 文件失效时 restart 兜底杀真实监听进程**：修「页面更新一直失败」——PID 文件残留尸体 PID 时什么都杀不掉、respawn 撞 EADDRINUSE 旧版本永远在线；现在带 CCR 身份校验的端口兜底 + 等待端口释放 + PID 文件 bind 成功后才写入。</li></ul> |
 | **v2.3.2431** | <ul><li>**Kiro 拒答不再误冷却且额度恢复（插件 0.1.2）**：上游 `CONTENT_FILTERED` / `REASONING_EXTRACTION` 空拒答流正确分类为 `kiro_content_filtered`（422），不再误判截断 502 并冷却全账号 5 分钟；只读额度/模型同步在 429 冷却期仍可用，并实现 `fetchQuota` 在主供应商列表展示 Kiro credits 额度，过滤过期 bonus 窗口。</li><li>**插件升级死循环修复与防呆守卫**：定位 `kiro@0.1.1` npm 包内含陈旧 `0.1.0` 清单导致反复提示升级；目录页改用 `semver` 比较防止本地较新版本被降级提示，安装器拦截 `package.json` 与 `plugin.json` 版本不一致的压缩包，Kiro 增加 `prepack` 自动构建与前置守卫。</li></ul> |
 | **v2.3.2430** | <ul><li>**Gemini OAuth 长会话 400 修复（插件 1.0.11）**：无签名的工具调用历史补哨兵、伪造/非法/外部（GLM 24位 hex）签名在发送前拦截；带 schema 的客户端 `web_search` 不再被误转成 Google 内置搜索。111 条消息/39 个工具的失败会话重放流式与非流式均 200。</li><li>**Gemini 流式缓存命中统计恢复（插件 1.0.11）**：收尾空文本帧携带的 `cachedContentTokenCount` 与 `finishReason` 不再被整帧丢弃，流式请求的缓存命中/最终 token 数/stop reason 正确记录（实测 ~93k token 提示词缓存命中 91067，此前恒为 0）。</li></ul> |
-| **v2.3.2429** | <ul><li>**Codex 手动用量重置**：卡片展示赠送的重置次数（来自上游），确认弹窗是唯一消耗入口；同步锁拒绝并发重复点击，重试复用幂等键，丢失响应不双花；kiro 0.1.1 随包发布。</li><li>**Gemini 传输与配额修复**：省略 Content-Type 时识别 Code Assist SSE；配额走共享管线；恢复后不再残留失败横幅。</li><li>**精确模型路由修复**：供应商显式暴露的模型 id 短路家族路由，Gemini 的 Claude 模型可按名称直达。</li><li>**Codex 掉登录修复**：剥离 Responses input 中的 thinking 字段（上游 400 根因）；成功输出清除错误残留。</li></ul> |
 
 > 仅保留最近 10 个版本，更早版本的发布摘要见 [CHANGELOG-archive.md](./CHANGELOG-archive.md)，完整详细变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 

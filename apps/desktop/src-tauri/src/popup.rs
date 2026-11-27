@@ -41,6 +41,16 @@ pub(crate) fn guard(window: &WebviewWindow) -> Result<(), String> {
         Err("This command is restricted to local desktop views".into())
     }
 }
+/// Stricter guard for commands that must not be reachable from the small always-on-top
+/// popup: the same exact-URL check as [`guard`], and only the `main` control-center window.
+pub(crate) fn guard_main(window: &WebviewWindow) -> Result<(), String> {
+    guard(window)?;
+    if window.label() == "main" {
+        Ok(())
+    } else {
+        Err("This command is restricted to the main control-center window".into())
+    }
+}
 pub fn install(app: &tauri::AppHandle) -> tauri::Result<()> {
     let _window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("quota.html".into()))
         .title("CCR 控制中心")

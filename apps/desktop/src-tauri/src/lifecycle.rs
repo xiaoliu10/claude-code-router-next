@@ -349,36 +349,83 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Stops a desktop-owned child: graceful SIGTERM (checked against `try_wait`
-/// first, so an exited child is never re-signalled — no PID-reuse kill), a
-/// bounded wait, then SIGKILL as the last resort. Returns once the process is
-/// gone. Never touches any other process on the system.
-pub fn stop_owned_gateway(child: &mut Child) -> bool {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return true;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayStop {
+    AlreadyExited,
+    Stopped,
+    Failed,
+}
+
+/// Stops only the desktop-owned child. Distinguish an exit observed before we
+/// requested termination so a failed installer can restore the previous state.
+pub fn stop_owned_gateway(child: &mut Child) -> GatewayStop {
+    match child.try_wait() {
+        Ok(Some(_)) => return GatewayStop::AlreadyExited,
+        Err(_) => return GatewayStop::Failed,
+        Ok(None) => {}
     }
     #[cfg(unix)]
-    {
-        let pid = child.id();
-        // The immediately preceding try_wait showed the process alive, so the
-        // PID is still ours with overwhelming probability; this is the standard
-        // handle-based pattern (no stored PID files, no process-name scan).
-        let _ = unsafe { libc::kill(pid as libc::c_int, libc::SIGTERM) };
-    }
+    let termination_requested =
+        unsafe { libc::kill(child.id() as libc::c_int, libc::SIGTERM) == 0 };
+    // Windows has no portable graceful-terminate signal. An exit during the
+    // grace period there was independent of this stop request.
     #[cfg(not(unix))]
-    {
-        // Windows has no portable graceful-terminate signal; fall through to the
-        // bounded kill below.
-    }
+    let termination_requested = false;
     let deadline = std::time::Instant::now() + TERM_GRACE;
     while std::time::Instant::now() < deadline {
         if matches!(child.try_wait(), Ok(Some(_))) {
-            return true;
+            return if termination_requested {
+                GatewayStop::Stopped
+            } else {
+                GatewayStop::AlreadyExited
+            };
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    let _ = child.kill();
-    child.wait().is_ok()
+    #[cfg(windows)]
+    {
+        force_stop_windows(child)
+    }
+    #[cfg(not(windows))]
+    {
+        let killed = child.kill().is_ok();
+        match child.wait() {
+            Ok(_) if killed || termination_requested => GatewayStop::Stopped,
+            Ok(_) => GatewayStop::AlreadyExited,
+            Err(_) => GatewayStop::Failed,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn force_stop_windows(child: &mut Child) -> GatewayStop {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    const UPDATE_STOP_CODE: u32 = 0x434352;
+    // SAFETY: Child owns this process handle for the duration of the call.
+    let requested = unsafe { TerminateProcess(child.as_raw_handle(), UPDATE_STOP_CODE) } != 0;
+    if !requested {
+        return match child.try_wait() {
+            Ok(Some(_)) => GatewayStop::AlreadyExited,
+            _ => GatewayStop::Failed,
+        };
+    }
+    match child.wait() {
+        Ok(status) if status.code() == Some(UPDATE_STOP_CODE as i32) => GatewayStop::Stopped,
+        Ok(_) => GatewayStop::AlreadyExited,
+        Err(_) => GatewayStop::Failed,
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn force_stop_after_grace_period_preserves_independent_exit() {
+    let mut child = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "exit 7"])
+        .spawn()
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+    assert_eq!(force_stop_windows(&mut child), GatewayStop::AlreadyExited);
 }
 
 pub struct Startup {
@@ -874,7 +921,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let script = fake_child_script(&dir, "sleepy.sh", false);
         let mut child = spawn_fake(&script);
-        assert!(stop_owned_gateway(&mut child));
+        assert_eq!(stop_owned_gateway(&mut child), GatewayStop::Stopped);
         assert!(matches!(child.try_wait(), Ok(Some(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -888,7 +935,7 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         // Already exited: must return immediately without touching any PID.
-        assert!(stop_owned_gateway(&mut child));
+        assert_eq!(stop_owned_gateway(&mut child), GatewayStop::AlreadyExited);
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[cfg(unix)]
@@ -919,7 +966,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(ready.exists(), "fake gateway should report trap readiness");
-        assert!(stop_owned_gateway(&mut child));
+        assert_eq!(stop_owned_gateway(&mut child), GatewayStop::Stopped);
         assert!(
             term_marker.exists(),
             "SIGTERM trap should have run before kill"
@@ -968,7 +1015,7 @@ mod tests {
         store_child(&slot, child);
         let mut child = lock(&slot).take().expect("child must be in shared slot");
         assert!(matches!(child.try_wait(), Ok(None)), "child must be alive");
-        assert!(stop_owned_gateway(&mut child));
+        assert_eq!(stop_owned_gateway(&mut child), GatewayStop::Stopped);
         assert_eq!(
             std::env::split_paths(&bundled_path(&bundle, OsStr::new("/usr/bin:/bin")).unwrap())
                 .take(2)

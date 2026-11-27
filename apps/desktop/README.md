@@ -121,7 +121,7 @@ node scripts/prepare-runtime.mjs --arch x64   # nodejs.org win-x64.zip + SHA256 
 node scripts/build-standalone-windows.mjs     # cargo tauri build --bundles nsis
 ```
 
-前置：rustup stable-msvc、VS Build Tools 2022（C++ workload）、cargo-tauri；Windows zip 的 better-sqlite3 需要 win32-x64 对应 Node ABI 的 prebuilt（npmmirror 镜像可取）。runtime 通过 `tauri.windows.conf.json` 的 resources 映射随 NSIS 安装包分发，构建脚本在每次构建前清空旧暂存树，并以 `target/release/runtime` 暂存树的存在性为结构化校验（安装包体积只是弱信号，防止映射失效打出空壳）。产物：`apps/desktop/src-tauri/target/release/bundle/nsis/*.exe`。已知限制：未签名；runtime 解压依赖系统 tar.exe（1809+ 内置）；`better-sqlite3` ABI 必须与 Node 大版本匹配，staging 末尾的 require 往返是权威校验。
+前置：rustup stable-msvc、VS Build Tools 2022（C++ workload）、cargo-tauri；Windows zip 的 better-sqlite3 需要 win32-x64 对应 Node ABI 的 prebuilt（npmmirror 镜像可取）。runtime 通过 `tauri.windows.conf.json` 的 resources 映射随 NSIS 安装包分发，构建脚本在每次构建前清空旧暂存树，并以 `target/release/runtime` 暂存树的存在性为结构化校验（安装包体积只是弱信号，防止映射失效打出空壳）。产物：`apps/desktop/src-tauri/target/release/bundle/nsis/*.exe`。常规构建不带更新签名；官方 Windows x64 更新构建、首次安装和仅发布 CLI 时的清单处理见 [Desktop 更新发布](../../docs/design/desktop-self-update.md)。runtime 解压依赖系统 tar.exe（1809+ 内置）；`better-sqlite3` ABI 必须与 Node 大版本匹配，staging 末尾的 require 往返是权威校验。
 
 ### 本次实际验证（2026-11-17）
 

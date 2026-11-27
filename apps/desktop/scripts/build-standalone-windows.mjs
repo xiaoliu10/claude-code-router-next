@@ -61,7 +61,27 @@ if (!staged) {
 const stagedResources = path.join(srcTauriDir, "target", "release", "runtime");
 fs.rmSync(stagedResources, { recursive: true, force: true });
 
-run("cargo", ["tauri", "build", "--bundles", "nsis", "--no-sign"], { cwd: srcTauriDir });
+const bundleDir = path.join(srcTauriDir, "target", "release", "bundle", "nsis");
+fs.rmSync(bundleDir, { recursive: true, force: true });
+const signing = process.argv.includes("--signed-update");
+const releaseConfig = path.join(srcTauriDir, "target", "desktop-signing.conf.json");
+const options = signing ? ["--config", releaseConfig] : ["--no-sign"];
+if (signing) {
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(path.join(srcTauriDir, "tauri.updater.conf.json"), "utf8"));
+  } catch (cause) {
+    throw new Error("Cannot read the Desktop signing configuration", { cause });
+  }
+  const publicKey = process.env.DESKTOP_UPDATE_PUBLIC_KEY?.trim();
+  if (!publicKey || !process.env.TAURI_SIGNING_PRIVATE_KEY) {
+    throw new Error("Configure DESKTOP_UPDATE_PUBLIC_KEY and TAURI_SIGNING_PRIVATE_KEY for the signed build");
+  }
+  config.plugins.updater.pubkey = publicKey;
+  fs.mkdirSync(path.dirname(releaseConfig), { recursive: true });
+  fs.writeFileSync(releaseConfig, JSON.stringify(config));
+}
+run("cargo", ["tauri", "build", "--bundles", "nsis", ...options], { cwd: srcTauriDir });
 
 // Deterministic presence gate: tauri-build stages the resources mapping into
 // target/release before the installer packs it. If the tree collapsed (a
@@ -74,7 +94,6 @@ for (const rel of required) {
   }
 }
 
-const bundleDir = path.join(srcTauriDir, "target", "release", "bundle", "nsis");
 const installers = fs
   .readdirSync(bundleDir)
   .filter((name) => name.endsWith(".exe"))
