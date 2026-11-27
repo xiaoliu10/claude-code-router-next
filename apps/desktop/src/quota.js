@@ -849,8 +849,21 @@
 
 
   // ---- Usage tab ---------------------------------------------------------
-  // usage_snapshot({period:'today'|'7d'|'30d'|'all'}) -> totals + byModel/byProvider/byDay.
-  // Numbers come from the server summary only; no currency/cost is shown.
+  var USAGE_FILTER_OPTIONS = { clientType: 'clients', provider: 'providers', model: 'models' };
+  var USAGE_FILTER_KEYS = Object.keys(USAGE_FILTER_OPTIONS);
+
+  function usageQuery(args, filters) {
+    return Object.keys(filters).length ? Object.assign({}, args, { filters: filters }) : args;
+  }
+
+  function normalizeFilterOptions(options) {
+    var result = {};
+    Object.values(USAGE_FILTER_OPTIONS).forEach(function (key) {
+      var values = options && options[key];
+      result[key] = Array.isArray(values) ? Array.from(new Set(values.filter(toStr))) : [];
+    });
+    return result;
+  }
 
   function usageRow(x) {
     var o = x && typeof x === 'object' ? x : {};
@@ -911,17 +924,24 @@
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createUsageController: 需要 invoke 函数');
     var snapshot = null, loading = false, error = null, period = DEFAULT_USAGE_PERIOD;
-    var epoch = 0, trend = null;
+    var epoch = 0, trend = null, filters = {}, filterOptions = null, optionsError = null;
     var listeners = new Set();
 
     function state() {
-      return { snapshot: snapshot, loading: loading, error: error, period: period, trend: trend };
+      return { snapshot: snapshot, loading: loading, error: error, period: period, trend: trend,
+        filters: filters, filterOptions: filterOptions, optionsError: optionsError };
     }
     function emit() { var s = state(); listeners.forEach(function (fn) { try { fn(s); } catch { /* Rendering errors do not affect controller state. */ } }); }
     function subscribe(fn) { listeners.add(fn); return function () { listeners.delete(fn); }; }
 
-    function load(p) {
+    function load(p, refreshOptions) {
       if (USAGE_PERIODS.indexOf(p) === -1) return;
+      var filtered = Object.keys(filters).length > 0;
+      if (period !== p) {
+        filterOptions = null;
+        optionsError = null;
+        if (filtered) snapshot = null;
+      }
       period = p;
       loading = true;
       error = null;
@@ -929,9 +949,13 @@
       var dayCount = p === 'today' || p === '7d' ? 7 : p === '30d' ? 30 : 0;
       trend = dayCount ? { dayCount: dayCount, rows: null, error: null } : null;
       emit();
-      invoke('usage_snapshot', { period: p }).then(function (r) {
+      invoke('usage_snapshot', usageQuery({ period: p }, filters)).then(function (r) {
         if (my !== epoch) return;
         snapshot = normalizeUsageSnapshot(r);
+        if (!filtered) {
+          filterOptions = normalizeFilterOptions(r && r.filterOptions);
+          optionsError = null;
+        }
         loading = false;
         emit();
       }, function (err) {
@@ -941,7 +965,7 @@
         emit();
       });
       if (trend) {
-        invoke('usage_snapshot', { period: dayCount + 'd', trend: true }).then(function (r) {
+        invoke('usage_snapshot', usageQuery({ period: dayCount + 'd', trend: true }, filters)).then(function (r) {
           if (my !== epoch) return;
           var end = new Date(r.updatedAt);
           if (!Number.isFinite(end.getTime())) throw new Error('趋势时间无效');
@@ -953,12 +977,26 @@
           emit();
         });
       }
+      // Only the unfiltered period summary supplies the full dropdown choices.
+      if (filtered && (refreshOptions || !filterOptions || optionsError)) {
+        invoke('usage_snapshot', { period: p }).then(function (r) {
+          if (my !== epoch) return;
+          filterOptions = normalizeFilterOptions(r && r.filterOptions);
+          optionsError = null;
+          emit();
+        }, function (err) {
+          if (my !== epoch) return;
+          optionsError = errorMessage(err);
+          emit();
+        });
+      }
     }
 
     return {
       subscribe: subscribe, state: state,
+      setFilters: function (next) { filters = next; snapshot = null; load(period); },
       setPeriod: function (p) { if (p !== period) load(p); },
-      refresh: function () { load(period); },
+      refresh: function () { load(period, true); },
     };
   }
 
@@ -973,7 +1011,7 @@
   var CLIENT_LABELS = { 'claude-code': 'Claude Code', 'zcode': 'ZCode', codex: 'Codex', pi: 'Pi', 'qwen-code': 'Qwen Code', opencode: 'OpenCode', api: 'API' };
   function clientLabel(type) {
     var t = toStr(type);
-    return t ? (CLIENT_LABELS[t] || t) : '未知';
+    return t ? (Object.hasOwn(CLIENT_LABELS, t) ? CLIENT_LABELS[t] : t) : '未知';
   }
   function normalizeRecord(r) {
     var o = r && typeof r === 'object' ? r : {};
@@ -1053,7 +1091,7 @@
   function createRecordsController(options) {
     var invoke = options && options.invoke;
     if (typeof invoke !== 'function') throw new TypeError('createRecordsController: 需要 invoke 函数');
-    var period = DEFAULT_USAGE_PERIOD, page = 1, pageSize = RECORDS_PAGE_SIZE;
+    var period = DEFAULT_USAGE_PERIOD, filters = {}, page = 1, pageSize = RECORDS_PAGE_SIZE;
     var data = null, loading = false, error = null;
     var epoch = 0;
     var listeners = new Set();
@@ -1061,7 +1099,7 @@
     function state() {
       var total = data ? data.total : null;
       return {
-        period: period, page: page, pageSize: pageSize,
+        period: period, filters: filters, page: page, pageSize: pageSize,
         data: data, loading: loading, error: error,
         total: total,
         totalPages: total === null ? null : Math.max(1, Math.ceil(total / pageSize)),
@@ -1077,7 +1115,7 @@
       error = null;
       emit();
       var my = ++epoch;
-      invoke('usage_records', { period: period, page: page, pageSize: pageSize }).then(function (r) {
+      invoke('usage_records', usageQuery({ period: period, page: page, pageSize: pageSize }, filters)).then(function (r) {
         if (my !== epoch) return;
         data = normalizeRecordsPage(r);
         loading = false;
@@ -1092,9 +1130,11 @@
 
     return {
       subscribe: subscribe, state: state,
+      setFilters: function (next) { filters = next; data = null; page = 1; load(); },
       setPeriod: function (p) {
         if (USAGE_PERIODS.indexOf(p) === -1 || p === period) return;
         period = p;
+        data = null;
         page = 1; // a new period always starts from the first page
         load();
       },
@@ -1382,60 +1422,6 @@
       revision: 'rev-1',
     };
     var previewDay = new Date();
-    var usage = {
-      today: {
-        period: 'today', totalRequests: 128, successCount: 125, errorCount: 3,
-        inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700, estimatedCount: 12,
-        avgTtftMs: 842, avgTokensPerSecond: 36.2,
-        byProvider: [
-          { name: 'alpha.example.com', requests: 96, inputTokens: 640000, effectiveInputTokens: 640000, outputTokens: 180000, cacheReadTokens: 80000, cacheWriteTokens: 10700 },
-          { name: 'beta.example.com', requests: 32, inputTokens: 202100, effectiveInputTokens: 202100, outputTokens: 51500, cacheReadTokens: 22400, cacheWriteTokens: 20000 },
-        ],
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
-        byDay: [{ name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 }],
-        updatedAt: Date.now() - 3000,
-      },
-      '7d': {
-        period: '7d', totalRequests: 902, successCount: 890, errorCount: 12,
-        inputTokens: 6210000, effectiveInputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500, estimatedCount: 57,
-        avgTtftMs: 905, avgTokensPerSecond: 33.8,
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 902, inputTokens: 6210000, effectiveInputTokens: 6210000, outputTokens: 1540000, cacheReadTokens: 810300, cacheWriteTokens: 214500 }],
-        byProvider: [
-          { name: 'alpha.example.com', requests: 655, inputTokens: 4500000, effectiveInputTokens: 4500000, outputTokens: 1150000, cacheReadTokens: 610300, cacheWriteTokens: 114500 },
-          { name: 'beta.example.com', requests: 247, inputTokens: 1710000, effectiveInputTokens: 1710000, outputTokens: 390000, cacheReadTokens: 200000, cacheWriteTokens: 100000 },
-        ],
-        byDay: [
-          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, effectiveInputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
-          { name: usageDayKey(previewDay, 2), requests: 155, inputTokens: 950000, effectiveInputTokens: 950000, outputTokens: 250000, cacheReadTokens: 130000, cacheWriteTokens: 40000 },
-          { name: usageDayKey(previewDay, 3), requests: 132, inputTokens: 720000, effectiveInputTokens: 720000, outputTokens: 190000, cacheReadTokens: 90000, cacheWriteTokens: 26000 },
-          { name: usageDayKey(previewDay, 4), requests: 147, inputTokens: 880000, effectiveInputTokens: 880000, outputTokens: 228000, cacheReadTokens: 105000, cacheWriteTokens: 31000 },
-          { name: usageDayKey(previewDay, 5), requests: 101, inputTokens: 520000, effectiveInputTokens: 520000, outputTokens: 152000, cacheReadTokens: 66000, cacheWriteTokens: 20000 },
-          { name: usageDayKey(previewDay, 6), requests: 99, inputTokens: 498000, effectiveInputTokens: 498000, outputTokens: 148500, cacheReadTokens: 67200, cacheWriteTokens: 18800 },
-        ],
-        updatedAt: Date.now() - 3000,
-      },
-      '30d': {
-        period: '30d', totalRequests: 4120, successCount: 4044, errorCount: 76,
-        inputTokens: 28600000, effectiveInputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000, estimatedCount: 231,
-        avgTtftMs: 878, avgTokensPerSecond: 34.9,
-        byModel: [{ name: 'claude-sonnet-4-5', requests: 4120, inputTokens: 28600000, effectiveInputTokens: 28600000, outputTokens: 7100000, cacheReadTokens: 3600000, cacheWriteTokens: 980000 }],
-        byProvider: [
-          { name: 'alpha.example.com', requests: 3010, inputTokens: 21000000, effectiveInputTokens: 21000000, outputTokens: 5300000, cacheReadTokens: 2600000, cacheWriteTokens: 680000 },
-          { name: 'beta.example.com', requests: 1110, inputTokens: 7600000, effectiveInputTokens: 7600000, outputTokens: 1800000, cacheReadTokens: 1000000, cacheWriteTokens: 300000 },
-        ],
-        byDay: [
-          { name: usageDayKey(previewDay, 0), requests: 128, inputTokens: 842100, effectiveInputTokens: 842100, outputTokens: 231500, cacheReadTokens: 102400, cacheWriteTokens: 30700 },
-          { name: usageDayKey(previewDay, 1), requests: 140, inputTokens: 900000, effectiveInputTokens: 900000, outputTokens: 240000, cacheReadTokens: 120000, cacheWriteTokens: 35000 },
-        ],
-        updatedAt: Date.now() - 3000,
-      },
-    };
-    var olderDay = { name: '2026-09-01', requests: 1, inputTokens: 1000, effectiveInputTokens: 1000, outputTokens: 250, cacheReadTokens: 0, cacheWriteTokens: 0 };
-    usage.all = Object.assign({}, usage['30d'], {
-      period: 'all', totalRequests: 4121, successCount: 4045, inputTokens: 28601000, effectiveInputTokens: 28601000, outputTokens: 7100250,
-      byDay: [olderDay].concat(usage['30d'].byDay),
-    });
     var clients = {
       clients: [
         { id: 'claudeCode', name: 'Claude Code', enabled: true, managed: true, exists: true, activeModel: 'claude-sonnet-4-5', modelAlias: 'claude-sonnet-4-5' },
@@ -1463,14 +1449,22 @@
       { original: 'gpt-5-codex', model: 'gpt-5-codex', upstream: null },
     ];
     var RECORD_COUNTS = { today: 45, '7d': 132, '30d': 260, all: 320 };
-    function previewRecords(period) {
-      var n = RECORD_COUNTS[period] || 45;
+    function previewRecords() {
+      var n = RECORD_COUNTS.all;
       var records = [];
       for (var i = 0; i < n; i++) {
         var chain = RECORD_CHAINS[i % RECORD_CHAINS.length];
         var failed = i === 4; // stable error record on the first page
+        // Keep each period a prefix of the same newest-first history.
+        var daysAgo = 0;
+        if (i >= RECORD_COUNTS['30d']) daysAgo = 30 + i - RECORD_COUNTS['30d'];
+        else if (i >= RECORD_COUNTS['7d']) daysAgo = 7 + Math.floor((i - RECORD_COUNTS['7d']) / 6);
+        else if (i >= RECORD_COUNTS.today) daysAgo = 1 + Math.floor((i - RECORD_COUNTS.today) / 15);
+        var timestamp = new Date(previewDay);
+        timestamp.setDate(timestamp.getDate() - daysAgo);
+        timestamp.setMilliseconds(Math.max(0, timestamp.getMilliseconds() - i));
         records.push({
-          timestamp: new Date(Date.now() - i * 240000).toISOString(),
+          timestamp: timestamp.toISOString(),
           provider: RECORD_PROVIDERS[i % RECORD_PROVIDERS.length],
           model: chain.model,
           originalModel: chain.original,
@@ -1492,10 +1486,50 @@
       }
       return records;
     }
-    var recordsCache = null;
-    function recordsFor(period) {
-      if (!recordsCache) recordsCache = { today: previewRecords('today'), '7d': previewRecords('7d'), '30d': previewRecords('30d'), all: previewRecords('all') };
-      return recordsCache[period] || recordsCache.today;
+    var previewUsageRecords = previewRecords();
+    function recordsFor(period, filters) {
+      return previewUsageRecords.slice(0, RECORD_COUNTS[period]).filter(function (record) {
+        return USAGE_FILTER_KEYS.every(function (key) { return !filters || !filters[key] || record[key] === filters[key]; });
+      });
+    }
+
+    function previewUsageSnapshot(period, filters) {
+      var records = recordsFor(period, filters);
+      var successes = records.filter(function (r) { return r.status === 'success'; });
+      var tokenKeys = ['inputTokens', 'effectiveInputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'];
+      function tokenTotals(rows) {
+        var totals = {};
+        tokenKeys.forEach(function (key) {
+          totals[key] = rows.reduce(function (sum, r) { return sum + (r.status === 'success' ? r[key] : 0); }, 0);
+        });
+        return totals;
+      }
+      function buckets(keyOf) {
+        var grouped = new Map();
+        records.forEach(function (r) {
+          var name = keyOf(r);
+          if (!grouped.has(name)) grouped.set(name, []);
+          grouped.get(name).push(r);
+        });
+        return Array.from(grouped, function (entry) {
+          return Object.assign({ name: entry[0], requests: entry[1].length }, tokenTotals(entry[1]));
+        });
+      }
+      function average(key) {
+        return successes.length ? successes.reduce(function (sum, r) { return sum + r[key]; }, 0) / successes.length : null;
+      }
+      var filterOptions = {};
+      USAGE_FILTER_KEYS.forEach(function (key) {
+        filterOptions[USAGE_FILTER_OPTIONS[key]] = Array.from(new Set(records.map(function (r) { return r[key]; }))).sort();
+      });
+      return Object.assign(tokenTotals(records), {
+        period: period, totalRequests: records.length, successCount: successes.length, errorCount: records.length - successes.length,
+        estimatedCount: successes.filter(function (r) { return r.usageEstimated; }).length,
+        avgTtftMs: average('ttftMs'), avgTokensPerSecond: average('tokensPerSecond'),
+        byModel: buckets(function (r) { return r.model; }), byProvider: buckets(function (r) { return r.provider; }),
+        byDay: buckets(function (r) { return usageDayKey(new Date(r.timestamp), 0); }).reverse(),
+        updatedAt: previewDay.getTime(), filterOptions: filterOptions,
+      });
     }
 
     function copy(v) { return JSON.parse(JSON.stringify(v)); }
@@ -1669,9 +1703,7 @@
       }
       if (cmd === 'usage_snapshot') {
         var period = USAGE_PERIODS.indexOf(a.period) !== -1 ? a.period : 'today';
-        var result = copy(usage[period]);
-        if (a.trend) result.updatedAt = previewDay.getTime();
-        return delay(result);
+        return delay(previewUsageSnapshot(period, a.filters));
       }
       if (cmd === 'usage_records') {
         // Mirrors the native contract: invalid period is a fixed error, page
@@ -1679,7 +1711,7 @@
         if (USAGE_PERIODS.indexOf(a.period) === -1) return Promise.reject(new Error('统计周期无效'));
         var recPage = Math.max(1, Math.floor(Number(a.page) || 1));
         var recSize = Math.min(50, Math.max(1, Math.floor(Number(a.pageSize) || RECORDS_PAGE_SIZE)));
-        var all = recordsFor(a.period);
+        var all = recordsFor(a.period, a.filters);
         var recStart = (recPage - 1) * recSize;
         return delay({ period: a.period, page: recPage, pageSize: recSize, total: all.length, records: all.slice(recStart, recStart + recSize) });
       }
@@ -2517,6 +2549,9 @@
       usageUpdated: document.getElementById('usage-updated'),
       usageRefresh: document.getElementById('usage-refresh'),
       usagePeriods: document.getElementById('usage-periods'),
+      usageFilters: document.getElementById('usage-filters').querySelectorAll('select'),
+      clearUsageFilters: document.getElementById('usage-clear-filters'),
+      filterMsg: document.getElementById('usage-filter-msg'),
       usageMsg: document.getElementById('usage-msg'),
       usageBody: document.getElementById('usage-body'),
       clientsRefresh: document.getElementById('clients-refresh'),
@@ -3063,7 +3098,31 @@
       return card;
     }
 
+    function renderUsageFilters(s) {
+      var filters = s.filters || {};
+      els.clearUsageFilters.disabled = !Object.keys(filters).length;
+      els.usageFilters.forEach(function (select) {
+        var key = select.dataset.filter, selected = filters[key] || '';
+        var values = s.filterOptions ? s.filterOptions[USAGE_FILTER_OPTIONS[key]] : [];
+        // Keep an active value removable even when the new period has no matches.
+        if (selected && !values.includes(selected)) values = values.concat(selected);
+        var choices = [''].concat(values);
+        if (choices.length !== select.children.length || choices.some(function (v, i) { return v !== select.children[i].value; })) {
+          select.textContent = '';
+          choices.forEach(function (value) {
+            var option = el('option', null, value ? (key === 'clientType' ? clientLabel(value) : value) : '全部');
+            option.value = value;
+            select.appendChild(option);
+          });
+        }
+        select.value = selected;
+        select.disabled = values.length === 0;
+      });
+      setBanner(els.filterMsg, s.optionsError ? '筛选选项读取失败：' + s.optionsError : null, 'error');
+    }
+
     function renderUsage(s) {
+      renderUsageFilters(s);
       els.usageRefresh.disabled = mode === 'missing' || s.loading;
       Array.prototype.slice.call(els.usagePeriods.querySelectorAll('.period-btn')).forEach(function (b) {
         b.setAttribute('aria-pressed', String(b.dataset.period === s.period));
@@ -3390,7 +3449,7 @@
         return;
       }
       if (!rs.data.records.length) {
-        refs.scroll.appendChild(noteEl('该周期暂无调用记录'));
+        refs.scroll.appendChild(noteEl(Object.keys(rs.filters).length ? '没有符合筛选条件的调用记录' : '该周期暂无调用记录'));
         return;
       }
       refs.scroll.appendChild(buildRecordsTable(rs.data.records));
@@ -3739,6 +3798,21 @@
         if (recordsCtrl) recordsCtrl.setPeriod(b.dataset.period); // resets to page 1
       });
     });
+    function applyUsageFilters(filters) {
+      if (!usageCtrl || !recordsCtrl) return;
+      usageCtrl.setFilters(filters);
+      recordsCtrl.setFilters(filters);
+    }
+    els.usageFilters.forEach(function (select) {
+      select.addEventListener('change', function () {
+        var filters = {};
+        els.usageFilters.forEach(function (field) {
+          if (field.value) filters[field.dataset.filter] = field.value;
+        });
+        applyUsageFilters(filters);
+      });
+    });
+    els.clearUsageFilters.addEventListener('click', function () { applyUsageFilters({}); });
     els.usageRefresh.addEventListener('click', function () {
       if (usageCtrl) usageCtrl.refresh();
       if (recordsCtrl) recordsCtrl.refresh();
