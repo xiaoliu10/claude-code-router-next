@@ -296,12 +296,12 @@ export function UsageStats() {
   const maxDailyTokens = Math.max(1, ...dailyData.map(([, d]) =>
     dailyUsesOutput ? d.outputTokens : usageTokens(d).total!
   ));
-  const modelUsesOutput = Object.values(summary?.byModel ?? {}).some(d => usageTokens(d).total === null);
+  const modelUsesRecorded = Object.values(summary?.byModel ?? {}).some(d => usageTokens(d).total === null);
 
   const modelData = Object.entries(summary?.byModel ?? {})
     .map(([model, data]) => {
       const { cacheMissInput, total } = usageTokens(data);
-      return { model, data, cacheMissInput, total, chartTokens: modelUsesOutput ? data.outputTokens : total! };
+      return { model, data, cacheMissInput, total, chartTokens: modelUsesRecorded ? (data.cacheReadInputTokens ?? 0) + data.outputTokens : total! };
     })
     .sort((a, b) => b.chartTokens - a.chartTokens)
     .slice(0, 10);
@@ -556,11 +556,11 @@ export function UsageStats() {
 
           {chartView === "model" && summary && (
             <section className="mb-4">
-              <h2 className="mb-2 text-sm font-semibold text-gray-700">{t(modelUsesOutput ? "usage.output_tokens" : "usage.total_tokens")}</h2>
+              <h2 className="mb-2 text-sm font-semibold text-gray-700">{t(modelUsesRecorded ? "usage.recorded_model_ranking" : "usage.total_tokens")}</h2>
               {modelData.length > 0 ? (
                 <div className="space-y-2">
                   {modelData.map(({ model, data, cacheMissInput, total, chartTokens }) => {
-                    const width = chartTokens > 0 ? Math.max(8, (chartTokens / maxModelTokens) * 100) : 0;
+                    const width = chartTokens > 0 ? (chartTokens / maxModelTokens) * 100 : 0;
                     const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
                     return (
                       <Tooltip key={model}>
@@ -575,7 +575,7 @@ export function UsageStats() {
                                 style={{ width: `${width}%` }}
                               />
                             </div>
-                            <div className="w-[70px] text-sm text-gray-500 text-right">
+                            <div className="w-[70px] text-sm text-gray-500 text-right" title={chartTokens.toLocaleString()}>
                               {formatTokens(chartTokens)}
                             </div>
                           </div>
