@@ -10,6 +10,7 @@
   <script src="projects.js" defer></script>
   <script src="plugins.js" defer></script>
   <script src="codex-service-tier.js" defer></script>
+  <script src="software-update.js" defer></script>
   <script src="quota.js" defer></script>
 </head>
 <body>
@@ -43,6 +44,11 @@
 
     <div id="service-reload-msg" class="banner" role="status" aria-live="polite" hidden></div>
 
+    <aside id="update-notice" class="update-notice update-line" aria-label="桌面软件更新" hidden>
+      <div><strong id="update-notice-status" role="status"></strong><div id="update-notice-warning" class="settings-note"></div></div>
+      <button id="update-notice-install" class="btn btn-primary" type="button" aria-describedby="update-notice-warning">立即更新</button>
+    </aside>
+
     <nav id="tabs" class="tabs" role="tablist" aria-label="控制中心页签">
       <button id="tab-quota" class="tab" type="button" role="tab" aria-selected="true" aria-controls="panel-quota">额度</button>
       <button id="tab-routing" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-routing" tabindex="-1">路由</button>
@@ -50,7 +56,7 @@
       <button id="tab-clients" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-clients" tabindex="-1">客户端</button>
       <button id="tab-projects" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-projects" tabindex="-1">项目</button>
       <button id="tab-plugins" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-plugins" tabindex="-1">插件</button>
-      <button id="tab-settings" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" tabindex="-1">设置</button>
+      <button id="tab-settings" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" tabindex="-1">设置<span id="tab-settings-update" class="tab-dot" role="img" aria-label="有可用的软件更新" hidden></span></button>
     </nav>
 
     <section id="panel-quota" class="panel" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
@@ -202,10 +208,30 @@
         <button id="settings-save" class="btn btn-primary" type="button" disabled hidden>保存设置</button>
         <button id="settings-refresh" class="btn" type="button" title="重新读取最新配置并保留草稿">刷新</button>
       </div>
-      <p class="hint">点击「保存设置」后才会写入配置。需要重启时，请先结束正在进行的请求。外部网关由其管理者重启。修改地址、端口或密钥后，请重新打开桌面并检查客户端连接。</p>
+      <p class="hint">网关配置需点击「保存设置」后才会写入。需要重启时，请先结束正在进行的请求。外部网关由其管理者重启。修改地址、端口或密钥后，请重新打开桌面并检查客户端连接。</p>
       <div id="settings-msg" class="banner" role="status" aria-live="polite" hidden></div>
 
-      <div id="settings-body" class="settings-body list" role="form" aria-label="通用设置" hidden>
+      <div class="list">
+        <section id="update-card" class="settings-group settings-rows" aria-labelledby="update-title" hidden>
+          <div class="update-line">
+            <h2 id="update-title" class="settings-group-title">软件更新</h2>
+            <span class="count">当前版本 <span id="update-current-version">—</span></span>
+            <button id="update-check" class="btn" type="button">检查更新</button>
+          </div>
+          <label class="flag"><input id="update-auto" class="switch" type="checkbox" role="switch"><span>每 6 小时自动检查更新</span></label>
+          <span id="update-pref-error" class="inline-msg" role="status" hidden></span>
+          <div id="update-status" class="settings-note" role="status"></div>
+          <progress id="update-progress" class="meter" max="100" aria-label="下载更新进度" hidden></progress>
+          <div id="update-install-row" class="update-line" hidden>
+            <span id="update-warning" class="settings-note"></span>
+            <button id="update-install" type="button" class="btn btn-primary" aria-describedby="update-warning">立即更新</button>
+          </div>
+          <details id="update-notes" hidden>
+            <summary>发行说明</summary>
+            <p id="update-notes-body" class="settings-note"></p>
+          </details>
+        </section>
+      <div id="settings-body" class="settings-body settings-rows" role="form" aria-label="通用设置" hidden>
         <div class="settings-group" role="group" aria-label="通用行为">
           <p class="settings-group-title">通用行为</p>
           <div class="settings-rows">
@@ -321,6 +347,8 @@
             </div>
           </div>
         </div>
+      </div>
+
       </div>
     </section>
 

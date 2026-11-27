@@ -1,3 +1,9 @@
+// The Windows lib-test executable needs the same Common Controls v6 manifest as
+// the app for muda's TaskDialogIndirect import to resolve before tests start.
+#[cfg(all(test, windows, target_env = "msvc"))]
+#[link(name = "resource", kind = "static", modifiers = "-bundle")]
+extern "C" {}
+
 mod api;
 mod autostart;
 mod control;
@@ -11,6 +17,7 @@ mod providers;
 mod quota;
 mod settings;
 mod tray;
+mod update;
 mod webview_retry;
 
 use std::sync::Arc;
@@ -26,7 +33,9 @@ pub fn run() {
         }));
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_nspanel::init());
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     let app = builder
+        .manage(update::UpdateService::default())
         .invoke_handler(tauri::generate_handler![
             autostart::login_start_status,
             autostart::login_start_set,
@@ -63,7 +72,10 @@ pub fn run() {
             credentials::quota_credentials_status,
             credentials::quota_credentials_save,
             lifecycle::service_snapshot,
-            lifecycle::service_action
+            lifecycle::service_action,
+            update::desktop_update_status,
+            update::desktop_update_check,
+            update::desktop_update_install
         ])
         .setup(|app| {
             // Both webview/window creations are retried for the

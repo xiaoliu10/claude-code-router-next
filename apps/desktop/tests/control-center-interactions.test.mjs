@@ -133,13 +133,15 @@ export function harness(overrides = {}, options = {}) {
     usage_records: args => ({ period: args.period || 'today', page: args.page || 1, pageSize: args.pageSize || 20, total: 0, records: [] }),
     ...overrides,
   };
-  const win = { __TAURI__: { window: { getCurrentWindow: () => ({ label: options.windowLabel ?? 'main' }) }, core: { invoke(cmd, args) {
+  const win = { __TAURI__: { window: { getCurrentWindow: () => ({ label: Object.hasOwn(options, 'windowLabel') ? options.windowLabel : 'main' }) }, core: { invoke(cmd, args) {
     calls.push({ cmd, args });
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };
+  if (options.listen) win.__TAURI__.event = { listen: options.listen };
+  if (options.storage) win.localStorage = options.storage;
   // options.setTimeout lets tests capture toast auto-hide timers deterministically.
   vm.runInNewContext(scripts, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout: options.setTimeout || setTimeout,
-    setInterval: (fn, ms) => { intervals.push([fn, ms]); return setInterval(fn, ms); },
+    setInterval: (fn, ms) => { intervals.push([fn, ms]); return options.setInterval ? options.setInterval(fn, ms) : setInterval(fn, ms); },
     clearInterval: (t) => { cleared.push(t); clearInterval(t); } });
   doc.events.DOMContentLoaded();
   return { doc, calls, route, id: id => doc.getElementById(id), focusWindow: () => windowEvents.focus(), windowEvents, win, intervals, cleared };

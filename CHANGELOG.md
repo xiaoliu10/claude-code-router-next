@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.3.2439] - 2026-11-27
+
+### English
+
+CCR Desktop 0.1.3 for Windows x64 adds signed updates. Install this first version manually. The control center can then check for a later version and offer to download and install it.
+
+### 中文
+
+Windows x64 版 CCR Desktop 0.1.3 新增签名更新。首次需要手动安装，之后控制中心可检查新版，并提示下载安装。
+
 ## [2.3.2438] - 2026-11-26
 
 ### English

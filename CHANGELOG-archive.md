@@ -8,6 +8,7 @@ This document archives the older release summaries that fall outside the "latest
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2429** | <ul><li>**Codex 手动用量重置**：卡片展示赠送的重置次数（来自上游），确认弹窗是唯一消耗入口；同步锁拒绝并发重复点击，重试复用幂等键，丢失响应不双花；kiro 0.1.1 随包发布。</li><li>**Gemini 传输与配额修复**：省略 Content-Type 时识别 Code Assist SSE；配额走共享管线；恢复后不再残留失败横幅。</li><li>**精确模型路由修复**：供应商显式暴露的模型 id 短路家族路由，Gemini 的 Claude 模型可按名称直达。</li><li>**Codex 掉登录修复**：剥离 Responses input 中的 thinking 字段（上游 400 根因）；成功输出清除错误残留。</li></ul> |
 | **v2.3.2428** | <ul><li>**配额适配器 gzip 修复**：经代理的配额请求固定 `Accept-Encoding: identity`，避免 undici 未解压 gzip 导致解析失败、卡片不显示用量（智谱等供应商恢复配额展示）。</li></ul> |
 | **v2.3.2426** | <ul><li>**Gemini (Antigravity) 模型隐藏/恢复**：卡片列出可见模型 chips（带隐藏按钮）与隐藏列表（恢复/全部恢复）；隐藏时自动清理 Router 引用并回退默认路由，失败完整回滚。</li></ul> |
 | **v2.3.2425** | <ul><li>**供应商拖动排序**：卡片可拖动重排，顺序立即写入配置；拖拽按稳定行 ID 定位，搜索过滤下依然正确，无 name 的供应商也能拖。</li><li>**grok 与 cursor 卡片对齐家族样式**：统一按钮词汇、尺寸、图标与 destructive 变体，七张供应商卡片外观一致。</li></ul> |
@@ -76,6 +77,7 @@ This document archives the older release summaries that fall outside the "latest
 
 | Version | Release Details |
 | --- | --- |
+| **v2.3.2429** | <ul><li><strong>Codex manual usage reset</strong>: the card shows gifted reset credits (upstream-owned); a confirmation dialog is the only spend path; a synchronous latch rejects concurrent double-clicks and retries reuse the idempotency key so a lost response cannot double-spend; kiro 0.1.1 ships with this release.</li><li><strong>Gemini transport &amp; quota fixes</strong>: recognize Code Assist SSE without a Content-Type; real quota via the shared pipeline; recovered requests no longer leave a stale failure banner.</li><li><strong>Exact model routing fix</strong>: provider-exposed model ids short-circuit family routing — Gemini’s Claude models are reachable by name again.</li><li><strong>Codex dropped-login fix</strong>: strip the thinking field from Responses input (the upstream 400 root cause); successful output clears error residue.</li></ul> |
 | **v2.3.2428** | <ul><li><strong>Quota adapter gzip fix</strong>: proxied quota requests pin <code>Accept-Encoding: identity</code> so an undecoded gzip body can no longer fail the parse and hide the provider quota (Zhipu and similar providers show usage again).</li></ul> |
 | **v2.3.2426** | <ul><li><strong>Gemini (Antigravity) model hide/restore</strong>: the card lists visible model chips with hide buttons plus a hidden list with restore/restore-all; hiding clears Router references with a first-visible default and rolls back completely on failure.</li></ul> |
 | **v2.3.2425** | <ul><li><strong>Provider drag-and-drop reordering</strong>: drag a provider card to reorder the list; the order is written to the config immediately. Drags resolve by stable row id, so they stay correct while the list is search-filtered, and unnamed providers can be dragged too.</li><li><strong>grok and cursor cards follow the family style</strong>: shared button vocabulary, sizes, icons and destructive variant, so all seven provider cards look alike.</li></ul> |

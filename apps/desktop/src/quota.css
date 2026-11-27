@@ -440,3 +440,12 @@ body {
 .plugins-actions { margin-top: 8px; }
 .plugins-confirm { margin: 0 14px 8px; }
 .plugins-confirm .card-message { margin-top: 0; }
+
+/* Software update appears above the gateway settings, including while the gateway is offline. */
+.update-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.update-line .settings-group-title { margin: 0; }
+.update-line .btn { margin-left: auto; flex: none; }
+.update-notice { margin: 0 14px 6px; padding: 6px 10px; border-radius: 8px; background: var(--accent-soft); color: var(--accent-deep); }
+#update-notes-body { margin-top: 6px; white-space: pre-wrap; max-height: 10em; overflow: auto; }
+#update-status[data-tone="error"] { color: var(--danger); }
+.tab-dot { display: inline-block; width: 6px; height: 6px; margin-left: 4px; border-radius: 50%; background: var(--accent); vertical-align: middle; }
