@@ -141,9 +141,7 @@ function formatTime(ts: string): string {
 
 export function UsageStats() {
   const { t } = useTranslation();
-  const [summary, setSummary] = useState<UsageSummary | null>(null);
-  const [records, setRecords] = useState<UsageRecord[]>([]);
-  const [total, setTotal] = useState(0);
+  const [resultPage, setResultPage] = useState<{ key: string; summary: UsageSummary; records: UsageRecord[]; total: number } | null>(null);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   // Guards stale responses from out-of-order fetches when filters change.
@@ -164,6 +162,12 @@ export function UsageStats() {
   const [filterScenario, setFilterScenario] = useState("");
   const [filterClient, setFilterClient] = useState("");
   const [filterStatus, setFilterStatus] = useState<"success" | "error" | "">("");
+
+  const queryKey = JSON.stringify([page, selection, filterModel, filterProvider, filterScenario, filterClient, filterStatus]);
+  const currentPage = resultPage?.key === queryKey ? resultPage : null;
+  const summary = currentPage?.summary;
+  const records = currentPage?.records ?? [];
+  const total = currentPage?.total ?? 0;
 
   const [chartView, setChartView] = useState<"daily" | "model">("daily");
   const [loadFailed, setLoadFailed] = useState(false);
@@ -188,16 +192,14 @@ export function UsageStats() {
       const result = await api.getUsage(params);
       if (generation !== generationRef.current) return;
       setLoadFailed(false);
-      setRecords(result.records || []);
-      setSummary(result.summary);
-      setTotal(result.total);
+      setResultPage({ key: queryKey, summary: result.summary, records: result.records || [], total: result.total });
     } catch (e) {
       if (generation === generationRef.current) setLoadFailed(true);
       console.error("Failed to load usage:", e);
     } finally {
       if (generation === generationRef.current) setLoading(false);
     }
-  }, [page, selection, filterModel, filterProvider, filterScenario, filterClient, filterStatus]);
+  }, [queryKey, page, selection, filterModel, filterProvider, filterScenario, filterClient, filterStatus]);
 
   // Serial, queue-style auto refresh:
   // - at most one /api/usage request in flight at a time;
