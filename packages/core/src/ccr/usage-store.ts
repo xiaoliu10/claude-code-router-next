@@ -84,12 +84,21 @@ export interface UsageRecord {
 
 type UsageRecordInput = Omit<UsageRecord, "effectiveInputTokens"> & { effectiveInputTokens?: number | null };
 
-export interface UsageSummary {
+interface CoveredUsage {
+  coveredRequests: number;
+  coveredEstimatedCount: number;
+  coveredInputTokens: number;
+  coveredOutputTokens: number;
+  coveredCacheReadTokens: number;
+}
+
+export interface UsageSummary extends CoveredUsage {
   estimatedCount: number;
   totalRequests: number;
   successCount: number;
   errorCount: number;
   totalEffectiveInputTokens: number | null;
+  totalHistoricalInputTokens: number | null;
   totalInputTokens: number;
   totalOutputTokens: number;
   totalCacheReadInputTokens: number;
@@ -511,9 +520,23 @@ const EFFECTIVE_INPUT_SUM_SQL = `
     ELSE COALESCE(SUM(CASE WHEN status = 'success' THEN effective_input_tokens ELSE 0 END), 0)
   END
 `;
+// A historical sum can recover cached rows whose raw input used the net-input
+// convention. A successful row with unknown input and no cache cannot be recovered.
+const HISTORICAL_INPUT_SUM_SQL = `
+  CASE
+    WHEN COUNT(CASE WHEN status = 'success' AND (
+      input_tokens < 0 OR cache_read_input_tokens < 0 OR cache_creation_input_tokens < 0 OR output_tokens < 0
+      OR effective_input_tokens < cache_read_input_tokens
+      OR (effective_input_tokens IS NULL AND cache_read_input_tokens = 0 AND cache_creation_input_tokens = 0)
+    ) THEN 1 END) > 0 THEN NULL
+    ELSE COALESCE(SUM(CASE WHEN status = 'success' THEN COALESCE(effective_input_tokens,
+      input_tokens + cache_read_input_tokens + cache_creation_input_tokens) END), 0)
+  END
+`;
 const SUMMARY_BUCKET_AGGREGATES = `
   COUNT(*) AS count,
   ${EFFECTIVE_INPUT_SUM_SQL} AS effectiveInputTokens,
+  ${HISTORICAL_INPUT_SUM_SQL} AS historicalInputTokens,
   COALESCE(SUM(CASE WHEN status = 'success' THEN input_tokens ELSE 0 END), 0) AS inputTokens,
   COALESCE(SUM(CASE WHEN status = 'success' THEN output_tokens ELSE 0 END), 0) AS outputTokens,
   COALESCE(SUM(CASE WHEN status = 'success' THEN cache_read_input_tokens ELSE 0 END), 0) AS cacheReadInputTokens,
@@ -521,6 +544,7 @@ const SUMMARY_BUCKET_AGGREGATES = `
 `;
 
 type SummaryBucket = {
+  historicalInputTokens: number | null;
   effectiveInputTokens: number | null;
   count: number;
   inputTokens: number;
@@ -561,6 +585,7 @@ function readSummaryBuckets(
     if (row.key == null) continue;
     map[String(row.key)] = {
       count: row.count,
+      historicalInputTokens: row.historicalInputTokens,
       effectiveInputTokens: row.effectiveInputTokens,
       inputTokens: row.inputTokens,
       outputTokens: row.outputTokens,
@@ -578,7 +603,14 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
     .prepare(`
       SELECT
         COUNT(*) AS totalRequests,
+        COUNT(CASE WHEN status = 'success' THEN effective_input_tokens END) AS coveredRequests,
+        COUNT(CASE WHEN status = 'success' AND effective_input_tokens IS NOT NULL
+          AND (usage_estimated = 1 OR effective_input_estimated = 1) THEN 1 END) AS coveredEstimatedCount,
+        COALESCE(SUM(CASE WHEN status = 'success' THEN effective_input_tokens END), 0) AS coveredInputTokens,
+        COALESCE(SUM(CASE WHEN status = 'success' AND effective_input_tokens IS NOT NULL THEN output_tokens END), 0) AS coveredOutputTokens,
+        COALESCE(SUM(CASE WHEN status = 'success' AND effective_input_tokens IS NOT NULL THEN cache_read_input_tokens END), 0) AS coveredCacheReadTokens,
         ${EFFECTIVE_INPUT_SUM_SQL} AS totalEffectiveInputTokens,
+        ${HISTORICAL_INPUT_SUM_SQL} AS totalHistoricalInputTokens,
         COALESCE(SUM(usage_estimated), 0) AS estimatedCount,
         COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS successCount,
         COALESCE(SUM(CASE WHEN status = 'success' THEN input_tokens ELSE 0 END), 0) AS totalInputTokens,
@@ -589,11 +621,12 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
         AVG(CASE WHEN status = 'success' AND tokens_per_second IS NOT NULL THEN tokens_per_second END) AS avgTokensPerSecond
       FROM usage_records ${where.sql}
     `)
-    .get(...where.params) as {
+    .get(...where.params) as CoveredUsage & {
     estimatedCount: number;
     totalRequests: number;
     successCount: number;
     totalEffectiveInputTokens: number | null;
+    totalHistoricalInputTokens: number | null;
     totalInputTokens: number;
     totalOutputTokens: number;
     totalCacheReadInputTokens: number;
@@ -603,8 +636,14 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
   };
 
   return {
+    coveredRequests: totals.coveredRequests,
+    coveredEstimatedCount: totals.coveredEstimatedCount,
+    coveredInputTokens: totals.coveredInputTokens,
+    coveredOutputTokens: totals.coveredOutputTokens,
+    coveredCacheReadTokens: totals.coveredCacheReadTokens,
     estimatedCount: totals.estimatedCount,
     totalEffectiveInputTokens: totals.totalEffectiveInputTokens,
+    totalHistoricalInputTokens: totals.totalHistoricalInputTokens,
     totalRequests: totals.totalRequests,
     successCount: totals.successCount,
     errorCount: totals.totalRequests - totals.successCount,

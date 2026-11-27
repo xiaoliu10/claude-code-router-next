@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "codex-reset",
+  "description": "Manual Codex reset credits in the local main control center",
+  "windows": ["main"],
+  "permissions": ["allow-codex-reset-credits", "allow-codex-reset-consume"]
+}

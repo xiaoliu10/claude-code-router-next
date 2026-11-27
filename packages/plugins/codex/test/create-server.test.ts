@@ -106,17 +106,15 @@ it("real createCcrServer: tarball activation, admin auth/guards, both endpoint t
             expect(result.body).not.toContain("fixture private upstream detail");
           } else {
             if (endpoint === "/v1/messages") {
-              // Known CORE double-conversion defect: this path produces an empty
-              // `output`. An empty turn is now a reported failure rather than a
-              // silent 200, so the request must surface an error instead of
-              // handing the client nothing.
+              // Codex UA on /v1/messages is bridged Responses->Chat->Anthropic->
+              // Responses. The former CORE double-conversion defect produced an
+              // empty `output` (surfaced as an error by the empty-answer guard);
+              // the bridge now carries real content, so this path must succeed
+              // with the same body as /v1/responses, never an empty answer.
               expect(result.headers["x-codex-on-messages"]).toBe("true");
-              expect(result.body).toContain("empty answer");
-              expect(result.statusCode).toBeGreaterThanOrEqual(400);
-            } else {
-              expect(result.statusCode, result.body).toBe(200);
-              expect(result.body).toContain(scenario === "tool" ? "weather" : "fixture healthy");
             }
+            expect(result.statusCode, result.body).toBe(200);
+            expect(result.body).toContain(scenario === "tool" ? "weather" : "fixture healthy");
             const body = JSON.parse(calls.at(-1).init.body);
             expect(body.store).toBe(false); expect(body.stream).toBe(true);
             if (scenario === "tool") expect(body.tools[0].name).toBe("weather");

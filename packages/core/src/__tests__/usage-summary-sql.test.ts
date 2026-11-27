@@ -127,6 +127,7 @@ describe("SQL usage summary", () => {
       count: 3,
       inputTokens: 600,
       effectiveInputTokens: 635,
+      historicalInputTokens: 635,
       outputTokens: 90,
       cacheReadInputTokens: 30,
       cacheCreationInputTokens: 5,
@@ -174,6 +175,7 @@ describe("SQL usage summary", () => {
     const empty = querySummary("2030-01-01T00:00:00.000Z", "2030-01-02T00:00:00.000Z");
     expect(empty.totalRequests).toBe(0);
     expect(empty.totalEffectiveInputTokens).toBe(0);
+    expect(empty.totalHistoricalInputTokens).toBe(0);
     expect(empty.successCount).toBe(0);
     expect(empty.errorCount).toBe(0);
     expect(empty.avgTtft).toBeNull();
@@ -251,6 +253,7 @@ describe("inclusive input SQL aggregation", () => {
     const { records, summary } = query({ provider });
     const expected = 110 + 110 + 14 + 17 + 10;
     expect(summary.totalEffectiveInputTokens).toBe(expected);
+    expect(summary.coveredEstimatedCount).toBe(1);
     for (const buckets of [summary.byModel, summary.byDay, summary.byFamily, summary.byClient, summary.byScenario, summary.byProvider]) {
       expect(Object.values(buckets).map(row => row.effectiveInputTokens)).toEqual([expected]);
     }
@@ -266,11 +269,13 @@ describe("inclusive input SQL aggregation", () => {
   it("nulls a legacy cached row and propagates null to its buckets and the total", () => {
     const provider = "effective-unknown";
     append(makeRecord({ id: "confirmable", provider, model: "m-confirmable", inputTokens: 5, effectiveInputTokens: 5 }));
-    append(makeRecord({ id: "ambiguous", provider, model: "m-ambiguous", inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7 }));
+    append(makeRecord({ id: "ambiguous", provider, model: "m-ambiguous", usageEstimated: true, inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7 }));
     const { records, summary } = query({ provider });
     const byId = Object.fromEntries(records.map(row => [row.id, row]));
     expect(byId.ambiguous.effectiveInputTokens).toBeNull();
     expect(byId.confirmable.effectiveInputTokens).toBe(5);
+    expect(summary).toMatchObject({ estimatedCount: 1, coveredEstimatedCount: 0, coveredRequests: 1, coveredInputTokens: 5,
+      coveredOutputTokens: 0, coveredCacheReadTokens: 0 });
     // Any unconfirmable successful row nulls the whole filtered total ...
     expect(summary.totalEffectiveInputTokens).toBeNull();
     expect(summary.byProvider[provider].effectiveInputTokens).toBeNull();
@@ -278,6 +283,28 @@ describe("inclusive input SQL aggregation", () => {
     expect(summary.byModel["m-ambiguous"].effectiveInputTokens).toBeNull();
     expect(summary.byModel["m-confirmable"].effectiveInputTokens).toBe(5);
     expect(querySummary().totalEffectiveInputTokens).toBeNull();
+  });
+
+  it("recovers mixed historical inputs row by row and propagates unrecoverable successes", () => {
+    const provider = "historical-mixed";
+    append(makeRecord({ id: "known-inclusive", provider, effectiveInputTokens: 110, inputTokens: 110,
+      cacheReadInputTokens: 100, cacheCreationInputTokens: 8, outputTokens: 2 }));
+    append(makeRecord({ id: "unknown-cached", provider, effectiveInputTokens: null, inputTokens: 3,
+      cacheReadInputTokens: 60, cacheCreationInputTokens: 7, outputTokens: 5 }));
+    append(makeRecord({ id: "failed-unknown", provider, status: "error", effectiveInputTokens: null, inputTokens: 999 }));
+    const { summary } = query({ provider });
+    expect(summary.totalEffectiveInputTokens).toBeNull();
+    expect(summary.totalHistoricalInputTokens).toBe(180);
+    expect(summary.totalOutputTokens).toBe(7);
+    for (const buckets of [summary.byModel, summary.byDay, summary.byFamily, summary.byClient, summary.byScenario, summary.byProvider]) {
+      expect(Object.values(buckets)).toMatchObject([{ effectiveInputTokens: null, historicalInputTokens: 180, outputTokens: 7 }]);
+    }
+
+    append(makeRecord({ id: "unknown-no-cache", provider, model: "missing", effectiveInputTokens: null, inputTokens: 1000 }));
+    const withUnknown = query({ provider }).summary;
+    expect(withUnknown.totalHistoricalInputTokens).toBeNull();
+    expect(withUnknown.byModel.missing.historicalInputTokens).toBeNull();
+    expect(withUnknown.byModel.m1.historicalInputTokens).toBe(180);
   });
 
   it("preserves a recorded zero without nulling aggregates", () => {

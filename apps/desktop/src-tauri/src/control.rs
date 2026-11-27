@@ -7,6 +7,7 @@
 //! rejects stale snapshots; desktop writers share one lock. External full-config
 //! writers still require server-side concurrency support for atomic protection.
 
+mod historical_usage;
 use crate::api::AdminClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -108,7 +109,21 @@ pub struct UsageBucket {
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct CoveredUsage {
+    pub requests: u64,
+    pub estimated: bool,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered: Option<CoveredUsage>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub historical_input_estimate: bool,
     pub period: String,
     pub total_requests: u64,
     pub success_count: u64,
@@ -304,14 +319,43 @@ impl ControlService {
     }
 
     pub(crate) async fn usage_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
-        let query = usage_date_query(period)?;
+        let window = if period == "all" {
+            None
+        } else {
+            Some(usage_window(period)?)
+        };
+        let query = window
+            .as_ref()
+            .map(|(start, end)| {
+                format!(
+                    "startDate={}&endDate={}",
+                    encode_query(start),
+                    encode_query(end)
+                )
+            })
+            .unwrap_or_default();
         let path = if query.is_empty() {
             "/api/usage/summary".to_string()
         } else {
             format!("/api/usage/summary?{query}")
         };
         let summary = self.client()?.get_json(&path).await?;
-        usage_snapshot_from(&summary, period)
+        let mut snapshot = usage_snapshot_from(&summary, period)?;
+        if snapshot.effective_input_tokens.is_none()
+            && summary.get("totalEffectiveInputTokens") == Some(&Value::Null)
+        {
+            if let Some(expected) = historical_usage::Counters::from_summary(&summary) {
+                let input = tokio::task::spawn_blocking(move || {
+                    historical_usage::local_input(window, expected)
+                })
+                .await
+                .ok()
+                .flatten();
+                snapshot.historical_input_estimate = input.is_some();
+                snapshot.effective_input_tokens = input;
+            }
+        }
+        Ok(snapshot)
     }
 
     async fn usage_trend_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
@@ -323,6 +367,23 @@ impl ControlService {
         );
         let summary = self.client()?.get_json(&path).await?;
         let mut snapshot = usage_snapshot_from(&summary, period)?;
+        let days = historical_usage::unknown_days(&summary);
+        if !days.is_empty() {
+            let end_bound = end.clone();
+            if let Some(inputs) = tokio::task::spawn_blocking(move || {
+                historical_usage::local_daily_inputs(start, end_bound, days)
+            })
+            .await
+            .ok()
+            .flatten()
+            {
+                for day in &mut snapshot.by_day {
+                    if day.effective_input_tokens.is_none() {
+                        day.effective_input_tokens = inputs.get(&day.name).copied();
+                    }
+                }
+            }
+        }
         // Anchor chart labels to the instant queried, even across local midnight.
         snapshot.updated_at = end;
         Ok(snapshot)
@@ -1037,7 +1098,27 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
     if !summary.is_object() {
         return Err(ERR_USAGE.into());
     }
+    // A partial summary uses the same successful requests for every counter.
+    let covered = (|| {
+        let requests = summary["coveredRequests"].as_u64()?;
+        let success = summary["successCount"].as_u64()?;
+        if requests == 0
+            || requests >= success
+            || !summary.get("totalEffectiveInputTokens")?.is_null()
+        {
+            return None;
+        }
+        Some(CoveredUsage {
+            requests,
+            input_tokens: summary["coveredInputTokens"].as_u64()?,
+            output_tokens: summary["coveredOutputTokens"].as_u64()?,
+            estimated: summary["coveredEstimatedCount"].as_u64()? > 0,
+            cache_read_tokens: summary["coveredCacheReadTokens"].as_u64()?,
+        })
+    })();
     Ok(UsageSnapshot {
+        covered,
+        historical_input_estimate: false,
         period: period.into(),
         total_requests: counter(summary, "totalRequests"),
         success_count: counter(summary, "successCount"),
@@ -1211,6 +1292,41 @@ fn project_clients(response: &Value) -> ClientSnapshot {
 mod tests {
     use super::*;
     use crate::api::mock::{response, Mock};
+
+    #[tokio::test]
+    #[ignore = "reads the configured local gateway and its usage database"]
+    async fn verify_local_daily_chart_metrics() {
+        let settings = crate::settings::ConnectionSettings::from_environment().unwrap();
+        let service = ControlService::new(Some(AdminClient::new(settings).unwrap()));
+        let trend = service.usage_trend_snapshot("7d").await.unwrap();
+        for day in trend.by_day.iter().rev().take(7) {
+            println!(
+                "{} {}",
+                day.name,
+                day.effective_input_tokens
+                    .expect("expected local historical fixture")
+                    + day.output_tokens
+            );
+        }
+        assert!(trend.by_day.len() >= 7);
+    }
+
+    #[tokio::test]
+    #[ignore = "reads the configured local gateway and its usage database"]
+    async fn verify_local_seven_day_usage_metrics() {
+        let settings = crate::settings::ConnectionSettings::from_environment().unwrap();
+        let service = ControlService::new(Some(AdminClient::new(settings).unwrap()));
+        let snapshot = service.usage_snapshot("7d").await.unwrap();
+        let input = snapshot.effective_input_tokens.unwrap();
+        assert!(input > 0 && input >= snapshot.cache_read_tokens);
+        println!(
+            "success={} total={} missed_input={} hit_rate={:.1}%",
+            snapshot.success_count,
+            input + snapshot.output_tokens,
+            input - snapshot.cache_read_tokens,
+            100.0 * snapshot.cache_read_tokens as f64 / input as f64
+        );
+    }
 
     fn config() -> Value {
         json!({
@@ -1790,6 +1906,31 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn partial_usage_requires_matched_counters_and_incomplete_coverage() {
+        let mut summary = json!({"totalEffectiveInputTokens":null,"successCount":2,"estimatedCount":1,"coveredRequests":1,
+            "coveredInputTokens":100,"coveredOutputTokens":10,"coveredCacheReadTokens":90,"coveredEstimatedCount":0});
+        let covered = usage_snapshot_from(&summary, "7d")
+            .unwrap()
+            .covered
+            .unwrap();
+        assert_eq!(
+            (
+                covered.requests,
+                covered.input_tokens,
+                covered.output_tokens,
+                covered.cache_read_tokens
+            ),
+            (1, 100, 10, 90)
+        );
+        assert!(!covered.estimated);
+        summary["coveredOutputTokens"] = Value::Null;
+        assert!(usage_snapshot_from(&summary, "7d")
+            .unwrap()
+            .covered
+            .is_none());
     }
 
     #[test]

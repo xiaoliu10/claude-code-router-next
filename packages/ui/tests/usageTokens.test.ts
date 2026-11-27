@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { usageTokens } from "../src/utils/usageTokens.ts";
+import { displayedUsageTotal, partialSummary, usageTokens } from "../src/utils/usageTokens.ts";
 
 const row = { inputTokens: 100, cacheReadInputTokens: 40, cacheCreationInputTokens: 60, outputTokens: 10 };
 
@@ -26,4 +26,28 @@ test("77k inclusive input with 76k cache reads displays 1k misses and a 98.7% hi
   assert.equal(tokens.cacheMissInput, 1000);
   assert.equal(tokens.total, 77200);
   assert.equal(((tokens.hitRate ?? 0) * 100).toFixed(1), "98.7");
+});
+
+test("mixed window and bucket totals add output to the gateway's row-level historical sum", () => {
+  const mixed = { effectiveInputTokens: null, inputTokens: 113, cacheReadInputTokens: 160, cacheCreationInputTokens: 15, outputTokens: 7 };
+  assert.equal(displayedUsageTotal({ ...mixed, historicalInputTokens: 180 }), 187);
+  assert.equal(displayedUsageTotal(mixed), null);
+  assert.equal(displayedUsageTotal({ ...mixed, historicalInputTokens: null }), null);
+  assert.equal(displayedUsageTotal({ ...mixed, historicalInputTokens: NaN }), null);
+  assert.equal(displayedUsageTotal({ ...row, effectiveInputTokens: 100, historicalInputTokens: 200 }), 110);
+  assert.equal(displayedUsageTotal({ ...row, effectiveInputTokens: 0, outputTokens: 0 }), 0);
+});
+
+test("mixed summaries use only matched request or date counters", () => {
+  const s = { successCount: 4, byDay: {
+    "day-a": { ...row, effectiveInputTokens: 80 }, "day-b": { ...row, inputTokens: 1000, effectiveInputTokens: null }
+  } };
+  assert.deepEqual(partialSummary(s), { total: 90, hitRate: 0.5, estimated: false, requests: null, days: ["day-a"] });
+  assert.deepEqual(partialSummary({ ...s, coveredRequests: 2, coveredInputTokens: 100, coveredOutputTokens: 22,
+    coveredCacheReadTokens: 75, coveredEstimatedCount: 0, estimatedCount: 1 }),
+    { total: 122, hitRate: 0.75, estimated: false, requests: 2, days: [] });
+  assert.equal(partialSummary({ ...s, byDay: { b: s.byDay["day-b"] } }), null);
+  assert.deepEqual(partialSummary({ ...s, estimatedCount: 1, byDay: { b: s.byDay["day-b"],
+    a: { inputTokens: 0, effectiveInputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0 } } }),
+    { total: 0, hitRate: null, estimated: false, requests: null, days: ["a"] });
 });

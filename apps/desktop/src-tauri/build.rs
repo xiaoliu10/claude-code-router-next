@@ -4,6 +4,8 @@ fn main() {
             "login_start_status",
             "login_start_set",
             "quota_snapshot",
+            "codex_reset_credits",
+            "codex_reset_consume",
             "quota_hide",
             "quota_open_ui",
             "quota_quit",

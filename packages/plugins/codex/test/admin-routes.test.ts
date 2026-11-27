@@ -15,6 +15,58 @@ function app(service: any, serviceTier: CodexAdminRouteDeps["serviceTier"] = { t
   return instance;
 }
 
+describe("POST /api/codex/reset-credits/consume-confirmed-v2", () => {
+  const url = "/api/codex/reset-credits/consume-confirmed-v2";
+
+  const accountRevision = "12345678-1234-4321-8765-001122334455";
+
+  it("requires an account revision and specific, bounded creditId and uses the strict service path", async () => {
+    const service = {
+      consumeConfirmedResetCredit: vi.fn(async () => ({ outcome: "reset", windowsReset: 2 })),
+      consumeResetCredit: vi.fn(async () => ({ outcome: "reset", windowsReset: 2, availableCount: 1 })),
+    };
+    const instance = app(service);
+    try {
+      for (const payload of [undefined, {}, { creditId: "gift" }, { creditId: "gift", accountRevision: "invalid" },
+        { accountRevision }, ...[null, "", " ", 1, "id\u0000", "x".repeat(257)].map(creditId => ({ creditId, accountRevision }))]) {
+        const res = await instance.inject({ method: "POST", url, payload, headers: localHeaders });
+        expect(res.statusCode).toBe(422);
+        expect(res.json()).toEqual({ ok: false, success: false, error: "codex_reset_invalid" });
+      }
+      expect(service.consumeConfirmedResetCredit).not.toHaveBeenCalled();
+      const res = await instance.inject({ method: "POST", url, payload: { creditId: "gift", accountRevision }, headers: localHeaders });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true, success: true, outcome: "reset", windowsReset: 2 });
+      expect(service.consumeConfirmedResetCredit).toHaveBeenCalledExactlyOnceWith("gift", accountRevision);
+      expect(service.consumeResetCredit).not.toHaveBeenCalled();
+      const obsolete = await instance.inject({ method: "POST", url: "/api/codex/reset-credits/consume-confirmed", payload: { creditId: "gift", accountRevision }, headers: localHeaders });
+      expect(obsolete.statusCode).toBe(404);
+      expect(service.consumeConfirmedResetCredit).toHaveBeenCalledTimes(1);
+
+      const legacy = await instance.inject({ method: "POST", url: "/api/codex/reset-credits/consume", payload: {}, headers: localHeaders });
+      expect(legacy.statusCode).toBe(200);
+      expect(legacy.json()).toEqual({ ok: true, success: true, outcome: "reset", windowsReset: 2, availableCount: 1 });
+      expect(service.consumeResetCredit).toHaveBeenCalledExactlyOnceWith(undefined);
+    } finally { await instance.close(); }
+  });
+
+  it("rejects remote requests and preserves the stable unknown-outcome code", async () => {
+    const service = {
+      consumeConfirmedResetCredit: vi.fn(async () => { throw codexAdminError("codex_reset_unavailable", 502); }),
+    };
+    const instance = app(service);
+    try {
+      const request = { method: "POST" as const, url, payload: { creditId: "gift", accountRevision }, headers: localHeaders };
+      const remote = await instance.inject({ ...request, remoteAddress: "192.0.2.42" });
+      expect(remote.statusCode).toBe(403);
+      expect(service.consumeConfirmedResetCredit).not.toHaveBeenCalled();
+      const local = await instance.inject(request);
+      expect(local.statusCode).toBe(502);
+      expect(local.json()).toEqual({ ok: false, success: false, error: "codex_reset_unavailable" });
+    } finally { await instance.close(); }
+  });
+});
+
 describe("Codex admin routes — models hide/restore", () => {
   it("hide posts the model and returns the workbuddy-shaped success envelope", async () => {
     const service = {

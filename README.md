@@ -93,6 +93,7 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 
 | 版本 | 发布内容 |
 | --- | --- |
+| **v2.3.2441** | CCR Desktop 0.1.5 和 Codex 插件 1.0.17 支持在 Codex 订阅卡片确认重置用量。桌面用量面板恢复历史汇总与每日图表，调用记录支持浮动横向滚动条。网页用量页支持每日与按模型切换、自然日筛选，以及最多 50 项的模型排行。 |
 | **v2.3.2440** | Windows x64 桌面客户端 0.1.4 提供从 0.1.3 升级的签名更新。在设置里检查更新后，点击「立即更新」即可安装。 |
 | **v2.3.2439** | Windows x64 版 CCR Desktop 0.1.3 新增签名更新。首次需要手动安装，之后控制中心可检查新版，并提示下载安装。 |
 | **v2.3.2438** | CCR Desktop 0.1.2 和 Codex 插件 1.0.16 在 Codex 订阅卡片新增服务层级选择。默认跟随请求，选择「快速（Fast）」后，后续订阅请求会发送 `priority`。选择「标准」可使用上游默认层级。 |
@@ -102,7 +103,6 @@ npm install -g @wengine-ai/claude-code-router-next@latest && ccr restart
 | **v2.3.2434** | Chat Completions 按模型族配置切换备用通道。Anthropic 备用通道返回标准 Chat 格式，调用记录按实际服务方记入最终结果。带工具的模型族请求会跳过纯文本 Agy ACP。 |
 | **v2.3.2433** | <ul><li>**桌面控制中心套件**：菜单栏全供应商额度面板（K/M/B + 焦点看门狗防卡死）、独立本地控制中心与内置网关运行时、项目配置页（按项目路由/别名/客户端接管）。</li><li>**桌面用量分析**：缓存感知有效输入总 tokens（不重复计数）、模型/提供方/日期缓存列、纯 CSS 图表、分页调用记录（成功率/TTFT/速度）。</li><li>**火山 Coding Plan 配额**（AK/SK 本地凭证面板 + SigV4 适配）；**Kimi 5h 窗口恢复**（上游缺 remaining 时不再消失）。</li><li>**Codex 套餐升级配额恢复 + UI HTML 协商缓存 + 卡片确认居中模态 + 冷却中同步模型可点**；插件：codex 1.0.14 / kiro 0.1.3 / workbuddy 1.0.3 / gemini-oauth 1.0.14。</li></ul> |
 | **v2.3.2432** | <ul><li>**Gemini 独立配额池（Argon / Hydrogen / Claude，插件 1.0.13）**：供应商卡片按模型家族分池展示配额，不再只看汇总——Argon 池耗尽一眼可见（此前周汇总 71% 却 429 的迷惑场景消除）。</li><li>**PID 文件失效时 restart 兜底杀真实监听进程**：修「页面更新一直失败」——PID 文件残留尸体 PID 时什么都杀不掉、respawn 撞 EADDRINUSE 旧版本永远在线；现在带 CCR 身份校验的端口兜底 + 等待端口释放 + PID 文件 bind 成功后才写入。</li></ul> |
-| **v2.3.2431** | <ul><li>**Kiro 拒答不再误冷却且额度恢复（插件 0.1.2）**：上游 `CONTENT_FILTERED` / `REASONING_EXTRACTION` 空拒答流正确分类为 `kiro_content_filtered`（422），不再误判截断 502 并冷却全账号 5 分钟；只读额度/模型同步在 429 冷却期仍可用，并实现 `fetchQuota` 在主供应商列表展示 Kiro credits 额度，过滤过期 bonus 窗口。</li><li>**插件升级死循环修复与防呆守卫**：定位 `kiro@0.1.1` npm 包内含陈旧 `0.1.0` 清单导致反复提示升级；目录页改用 `semver` 比较防止本地较新版本被降级提示，安装器拦截 `package.json` 与 `plugin.json` 版本不一致的压缩包，Kiro 增加 `prepack` 自动构建与前置守卫。</li></ul> |
 
 > 仅保留最近 10 个版本，更早版本的发布摘要见 [CHANGELOG-archive.md](./CHANGELOG-archive.md)，完整详细变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 

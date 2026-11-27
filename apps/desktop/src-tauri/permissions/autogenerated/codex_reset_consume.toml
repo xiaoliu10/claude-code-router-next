@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-codex-reset-consume"
+description = "Enables the codex_reset_consume command without any pre-configured scope."
+commands.allow = ["codex_reset_consume"]
+
+[[permission]]
+identifier = "deny-codex-reset-consume"
+description = "Denies the codex_reset_consume command without any pre-configured scope."
+commands.deny = ["codex_reset_consume"]

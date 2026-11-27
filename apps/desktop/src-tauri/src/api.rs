@@ -78,6 +78,10 @@ impl AdminClient {
         self.writes.lock().await
     }
 
+    pub(crate) fn try_write_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        self.writes.try_lock().ok()
+    }
+
     async fn request(
         &self,
         method: Method,
@@ -206,29 +210,10 @@ impl AdminClient {
         body: Option<&Value>,
     ) -> Result<Value, crate::quota::SourceError> {
         use crate::quota::SourceError;
-        let mut request = self
-            .client
-            .request(method, format!("{}{path}", self.base_url));
-        if let Some(key) = &self.api_key {
-            request = request.header("X-API-Key", key);
-        }
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let mut response = request.send().await.map_err(|_| SourceError::Unavailable)?;
-        let status = response.status();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
+        let (status, value) = self
+            .bounded_json(method, path, body, Duration::from_secs(5))
             .await
-            .map_err(|_| SourceError::Unavailable)?
-        {
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err(SourceError::Unavailable);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| SourceError::Unavailable)?;
+            .map_err(|_| SourceError::Unavailable)?;
         if !status.is_success() {
             return Err(match value.get("error").and_then(Value::as_str) {
                 Some(
@@ -241,6 +226,33 @@ impl AdminClient {
             });
         }
         Ok(value)
+    }
+
+    /// Preserve the HTTP status so plugin callers can map allowlisted codes.
+    pub(crate) async fn bounded_json(
+        &self,
+        method: Method,
+        path: &'static str,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<(reqwest::StatusCode, Value), ()> {
+        let mut response = self
+            .send(method, path, body, timeout)
+            .await
+            .map_err(|_| ())?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        match serde_json::from_slice(&bytes) {
+            Ok(value) => Ok((status, value)),
+            Err(_) if !status.is_success() => Ok((status, Value::Null)),
+            Err(_) => Err(()),
+        }
     }
 
     pub async fn health(&self) -> bool {

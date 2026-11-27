@@ -1,4 +1,5 @@
 //! Read-only quota projection. Config and upstream payloads never cross the IPC boundary.
+pub(crate) mod codex_reset;
 pub(crate) mod codex_service_tier;
 mod step_plan;
 use crate::api::{admin_auth_failed, AdminClient};
@@ -29,6 +30,7 @@ pub struct QuotaWindow {
 pub struct ProviderQuota {
     pub name: String,
     enabled: bool,
+    codex_reset_eligible: bool,
     plan: Option<String>,
     status: QuotaStatus,
     message: Option<String>,
@@ -77,6 +79,7 @@ struct ConfiguredProvider {
     step_plan_fingerprint: u64,
 }
 
+const CODEX_PROVIDER: &str = "codex-subscription";
 const REFRESH_THROTTLE_MS: u64 = 3_000;
 // Managed-card reads can reuse a Step Plan observation for at most the gateway's stale window.
 const STEP_PLAN_REUSE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
@@ -146,10 +149,17 @@ fn provider_credential(entry: &Value) -> Option<&str> {
 
 fn configured(config: &Value, step_plan_hasher: &RandomState) -> Vec<ConfiguredProvider> {
     let mut seen = HashSet::new();
-    config[crate::api::provider_list_key(config)]
+    let entries = config[crate::api::provider_list_key(config)]
         .as_array()
-        .into_iter()
-        .flatten()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let unique_codex = entries
+        .iter()
+        .filter(|p| p["name"] == CODEX_PROVIDER)
+        .count()
+        == 1;
+    entries
+        .iter()
         .filter_map(|entry| {
             let name = text(&entry["name"])?;
             if name.contains(',') || name.trim() != name || !seen.insert(name.clone()) {
@@ -161,7 +171,7 @@ fn configured(config: &Value, step_plan_hasher: &RandomState) -> Vec<ConfiguredP
             let key = credential.unwrap_or("");
             let flag = |a: &str, b: &str| entry[a] == true || entry[b] == true;
             let adapter = match name.as_str() {
-                "codex-subscription" if codex_managed(entry, credential) => Adapter::Codex,
+                CODEX_PROVIDER if codex_managed(entry, credential) => Adapter::Codex,
                 "kiro-subscription"
                     if flag("kiro_managed", "kiroManaged") || key == "ccr-managed-kiro" =>
                 {
@@ -187,6 +197,9 @@ fn configured(config: &Value, step_plan_hasher: &RandomState) -> Vec<ConfiguredP
                 row: ProviderQuota {
                     name,
                     enabled,
+                    codex_reset_eligible: unique_codex
+                        && adapter == Adapter::Codex
+                        && matches!(entry.get("enabled"), None | Some(Value::Bool(true))),
                     plan: None,
                     status: QuotaStatus::Unavailable,
                     message: None,
@@ -286,6 +299,7 @@ impl QuotaService {
             cache.snapshot.error = Some("无法连接本地 CCR，显示上次已知数据（可能过期）".into());
             cache.step_plan_identities.clear();
             for row in &mut cache.snapshot.providers {
+                row.codex_reset_eligible = false;
                 if row.step_plan.is_some() {
                     *row = project_step_plan(row.clone(), &Value::Null);
                 }
@@ -295,6 +309,12 @@ impl QuotaService {
         let rows = configured(&config, &self.step_plan_hasher);
         drop(config);
         cache.invalidate_step_plans(&rows, stamp);
+        // Even a throttled result must reflect any freshly observed loss of eligibility.
+        for row in &mut cache.snapshot.providers {
+            if row.codex_reset_eligible {
+                row.codex_reset_eligible = rows.iter().any(|r| r.row.codex_reset_eligible);
+            }
+        }
         if provider
             .as_ref()
             .is_some_and(|name| !rows.iter().any(|r| &r.row.name == name))
@@ -404,6 +424,7 @@ fn reuse_row(configured: ProviderQuota, previous: Option<&ProviderQuota>) -> Pro
     match previous {
         Some(previous) => ProviderQuota {
             enabled: configured.enabled,
+            codex_reset_eligible: configured.codex_reset_eligible,
             ..previous.clone()
         },
         None => configured,

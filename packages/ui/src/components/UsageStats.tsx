@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { usageTokens } from "@/utils/usageTokens";
+import { usageDateRange, type UsageRange } from "@/utils/usageDateRange";
+import { displayedUsageTotal, partialSummary, usageTokens } from "@/utils/usageTokens";
 import { api } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -57,6 +58,7 @@ interface UsageRecord {
 }
 
 interface ModelDayData {
+  historicalInputTokens?: number | null;
   count: number;
   inputTokens: number;
   effectiveInputTokens?: number | null;
@@ -72,6 +74,7 @@ interface UsageSummary {
   errorCount: number;
   totalInputTokens: number;
   totalEffectiveInputTokens?: number | null;
+  totalHistoricalInputTokens?: number | null;
   totalOutputTokens: number;
   totalCacheReadInputTokens: number;
   totalCacheCreationInputTokens: number;
@@ -85,9 +88,9 @@ interface UsageSummary {
   byClient: Record<string, ModelDayData>;
 }
 
-function formatTokens(n: number | null, estimated = false): string {
+function formatTokens(n: number | null): string {
   if (n === null) return "—";
-  return (estimated ? "≈" : "") + compactTokens(n);
+  return compactTokens(n);
 }
 
 function compactTokens(n: number): string {
@@ -138,18 +141,9 @@ function formatTime(ts: string): string {
   });
 }
 
-function formatDateInput(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
 export function UsageStats() {
   const { t } = useTranslation();
-  const [summary, setSummary] = useState<UsageSummary | null>(null);
-  const [records, setRecords] = useState<UsageRecord[]>([]);
-  const [total, setTotal] = useState(0);
+  const [resultPage, setResultPage] = useState<{ key: string; summary: UsageSummary; records: UsageRecord[]; total: number } | null>(null);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   // Guards stale responses from out-of-order fetches when filters change.
@@ -163,16 +157,23 @@ export function UsageStats() {
   // usage table synchronously on the server's event loop, which stalls every
   // other management API while the auto-refresh loop polls every 30s. Users
   // can still opt into an unbounded scan via the "All" preset.
-  const [startDate, setStartDate] = useState(() =>
-    formatDateInput(new Date(Date.now() - DEFAULT_RANGE_HOURS * 60 * 60 * 1000)));
-  const [endDate, setEndDate] = useState(() => formatDateInput(new Date()));
-  const [activeRange, setActiveRange] = useState<number | null>(DEFAULT_RANGE_HOURS);
+  const [selection, setSelection] = useState<UsageRange>(DEFAULT_RANGE_HOURS);
+  const { startDate, endDate } = usageDateRange(selection);
   const [filterModel, setFilterModel] = useState("");
   const [filterProvider, setFilterProvider] = useState("");
   const [filterScenario, setFilterScenario] = useState("");
   const [filterClient, setFilterClient] = useState("");
   const [filterStatus, setFilterStatus] = useState<"success" | "error" | "">("");
 
+  const queryKey = JSON.stringify([page, selection, filterModel, filterProvider, filterScenario, filterClient, filterStatus]);
+  const currentPage = resultPage?.key === queryKey ? resultPage : null;
+  const summary = currentPage?.summary;
+  const records = currentPage?.records ?? [];
+  const total = currentPage?.total ?? 0;
+
+  const [chartView, setChartView] = useState<"daily" | "model">("daily");
+  const [modelLimit, setModelLimit] = useState(10);
+  const [loadFailed, setLoadFailed] = useState(false);
   const pageSize = 20;
 
   const loadData = useCallback(async () => {
@@ -181,9 +182,10 @@ export function UsageStats() {
     const generation = generationRef.current;
     setLoading(true);
     try {
-      const params: Record<string, any> = { page, pageSize };
-      if (startDate) params.startDate = new Date(startDate).toISOString();
-      if (endDate) params.endDate = new Date(endDate + "T23:59:59").toISOString();
+      const range = usageDateRange(selection);
+      const params: NonNullable<Parameters<typeof api.getUsage>[0]> = { page, pageSize };
+      if (range.start) params.startDate = range.start;
+      if (range.end) params.endDate = range.end;
       if (filterModel) params.model = filterModel;
       if (filterProvider) params.provider = filterProvider;
       if (filterScenario) params.scenario = filterScenario;
@@ -192,15 +194,15 @@ export function UsageStats() {
 
       const result = await api.getUsage(params);
       if (generation !== generationRef.current) return;
-      setRecords(result.records || []);
-      setSummary(result.summary);
-      setTotal(result.total);
+      setLoadFailed(false);
+      setResultPage({ key: queryKey, summary: result.summary, records: result.records || [], total: result.total });
     } catch (e) {
+      if (generation === generationRef.current) setLoadFailed(true);
       console.error("Failed to load usage:", e);
     } finally {
       if (generation === generationRef.current) setLoading(false);
     }
-  }, [page, startDate, endDate, filterModel, filterProvider, filterScenario, filterClient, filterStatus]);
+  }, [queryKey, page, selection, filterModel, filterProvider, filterScenario, filterClient, filterStatus]);
 
   // Serial, queue-style auto refresh:
   // - at most one /api/usage request in flight at a time;
@@ -287,18 +289,22 @@ export function UsageStats() {
   const dailyData = summary?.byDay ? Object.entries(summary.byDay)
     .sort(([a], [b]) => a.localeCompare(b))
     : [];
+  // Keep a single unit within each chart when historical totals are unknown.
+  const dailyUsesOutput = dailyData.some(([, d]) => displayedUsageTotal(d) === null);
   const maxDailyTokens = Math.max(1, ...dailyData.map(([, d]) =>
-    usageTokens(d).total ?? 0
+    dailyUsesOutput ? d.outputTokens : displayedUsageTotal(d)!
   ));
+  const modelUsesRecorded = Object.values(summary?.byModel ?? {}).some(d => displayedUsageTotal(d) === null);
 
   const modelData = Object.entries(summary?.byModel ?? {})
     .map(([model, data]) => {
-      const { cacheMissInput, total } = usageTokens(data);
-      return { model, data, cacheMissInput, total };
+      const { cacheMissInput } = usageTokens(data);
+      const total = displayedUsageTotal(data);
+      return { model, data, cacheMissInput, total, chartTokens: modelUsesRecorded ? (data.cacheReadInputTokens ?? 0) + data.outputTokens : total! };
     })
-    .sort((a, b) => (b.total ?? -1) - (a.total ?? -1))
-    .slice(0, 10);
-  const maxModelTokens = Math.max(1, ...modelData.map(p => p.total ?? 0));
+    .sort((a, b) => b.chartTokens - a.chartTokens)
+    .slice(0, modelLimit);
+  const maxModelTokens = Math.max(1, ...modelData.map(p => p.chartTokens));
 
   return (
     <TooltipProvider>
@@ -308,9 +314,9 @@ export function UsageStats() {
         <div className="flex items-center gap-2.5 flex-wrap">
           {/* Quick time range presets */}
           <div className="flex items-center gap-0.5 rounded-md bg-white border border-gray-200 p-0.5 shadow-sm">
-            {[24, 168, 720].map((hours) => {
+            {([24, 168, 720] as const).map((hours) => {
               const label = hours === 24 ? "24h" : hours === 168 ? "7d" : "30d";
-              const isActive = activeRange === hours;
+              const isActive = selection === hours;
               return (
                 <button
                   key={hours}
@@ -322,11 +328,7 @@ export function UsageStats() {
                       : "border-transparent text-gray-600 hover:bg-gray-100"
                   }`}
                   onClick={() => {
-                    const now = new Date();
-                    const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
-                    setStartDate(formatDateInput(start));
-                    setEndDate(formatDateInput(now));
-                    setActiveRange(hours);
+                    setSelection(hours);
                     setPage(1);
                   }}
                 >
@@ -341,7 +343,7 @@ export function UsageStats() {
                   ? "bg-blue-500 text-white shadow-sm"
                   : "text-gray-600 hover:bg-gray-50"
               }`}
-              onClick={() => { setStartDate(""); setEndDate(""); setActiveRange(null); setPage(1); }}
+              onClick={() => { setSelection({ startDate: "", endDate: "" }); setPage(1); }}
             >
               {t("usage.all")}
             </button>
@@ -353,7 +355,7 @@ export function UsageStats() {
               type="date"
               className="h-6 text-xs w-[120px] border-0 px-1 focus-visible:ring-0 focus-visible:ring-offset-0"
               value={startDate}
-              onChange={(e) => { setStartDate(e.target.value); setActiveRange(null); setPage(1); }}
+              onChange={(e) => { setSelection({ startDate: e.target.value, endDate }); setPage(1); }}
               placeholder={t("usage.start_date")}
             />
             <span className="text-xs text-gray-400 select-none">→</span>
@@ -361,7 +363,7 @@ export function UsageStats() {
               type="date"
               className="h-6 text-xs w-[120px] border-0 px-1 focus-visible:ring-0 focus-visible:ring-offset-0"
               value={endDate}
-              onChange={(e) => { setEndDate(e.target.value); setActiveRange(null); setPage(1); }}
+              onChange={(e) => { setSelection({ startDate, endDate: e.target.value }); setPage(1); }}
               placeholder={t("usage.end_date")}
             />
           </div>
@@ -427,16 +429,24 @@ export function UsageStats() {
       </div>
 
       <CardContent className="flex-1 overflow-auto pt-4">
+          {loadFailed && <p role="alert" className="mb-2 text-sm text-red-600">{t("usage.fetch_failed")}</p>}
           {/* Summary Cards */}
           {summary && (() => {
-            const tokens = usageTokens({
+            const counts = {
               inputTokens: summary.totalInputTokens,
               effectiveInputTokens: summary.totalEffectiveInputTokens,
+              historicalInputTokens: summary.totalHistoricalInputTokens,
               cacheReadInputTokens: summary.totalCacheReadInputTokens,
               cacheCreationInputTokens: summary.totalCacheCreationInputTokens,
               outputTokens: summary.totalOutputTokens,
-            });
-            const estimated = (summary.estimatedCount ?? 0) > 0;
+            };
+            const tokens = usageTokens(counts);
+            const partial = tokens.total === null ? partialSummary(summary) : null;
+            const displayedTotal = displayedUsageTotal(counts);
+            const displayedRate = partial ? partial.hitRate : tokens.hitRate;
+            const coverage = partial && (partial.requests !== null
+              ? t("usage.covered_requests", { count: partial.requests, total: summary.successCount })
+              : t("usage.covered_dates", { dates: partial.days.join(", ") }));
             return (
               <div className="grid grid-cols-5 gap-2 mb-3">
               <div className="rounded-lg border bg-blue-50 p-2 text-center">
@@ -451,15 +461,15 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.success_rate")}</div>
               </div>
               <div className="rounded-lg border bg-green-50 p-2 text-center">
-                <div className="text-lg font-bold text-green-600">{formatTokens(tokens.cacheMissInput, estimated)}</div>
-                <div className="text-xs text-gray-500">{t("usage.total_input_tokens")}</div>
+                <div className="text-lg font-bold text-green-600">{formatTokens(tokens.cacheMissInput ?? summary.totalInputTokens)}</div>
+                <div className="text-xs text-gray-500">{t(tokens.cacheMissInput === null ? "usage.reported_input" : "usage.total_input_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-yellow-50 p-2 text-center">
-                <div className="text-lg font-bold text-yellow-600">{formatTokens(summary.totalOutputTokens, estimated)}</div>
+                <div className="text-lg font-bold text-yellow-600">{formatTokens(summary.totalOutputTokens)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_output_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
-                <div className="text-lg font-bold text-indigo-600">{formatTokens(tokens.total, estimated)}</div>
+                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-emerald-50 p-2 text-center">
@@ -470,9 +480,9 @@ export function UsageStats() {
                 <div className="text-lg font-bold text-teal-600">{formatTokens(summary.totalCacheCreationInputTokens || 0)}</div>
                 <div className="text-xs text-gray-500">{t("usage.cache_creation")}</div>
               </div>
-              <div className="rounded-lg border bg-cyan-50 p-2 text-center">
+              <div className="rounded-lg border bg-cyan-50 p-2 text-center" title={coverage || undefined}>
                 <div className="text-lg font-bold text-cyan-600">
-                  {tokens.hitRate === null ? "—" : (estimated ? "≈" : "") + (tokens.hitRate * 100).toFixed(1) + "%"}
+                  {displayedRate === null ? "—" : (displayedRate * 100).toFixed(2) + "%"}
                 </div>
                 <div className="text-xs text-gray-500">{t("usage.cache_hit_rate")}</div>
               </div>
@@ -490,16 +500,35 @@ export function UsageStats() {
           })()}
 
           {/* Daily Chart */}
-          {dailyData.length > 0 && (
+          <div className="mb-2 flex gap-1">
+            {(["daily", "model"] as const).map(view => (
+              <Button key={view} variant={chartView === view ? "secondary" : "ghost"} size="sm"
+                aria-pressed={chartView === view} onClick={() => setChartView(view)}>
+                {view === "daily" && <BarChart3 className="mr-1 h-3 w-3" aria-hidden="true" />}
+                {t(view === "daily" ? "usage.daily_chart" : "usage.model_chart")}
+              </Button>
+            ))}
+            {chartView === "model" && (
+              <select aria-label={t("usage.model_limit")} value={modelLimit}
+                onChange={event => setModelLimit(Number(event.target.value))}
+                className="h-8 rounded-md border bg-background px-2 text-sm">
+                {[10, 20, 30, 40, 50].map(limit => (
+                  <option key={limit} value={limit}>{t("usage.top_models", { limit })}</option>
+                ))}
+              </select>
+            )}
+          </div>
+          {chartView === "daily" && dailyData.length > 0 && (
             <div className="mb-3">
               <div className="flex items-center gap-1 text-xs text-gray-500 mb-1">
-                <BarChart3 className="h-3 w-3" aria-hidden="true" />
-                <span>{t("usage.daily_chart")}</span>
+                <span>{t(dailyUsesOutput ? "usage.output_tokens" : "usage.total_tokens")}</span>
               </div>
               <div className="flex items-end gap-1 h-14">
                 {dailyData.map(([day, data]) => {
-                  const { cacheMissInput, total } = usageTokens(data);
-                  const height = total === null ? 0 : Math.max(4, (total / maxDailyTokens) * 100);
+                  const { cacheMissInput } = usageTokens(data);
+                  const total = displayedUsageTotal(data);
+                  const amount = dailyUsesOutput ? data.outputTokens : total!;
+                  const height = amount > 0 ? Math.max(4, (amount / maxDailyTokens) * 100) : 0;
                   return (
                     <Tooltip key={day}>
                       <TooltipTrigger asChild>
@@ -528,13 +557,13 @@ export function UsageStats() {
             </div>
           )}
 
-          {summary && (
+          {chartView === "model" && summary && (
             <section className="mb-4">
-              <h2 className="mb-2 text-sm font-semibold text-gray-700">{t("usage.model_chart")}</h2>
+              <h2 className="mb-2 text-sm font-semibold text-gray-700">{t(modelUsesRecorded ? "usage.recorded_model_ranking" : "usage.total_tokens")}</h2>
               {modelData.length > 0 ? (
                 <div className="space-y-2">
-                  {modelData.map(({ model, data, cacheMissInput, total }) => {
-                    const width = total === null ? 0 : Math.max(8, (total / maxModelTokens) * 100);
+                  {modelData.map(({ model, data, cacheMissInput, total, chartTokens }) => {
+                    const width = chartTokens > 0 ? (chartTokens / maxModelTokens) * 100 : 0;
                     const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
                     return (
                       <Tooltip key={model}>
@@ -549,8 +578,8 @@ export function UsageStats() {
                                 style={{ width: `${width}%` }}
                               />
                             </div>
-                            <div className="w-[70px] text-sm text-gray-500 text-right">
-                              {formatTokens(total)}
+                            <div className="w-[70px] text-sm text-gray-500 text-right" title={chartTokens.toLocaleString()}>
+                              {formatTokens(chartTokens)}
                             </div>
                           </div>
                         </TooltipTrigger>
@@ -623,8 +652,8 @@ export function UsageStats() {
                     <td className="p-1.5">{r.provider}</td>
                     <td className="p-1.5 max-w-[280px] truncate" title={fullChain}>{modelDisplay}</td>
                     <td className="p-1.5">{r.modelFamily ? `${r.modelFamily}/${r.scenarioType}` : r.scenarioType}</td>
-                    <td className="text-right p-1.5">{formatTokens(usageTokens(r).cacheMissInput, r.usageEstimated)}</td>
-                    <td className="text-right p-1.5">{r.usageEstimated ? "≈" : ""}{formatTokens(r.outputTokens)}</td>
+                    <td className="text-right p-1.5">{formatTokens(usageTokens(r).cacheMissInput)}</td>
+                    <td className="text-right p-1.5">{formatTokens(r.outputTokens)}</td>
                     <td className="text-right p-1.5">{formatTokens(r.cacheReadInputTokens ?? 0)}</td>
                     <td className="text-right p-1.5">{formatTokens(r.cacheCreationInputTokens ?? 0)}</td>
                     <td className="text-right p-1.5">{formatMs(r.ttft)}</td>

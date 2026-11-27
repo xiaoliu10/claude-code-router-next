@@ -110,7 +110,7 @@ fn generate_local_api_key() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn config_path<F: Fn(&str) -> Option<String>>(resolver: &F) -> Result<PathBuf, String> {
+pub(crate) fn config_path<F: Fn(&str) -> Option<String>>(resolver: &F) -> Result<PathBuf, String> {
     let nonempty = |name| resolver(name).filter(|value| !value.is_empty());
     let directory = match nonempty("CCR_CONFIG_DIR") {
         Some(directory) => PathBuf::from(directory),

@@ -40,6 +40,8 @@ pub fn run() {
             autostart::login_start_status,
             autostart::login_start_set,
             popup::quota_snapshot,
+            quota::codex_reset::codex_reset_credits,
+            quota::codex_reset::codex_reset_consume,
             popup::quota_hide,
             popup::quota_open_ui,
             popup::quota_quit,

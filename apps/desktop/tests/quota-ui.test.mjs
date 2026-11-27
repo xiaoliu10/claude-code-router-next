@@ -235,7 +235,7 @@ test("controller: per-card merged response applies the full list and metadata (a
   const ipc = fakeInvoke()
   const c = Q.createController({ invoke: ipc.fn })
   c.refreshAll(); await flush()
-  ipc.resolve(0, snap([prov("a")])); await flush()
+  ipc.resolve(0, snap([prov("a")], { updatedAt: 1 })); await flush()
   c.refreshProvider("a"); await flush()
   // backend answers per-card requests with a complete merged snapshot
   ipc.resolve(1, snap([prov("a", { updatedAt: 11 }), prov("b")], { online: false, error: "upstream quota api failed", updatedAt: 111 }))
@@ -325,7 +325,7 @@ test("controller: a successful per-card apply clears fullError from an earlier f
   const ipc = fakeInvoke()
   const c = Q.createController({ invoke: ipc.fn })
   c.refreshAll(); await flush()
-  ipc.resolve(0, snap([prov("a")])); await flush()
+  ipc.resolve(0, snap([prov("a")], { updatedAt: 1 })); await flush()
   c.refreshAll(); await flush()
   ipc.reject(1, "gateway down")
   await flush()
