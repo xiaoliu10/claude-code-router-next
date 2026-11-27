@@ -871,6 +871,7 @@
       ...(s.covered && Number.isSafeInteger(s.covered.requests) && s.covered.requests > 0 && s.covered.requests < s.successCount
         && ['inputTokens', 'outputTokens', 'cacheReadTokens'].every(function (key) { return Number.isSafeInteger(s.covered[key]) && s.covered[key] >= 0; })
         ? { covered: { estimated: s.covered.estimated === true, requests: s.covered.requests, inputTokens: s.covered.inputTokens, outputTokens: s.covered.outputTokens, cacheReadTokens: s.covered.cacheReadTokens } } : {}),
+      ...(s.historicalInputEstimate === true ? { historicalInputEstimate: true } : {}),
       totalRequests: toNum(s.totalRequests),
       successCount: toNum(s.successCount),
       errorCount: toNum(s.errorCount),
@@ -3028,27 +3029,26 @@
         totalTokens = inclusive + covered.outputTokens;
         input = inclusive >= cacheRead ? inclusive - cacheRead : null;
       }
-      var estimated = u.estimatedCount > 0;
-      var inputEstimated = covered ? covered.estimated : estimated;
-      function summaryTokenCell(metric, label, count, isEstimated) {
-        var cell = recordsTokenCell(count, isEstimated);
+      function summaryTokenCell(metric, label, count) {
+        var cell = recordsTokenCell(count);
         return usageNumCell(metric, label, cell.text, cell.title);
       }
-      grid.appendChild(summaryTokenCell('total', '总 tokens' + scope, totalTokens, inputEstimated));
-      grid.appendChild(summaryTokenCell('input', '输入（未命中）' + scope, input, inputEstimated));
-      grid.appendChild(summaryTokenCell('output', '输出 tokens', u.outputTokens, estimated));
+      grid.appendChild(summaryTokenCell('total', '总 tokens' + scope, totalTokens));
+      grid.appendChild(summaryTokenCell('input', '输入（未命中）' + scope, input));
+      grid.appendChild(summaryTokenCell('output', '输出 tokens', u.outputTokens));
       grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
       grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
       var hitRate = inclusive > 0 && cacheRead !== null && cacheRead <= inclusive
-        ? (inputEstimated ? '≈' : '') + (cacheRead / inclusive * 100).toFixed(1) + '%' : null;
+        ? (cacheRead / inclusive * 100).toFixed(1) + '%' : null;
       var cacheHitCell = usageNumCell('cache-hit', '缓存命中率' + scope, hitRate);
       cacheHitCell.title = '缓存读取 tokens ÷ 有效输入 tokens';
       grid.appendChild(cacheHitCell);
       grid.appendChild(usageNumCell('ttft', '平均 TTFT', formatMs(u.avgTtftMs)));
       grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
+      if (u.historicalInputEstimate) totals.title = '含历史记录估算';
       totals.appendChild(grid);
       body.appendChild(totals);
-      totals.appendChild(noteEl(covered
+      if (!u.historicalInputEstimate) totals.appendChild(noteEl(covered
         ? '部分记录覆盖 ' + formatInt(covered.requests) + ' / ' + formatInt(u.successCount) + ' 次成功请求。输出、缓存读和缓存写覆盖全部成功请求。'
         : '总 tokens = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。'));
       if (s.trend) {
@@ -3195,10 +3195,10 @@
       return Number.isNaN(t.getTime()) ? s : formatClock(t.getTime());
     }
     var RECORD_HEADERS = ['时间', '提供方', '模型', '客户端', '输入（未命中）', '输出', '缓存读', '缓存写', '耗时', 'TTFT', '速度', '状态'];
-    function recordsTokenCell(value, estimated) {
+    function recordsTokenCell(value) {
       return {
-        text: value == null ? '—' : (estimated ? '≈' : '') + formatCompact(value),
-        title: value == null ? null : (estimated ? '≈' : '') + formatInt(value),
+        text: value == null ? '—' : formatCompact(value),
+        title: value == null ? null : formatInt(value),
       };
     }
     function recordsNumCell(cell) {
@@ -3230,10 +3230,10 @@
         modelTd.title = chain;
         tr.appendChild(modelTd);
         tr.appendChild(el('td', null, clientLabel(r.clientType)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(cacheMissInputTokens(r), r.usageEstimated)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.outputTokens, r.usageEstimated)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheReadTokens, false)));
-        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheWriteTokens, false)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(cacheMissInputTokens(r))));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.outputTokens)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheReadTokens)));
+        tr.appendChild(recordsNumCell(recordsTokenCell(r.cacheWriteTokens)));
         tr.appendChild(recordsNumCell({ text: formatMs(r.durationMs) || '—' }));
         tr.appendChild(recordsNumCell({ text: formatMs(r.ttftMs) || '—' }));
         tr.appendChild(recordsNumCell({ text: formatSpeed(r.tokensPerSecond) || '—' }));
@@ -3262,15 +3262,25 @@
       pager.appendChild(info);
       pager.appendChild(next);
       root.appendChild(pager);
-      // The horizontal scroller lives in a sticky wrapper so its scrollbar
-      // floats at the bottom of the visible list instead of only at the end
-      // of a tall record set. refs.scroll keeps pointing at the actual
-      // scroller so every existing append/clear call is unchanged.
-      var sticky = el('div', 'records-scroll-sticky');
       var scroll = el('div', 'records-scroll');
-      sticky.appendChild(scroll);
-      root.appendChild(sticky);
-      return { root: root, prev: prev, info: info, next: next, scroll: scroll };
+      root.appendChild(scroll);
+      var bar = el('input', 'records-scroll-bar');
+      bar.type = 'range';
+      bar.min = '0';
+      bar.setAttribute('aria-label', '横向滚动调用记录');
+      root.appendChild(bar);
+      function syncBar() {
+        var distance = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+        bar.hidden = !distance;
+        bar.max = String(distance);
+        bar.value = String(scroll.scrollLeft);
+      }
+      bar.addEventListener('input', function () { scroll.scrollLeft = Number(bar.value); });
+      scroll.addEventListener('scroll', function () { bar.value = String(scroll.scrollLeft); });
+      var observer = typeof ResizeObserver === 'function' ? new ResizeObserver(syncBar) : null;
+      if (observer) observer.observe(scroll);
+      return { root: root, prev: prev, info: info, next: next, scroll: scroll,
+        syncBar: syncBar, observer: observer };
     }
 
     function syncRecordsCard(refs, rs) {
@@ -3332,11 +3342,13 @@
       var preservedScroll = attached ? recordsRefs.scroll.scrollLeft : pendingRecordsScroll;
       var restoreFocus = attached ? null : pendingPagerFocus;
       if (!attached) {
+        if (recordsRefs && recordsRefs.observer) recordsRefs.observer.disconnect();
         recordsRefs = buildRecordsCard();
         els.usageBody.appendChild(recordsRefs.root);
       }
       syncRecordsCard(recordsRefs, rs);
       if (preservedScroll > 0) recordsRefs.scroll.scrollLeft = preservedScroll;
+      recordsRefs.syncBar();
       // Restore keyboard focus to the rebuilt pager when the user had a pager
       // button focused before the rebuild, unless focus moved elsewhere.
       if (restoreFocus) {

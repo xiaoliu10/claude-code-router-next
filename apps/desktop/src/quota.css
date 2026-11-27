@@ -325,13 +325,14 @@ body {
 .records-pager { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-2); }
 .records-pager .btn { padding: 1px 8px; font-size: 11.5px; }
 .records-info { font-variant-numeric: tabular-nums; }
-/* Sticky wrapper keeps the horizontal scrollbar floating at the visible
-   bottom of the records card while the outer list scrolls vertically. */
-.records-scroll-sticky { position: sticky; bottom: 0; z-index: 1; background: var(--surface); }
-.records-scroll { overflow-x: auto; min-width: 0; }
-.records-scroll::-webkit-scrollbar { height: 8px; }
-.records-scroll::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.14); border-radius: 999px; }
-.records-scroll::-webkit-scrollbar-track { background: transparent; }
+.records-scroll { overflow-x: auto; min-width: 0; scrollbar-width: none; }
+.records-scroll::-webkit-scrollbar { display: none; }
+/* Pin only the control: the table itself follows the vertical list. */
+.records-scroll-bar { position: sticky; bottom: 0; z-index: 1; display: block; box-sizing: border-box;
+  width: 100%; height: 14px; margin: 0; padding: 0; appearance: none; -webkit-appearance: none; background: var(--surface); cursor: ew-resize; }
+.records-scroll-bar[hidden] { display: none; }
+.records-scroll-bar::-webkit-slider-runnable-track { height: 8px; border-radius: 4px; background: var(--meter-track); }
+.records-scroll-bar::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; height: 8px; width: 32px; border-radius: 4px; background: var(--text-3); }
 .records-table { width: 100%; min-width: 780px; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
 .records-table th { text-align: left; font-weight: 500; color: var(--text-3); padding: 2px 4px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 .records-table td { padding: 2px 4px; color: var(--text-2); border-bottom: 1px solid rgba(0, 0, 0, 0.04); white-space: nowrap; }

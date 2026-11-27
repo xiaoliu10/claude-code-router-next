@@ -140,7 +140,7 @@ export function harness(overrides = {}, options = {}) {
   if (options.listen) win.__TAURI__.event = { listen: options.listen };
   if (options.storage) win.localStorage = options.storage;
   // options.setTimeout lets tests capture toast auto-hide timers deterministically.
-  vm.runInNewContext(scripts, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout: options.setTimeout || setTimeout,
+  vm.runInNewContext(scripts, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, ResizeObserver: options.ResizeObserver, setTimeout: options.setTimeout || setTimeout,
     setInterval: (fn, ms) => { intervals.push([fn, ms]); return options.setInterval ? options.setInterval(fn, ms) : setInterval(fn, ms); },
     clearInterval: (t) => { cleared.push(t); clearInterval(t); } });
   doc.events.DOMContentLoaded();
@@ -369,7 +369,23 @@ test('interaction: mixed weekly usage shows matched inputs, outputs and reads wi
   assert.equal(value('总 tokens（部分记录）'), '224');
   assert.equal(value('缓存命中率（部分记录）'), '75.0%');
   assert.equal(value('缓存读'), '500');
-  assert.equal(value('输出 tokens'), '≈75');
+  assert.equal(value('输出 tokens'), '75');
+});
+
+test('interaction: exact and recovered historical totals take precedence over partial coverage', async () => {
+  for (const historicalInputEstimate of [false, true]) {
+    const h = harness({ usage_snapshot: () => ({ successCount: 9, estimatedCount: 1,
+      effectiveInputTokens: 800, historicalInputEstimate, cacheReadTokens: 500, outputTokens: 75,
+      covered: { estimated: true, requests: 3, inputTokens: 200, outputTokens: 24, cacheReadTokens: 150 } }) });
+    await openUsage(h);
+    const summary = h.id('usage-body').querySelector('.usage-card');
+    const value = label => summary.querySelectorAll('.usage-cell').find(c => c.textContent.includes(label)).querySelector('.usage-num').textContent;
+    assert.equal(value('总 tokens'), '875');
+    assert.equal(value('输入（未命中）'), '300');
+    assert.equal(value('缓存命中率'), '62.5%');
+    assert.doesNotMatch(summary.textContent, /部分记录|≈/);
+    assert.equal(summary.title === '含历史记录估算', historicalInputEstimate);
+  }
 });
 
 test('interaction: ambiguous legacy cache leaves derived totals, inputs and hit rates unavailable', async () => {
@@ -388,7 +404,7 @@ test('interaction: ambiguous legacy cache leaves derived totals, inputs and hit 
   assert.equal(body.querySelector('.usage-hbar-total').textContent, '—');
   const rows = recordsCard(body).querySelector('tbody').children;
   assert.equal(rows[0].children[4].textContent, '—');
-  assert.equal(rows[1].children[4].textContent, '≈130');
+  assert.equal(rows[1].children[4].textContent, '130');
 });
 
 test('interaction: restore is local confirmation then single individual IPC; usage uses safe text', async () => {
@@ -503,6 +519,39 @@ test('interaction: usage auto-refreshes on an interval while open and stops on t
   assert.equal(live(), 0, 'no timer left running at the end of the test');
 });
 
+test('interaction: records scrollbar tracks overflow, drag and horizontal scrolling', async () => {
+  const observers = new Map();
+  class TestResizeObserver {
+    constructor(callback) { this.callback = callback; }
+    observe(target) { this.target = target; observers.set(target, this.callback); }
+    disconnect() { observers.delete(this.target); }
+  }
+  const h = harness({}, { ResizeObserver: TestResizeObserver });
+  await openUsage(h);
+  const card = recordsCard(h.id('usage-body'));
+  const scroll = card.querySelector('.records-scroll');
+  const bar = card.querySelector('.records-scroll-bar');
+  scroll.scrollWidth = 1100;
+  scroll.clientWidth = 320;
+  scroll.scrollLeft = 320;
+  observers.get(scroll)();
+  assert.equal(bar.hidden, false);
+  assert.equal(bar.max, '780');
+  assert.equal(bar.value, '320');
+  bar.value = '400';
+  bar.fire('input');
+  assert.equal(scroll.scrollLeft, 400);
+  scroll.scrollLeft = 100;
+  scroll.fire('scroll');
+  assert.equal(bar.value, '100');
+  scroll.clientWidth = scroll.scrollWidth;
+  scroll.scrollLeft = 0;
+  observers.get(scroll)();
+  assert.equal(bar.hidden, true);
+  assert.equal(bar.max, '0');
+  h.id('tab-quota').click();
+});
+
 test('interaction: auto-refresh rebuild preserves the records horizontal scroll position', async () => {
   const h = harness();
   h.win.__CCR_USAGE_REFRESH_MS__ = 10;
@@ -589,11 +638,10 @@ test('interaction: records table never echoes responseBody/sessionId and keeps X
   assert.equal(errorCell.textContent.includes('上游提供方返回 429'), false, 'error message stays a tooltip');
   const successCell = statusCells.find(td => td.querySelector('.record-dot').getAttribute('data-tone') === 'ok');
   assert.equal(successCell.title, '成功');
-  // Estimated record: ≈ prefix on cells and their tooltips.
-  const estimatedRow = rows.find(r => r.children[4].textContent.startsWith('≈'));
-  assert.ok(estimatedRow, 'estimated row carries the ≈ prefix');
-  assert.equal(estimatedRow.children[5].textContent.startsWith('≈'), true);
-  assert.match(estimatedRow.children[4].title, /^≈\d/, 'tooltip also marks the estimated count');
+  const estimatedRow = rows[3];
+  assert.match(estimatedRow.children[4].textContent, /^\d/);
+  assert.match(estimatedRow.children[5].textContent, /^\d/);
+  assert.match(estimatedRow.children[4].title, /^\d/);
   // Model chain column: originalModel/routed model chain in text, full chain as title.
   const modelCell = rows[0].children[2];
   assert.equal(modelCell.className.includes('cell-truncate'), true);
