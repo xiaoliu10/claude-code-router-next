@@ -6,9 +6,10 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const provider = { name: 'codex-subscription', codexResetEligible: true, enabled: true };
 const accountA = '11111111-1111-4111-8111-111111111111';
 const accountB = '22222222-2222-4222-8222-222222222222';
-const firstExpiry = new Date(2030, 4, 2, 14, 30).getTime();
+const firstExpiry = new Date(new Date().getFullYear() + 1, 4, 2, 14, 30).getTime();
 const listing = () => ({ accountRevision: accountA, availableCount: 4, credits: [
   { id: 'used', status: 'redeemed', expiresAt: firstExpiry - 1000 },
+  { id: 'expired', status: 'available', expiresAt: Date.now() - 86400e3 },
   { id: 'undated', status: 'available' },
   { id: 'later', status: 'available', expiresAt: firstExpiry + 86400e3 },
   { id: 'first', status: 'available', expiresAt: firstExpiry },
@@ -34,10 +35,11 @@ test('Codex reset controls require the main window and an enabled, explicitly el
 
 test('Codex list errors, zero allowance and missing available targets disable consumption until rechecked', async () => {
   const results = [() => { throw Error('fixture-secret'); }, () => ({ ...listing(), availableCount: 0 }),
-    () => ({ accountRevision: accountA, availableCount: 2, credits: [] }), listing];
+    () => ({ accountRevision: accountA, availableCount: 2, credits: [] }),
+    () => ({ accountRevision: accountA, availableCount: 1, credits: [{ id: 'expired', status: 'available', expiresAt: Date.now() - 1 }] }), listing];
   const h = await start({ codex_reset_credits: () => results.shift()() });
   const panel = h.panel();
-  for (const text of [/无法读取/, /0 张/, /2 张.*暂无可选择/]) {
+  for (const text of [/无法读取/, /0 张/, /2 张.*暂无可选择/, /1 张.*暂无可选择/]) {
     assert.match(panel.textContent, text);
     assert.doesNotMatch(panel.textContent, /fixture-secret/);
     assert.equal(button(panel, '重置用量').disabled, true);

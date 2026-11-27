@@ -1332,8 +1332,9 @@ export class CodexAuthService {
     this.resetCache = null;
   }
 
-  private fetchResetCredits(account: CodexAccountRecord): Promise<CodexResetCredits | null> {
+  private fetchResetCredits(account: CodexAccountRecord, confirmedCreditId?: string): Promise<CodexResetCredits | null> {
     return fetchCodexResetCredits({
+      confirmedCreditId,
       accessToken: account.accessToken,
       accountId: account.accountId || undefined,
       fetchImpl: (url, init) => this.directFetch(url, init),
@@ -1415,7 +1416,7 @@ export class CodexAuthService {
       if (confirmed) {
         // Use one credential snapshot for both requests. The display cache
         // cannot authorize a spend, even for a retry of an unsettled POST.
-        const listing = await this.fetchResetCredits(account);
+        const listing = await this.fetchResetCredits(account, creditId);
         await this.mutationTail;
         const fresh = await this.ensureLoaded(true);
         assertCurrentAccount();
