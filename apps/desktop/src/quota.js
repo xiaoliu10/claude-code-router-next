@@ -840,6 +840,7 @@
     var s = r && typeof r === 'object' ? r : {};
     return {
       period: toStr(s.period),
+      ...(s.historicalInputEstimate === true ? { historicalInputEstimate: true } : {}),
       totalRequests: toNum(s.totalRequests),
       successCount: toNum(s.successCount),
       errorCount: toNum(s.errorCount),
@@ -2814,9 +2815,10 @@
       grid.appendChild(cacheHitCell);
       grid.appendChild(usageNumCell('ttft', '平均 TTFT', formatMs(u.avgTtftMs)));
       grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
+      if (u.historicalInputEstimate) totals.title = '含历史记录估算';
       totals.appendChild(grid);
       body.appendChild(totals);
-      totals.appendChild(noteEl('总 tokens = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。'));
+      if (!u.historicalInputEstimate) totals.appendChild(noteEl('总 tokens = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。'));
       if (s.trend) {
         body.appendChild(buildUsageTrend(s.trend));
       } else {

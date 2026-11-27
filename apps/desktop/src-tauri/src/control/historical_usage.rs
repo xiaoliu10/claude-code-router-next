@@ -38,6 +38,7 @@ fn matched_input(
     let mut sql = String::from("SELECT COUNT(*),SUM(input_tokens),SUM(cache_read_input_tokens),SUM(cache_creation_input_tokens),SUM(output_tokens),
         SUM(COALESCE(effective_input_tokens,input_tokens+cache_read_input_tokens+cache_creation_input_tokens)),
         COUNT(CASE WHEN input_tokens < 0 OR cache_read_input_tokens < 0 OR cache_creation_input_tokens < 0 OR output_tokens < 0
+          OR (effective_input_tokens IS NULL AND cache_read_input_tokens = 0 AND cache_creation_input_tokens = 0)
           OR effective_input_tokens < cache_read_input_tokens THEN 1 END)
         FROM usage_records WHERE status='success'");
     let params: Vec<String> = match window {
@@ -84,6 +85,15 @@ mod tests {
         assert_eq!(
             matched_input(&db, None, Counters([3, 913, 160, 15, 7])),
             Some(980)
+        );
+        db.execute(
+            "INSERT INTO usage_records VALUES ('05','success',1000,0,0,0,NULL)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            matched_input(&db, None, Counters([4, 1913, 160, 15, 7])),
+            None
         );
     }
 }

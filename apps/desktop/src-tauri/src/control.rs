@@ -110,6 +110,8 @@ pub struct UsageBucket {
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub historical_input_estimate: bool,
     pub period: String,
     pub total_requests: u64,
     pub success_count: u64,
@@ -337,6 +339,7 @@ impl ControlService {
                 .await
                 .ok()
                 .flatten();
+                snapshot.historical_input_estimate = input.is_some();
                 snapshot.effective_input_tokens = input;
             }
         }
@@ -1067,6 +1070,7 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
         return Err(ERR_USAGE.into());
     }
     Ok(UsageSnapshot {
+        historical_input_estimate: false,
         period: period.into(),
         total_requests: counter(summary, "totalRequests"),
         success_count: counter(summary, "successCount"),
