@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { partialSummary, usageTokens } from "../src/utils/usageTokens.ts";
+import { historicalWindowTotal, partialSummary, usageTokens } from "../src/utils/usageTokens.ts";
 
 const row = { inputTokens: 100, cacheReadInputTokens: 40, cacheCreationInputTokens: 60, outputTokens: 10 };
 
@@ -26,6 +26,14 @@ test("77k inclusive input with 76k cache reads displays 1k misses and a 98.7% hi
   assert.equal(tokens.cacheMissInput, 1000);
   assert.equal(tokens.total, 77200);
   assert.equal(((tokens.hitRate ?? 0) * 100).toFixed(1), "98.7");
+});
+
+test("historical totals include the entire selected period even when the same date is fully accounted", () => {
+  assert.equal(historicalWindowTotal(100, 200, 5, 10), 315);
+  assert.equal(historicalWindowTotal(110, 300, 7, 20), 437);
+  assert.equal(historicalWindowTotal(150, 500, 9, 45), 704);
+  assert.equal(historicalWindowTotal(0, 0, 0, 0), 0);
+  assert.equal(historicalWindowTotal(NaN, 0, 0, 0), null);
 });
 
 test("mixed summaries use only matched request or date counters", () => {

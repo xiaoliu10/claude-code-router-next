@@ -532,6 +532,7 @@
   "usage": {
     "title": "Usage Statistics",
     "recorded_model_ranking": "Ranked by cache reads + output (historical input totals unavailable)",
+    "window_total_estimate": "Window estimate: raw input + cache reads and writes + output. Historical input may already include cached tokens.",
     "covered_dates": "Covered dates: {{dates}}",
     "covered_requests": "Covered requests: {{count}} / {{total}}",
     "token_accounting": "Total tokens = cache-miss input + cache reads + output. A dash means the gateway could not determine the count.",

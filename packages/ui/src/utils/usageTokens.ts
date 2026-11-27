@@ -32,6 +32,14 @@ interface SummaryCoverage {
 
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
+// Estimate a whole-window count on legacy gateways assuming raw input excludes
+// cached tokens. Keep it distinct from partial coverage used for the hit rate.
+export function historicalWindowTotal(raw: number, read: number, write: number, output: number) {
+  if (![raw, read, write, output].every(isCount)) return null;
+  const sum = raw + read + write + output;
+  return Number.isSafeInteger(sum) ? sum : null;
+}
+
 // Legacy gateways only expose a normalized sum for fully accounted day buckets.
 // Use the same subset for output, cache reads and the hit-rate denominator.
 export function partialSummary(s: SummaryCoverage) {

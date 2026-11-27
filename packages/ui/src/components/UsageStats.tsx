@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { usageDateRange, type UsageRange } from "@/utils/usageDateRange";
-import { partialSummary, usageTokens } from "@/utils/usageTokens";
+import { historicalWindowTotal, partialSummary, usageTokens } from "@/utils/usageTokens";
 import { api } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -435,7 +435,8 @@ export function UsageStats() {
             });
             const estimated = (summary.estimatedCount ?? 0) > 0;
             const partial = tokens.total === null ? partialSummary(summary) : null;
-            const displayedTotal = partial ? partial.total : tokens.total;
+            const displayedTotal = tokens.total ?? historicalWindowTotal(summary.totalInputTokens,
+              summary.totalCacheReadInputTokens, summary.totalCacheCreationInputTokens, summary.totalOutputTokens);
             const displayedRate = partial ? partial.hitRate : tokens.hitRate;
             const markedEstimate = partial ? partial.estimated : estimated;
             const coverage = partial && (partial.requests !== null
@@ -463,9 +464,9 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.total_output_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
-                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal, markedEstimate)}</div>
+                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal, estimated || tokens.total === null)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
-                {coverage && <div className="text-xs text-gray-500">{coverage}</div>}
+                {tokens.total === null && displayedTotal !== null && <div className="text-xs text-gray-500">{t("usage.window_total_estimate")}</div>}
               </div>
               <div className="rounded-lg border bg-emerald-50 p-2 text-center">
                 <div className="text-lg font-bold text-emerald-600">{formatTokens(summary.totalCacheReadInputTokens || 0)}</div>
