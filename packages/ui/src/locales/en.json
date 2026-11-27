@@ -534,7 +534,7 @@
     "recorded_model_ranking": "Ranked by cache reads + output (historical input totals unavailable)",
     "covered_dates": "Covered dates: {{dates}}",
     "covered_requests": "Covered requests: {{count}} / {{total}}",
-    "token_accounting": "For normalized records, total tokens equal cache-miss input plus cache reads and output. An ≈ indicates an estimate.",
+    "token_accounting": "For normalized records, total tokens equal cache-miss input plus cache reads and output.",
     "total_requests": "Total Requests",
     "total_input_tokens": "Input (cache miss)",
     "total_output_tokens": "Output Tokens",

@@ -86,9 +86,9 @@ interface UsageSummary {
   byClient: Record<string, ModelDayData>;
 }
 
-function formatTokens(n: number | null, estimated = false): string {
+function formatTokens(n: number | null): string {
   if (n === null) return "—";
-  return (estimated ? "≈" : "") + compactTokens(n);
+  return compactTokens(n);
 }
 
 function compactTokens(n: number): string {
@@ -436,11 +436,9 @@ export function UsageStats() {
               outputTokens: summary.totalOutputTokens,
             };
             const tokens = usageTokens(counts);
-            const estimated = (summary.estimatedCount ?? 0) > 0;
             const partial = tokens.total === null ? partialSummary(summary) : null;
             const displayedTotal = displayedUsageTotal(counts);
             const displayedRate = partial ? partial.hitRate : tokens.hitRate;
-            const markedEstimate = partial ? partial.estimated : estimated;
             const coverage = partial && (partial.requests !== null
               ? t("usage.covered_requests", { count: partial.requests, total: summary.successCount })
               : t("usage.covered_dates", { dates: partial.days.join(", ") }));
@@ -458,15 +456,15 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.success_rate")}</div>
               </div>
               <div className="rounded-lg border bg-green-50 p-2 text-center">
-                <div className="text-lg font-bold text-green-600">{formatTokens(tokens.cacheMissInput ?? summary.totalInputTokens, estimated)}</div>
+                <div className="text-lg font-bold text-green-600">{formatTokens(tokens.cacheMissInput ?? summary.totalInputTokens)}</div>
                 <div className="text-xs text-gray-500">{t(tokens.cacheMissInput === null ? "usage.reported_input" : "usage.total_input_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-yellow-50 p-2 text-center">
-                <div className="text-lg font-bold text-yellow-600">{formatTokens(summary.totalOutputTokens, estimated)}</div>
+                <div className="text-lg font-bold text-yellow-600">{formatTokens(summary.totalOutputTokens)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_output_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
-                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal.value, estimated || displayedTotal.estimated)}</div>
+                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal.value)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-emerald-50 p-2 text-center">
@@ -479,7 +477,7 @@ export function UsageStats() {
               </div>
               <div className="rounded-lg border bg-cyan-50 p-2 text-center">
                 <div className="text-lg font-bold text-cyan-600">
-                  {displayedRate === null ? "—" : (markedEstimate ? "≈" : "") + (displayedRate * 100).toFixed(2) + "%"}
+                  {displayedRate === null ? "—" : (displayedRate * 100).toFixed(2) + "%"}
                 </div>
                 <div className="text-xs text-gray-500">{t("usage.cache_hit_rate")}</div>
                 {coverage && <div className="text-xs text-gray-500">{coverage}</div>}
@@ -530,7 +528,7 @@ export function UsageStats() {
                         <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
                         <div>{t("usage.cache_read")}: {formatTokens(data.cacheReadInputTokens ?? 0)}</div>
                         <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
-                        <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(shown.value, shown.estimated)}</div>
+                        <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(shown.value)}</div>
                       </TooltipContent>
                     </Tooltip>
                   );
@@ -579,7 +577,7 @@ export function UsageStats() {
                           <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
                           <div>{t("usage.cache_read")}: {formatTokens(data.cacheReadInputTokens ?? 0)}</div>
                           <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
-                          <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(shown.value, shown.estimated)}</div>
+                          <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(shown.value)}</div>
                         </TooltipContent>
                       </Tooltip>
                     );
@@ -642,8 +640,8 @@ export function UsageStats() {
                     <td className="p-1.5">{r.provider}</td>
                     <td className="p-1.5 max-w-[280px] truncate" title={fullChain}>{modelDisplay}</td>
                     <td className="p-1.5">{r.modelFamily ? `${r.modelFamily}/${r.scenarioType}` : r.scenarioType}</td>
-                    <td className="text-right p-1.5">{formatTokens(usageTokens(r).cacheMissInput, r.usageEstimated)}</td>
-                    <td className="text-right p-1.5">{r.usageEstimated ? "≈" : ""}{formatTokens(r.outputTokens)}</td>
+                    <td className="text-right p-1.5">{formatTokens(usageTokens(r).cacheMissInput)}</td>
+                    <td className="text-right p-1.5">{formatTokens(r.outputTokens)}</td>
                     <td className="text-right p-1.5">{formatTokens(r.cacheReadInputTokens ?? 0)}</td>
                     <td className="text-right p-1.5">{formatTokens(r.cacheCreationInputTokens ?? 0)}</td>
                     <td className="text-right p-1.5">{formatMs(r.ttft)}</td>
