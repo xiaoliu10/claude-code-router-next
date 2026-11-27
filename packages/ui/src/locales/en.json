@@ -542,6 +542,8 @@
     "avg_speed": "Avg Speed",
     "cache_hit_rate": "Cache Hit Rate",
     "success_rate": "Success Rate",
+    "reported_input": "Input (raw count)",
+    "fetch_failed": "Could not load usage. Refresh to retry.",
     "daily_chart": "Daily Usage",
     "provider_chart": "Provider Usage",
     "model_chart": "Top 10 Models by Token Usage",

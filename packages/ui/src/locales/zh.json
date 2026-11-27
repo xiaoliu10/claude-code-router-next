@@ -542,6 +542,8 @@
     "avg_speed": "平均速度",
     "cache_hit_rate": "缓存命中率",
     "success_rate": "成功率",
+    "reported_input": "输入（原始计数）",
+    "fetch_failed": "读取用量失败，请刷新重试。",
     "daily_chart": "每日用量",
     "provider_chart": "供应商用量",
     "model_chart": "模型 Token 用量前 10 名",

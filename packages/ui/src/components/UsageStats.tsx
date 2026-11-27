@@ -173,6 +173,8 @@ export function UsageStats() {
   const [filterClient, setFilterClient] = useState("");
   const [filterStatus, setFilterStatus] = useState<"success" | "error" | "">("");
 
+  const [chartView, setChartView] = useState<"daily" | "model">("daily");
+  const [loadFailed, setLoadFailed] = useState(false);
   const pageSize = 20;
 
   const loadData = useCallback(async () => {
@@ -192,10 +194,12 @@ export function UsageStats() {
 
       const result = await api.getUsage(params);
       if (generation !== generationRef.current) return;
+      setLoadFailed(false);
       setRecords(result.records || []);
       setSummary(result.summary);
       setTotal(result.total);
     } catch (e) {
+      if (generation === generationRef.current) setLoadFailed(true);
       console.error("Failed to load usage:", e);
     } finally {
       if (generation === generationRef.current) setLoading(false);
@@ -287,18 +291,21 @@ export function UsageStats() {
   const dailyData = summary?.byDay ? Object.entries(summary.byDay)
     .sort(([a], [b]) => a.localeCompare(b))
     : [];
+  // Keep a single unit within each chart when historical totals are unknown.
+  const dailyUsesOutput = dailyData.some(([, d]) => usageTokens(d).total === null);
   const maxDailyTokens = Math.max(1, ...dailyData.map(([, d]) =>
-    usageTokens(d).total ?? 0
+    dailyUsesOutput ? d.outputTokens : usageTokens(d).total!
   ));
+  const modelUsesOutput = Object.values(summary?.byModel ?? {}).some(d => usageTokens(d).total === null);
 
   const modelData = Object.entries(summary?.byModel ?? {})
     .map(([model, data]) => {
       const { cacheMissInput, total } = usageTokens(data);
-      return { model, data, cacheMissInput, total };
+      return { model, data, cacheMissInput, total, chartTokens: modelUsesOutput ? data.outputTokens : total! };
     })
-    .sort((a, b) => (b.total ?? -1) - (a.total ?? -1))
+    .sort((a, b) => b.chartTokens - a.chartTokens)
     .slice(0, 10);
-  const maxModelTokens = Math.max(1, ...modelData.map(p => p.total ?? 0));
+  const maxModelTokens = Math.max(1, ...modelData.map(p => p.chartTokens));
 
   return (
     <TooltipProvider>
@@ -427,6 +434,7 @@ export function UsageStats() {
       </div>
 
       <CardContent className="flex-1 overflow-auto pt-4">
+          {loadFailed && <p role="alert" className="mb-2 text-sm text-red-600">{t("usage.fetch_failed")}</p>}
           {/* Summary Cards */}
           {summary && (() => {
             const tokens = usageTokens({
@@ -451,8 +459,8 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.success_rate")}</div>
               </div>
               <div className="rounded-lg border bg-green-50 p-2 text-center">
-                <div className="text-lg font-bold text-green-600">{formatTokens(tokens.cacheMissInput, estimated)}</div>
-                <div className="text-xs text-gray-500">{t("usage.total_input_tokens")}</div>
+                <div className="text-lg font-bold text-green-600">{formatTokens(tokens.cacheMissInput ?? summary.totalInputTokens, estimated)}</div>
+                <div className="text-xs text-gray-500">{t(tokens.cacheMissInput === null ? "usage.reported_input" : "usage.total_input_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-yellow-50 p-2 text-center">
                 <div className="text-lg font-bold text-yellow-600">{formatTokens(summary.totalOutputTokens, estimated)}</div>
@@ -490,16 +498,25 @@ export function UsageStats() {
           })()}
 
           {/* Daily Chart */}
-          {dailyData.length > 0 && (
+          <div className="mb-2 flex gap-1">
+            {(["daily", "model"] as const).map(view => (
+              <Button key={view} variant={chartView === view ? "secondary" : "ghost"} size="sm"
+                aria-pressed={chartView === view} onClick={() => setChartView(view)}>
+                {view === "daily" && <BarChart3 className="mr-1 h-3 w-3" aria-hidden="true" />}
+                {t(view === "daily" ? "usage.daily_chart" : "usage.model_chart")}
+              </Button>
+            ))}
+          </div>
+          {chartView === "daily" && dailyData.length > 0 && (
             <div className="mb-3">
               <div className="flex items-center gap-1 text-xs text-gray-500 mb-1">
-                <BarChart3 className="h-3 w-3" aria-hidden="true" />
-                <span>{t("usage.daily_chart")}</span>
+                <span>{t(dailyUsesOutput ? "usage.output_tokens" : "usage.total_tokens")}</span>
               </div>
               <div className="flex items-end gap-1 h-14">
                 {dailyData.map(([day, data]) => {
                   const { cacheMissInput, total } = usageTokens(data);
-                  const height = total === null ? 0 : Math.max(4, (total / maxDailyTokens) * 100);
+                  const amount = dailyUsesOutput ? data.outputTokens : total!;
+                  const height = amount > 0 ? Math.max(4, (amount / maxDailyTokens) * 100) : 0;
                   return (
                     <Tooltip key={day}>
                       <TooltipTrigger asChild>
@@ -528,13 +545,13 @@ export function UsageStats() {
             </div>
           )}
 
-          {summary && (
+          {chartView === "model" && summary && (
             <section className="mb-4">
-              <h2 className="mb-2 text-sm font-semibold text-gray-700">{t("usage.model_chart")}</h2>
+              <h2 className="mb-2 text-sm font-semibold text-gray-700">{t(modelUsesOutput ? "usage.output_tokens" : "usage.total_tokens")}</h2>
               {modelData.length > 0 ? (
                 <div className="space-y-2">
-                  {modelData.map(({ model, data, cacheMissInput, total }) => {
-                    const width = total === null ? 0 : Math.max(8, (total / maxModelTokens) * 100);
+                  {modelData.map(({ model, data, cacheMissInput, total, chartTokens }) => {
+                    const width = chartTokens > 0 ? Math.max(8, (chartTokens / maxModelTokens) * 100) : 0;
                     const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
                     return (
                       <Tooltip key={model}>
@@ -550,7 +567,7 @@ export function UsageStats() {
                               />
                             </div>
                             <div className="w-[70px] text-sm text-gray-500 text-right">
-                              {formatTokens(total)}
+                              {formatTokens(chartTokens)}
                             </div>
                           </div>
                         </TooltipTrigger>
