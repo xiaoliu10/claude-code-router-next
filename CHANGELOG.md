@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.3.2442] - 2026-11-27
+
+### English
+
+CCR Desktop 0.1.6 adds searchable provider/model choices for routes and fallbacks, searchable transformer names, and usage filters for client, provider and model. Daily usage bars fit the window width. Switching windows preserves the current provider draft.
+
+### 中文
+
+CCR Desktop 0.1.6 支持搜索路由目标和回退模型、按名称查找转换器，以及按客户端、供应商和模型组合筛选用量。每日用量柱状图随窗口宽度换行。切换窗口时保留正在编辑的供应商配置。
+
 ## [2.3.2441] - 2026-11-27
 
 ### English

@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="quota.css">
   <!-- CSP is enforced by tauri.conf.json (script-src 'self'): external scripts only, no inline script/handlers. -->
   <script src="general-settings.js" defer></script>
+  <script src="route-picker.js" defer></script>
   <script src="projects.js" defer></script>
   <script src="plugins.js" defer></script>
   <script src="codex-service-tier.js" defer></script>
@@ -127,7 +128,7 @@
       <div id="routing-body" class="list" aria-live="polite" aria-busy="false"></div>
       <div id="alias-add" class="alias-add" hidden>
         <input id="alias-name" class="route-input" type="text" placeholder="新别名，如 glm-5" aria-label="新模型别名">
-        <input id="alias-target" class="route-input" type="text" list="route-choices" placeholder="目标 提供方,模型" aria-label="别名目标">
+        <input id="alias-target" class="route-input" type="text" placeholder="目标 提供方,模型" aria-label="别名目标">
         <button id="alias-add-btn" class="btn" type="button">添加别名</button>
         <span id="alias-add-msg" class="inline-msg" role="status"></span>
       </div>
@@ -146,6 +147,13 @@
         <button class="period-btn" type="button" data-period="30d" aria-pressed="false">近 30 天</button>
         <button class="period-btn" type="button" data-period="all" aria-pressed="false">全部</button>
       </div>
+      <div id="usage-filters" class="usage-filters" role="group" aria-label="用量筛选">
+        <label>客户端<select data-filter="clientType" class="route-input" disabled><option value="">全部</option></select></label>
+        <label>供应商<select data-filter="provider" class="route-input" disabled><option value="">全部</option></select></label>
+        <label>模型<select data-filter="model" class="route-input" disabled><option value="">全部</option></select></label>
+        <button id="usage-clear-filters" class="btn" type="button" disabled>清空筛选</button>
+      </div>
+      <div id="usage-filter-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <div id="usage-msg" class="banner" role="status" aria-live="polite" hidden></div>
       <div id="usage-body" class="list" aria-live="polite" aria-busy="false"></div>
     </section>

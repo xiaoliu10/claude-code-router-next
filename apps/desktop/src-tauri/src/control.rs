@@ -118,8 +118,16 @@ pub struct CoveredUsage {
 }
 
 #[derive(Serialize, Clone, Debug)]
+pub struct UsageFilterOptions {
+    pub clients: Vec<String>,
+    pub providers: Vec<String>,
+    pub models: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
+    pub filter_options: UsageFilterOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub covered: Option<CoveredUsage>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -203,6 +211,30 @@ pub struct ClientSnapshot {
 }
 
 // ============================== IPC inputs ==============================
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageFilters {
+    client_type: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+impl UsageFilters {
+    fn pairs(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            ("clientType", self.client_type.as_deref()),
+            ("provider", self.provider.as_deref()),
+            ("model", self.model.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, value.filter(|s| !s.is_empty())?)))
+    }
+
+    fn active(&self) -> bool {
+        self.pairs().next().is_some()
+    }
+}
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -318,29 +350,44 @@ impl ControlService {
         Ok(routing_snapshot_from(&verified))
     }
 
-    pub(crate) async fn usage_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
-        let window = if period == "all" {
-            None
-        } else {
-            Some(usage_window(period)?)
-        };
-        let query = window
-            .as_ref()
-            .map(|(start, end)| {
-                format!(
-                    "startDate={}&endDate={}",
-                    encode_query(start),
-                    encode_query(end)
-                )
-            })
-            .unwrap_or_default();
+    async fn usage_summary(
+        &self,
+        window: Option<&(String, String)>,
+        filters: &UsageFilters,
+    ) -> Result<Value, String> {
+        let client = self.client()?;
+        let query = usage_query(window, filters);
+        if filters.active() {
+            // Older gateways apply dimension filters only on the paginated route.
+            let mut response = client
+                .get_json(&usage_page_path(query, 1, 1))
+                .await
+                .map_err(|_| ERR_USAGE.to_string())?;
+            return response
+                .get_mut("summary")
+                .map(Value::take)
+                .ok_or_else(|| ERR_USAGE.into());
+        }
         let path = if query.is_empty() {
-            "/api/usage/summary".to_string()
+            "/api/usage/summary".into()
         } else {
-            format!("/api/usage/summary?{query}")
+            format!("/api/usage/summary?{}", query.join("&"))
         };
-        let summary = self.client()?.get_json(&path).await?;
+        client.get_json(&path).await
+    }
+
+    pub(crate) async fn usage_snapshot(
+        &self,
+        period: &str,
+        filters: &UsageFilters,
+    ) -> Result<UsageSnapshot, String> {
+        let window = usage_period_window(period)?;
+        let summary = self.usage_summary(window.as_ref(), filters).await?;
         let mut snapshot = usage_snapshot_from(&summary, period)?;
+        if filters.active() {
+            apply_filtered_historical_input(&mut snapshot, &summary);
+            return Ok(snapshot);
+        }
         if snapshot.effective_input_tokens.is_none()
             && summary.get("totalEffectiveInputTokens") == Some(&Value::Null)
         {
@@ -358,20 +405,25 @@ impl ControlService {
         Ok(snapshot)
     }
 
-    async fn usage_trend_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
-        let (start, end) = usage_trend_window(period, OffsetDateTime::now_utc())?;
-        let path = format!(
-            "/api/usage/summary?startDate={}&endDate={}",
-            encode_query(&start),
-            encode_query(&end)
-        );
-        let summary = self.client()?.get_json(&path).await?;
+    async fn usage_trend_snapshot(
+        &self,
+        period: &str,
+        filters: &UsageFilters,
+    ) -> Result<UsageSnapshot, String> {
+        let window = usage_trend_window(period, OffsetDateTime::now_utc())?;
+        let summary = self.usage_summary(Some(&window), filters).await?;
         let mut snapshot = usage_snapshot_from(&summary, period)?;
+        let (start, end) = window;
+        // Anchor chart labels to the instant queried, even across local midnight.
+        snapshot.updated_at = end.clone();
+        if filters.active() {
+            apply_filtered_historical_input(&mut snapshot, &summary);
+            return Ok(snapshot);
+        }
         let days = historical_usage::unknown_days(&summary);
         if !days.is_empty() {
-            let end_bound = end.clone();
             if let Some(inputs) = tokio::task::spawn_blocking(move || {
-                historical_usage::local_daily_inputs(start, end_bound, days)
+                historical_usage::local_daily_inputs(start, end, days)
             })
             .await
             .ok()
@@ -384,8 +436,6 @@ impl ControlService {
                 }
             }
         }
-        // Anchor chart labels to the instant queried, even across local midnight.
-        snapshot.updated_at = end;
         Ok(snapshot)
     }
 
@@ -394,19 +444,24 @@ impl ControlService {
         period: &str,
         page: Option<u32>,
         page_size: Option<u32>,
+        filters: &UsageFilters,
     ) -> Result<UsageRecordsPage, String> {
-        let query = usage_date_query(period)?;
+        let query = usage_query(usage_period_window(period)?.as_ref(), filters);
         let page = page.unwrap_or(DEFAULT_USAGE_PAGE).max(1);
         let page_size = page_size
             .unwrap_or(DEFAULT_USAGE_PAGE_SIZE)
             .clamp(1, MAX_USAGE_PAGE_SIZE);
-        let prefix = if query.is_empty() {
-            query
-        } else {
-            format!("{query}&")
-        };
-        let path = format!("/api/usage?{prefix}page={page}&pageSize={page_size}");
-        let response = self.client()?.get_json(&path).await?;
+        let response = self
+            .client()?
+            .get_json(&usage_page_path(query, page, page_size))
+            .await
+            .map_err(|error| {
+                if filters.active() {
+                    ERR_USAGE.into()
+                } else {
+                    error
+                }
+            })?;
         usage_records_from(&response, period, page, page_size)
     }
 
@@ -568,12 +623,14 @@ pub async fn usage_snapshot(
     service: tauri::State<'_, ControlService>,
     period: String,
     trend: Option<bool>,
+    filters: Option<UsageFilters>,
 ) -> Result<UsageSnapshot, String> {
     crate::popup::guard(&window)?;
+    let filters = filters.unwrap_or_default();
     if trend.unwrap_or(false) {
-        service.usage_trend_snapshot(&period).await
+        service.usage_trend_snapshot(&period, &filters).await
     } else {
-        service.usage_snapshot(&period).await
+        service.usage_snapshot(&period, &filters).await
     }
 }
 
@@ -584,9 +641,12 @@ pub async fn usage_records(
     period: String,
     page: Option<u32>,
     page_size: Option<u32>,
+    filters: Option<UsageFilters>,
 ) -> Result<UsageRecordsPage, String> {
     crate::popup::guard(&window)?;
-    service.usage_records(&period, page, page_size).await
+    service
+        .usage_records(&period, page, page_size, &filters.unwrap_or_default())
+        .await
 }
 
 #[tauri::command]
@@ -1005,16 +1065,31 @@ fn usage_window(period: &str) -> Result<(String, String), String> {
     Ok((rfc3339(start.to_offset(time::UtcOffset::UTC)), rfc3339(now)))
 }
 
-fn usage_date_query(period: &str) -> Result<String, String> {
+fn usage_period_window(period: &str) -> Result<Option<(String, String)>, String> {
     if period == "all" {
-        return Ok(String::new());
+        Ok(None)
+    } else {
+        usage_window(period).map(Some)
     }
-    let (start, end) = usage_window(period)?;
-    Ok(format!(
-        "startDate={}&endDate={}",
-        encode_query(&start),
-        encode_query(&end)
-    ))
+}
+
+fn usage_query(window: Option<&(String, String)>, filters: &UsageFilters) -> Vec<String> {
+    let mut query = Vec::new();
+    if let Some((start, end)) = window {
+        query.push(format!("startDate={}", encode_query(start)));
+        query.push(format!("endDate={}", encode_query(end)));
+    }
+    query.extend(
+        filters
+            .pairs()
+            .map(|(key, value)| format!("{key}={}", encode_query(value))),
+    );
+    query
+}
+
+fn usage_page_path(mut query: Vec<String>, page: u32, page_size: u32) -> String {
+    query.push(format!("page={page}&pageSize={page_size}"));
+    format!("/api/usage?{}", query.join("&"))
 }
 
 fn counter(summary: &Value, key: &str) -> u64 {
@@ -1091,9 +1166,42 @@ fn buckets(summary: &Value, key: &str, cap: usize, sort_desc: bool) -> Vec<Usage
     entries
 }
 
-/// Whitelisted counters only: non-whitelisted buckets (byClient, byScenario,
-/// byFamily) are never projected; avgTtft/avgTokensPerSecond are surfaced as
-/// the optional typed metrics on the snapshot.
+// The gateway summary already reflects all dimensions. The local historical
+// queries match dates and counters only, so cannot establish filtered coverage.
+fn apply_filtered_historical_input(snapshot: &mut UsageSnapshot, summary: &Value) {
+    if snapshot.effective_input_tokens.is_none() {
+        snapshot.effective_input_tokens = summary["totalHistoricalInputTokens"]
+            .as_u64()
+            .filter(|input| *input >= snapshot.cache_read_tokens);
+        snapshot.historical_input_estimate = snapshot.effective_input_tokens.is_some();
+    }
+    for (key, buckets) in [
+        ("byDay", &mut snapshot.by_day),
+        ("byModel", &mut snapshot.by_model),
+        ("byProvider", &mut snapshot.by_provider),
+    ] {
+        for bucket in buckets {
+            if bucket.effective_input_tokens.is_none() {
+                bucket.effective_input_tokens = summary[key][&bucket.name]["historicalInputTokens"]
+                    .as_u64()
+                    .filter(|input| *input >= bucket.cache_read_tokens);
+            }
+        }
+    }
+}
+
+fn usage_filter_keys(summary: &Value, bucket: &str) -> Vec<String> {
+    let mut names: Vec<_> = summary[bucket]
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.keys())
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, String> {
     if !summary.is_object() {
         return Err(ERR_USAGE.into());
@@ -1117,6 +1225,11 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
         })
     })();
     Ok(UsageSnapshot {
+        filter_options: UsageFilterOptions {
+            clients: usage_filter_keys(summary, "byClient"),
+            providers: usage_filter_keys(summary, "byProvider"),
+            models: usage_filter_keys(summary, "byModel"),
+        },
         covered,
         historical_input_estimate: false,
         period: period.into(),
@@ -1298,7 +1411,10 @@ mod tests {
     async fn verify_local_daily_chart_metrics() {
         let settings = crate::settings::ConnectionSettings::from_environment().unwrap();
         let service = ControlService::new(Some(AdminClient::new(settings).unwrap()));
-        let trend = service.usage_trend_snapshot("7d").await.unwrap();
+        let trend = service
+            .usage_trend_snapshot("7d", &UsageFilters::default())
+            .await
+            .unwrap();
         for day in trend.by_day.iter().rev().take(7) {
             println!(
                 "{} {}",
@@ -1316,7 +1432,10 @@ mod tests {
     async fn verify_local_seven_day_usage_metrics() {
         let settings = crate::settings::ConnectionSettings::from_environment().unwrap();
         let service = ControlService::new(Some(AdminClient::new(settings).unwrap()));
-        let snapshot = service.usage_snapshot("7d").await.unwrap();
+        let snapshot = service
+            .usage_snapshot("7d", &UsageFilters::default())
+            .await
+            .unwrap();
         let input = snapshot.effective_input_tokens.unwrap();
         assert!(input > 0 && input >= snapshot.cache_read_tokens);
         println!(
@@ -1811,7 +1930,7 @@ mod tests {
             },
             "byDay": {"2026-11-17": {"count": 9}, "2026-11-16": {"count": 3}},
             "byModel": {"model-a": {"count": 4, "inputTokens": 12, "effectiveInputTokens": 12, "outputTokens": 3, "cacheReadInputTokens": 9, "cacheCreationInputTokens": 2, "secret": "sekret"}},
-            "byClient": {"secret-client": {"count": 4}}
+            "byClient": {"unknown": {"count": 4, "private": "client-secret"}}
         });
         let snapshot = usage_snapshot_from(&summary, "7d").unwrap();
         assert_eq!(snapshot.period, "7d");
@@ -1839,7 +1958,13 @@ mod tests {
         assert!(!rendered.contains("byScenario"));
         assert!(!rendered.contains("byFamily"));
         assert!(!rendered.contains("byClient"));
-        assert!(!rendered.contains("secret-client"));
+        assert_eq!(
+            serde_json::to_value(&snapshot.filter_options).unwrap(),
+            json!({
+                "clients": ["unknown"], "providers": ["$SECRET", "alpha", "beta"], "models": ["model-a"]
+            })
+        );
+        assert!(!rendered.contains("client-secret"));
         assert!(!rendered.contains("sekret"));
         assert!(snapshot.updated_at.contains('T'));
 
@@ -1866,6 +1991,11 @@ mod tests {
             (MAX_MODEL_BUCKETS + 9) as u64
         );
         assert_eq!(snapshot.by_provider.len(), MAX_PROVIDER_BUCKETS);
+        assert_eq!(
+            snapshot.filter_options.providers.len(),
+            MAX_PROVIDER_BUCKETS + 10
+        );
+        assert_eq!(snapshot.filter_options.models.len(), MAX_MODEL_BUCKETS + 10);
         assert_eq!(snapshot.by_day.len(), MAX_DAY_BUCKETS);
     }
 
@@ -1954,12 +2084,21 @@ mod tests {
     async fn usage_unknown_period_and_transport_failures_are_safe() {
         let mock = Mock::new(vec![]);
         let service = ControlService::new(Some(mock.client()));
-        assert_eq!(service.usage_snapshot("90d").await.unwrap_err(), ERR_PERIOD);
+        assert_eq!(
+            service
+                .usage_snapshot("90d", &UsageFilters::default())
+                .await
+                .unwrap_err(),
+            ERR_PERIOD
+        );
         assert!(mock.finish().await.is_empty());
 
         let mock = Mock::new(vec![(500, "LEAK_SECRET".into())]);
         let service = ControlService::new(Some(mock.client()));
-        let error = service.usage_snapshot("today").await.unwrap_err();
+        let error = service
+            .usage_snapshot("today", &UsageFilters::default())
+            .await
+            .unwrap_err();
         assert!(!error.contains("LEAK_SECRET"));
         assert_eq!(mock.finish().await.len(), 1);
     }
@@ -1995,7 +2134,10 @@ mod tests {
         });
         let mock = Mock::new(vec![response(payload)]);
         let service = ControlService::new(Some(mock.client()));
-        let page = service.usage_records("7d", None, None).await.unwrap();
+        let page = service
+            .usage_records("7d", None, None, &UsageFilters::default())
+            .await
+            .unwrap();
 
         // The pager echoes the clamped request values, not the gateway's.
         assert_eq!(page.period, "7d");
@@ -2079,16 +2221,120 @@ mod tests {
         ]);
         let service = ControlService::new(Some(mock.client()));
         assert_eq!(
-            service.usage_snapshot("all").await.unwrap().by_day.len(),
+            service
+                .usage_snapshot("all", &UsageFilters::default())
+                .await
+                .unwrap()
+                .by_day
+                .len(),
             90
         );
         service
-            .usage_records("all", Some(2), Some(20))
+            .usage_records("all", Some(2), Some(20), &UsageFilters::default())
             .await
             .unwrap();
         let requests = mock.finish().await;
         assert!(requests[0].starts_with("GET /api/usage/summary HTTP/"));
         assert!(requests[1].starts_with("GET /api/usage?page=2&pageSize=20 HTTP/"));
+    }
+
+    #[tokio::test]
+    async fn usage_filters_reach_snapshot_trend_and_records_as_encoded_query_values() {
+        let filters: UsageFilters = serde_json::from_value(json!({
+            "clientType": "unknown", "provider": "A &B/1", "model": "模+#?%"
+        }))
+        .unwrap();
+        let summary = json!({
+            "totalRequests": 4, "totalEffectiveInputTokens": null, "totalHistoricalInputTokens": 20,
+            "byModel": {"m": {"effectiveInputTokens":null, "historicalInputTokens":20}},
+            "byProvider": {"p": {"effectiveInputTokens":null, "historicalInputTokens":2, "cacheReadInputTokens":12}},
+            "byDay": {
+                "2026-11-10": {"effectiveInputTokens": null, "historicalInputTokens": 11},
+                "2026-11-11": {"effectiveInputTokens": 9, "historicalInputTokens": 19},
+                "2026-11-12": {"effectiveInputTokens": null, "historicalInputTokens": null}
+            }
+        });
+        let envelope = json!({"summary": summary, "records": [{"responseBody":"secret-record"}], "totalRequests": 999});
+        let mock = Mock::new(vec![
+            response(envelope.clone()),
+            response(envelope),
+            response(json!({"records":[], "total":4})),
+        ]);
+        let service = ControlService::new(Some(mock.client()));
+        let snapshot = service.usage_snapshot("all", &filters).await.unwrap();
+        assert_eq!(snapshot.total_requests, 4);
+        assert_eq!(snapshot.effective_input_tokens, Some(20));
+        assert!(snapshot.historical_input_estimate);
+        assert_eq!(snapshot.by_model[0].effective_input_tokens, Some(20));
+        assert_eq!(snapshot.by_provider[0].effective_input_tokens, None);
+        assert!(!serialized(&snapshot).contains("secret-record"));
+        let trend = service.usage_trend_snapshot("7d", &filters).await.unwrap();
+        assert_eq!(
+            trend
+                .by_day
+                .iter()
+                .map(|day| day.effective_input_tokens)
+                .collect::<Vec<_>>(),
+            vec![Some(11), Some(9), None]
+        );
+        let page = service
+            .usage_records("30d", Some(3), Some(900), &filters)
+            .await
+            .unwrap();
+        assert_eq!((page.total, page.page, page.page_size), (4, 3, 50));
+
+        let requests = mock.finish().await;
+        let dimensions = "clientType=unknown&provider=A%20%26B%2F1&model=%E6%A8%A1%2B%23%3F%25";
+        assert!(requests[0].starts_with(&format!(
+            "GET /api/usage?{dimensions}&page=1&pageSize=1 HTTP/"
+        )));
+        for (request, pager) in requests[1..]
+            .iter()
+            .zip(["page=1&pageSize=1", "page=3&pageSize=50"])
+        {
+            assert!(request.starts_with("GET /api/usage?startDate="));
+            assert!(request.contains("&endDate="));
+            assert!(request.contains(&format!("&{dimensions}&{pager} HTTP/")));
+        }
+        assert!(requests[1].contains(&format!("&endDate={}&", encode_query(&trend.updated_at))));
+    }
+
+    #[tokio::test]
+    async fn empty_usage_filters_use_summary_and_single_dimension_requires_nested_summary() {
+        let empty = serde_json::from_value(json!({"model":"", "provider":null})).unwrap();
+        let single = serde_json::from_value(json!({"provider":"p"})).unwrap();
+        let mock = Mock::new(vec![
+            response(json!({"totalRequests":8})),
+            response(json!({"totalRequests":9})),
+            response(json!({"summary":[]})),
+            response(json!({"summary":{
+                "successCount":1, "totalInputTokens":4, "totalEffectiveInputTokens":null,
+                "totalOutputTokens":2, "totalCacheReadInputTokens":3, "totalCacheCreationInputTokens":0
+            }})),
+        ]);
+        let service = ControlService::new(Some(mock.client()));
+        assert_eq!(
+            service
+                .usage_snapshot("7d", &empty)
+                .await
+                .unwrap()
+                .total_requests,
+            8
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                service.usage_snapshot("all", &single).await.unwrap_err(),
+                ERR_USAGE
+            );
+        }
+        let snapshot = service.usage_snapshot("all", &single).await.unwrap();
+        assert_eq!(snapshot.effective_input_tokens, None);
+        assert!(!snapshot.historical_input_estimate);
+        let requests = mock.finish().await;
+        assert!(requests[0].starts_with("GET /api/usage/summary?startDate="));
+        for request in &requests[1..] {
+            assert!(request.starts_with("GET /api/usage?provider=p&page=1&pageSize=1 HTTP/"));
+        }
     }
 
     #[tokio::test]
@@ -2101,7 +2347,7 @@ mod tests {
             let mock = Mock::new(vec![response(json!({"records": [], "total": 0}))]);
             let service = ControlService::new(Some(mock.client()));
             service
-                .usage_records("today", page, page_size)
+                .usage_records("today", page, page_size, &UsageFilters::default())
                 .await
                 .unwrap();
             let requests = mock.finish().await;
@@ -2123,7 +2369,10 @@ mod tests {
         });
         let mock = Mock::new(vec![response(payload)]);
         let service = ControlService::new(Some(mock.client()));
-        let page = service.usage_records("today", None, None).await.unwrap();
+        let page = service
+            .usage_records("today", None, None, &UsageFilters::default())
+            .await
+            .unwrap();
         assert_eq!(
             page.records[0].error_message,
             Some("E".repeat(MAX_USAGE_ERROR_MESSAGE_CHARS))
@@ -2143,7 +2392,10 @@ mod tests {
         let mock = Mock::new(vec![]);
         let service = ControlService::new(Some(mock.client()));
         assert_eq!(
-            service.usage_records("90d", None, None).await.unwrap_err(),
+            service
+                .usage_records("90d", None, None, &UsageFilters::default())
+                .await
+                .unwrap_err(),
             ERR_PERIOD
         );
         assert!(mock.finish().await.is_empty());
@@ -2156,14 +2408,14 @@ mod tests {
         let service = ControlService::new(Some(mock.client()));
         assert_eq!(
             service
-                .usage_records("today", None, None)
+                .usage_records("today", None, None, &UsageFilters::default())
                 .await
                 .unwrap_err(),
             ERR_USAGE
         );
         assert_eq!(
             service
-                .usage_records("today", None, None)
+                .usage_records("today", None, None, &UsageFilters::default())
                 .await
                 .unwrap_err(),
             ERR_USAGE
@@ -2174,7 +2426,7 @@ mod tests {
         let mock = Mock::new(vec![(500, "LEAK_SECRET".into())]);
         let service = ControlService::new(Some(mock.client()));
         let error = service
-            .usage_records("today", None, None)
+            .usage_records("today", None, None, &UsageFilters::default())
             .await
             .unwrap_err();
         assert!(!error.contains("LEAK_SECRET"));
@@ -2400,12 +2652,15 @@ mod tests {
         assert_eq!(service.routing_snapshot().await.unwrap_err(), ERR_OFFLINE);
         assert_eq!(service.config_reload().await.unwrap_err(), ERR_OFFLINE);
         assert_eq!(
-            service.usage_snapshot("today").await.unwrap_err(),
+            service
+                .usage_snapshot("today", &UsageFilters::default())
+                .await
+                .unwrap_err(),
             ERR_OFFLINE
         );
         assert_eq!(
             service
-                .usage_records("today", None, None)
+                .usage_records("today", None, None, &UsageFilters::default())
                 .await
                 .unwrap_err(),
             ERR_OFFLINE

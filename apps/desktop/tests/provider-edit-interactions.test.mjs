@@ -33,8 +33,13 @@ test('provider_get opens a labeled, prefilled editor and clears the key on dismi
   assert.equal(h.id('provider-models').value, 'one\ntwo');
   assert.equal(key.value, '');
   assert.equal(key.placeholder, '已保存，留空则不修改');
-  key.value = 'test-key'; h.windowEvents.blur(); assert.equal(key.value, '');
-  key.value = 'test-key'; h.windowEvents.keydown({ key: 'Escape', preventDefault() {} });
+  key.value = 'test-key'; h.id('provider-models').value = 'draft-model';
+  h.windowEvents.blur?.(); h.doc.visibilityState = 'hidden'; h.doc.events.visibilitychange?.();
+  h.doc.visibilityState = 'visible'; h.doc.events.visibilitychange?.(); h.windowEvents.focus(); await flush();
+  assert.equal(key.value, 'test-key');
+  assert.equal(h.id('provider-models').value, 'draft-model');
+  assert.equal(h.id('provider-add-form').hidden, false);
+  h.windowEvents.keydown({ key: 'Escape', preventDefault() {} });
   assert.equal(h.id('provider-add-form').hidden, true);
   assert.equal(h.doc.activeElement, edit);
   assert.equal(key.value, '');

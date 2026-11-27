@@ -228,6 +228,21 @@ test('interaction: one save button commits edits across model groups only', asyn
   assert.equal(body.querySelector('.route-save').disabled, false);
 });
 
+test('routing refresh invalidates a removed candidate and Escape on the trigger closes its panel', async () => {
+  const h = harness(); await flush(); h.id('tab-routing').click(); await flush();
+  const field = h.id('routing-body').querySelector('.route-input'); field.click();
+  const wrap = field.parentNode, search = wrap.querySelector('.model-picker-panel').querySelector('input');
+  search.value = 'two'; search.fire('input');
+  const stale = wrap.querySelector('.model-picker-option'); assert.equal(stale.textContent, 'alpha,two');
+  h.route.providers[0].models = ['one']; h.route.revision = '2';
+  h.id('routing-refresh').click(); await flush();
+  assert.equal(wrap.querySelector('.model-picker-option'), null);
+  search.fire('keydown', { key: 'Enter', stopPropagation() {} }); stale.fire('click');
+  assert.equal(field.value, 'alpha,one');
+  field.focus(); field.fire('keydown', { key: 'Escape', stopPropagation() {} });
+  assert.equal(field.getAttribute('aria-expanded'), 'false');
+});
+
 test('interaction: fallback add fires once, keyboard add, move/remove and explicit save', async () => {
   const h = harness(); await flush(); h.id('tab-routing').click(); await flush();
   const card = h.id('routing-body').children[0];
@@ -235,7 +250,13 @@ test('interaction: fallback add fires once, keyboard add, move/remove and explic
   input.value = 'alpha,one'; add.querySelector('button').click();
   assert.equal(card.querySelectorAll('.fallback-item').length, 1);
   assert.equal(input.getAttribute('aria-invalid'), null);
-  input.value = 'alpha,two'; input.fire('keydown', { key: 'Enter' });
+  input.fire('keydown', { key: 'Enter' });
+  const search = add.querySelector('.model-picker-panel').querySelector('input');
+  search.value = 'TWO'; search.fire('input');
+  assert.equal(add.querySelector('.model-picker-option').textContent, 'alpha,two');
+  search.fire('keydown', { key: 'Enter', stopPropagation() {} });
+  assert.equal(input.value, 'alpha,two');
+  add.querySelector('button').click();
   card.querySelectorAll('.fallback-item')[1].querySelector('button').click();
   assert.match(card.querySelector('.fallback-item').textContent, /alpha,two/);
   card.querySelectorAll('.fallback-item')[1].querySelectorAll('button')[2].click();
@@ -480,6 +501,101 @@ test('interaction: opening usage loads the seven-day chart and matching records 
   assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_records').at(-1).args), { period: 'all', page: 1, pageSize: 20 });
 });
 
+test('interaction: combine, remove and clear usage filters across paging, polling and periods', async () => {
+  const weekChoices = { clients: ['pi', 'codex'], providers: ['a&b', 'backup'], models: ['m/+?', 'other'] };
+  const todayChoices = { clients: ['codex'], providers: ['today-only'], models: ['new'] };
+  let optionsFail = false;
+  const h = harness({
+    usage_snapshot: ({ period, filters, trend }) => {
+      if (optionsFail && !filters && !trend) throw new Error('offline');
+      const filterOptions = trend || filters ? { clients: ['narrow'] } : period === 'today' ? todayChoices : weekChoices;
+      return { period, filterOptions, totalRequests: filters ? 0 : 45, updatedAt: 1, byDay: [] };
+    },
+    usage_records: ({ period, page, filters }) => ({ period, page, total: filters ? 0 : 45, records: [] }),
+  });
+  await openUsage(h);
+  const [client, provider, model] = h.id('usage-filters').querySelectorAll('select');
+  const clear = h.id('usage-clear-filters');
+  const values = select => select.children.map(option => option.value);
+  const choose = async (select, value) => {
+    assert.ok(values(select).includes(value));
+    select.value = value; select.fire('change'); await flush();
+  };
+  const lastArgs = (cmd, trend = false) => plain(h.calls.filter(c => c.cmd === cmd && !!c.args.trend === trend).at(-1).args);
+  const assertQuery = (filters, period = '7d') => {
+    const optional = filters ? { filters } : {};
+    assert.deepEqual(lastArgs('usage_records'), { period, page: 1, pageSize: 20, ...optional });
+    assert.deepEqual(lastArgs('usage_snapshot', true), { period: '7d', trend: true, ...optional });
+    assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'usage_snapshot' && !c.args.trend && !!c.args.filters === !!filters).at(-1).args), { period, ...optional });
+  };
+  assert.ok(clear.disabled);
+  recordsCard(h.id('usage-body')).querySelectorAll('.btn')[1].click(); await flush();
+  assert.equal(lastArgs('usage_records').page, 2);
+  await choose(client, 'pi'); assertQuery({ clientType: 'pi' });
+  await choose(provider, 'a&b'); assertQuery({ clientType: 'pi', provider: 'a&b' });
+  await choose(model, 'm/+?');
+  const combined = { clientType: 'pi', provider: 'a&b', model: 'm/+?' };
+  assertQuery(combined);
+  assert.deepEqual(values(model), ['', ...weekChoices.models]);
+  assert.match(recordsCard(h.id('usage-body')).textContent, /没有符合筛选条件/);
+  const start = h.calls.length;
+  h.intervals.at(-1)[0](); await flush();
+  assert.deepEqual(plain(h.calls.slice(start).filter(c => c.args.filters).map(c => c.args.filters)), [combined, combined, combined]);
+  await choose(provider, ''); assertQuery({ clientType: 'pi', model: 'm/+?' });
+  optionsFail = true;
+  h.id('usage-periods').children[0].click(); await flush();
+  assertQuery({ clientType: 'pi', model: 'm/+?' }, 'today');
+  assert.deepEqual(values(provider), ['']);
+  assert.match(h.id('usage-filter-msg').textContent, /offline/);
+  optionsFail = false;
+  h.id('usage-refresh').click(); await flush();
+  assert.equal(h.id('usage-filter-msg').hidden, true);
+  assert.deepEqual(values(provider), ['', 'today-only']);
+  assert.deepEqual(values(model), ['', 'new', 'm/+?']);
+  assert.equal(client.value, 'pi');
+  clear.click(); await flush();
+  assertQuery(null, 'today');
+  assert.deepEqual(values(model), ['', 'new']);
+  assert.ok(clear.disabled);
+});
+
+test('interaction: changing the filter discards pending summary, trend, choices and records', async () => {
+  const choices = { clients: ['pi'], providers: ['a'], models: ['current'] };
+  const snapshot = { period: '7d', updatedAt: 1, byDay: [], filterOptions: choices, totalRequests: 30 };
+  let stall = false, fail = false;
+  const stale = [];
+  function reply(value) {
+    if (stall) return new Promise((resolve, reject) => stale.push({ resolve, reject, value }));
+    if (fail) throw new Error('current error');
+    return value;
+  }
+  const h = harness({
+    usage_snapshot: args => reply({ ...snapshot, totalRequests: stall ? 999 : args.filters ? 1 : 30,
+      filterOptions: stall ? { clients: ['old'] } : choices }),
+    usage_records: args => reply({ period: '7d', page: 1, total: stall ? 999 : 1, records: [recordFixture(1)] }),
+  });
+  await openUsage(h);
+  const [client, provider] = h.id('usage-filters').querySelectorAll('select');
+  client.value = 'pi'; client.fire('change'); await flush();
+  stall = true;
+  h.id('usage-refresh').click(); await flush();
+  assert.equal(stale.length, 4);
+  stall = false; fail = true;
+  provider.value = 'a'; provider.fire('change'); await flush();
+  const body = h.id('usage-body');
+  assert.match(h.id('usage-msg').textContent, /current error/);
+  assert.equal(body.querySelector('.usage-grid'), null);
+  assert.match(recordsCard(body).textContent, /current error/);
+  fail = false;
+  h.id('usage-refresh').click(); await flush();
+  stale.forEach(({ resolve, reject, value }, i) => i === 1 ? reject(new Error('stale trend error')) : resolve(value));
+  await flush();
+  assert.equal(body.querySelector('.usage-num').textContent, '1');
+  assert.deepEqual(client.children.map(o => o.value), ['', 'pi']);
+  assert.match(recordsCard(body).textContent, /共 1 条/);
+  assert.doesNotMatch(body.textContent, /stale trend error|current error/);
+});
+
 test('interaction: usage auto-refreshes on an interval while open and stops on tab switch', async () => {
   const h = harness();
   h.win.__CCR_USAGE_REFRESH_MS__ = 10;
@@ -711,7 +827,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(bars[2].title.startsWith('2026-11-18'), true);
   assert.equal(bars[2].style.height, '12%', 'smaller days scale relative to the max');
   assert.equal(bars[3].style.height, '0%', 'unknown totals have no filled bar');
-  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19', '2026-11-20', '2026-11-21', '2026-11-22']);
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['11-16', '11-17', '11-18', '11-19', '11-20', '11-21', '11-22']);
   assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), ['1.3K', '0', '150', '—', '0', '0', '0']);
   // Model chart: ranked by effective (cache-aware) input+output desc, capped at 10, exact values in title.
   const modelCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('模型 Top 10'));
@@ -741,7 +857,7 @@ test('interaction: Today uses the same seven calendar dates and values as 7d whi
   await openUsage(h);
   const body = h.id('usage-body');
   const trend = () => body.querySelectorAll('.usage-bar-col').map(col => [
-    col.querySelector('.usage-day-date').textContent, col.querySelector('.usage-day-value').textContent,
+    col.querySelector('.usage-day-date').dateTime, col.querySelector('.usage-day-value').textContent,
   ]);
   const week = [
     ['2026-10-27', '71'], ['2026-10-28', '0'], ['2026-10-29', '99'], ['2026-10-30', '0'],

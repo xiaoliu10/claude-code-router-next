@@ -404,6 +404,27 @@ test("preview: usage_snapshot covers today/7d/30d with complete summaries", asyn
   assertUsageSnapshot(fallback, "today", "bogus period falls back to today")
 })
 
+test("preview: usage dropdown choices lead to matching summary, trend and paged records", async () => {
+  const invoke = Q.createPreviewInvoke()
+  const period = "7d"
+  const summary = await previewCall(invoke, "usage_snapshot", { period })
+  for (const key of ["clients", "providers", "models"]) assert.ok(summary.filterOptions[key].length > 1)
+  const sample = (await previewCall(invoke, "usage_records", { period })).records[0]
+  const filters = { clientType: sample.clientType, provider: sample.provider, model: sample.model }
+  const [filtered, trend, page] = await Promise.all([
+    previewCall(invoke, "usage_snapshot", { period, filters }),
+    previewCall(invoke, "usage_snapshot", { period, filters, trend: true }),
+    previewCall(invoke, "usage_records", { period, filters, pageSize: 2, page: 2 }),
+  ])
+  assert.ok(page.total < summary.totalRequests && page.records.length === 2)
+  assert.equal(filtered.totalRequests, page.total)
+  assert.ok(page.records.every(r => Object.entries(filters).every(([key, value]) => r[key] === value)))
+  assert.deepEqual(Array.from(filtered.byModel, r => r.name), [sample.model])
+  assert.deepEqual(Array.from(filtered.byProvider, r => r.name), [sample.provider])
+  assert.equal(trend.byDay.reduce((n, row) => n + row.requests, 0), page.total)
+  assert.equal((await previewCall(invoke, "usage_snapshot", { period, filters: { ...filters, model: "absent" } })).totalRequests, 0)
+})
+
 test("preview: clients_snapshot discovers the five known clients with complete fields", async () => {
   const invoke = Q.createPreviewInvoke()
   assertClientsResponse(await previewCall(invoke, "clients_snapshot", {}), "clients_snapshot")

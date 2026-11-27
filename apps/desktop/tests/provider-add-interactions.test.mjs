@@ -37,12 +37,16 @@ test('provider_add: discoverable action, password field, cancel, Escape and dism
   open.click(); fill(h); h.id('tab-routing').click();
   assert.equal(form.hidden, true);
   assert.equal(key.value, '');
-  h.id('tab-quota').click(); open.click(); fill(h); h.windowEvents.blur();
-  assert.equal(key.value, '');
-  fill(h); h.doc.visibilityState = 'hidden'; h.doc.events.visibilitychange();
-  assert.equal(form.hidden, true);
-  assert.equal(key.value, '');
+  h.id('tab-quota').click(); open.click(); fill(h); h.windowEvents.blur?.();
+  assert.equal(key.value, 'test-key');
+  h.doc.visibilityState = 'hidden'; h.doc.events.visibilitychange?.();
+  h.doc.visibilityState = 'visible'; h.doc.events.visibilitychange?.(); h.windowEvents.focus(); await flush();
+  assert.equal(form.hidden, false);
+  assert.equal(h.id('provider-name').value.trim(), name);
+  assert.equal(h.id('provider-base-url').value, baseUrl);
+  assert.equal(key.value, 'test-key');
   assert.equal(addCalls(h).length, 0);
+  h.id('provider-add-cancel').click(); assert.equal(key.value, '');
 });
 
 test('provider_add: invalid fields focus and explain the correction before IPC', async () => {
