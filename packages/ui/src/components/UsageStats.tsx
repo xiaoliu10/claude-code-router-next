@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { usageDateRange, type UsageRange } from "@/utils/usageDateRange";
 import { partialSummary, usageTokens } from "@/utils/usageTokens";
 import { api } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
@@ -138,13 +139,6 @@ function formatTime(ts: string): string {
   });
 }
 
-function formatDateInput(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
 export function UsageStats() {
   const { t } = useTranslation();
   const [summary, setSummary] = useState<UsageSummary | null>(null);
@@ -163,10 +157,8 @@ export function UsageStats() {
   // usage table synchronously on the server's event loop, which stalls every
   // other management API while the auto-refresh loop polls every 30s. Users
   // can still opt into an unbounded scan via the "All" preset.
-  const [startDate, setStartDate] = useState(() =>
-    formatDateInput(new Date(Date.now() - DEFAULT_RANGE_HOURS * 60 * 60 * 1000)));
-  const [endDate, setEndDate] = useState(() => formatDateInput(new Date()));
-  const [activeRange, setActiveRange] = useState<number | null>(DEFAULT_RANGE_HOURS);
+  const [selection, setSelection] = useState<UsageRange>(DEFAULT_RANGE_HOURS);
+  const { startDate, endDate } = usageDateRange(selection);
   const [filterModel, setFilterModel] = useState("");
   const [filterProvider, setFilterProvider] = useState("");
   const [filterScenario, setFilterScenario] = useState("");
@@ -183,9 +175,10 @@ export function UsageStats() {
     const generation = generationRef.current;
     setLoading(true);
     try {
-      const params: Record<string, any> = { page, pageSize };
-      if (startDate) params.startDate = new Date(startDate).toISOString();
-      if (endDate) params.endDate = new Date(endDate + "T23:59:59").toISOString();
+      const range = usageDateRange(selection);
+      const params: NonNullable<Parameters<typeof api.getUsage>[0]> = { page, pageSize };
+      if (range.start) params.startDate = range.start;
+      if (range.end) params.endDate = range.end;
       if (filterModel) params.model = filterModel;
       if (filterProvider) params.provider = filterProvider;
       if (filterScenario) params.scenario = filterScenario;
@@ -204,7 +197,7 @@ export function UsageStats() {
     } finally {
       if (generation === generationRef.current) setLoading(false);
     }
-  }, [page, startDate, endDate, filterModel, filterProvider, filterScenario, filterClient, filterStatus]);
+  }, [page, selection, filterModel, filterProvider, filterScenario, filterClient, filterStatus]);
 
   // Serial, queue-style auto refresh:
   // - at most one /api/usage request in flight at a time;
@@ -315,9 +308,9 @@ export function UsageStats() {
         <div className="flex items-center gap-2.5 flex-wrap">
           {/* Quick time range presets */}
           <div className="flex items-center gap-0.5 rounded-md bg-white border border-gray-200 p-0.5 shadow-sm">
-            {[24, 168, 720].map((hours) => {
+            {([24, 168, 720] as const).map((hours) => {
               const label = hours === 24 ? "24h" : hours === 168 ? "7d" : "30d";
-              const isActive = activeRange === hours;
+              const isActive = selection === hours;
               return (
                 <button
                   key={hours}
@@ -329,11 +322,7 @@ export function UsageStats() {
                       : "border-transparent text-gray-600 hover:bg-gray-100"
                   }`}
                   onClick={() => {
-                    const now = new Date();
-                    const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
-                    setStartDate(formatDateInput(start));
-                    setEndDate(formatDateInput(now));
-                    setActiveRange(hours);
+                    setSelection(hours);
                     setPage(1);
                   }}
                 >
@@ -348,7 +337,7 @@ export function UsageStats() {
                   ? "bg-blue-500 text-white shadow-sm"
                   : "text-gray-600 hover:bg-gray-50"
               }`}
-              onClick={() => { setStartDate(""); setEndDate(""); setActiveRange(null); setPage(1); }}
+              onClick={() => { setSelection({ startDate: "", endDate: "" }); setPage(1); }}
             >
               {t("usage.all")}
             </button>
@@ -360,7 +349,7 @@ export function UsageStats() {
               type="date"
               className="h-6 text-xs w-[120px] border-0 px-1 focus-visible:ring-0 focus-visible:ring-offset-0"
               value={startDate}
-              onChange={(e) => { setStartDate(e.target.value); setActiveRange(null); setPage(1); }}
+              onChange={(e) => { setSelection({ startDate: e.target.value, endDate }); setPage(1); }}
               placeholder={t("usage.start_date")}
             />
             <span className="text-xs text-gray-400 select-none">→</span>
@@ -368,7 +357,7 @@ export function UsageStats() {
               type="date"
               className="h-6 text-xs w-[120px] border-0 px-1 focus-visible:ring-0 focus-visible:ring-offset-0"
               value={endDate}
-              onChange={(e) => { setEndDate(e.target.value); setActiveRange(null); setPage(1); }}
+              onChange={(e) => { setSelection({ startDate, endDate: e.target.value }); setPage(1); }}
               placeholder={t("usage.end_date")}
             />
           </div>
