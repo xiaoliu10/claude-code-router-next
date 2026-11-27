@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { usageTokens } from "@/utils/usageTokens";
+import { partialSummary, usageTokens } from "@/utils/usageTokens";
 import { api } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -445,6 +445,13 @@ export function UsageStats() {
               outputTokens: summary.totalOutputTokens,
             });
             const estimated = (summary.estimatedCount ?? 0) > 0;
+            const partial = tokens.total === null ? partialSummary(summary) : null;
+            const displayedTotal = partial ? partial.total : tokens.total;
+            const displayedRate = partial ? partial.hitRate : tokens.hitRate;
+            const markedEstimate = partial ? partial.estimated : estimated;
+            const coverage = partial && (partial.requests !== null
+              ? t("usage.covered_requests", { count: partial.requests, total: summary.successCount })
+              : t("usage.covered_dates", { dates: partial.days.join(", ") }));
             return (
               <div className="grid grid-cols-5 gap-2 mb-3">
               <div className="rounded-lg border bg-blue-50 p-2 text-center">
@@ -467,8 +474,9 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.total_output_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
-                <div className="text-lg font-bold text-indigo-600">{formatTokens(tokens.total, estimated)}</div>
+                <div className="text-lg font-bold text-indigo-600">{displayedTotal === null ? "—" : (markedEstimate ? "≈" : "") + displayedTotal.toLocaleString()}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
+                {coverage && <div className="text-xs text-gray-500">{coverage}</div>}
               </div>
               <div className="rounded-lg border bg-emerald-50 p-2 text-center">
                 <div className="text-lg font-bold text-emerald-600">{formatTokens(summary.totalCacheReadInputTokens || 0)}</div>
@@ -480,9 +488,10 @@ export function UsageStats() {
               </div>
               <div className="rounded-lg border bg-cyan-50 p-2 text-center">
                 <div className="text-lg font-bold text-cyan-600">
-                  {tokens.hitRate === null ? "—" : (estimated ? "≈" : "") + (tokens.hitRate * 100).toFixed(1) + "%"}
+                  {displayedRate === null ? "—" : (markedEstimate ? "≈" : "") + (displayedRate * 100).toFixed(2) + "%"}
                 </div>
                 <div className="text-xs text-gray-500">{t("usage.cache_hit_rate")}</div>
+                {coverage && <div className="text-xs text-gray-500">{coverage}</div>}
               </div>
               <div className="rounded-lg border bg-purple-50 p-2 text-center">
                 <div className="text-lg font-bold text-purple-600">{formatMs(summary.avgTtft)}</div>

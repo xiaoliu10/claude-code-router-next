@@ -531,6 +531,8 @@
   },
   "usage": {
     "title": "Usage Statistics",
+    "covered_dates": "Covered dates: {{dates}}",
+    "covered_requests": "Covered requests: {{count}} / {{total}}",
     "token_accounting": "Total tokens = cache-miss input + cache reads + output. A dash means the gateway could not determine the count.",
     "total_requests": "Total Requests",
     "total_input_tokens": "Input (cache miss)",

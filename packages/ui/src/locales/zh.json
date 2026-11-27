@@ -531,6 +531,8 @@
   },
   "usage": {
     "title": "用量统计",
+    "covered_dates": "可核算日期：{{dates}}",
+    "covered_requests": "可核算请求：{{count}} / {{total}}",
     "token_accounting": "总 Token = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。",
     "total_requests": "总请求数",
     "total_input_tokens": "输入（未命中）",
