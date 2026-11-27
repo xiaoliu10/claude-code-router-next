@@ -170,6 +170,7 @@ export function UsageStats() {
   const total = currentPage?.total ?? 0;
 
   const [chartView, setChartView] = useState<"daily" | "model">("daily");
+  const [modelLimit, setModelLimit] = useState(10);
   const [loadFailed, setLoadFailed] = useState(false);
   const pageSize = 20;
 
@@ -299,7 +300,7 @@ export function UsageStats() {
       return { model, data, cacheMissInput, total, chartTokens: modelUsesRecorded ? (data.cacheReadInputTokens ?? 0) + data.outputTokens : total! };
     })
     .sort((a, b) => b.chartTokens - a.chartTokens)
-    .slice(0, 10);
+    .slice(0, modelLimit);
   const maxModelTokens = Math.max(1, ...modelData.map(p => p.chartTokens));
 
   return (
@@ -503,6 +504,15 @@ export function UsageStats() {
                 {t(view === "daily" ? "usage.daily_chart" : "usage.model_chart")}
               </Button>
             ))}
+            {chartView === "model" && (
+              <select aria-label={t("usage.model_limit")} value={modelLimit}
+                onChange={event => setModelLimit(Number(event.target.value))}
+                className="h-8 rounded-md border bg-background px-2 text-sm">
+                {[10, 20, 30, 40, 50].map(limit => (
+                  <option key={limit} value={limit}>{t("usage.top_models", { limit })}</option>
+                ))}
+              </select>
+            )}
           </div>
           {chartView === "daily" && dailyData.length > 0 && (
             <div className="mb-3">
