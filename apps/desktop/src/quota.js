@@ -3028,15 +3028,25 @@
       pager.appendChild(info);
       pager.appendChild(next);
       root.appendChild(pager);
-      // The horizontal scroller lives in a sticky wrapper so its scrollbar
-      // floats at the bottom of the visible list instead of only at the end
-      // of a tall record set. refs.scroll keeps pointing at the actual
-      // scroller so every existing append/clear call is unchanged.
-      var sticky = el('div', 'records-scroll-sticky');
       var scroll = el('div', 'records-scroll');
-      sticky.appendChild(scroll);
-      root.appendChild(sticky);
-      return { root: root, prev: prev, info: info, next: next, scroll: scroll };
+      root.appendChild(scroll);
+      var bar = el('input', 'records-scroll-bar');
+      bar.type = 'range';
+      bar.min = '0';
+      bar.setAttribute('aria-label', '横向滚动调用记录');
+      root.appendChild(bar);
+      function syncBar() {
+        var distance = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+        bar.hidden = !distance;
+        bar.max = String(distance);
+        bar.value = String(scroll.scrollLeft);
+      }
+      bar.addEventListener('input', function () { scroll.scrollLeft = Number(bar.value); });
+      scroll.addEventListener('scroll', function () { bar.value = String(scroll.scrollLeft); });
+      var observer = typeof ResizeObserver === 'function' ? new ResizeObserver(syncBar) : null;
+      if (observer) observer.observe(scroll);
+      return { root: root, prev: prev, info: info, next: next, scroll: scroll,
+        syncBar: syncBar, observer: observer };
     }
 
     function syncRecordsCard(refs, rs) {
@@ -3098,11 +3108,13 @@
       var preservedScroll = attached ? recordsRefs.scroll.scrollLeft : pendingRecordsScroll;
       var restoreFocus = attached ? null : pendingPagerFocus;
       if (!attached) {
+        if (recordsRefs && recordsRefs.observer) recordsRefs.observer.disconnect();
         recordsRefs = buildRecordsCard();
         els.usageBody.appendChild(recordsRefs.root);
       }
       syncRecordsCard(recordsRefs, rs);
       if (preservedScroll > 0) recordsRefs.scroll.scrollLeft = preservedScroll;
+      recordsRefs.syncBar();
       // Restore keyboard focus to the rebuilt pager when the user had a pager
       // button focused before the rebuild, unless focus moved elsewhere.
       if (restoreFocus) {
