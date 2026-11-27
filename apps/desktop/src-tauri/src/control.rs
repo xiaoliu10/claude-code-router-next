@@ -108,7 +108,19 @@ pub struct UsageBucket {
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct CoveredUsage {
+    pub requests: u64,
+    pub estimated: bool,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered: Option<CoveredUsage>,
     pub period: String,
     pub total_requests: u64,
     pub success_count: u64,
@@ -1037,7 +1049,26 @@ fn usage_snapshot_from(summary: &Value, period: &str) -> Result<UsageSnapshot, S
     if !summary.is_object() {
         return Err(ERR_USAGE.into());
     }
+    // A partial summary uses the same successful requests for every counter.
+    let covered = (|| {
+        let requests = summary["coveredRequests"].as_u64()?;
+        let success = summary["successCount"].as_u64()?;
+        if requests == 0
+            || requests >= success
+            || !summary.get("totalEffectiveInputTokens")?.is_null()
+        {
+            return None;
+        }
+        Some(CoveredUsage {
+            requests,
+            input_tokens: summary["coveredInputTokens"].as_u64()?,
+            output_tokens: summary["coveredOutputTokens"].as_u64()?,
+            estimated: summary["coveredEstimatedCount"].as_u64()? > 0,
+            cache_read_tokens: summary["coveredCacheReadTokens"].as_u64()?,
+        })
+    })();
     Ok(UsageSnapshot {
+        covered,
         period: period.into(),
         total_requests: counter(summary, "totalRequests"),
         success_count: counter(summary, "successCount"),
@@ -1790,6 +1821,31 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn partial_usage_requires_matched_counters_and_incomplete_coverage() {
+        let mut summary = json!({"totalEffectiveInputTokens":null,"successCount":2,"estimatedCount":1,"coveredRequests":1,
+            "coveredInputTokens":100,"coveredOutputTokens":10,"coveredCacheReadTokens":90,"coveredEstimatedCount":0});
+        let covered = usage_snapshot_from(&summary, "7d")
+            .unwrap()
+            .covered
+            .unwrap();
+        assert_eq!(
+            (
+                covered.requests,
+                covered.input_tokens,
+                covered.output_tokens,
+                covered.cache_read_tokens
+            ),
+            (1, 100, 10, 90)
+        );
+        assert!(!covered.estimated);
+        summary["coveredOutputTokens"] = Value::Null;
+        assert!(usage_snapshot_from(&summary, "7d")
+            .unwrap()
+            .covered
+            .is_none());
     }
 
     #[test]

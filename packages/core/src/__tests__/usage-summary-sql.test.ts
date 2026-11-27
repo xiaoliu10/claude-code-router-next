@@ -251,6 +251,7 @@ describe("inclusive input SQL aggregation", () => {
     const { records, summary } = query({ provider });
     const expected = 110 + 110 + 14 + 17 + 10;
     expect(summary.totalEffectiveInputTokens).toBe(expected);
+    expect(summary.coveredEstimatedCount).toBe(1);
     for (const buckets of [summary.byModel, summary.byDay, summary.byFamily, summary.byClient, summary.byScenario, summary.byProvider]) {
       expect(Object.values(buckets).map(row => row.effectiveInputTokens)).toEqual([expected]);
     }
@@ -266,11 +267,13 @@ describe("inclusive input SQL aggregation", () => {
   it("nulls a legacy cached row and propagates null to its buckets and the total", () => {
     const provider = "effective-unknown";
     append(makeRecord({ id: "confirmable", provider, model: "m-confirmable", inputTokens: 5, effectiveInputTokens: 5 }));
-    append(makeRecord({ id: "ambiguous", provider, model: "m-ambiguous", inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7 }));
+    append(makeRecord({ id: "ambiguous", provider, model: "m-ambiguous", usageEstimated: true, inputTokens: 3, cacheReadInputTokens: 60, cacheCreationInputTokens: 7 }));
     const { records, summary } = query({ provider });
     const byId = Object.fromEntries(records.map(row => [row.id, row]));
     expect(byId.ambiguous.effectiveInputTokens).toBeNull();
     expect(byId.confirmable.effectiveInputTokens).toBe(5);
+    expect(summary).toMatchObject({ estimatedCount: 1, coveredEstimatedCount: 0, coveredRequests: 1, coveredInputTokens: 5,
+      coveredOutputTokens: 0, coveredCacheReadTokens: 0 });
     // Any unconfirmable successful row nulls the whole filtered total ...
     expect(summary.totalEffectiveInputTokens).toBeNull();
     expect(summary.byProvider[provider].effectiveInputTokens).toBeNull();

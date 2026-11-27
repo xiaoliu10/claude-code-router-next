@@ -357,6 +357,21 @@ test('interaction: explicit unknown input stays unavailable while an older zero-
   assert.equal(rows[1].children[4].textContent, '100');
 });
 
+test('interaction: mixed weekly usage shows matched inputs, outputs and reads with coverage', async () => {
+  const h = harness({ usage_snapshot: args => ({ period: args.period, successCount: 9, estimatedCount: 1,
+    effectiveInputTokens: null, cacheReadTokens: 500, outputTokens: 75, cacheWriteTokens: 80,
+    covered: { estimated: false, requests: 3, inputTokens: 200, outputTokens: 24, cacheReadTokens: 150 } }) });
+  await openUsage(h);
+  h.id('usage-periods').children[1].click(); await flush();
+  const body = h.id('usage-body');
+  assert.match(body.textContent, /部分记录覆盖 3 \/ 9 次成功请求/);
+  const value = label => body.querySelectorAll('.usage-cell').find(c => c.textContent.includes(label)).querySelector('.usage-num').textContent;
+  assert.equal(value('总 tokens（部分记录）'), '224');
+  assert.equal(value('缓存命中率（部分记录）'), '75.0%');
+  assert.equal(value('缓存读'), '500');
+  assert.equal(value('输出 tokens'), '≈75');
+});
+
 test('interaction: ambiguous legacy cache leaves derived totals, inputs and hit rates unavailable', async () => {
   const row = { inputTokens: 100, outputTokens: 5, cacheReadTokens: 50, cacheWriteTokens: 30 };
   const h = harness({
