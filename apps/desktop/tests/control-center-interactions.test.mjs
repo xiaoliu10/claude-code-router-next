@@ -138,7 +138,7 @@ export function harness(overrides = {}, options = {}) {
     return Promise.resolve().then(() => responses[cmd]?.(args));
   } } }, addEventListener(type, fn) { windowEvents[type] = fn; } };
   // options.setTimeout lets tests capture toast auto-hide timers deterministically.
-  vm.runInNewContext(scripts, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, setTimeout: options.setTimeout || setTimeout,
+  vm.runInNewContext(scripts, { document: doc, window: win, location: { search: '?preview=1' }, URL, TextEncoder, ResizeObserver: options.ResizeObserver, setTimeout: options.setTimeout || setTimeout,
     setInterval: (fn, ms) => { intervals.push([fn, ms]); return setInterval(fn, ms); },
     clearInterval: (t) => { cleared.push(t); clearInterval(t); } });
   doc.events.DOMContentLoaded();
@@ -484,6 +484,39 @@ test('interaction: usage auto-refreshes on an interval while open and stops on t
   // Leave the tab so the short test interval cannot fire into later cases.
   h.id('tab-quota').click(); await flush();
   assert.equal(live(), 0, 'no timer left running at the end of the test');
+});
+
+test('interaction: records scrollbar tracks overflow, drag and horizontal scrolling', async () => {
+  const observers = new Map();
+  class TestResizeObserver {
+    constructor(callback) { this.callback = callback; }
+    observe(target) { this.target = target; observers.set(target, this.callback); }
+    disconnect() { observers.delete(this.target); }
+  }
+  const h = harness({}, { ResizeObserver: TestResizeObserver });
+  await openUsage(h);
+  const card = recordsCard(h.id('usage-body'));
+  const scroll = card.querySelector('.records-scroll');
+  const bar = card.querySelector('.records-scroll-bar');
+  scroll.scrollWidth = 1100;
+  scroll.clientWidth = 320;
+  scroll.scrollLeft = 320;
+  observers.get(scroll)();
+  assert.equal(bar.hidden, false);
+  assert.equal(bar.max, '780');
+  assert.equal(bar.value, '320');
+  bar.value = '400';
+  bar.fire('input');
+  assert.equal(scroll.scrollLeft, 400);
+  scroll.scrollLeft = 100;
+  scroll.fire('scroll');
+  assert.equal(bar.value, '100');
+  scroll.clientWidth = scroll.scrollWidth;
+  scroll.scrollLeft = 0;
+  observers.get(scroll)();
+  assert.equal(bar.hidden, true);
+  assert.equal(bar.max, '0');
+  h.id('tab-quota').click();
 });
 
 test('interaction: auto-refresh rebuild preserves the records horizontal scroll position', async () => {
