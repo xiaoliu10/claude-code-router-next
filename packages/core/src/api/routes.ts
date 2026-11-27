@@ -1189,9 +1189,16 @@ export function stampUpstreamSessionId(
 type ClientResponseFormat = "responses" | "chat" | "anthropic";
 
 /**
- * Which protocol the CLIENT of this attempt expects. Codex clients always get
- * native Responses; /v1/messages clients get the unified Chat shape converted
- * from Anthropic on the way out; everything else speaks Chat.
+ * Which protocol the CLIENT of this attempt expects. Codex clients get native
+ * Responses on every endpoint EXCEPT /v1/messages, where the Anthropic endpoint
+ * bridges them: the upstream Responses stream must first become the unified
+ * Chat shape so AnthropicTransformer.transformResponseIn can render it, and
+ * processResponseTransformers then converts that Anthropic SSE back to
+ * Responses for the codex client (isCodexOnMessagesEndpoint). Returning
+ * "responses" there left the native stream untouched, AnthropicTransformer
+ * parsed it as Chat chunks with no choices, and the codex client received an
+ * empty Responses answer. /v1/messages clients get the unified Chat shape
+ * converted from Anthropic on the way out; everything else speaks Chat.
  */
 function resolveClientResponseFormat(
   req: any,
@@ -1199,7 +1206,7 @@ function resolveClientResponseFormat(
   codexDetected: boolean
 ): ClientResponseFormat {
   const stored = (req as any).codexDetected ?? codexDetected;
-  if (stored) return "responses";
+  if (stored && transformer?.endPoint !== "/v1/messages") return "responses";
   return transformer?.endPoint === "/v1/messages" ? "anthropic" : "chat";
 }
 

@@ -597,6 +597,8 @@ export class OpenAIResponsesTransformer implements Transformer {
     let lastActivity = "";
     const toolIndexByCallKey = new Map<string, number>();
     const callIdByToolIndex = new Map<number, string>();
+    /** Tool-call indexes whose arguments were already streamed as deltas. */
+    const streamedArgsByToolIndex = new Set<number>();
     let nextToolIndex = 0;
     let emittedError = false;
     let finished = false;
@@ -786,6 +788,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                 { id: data.item_id },
                 data.output_index
               );
+              streamedArgsByToolIndex.add(index);
               lastActivity = "tool";
               const knownCallId = callIdByToolIndex.get(index);
               emitChunk({
@@ -796,6 +799,58 @@ export class OpenAIResponsesTransformer implements Transformer {
                     // block for this index does not invent a placeholder id.
                     ...(knownCallId ? { id: knownCallId, type: "function" } : {}),
                     function: { arguments: typeof data.delta === "string" ? data.delta : "" },
+                  },
+                ],
+              });
+              return;
+            }
+            case "response.output_item.done": {
+              // A `done` frame may carry the WHOLE function call inline (no
+              // added event, no argument deltas — the compact relay shape) or
+              // only the complete arguments after a bare `added`. Dropping it
+              // lost the call entirely and the empty-answer guard 400ed a turn
+              // the upstream had actually answered.
+              const item: any = data.item;
+              if (item?.type !== "function_call") return;
+              lastActivity = "tool";
+              const key = item.call_id || item.id;
+              const knownIndex = key ? toolIndexByCallKey.get(key) : undefined;
+              if (knownIndex !== undefined) {
+                // Already opened by `added`/deltas: emit the complete arguments
+                // unless they were streamed as deltas (re-sending them would
+                // duplicate the accumulated JSON).
+                if (streamedArgsByToolIndex.has(knownIndex)) return;
+                const knownCallId = callIdByToolIndex.get(knownIndex);
+                emitChunk({
+                  tool_calls: [
+                    {
+                      index: knownIndex,
+                      ...(knownCallId ? { id: knownCallId, type: "function" } : {}),
+                      function: {
+                        name: item.name || "",
+                        arguments: typeof item.arguments === "string" ? item.arguments : "",
+                      },
+                    },
+                  ],
+                });
+                return;
+              }
+              // Whole call inline — same shape emitInlineOutput uses for
+              // terminal frames, so the downstream block synthesis is identical.
+              const index = toolIndexFor(item, data.output_index);
+              const id = item.call_id || item.id;
+              if (id) callIdByToolIndex.set(index, id);
+              emitChunk({
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index,
+                    id,
+                    type: "function",
+                    function: {
+                      name: item.name || "",
+                      arguments: typeof item.arguments === "string" ? item.arguments : "",
+                    },
                   },
                 ],
               });
