@@ -221,6 +221,15 @@ body {
 .route-input::placeholder { color: var(--text-3); opacity: 1; }
 .route-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
 .route-clear { flex: none; }
+.model-picker { flex: 1; min-width: 0; }
+.model-picker > input { box-sizing: border-box; width: 100%; cursor: pointer; padding-right: 20px; }
+.model-picker:has(> input:not(:disabled)) { position: relative; }
+.model-picker:has(> input:not(:disabled))::after { content: '▾'; position: absolute; right: 7px; top: 4px; pointer-events: none; color: var(--text-3); }
+.model-picker-panel { margin-top: 3px; padding: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+.model-picker-panel > input { width: 100%; box-sizing: border-box; }
+.model-picker-list { max-height: min(180px, 30vh); overflow-y: auto; }
+.model-picker-option { padding: 4px 6px; overflow-wrap: anywhere; cursor: pointer; }
+.model-picker-option:hover, .model-picker-option[aria-selected="true"] { background: var(--accent); color: white; }
 .route-fallback { margin-top: 6px; }
 .route-fallback-label { font-size: 11px; color: var(--text-3); }
 .fallback-list { margin: 4px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; }

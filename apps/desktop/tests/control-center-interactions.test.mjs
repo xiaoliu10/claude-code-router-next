@@ -228,6 +228,21 @@ test('interaction: one save button commits edits across model groups only', asyn
   assert.equal(body.querySelector('.route-save').disabled, false);
 });
 
+test('routing refresh invalidates a removed candidate and Escape on the trigger closes its panel', async () => {
+  const h = harness(); await flush(); h.id('tab-routing').click(); await flush();
+  const field = h.id('routing-body').querySelector('.route-input'); field.click();
+  const wrap = field.parentNode, search = wrap.querySelector('.model-picker-panel').querySelector('input');
+  search.value = 'two'; search.fire('input');
+  const stale = wrap.querySelector('.model-picker-option'); assert.equal(stale.textContent, 'alpha,two');
+  h.route.providers[0].models = ['one']; h.route.revision = '2';
+  h.id('routing-refresh').click(); await flush();
+  assert.equal(wrap.querySelector('.model-picker-option'), null);
+  search.fire('keydown', { key: 'Enter', stopPropagation() {} }); stale.fire('click');
+  assert.equal(field.value, 'alpha,one');
+  field.focus(); field.fire('keydown', { key: 'Escape', stopPropagation() {} });
+  assert.equal(field.getAttribute('aria-expanded'), 'false');
+});
+
 test('interaction: fallback add fires once, keyboard add, move/remove and explicit save', async () => {
   const h = harness(); await flush(); h.id('tab-routing').click(); await flush();
   const card = h.id('routing-body').children[0];
@@ -235,7 +250,13 @@ test('interaction: fallback add fires once, keyboard add, move/remove and explic
   input.value = 'alpha,one'; add.querySelector('button').click();
   assert.equal(card.querySelectorAll('.fallback-item').length, 1);
   assert.equal(input.getAttribute('aria-invalid'), null);
-  input.value = 'alpha,two'; input.fire('keydown', { key: 'Enter' });
+  input.fire('keydown', { key: 'Enter' });
+  const search = add.querySelector('.model-picker-panel').querySelector('input');
+  search.value = 'TWO'; search.fire('input');
+  assert.equal(add.querySelector('.model-picker-option').textContent, 'alpha,two');
+  search.fire('keydown', { key: 'Enter', stopPropagation() {} });
+  assert.equal(input.value, 'alpha,two');
+  add.querySelector('button').click();
   card.querySelectorAll('.fallback-item')[1].querySelector('button').click();
   assert.match(card.querySelector('.fallback-item').textContent, /alpha,two/);
   card.querySelectorAll('.fallback-item')[1].querySelectorAll('button')[2].click();

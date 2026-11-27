@@ -948,7 +948,7 @@
     var message = doc.getElementById('projects-msg');
     var refresh = doc.getElementById('projects-refresh');
     var scopes = new Map(), buffers = new Map();
-    var currentSignature = null, refs = [], localError = '', newPath = '';
+    var choiceSignature = null, currentSignature = null, refs = [], localError = '', newPath = '';
     function el(tag, cls, text) {
       var n = doc.createElement(tag);
       if (cls) n.className = cls;
@@ -1083,10 +1083,14 @@
         Object.keys(structuralRouter.families || {}).forEach(function (f) { omitInputs(structuralRouter.families[f]); });
         if (structuralRouter.models) Object.keys(structuralRouter.models).forEach(function (a) { structuralRouter.models[a] = true; });
       }
-      var signature = canonicalJson([s && s.selectedId, scope, global, structuralRouter, busy,
+      var nextChoices = canonicalJson(s && s.choices);
+      var choicesChanged = nextChoices !== choiceSignature;
+      choiceSignature = nextChoices;
+      var signature = canonicalJson([s && s.selectedId, scope, global, structuralRouter, !p && busy,
         d ? d.clients : p && p.takeoverClients, s && s.confirmDeleteId, s && s.pending,
-        s && s.choices, !!p, !!(s && s.snapshot)]);
+        !!p, !!(s && s.snapshot)]);
       if (signature === currentSignature) {
+        if (choicesChanged) globalThis.RouteModelPicker.refresh(body);
         refs.forEach(function (r) {
           var source = r.scope === 'root' ? router : r.scope === 'models' ? router.models || {} : router.families && router.families[r.scope] || {};
           var v = source[r.field] == null ? '' : String(source[r.field]);
@@ -1106,10 +1110,11 @@
       addCard.appendChild(el('p', 'project-note', '添加时会创建 CCR 项目配置并默认接管 Claude Code；其他客户端需手动选择。'));
       var addRow = el('div', 'route-target');
       var pathInput = input('新项目绝对路径', newPath, function (v) { newPath = v; }, busy, 'new-project-path');
+      pathInput.setAttribute('data-project-add-path', '');
       pathInput.placeholder = '/Users/you/project'; addRow.appendChild(pathInput);
       addRow.appendChild(button(s && s.pending && s.pending.kind === 'add' ? '添加中…' : '添加', function () {
         var result = controller.addProject(newPath); localError = result.ok ? '' : result.message; render();
-      }, busy || !s.snapshot));
+      }, busy || !s.snapshot, 'btn project-add'));
       addCard.appendChild(addRow); body.appendChild(addCard);
       if (!p) {
         body.appendChild(el('div', 'empty', !s ? '桌面 IPC 不可用，无法读取项目。' : s.loading ? '正在读取项目…' : s.snapshot ? '暂无已配置项目，请输入绝对路径添加。' : '打开项目页后读取项目；读取失败可点击刷新重试。'));
@@ -1127,7 +1132,7 @@
       actions.appendChild(button('重新加载 / 放弃修改', function () {
         controller.resetDraft(id); localError = ''; controller.refresh();
       }, busy, 'btn project-reset'));
-      actions.appendChild(button('移除项目配置', function () { controller.requestDelete(id); }, busy, 'btn btn-danger-quiet'));
+      actions.appendChild(button('移除项目配置', function () { controller.requestDelete(id); }, busy, 'btn btn-danger-quiet project-delete'));
       header.appendChild(actions);
       if (s.confirmDeleteId === id) {
         var confirm = el('div', 'client-confirm');
@@ -1151,8 +1156,9 @@
         var b = button(label, function () { scopes.set(id, f); localError = ''; render(); }, false, 'scope-btn');
         b.setAttribute('aria-pressed', String(scope === f)); nav.appendChild(b);
       }); body.appendChild(nav);
-      var choices = el('datalist'); choices.id = 'project-route-choices'; choices.setAttribute('id', 'project-route-choices');
-      s.choices.forEach(function (v) { var o = el('option'); o.value = v; choices.appendChild(o); }); body.appendChild(choices);
+      function pickModel(field, commit) {
+        return globalThis.RouteModelPicker.mount(field, function () { return controller.state().choices; }, commit);
+      }
       if (scope === 'models') {
         Object.keys(obj || {}).forEach(function (alias) {
           var card = el('div', 'route'); card.appendChild(el('div', 'route-name', alias));
@@ -1162,8 +1168,8 @@
         if (!global) {
           var aliasCard = el('div', 'card');
           var aliasName = tempInput('新模型别名', id + '|alias-name', false), aliasTarget = tempInput('别名目标', id + '|alias-target', false);
-          aliasTarget.setAttribute('list', 'project-route-choices');
-          aliasCard.appendChild(labeled('新别名', aliasName)); aliasCard.appendChild(labeled('目标 提供方,模型', aliasTarget));
+          aliasCard.appendChild(labeled('新别名', aliasName));
+          aliasCard.appendChild(pickModel(aliasTarget, function (v) { buffers.set(id + '|alias-target', v); }));
           aliasCard.appendChild(button('添加别名', function () {
             var result = controller.addAlias(id, aliasName.value, aliasTarget.value);
             localError = result.ok ? '' : result.message;
@@ -1209,21 +1215,21 @@
           }); card.appendChild(list);
           if (!global) {
             var key = id + '|' + scope + '|' + scenario + '|fallback', add = el('div', 'fallback-add');
-            var n = tempInput(label + ' 添加回退', key, false); n.setAttribute('list', 'project-route-choices'); n.placeholder = '提供方,模型';
+            var n = tempInput(label + ' 添加回退', key, false); n.placeholder = '提供方,模型';
             function submit() {
               var result = controller.addFallback(id, scope, scenario, n.value); localError = result.ok ? '' : result.message;
               if (result.ok) { buffers.delete(key); currentSignature = null; } render();
             }
-            n.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
-            add.appendChild(n); add.appendChild(button('添加', submit)); card.appendChild(add);
+            add.appendChild(pickModel(n, function (v) { buffers.set(key, v); })); add.appendChild(button('添加', submit)); card.appendChild(add);
           }
           grid.appendChild(card);
         }); body.appendChild(grid);
       }
       function routeInput(label, value, field) {
         var n = hintWhen(global, input(label, value, function (v) { controller.setTarget(id, scope, field, v); }, global, id + '|' + scope + '|' + field));
-        n.setAttribute('list', 'project-route-choices'); n.placeholder = '提供方,模型（留空清除）';
-        refs.push({ node: n, scope: scope, field: field }); return n;
+        n.placeholder = '选择供应商和模型';
+        refs.push({ node: n, scope: scope, field: field });
+        return pickModel(n, function (v) { controller.setTarget(id, scope, field, v); });
       }
       updateActions(s, p, d, busy);
       body.scrollTop = scroll;
@@ -1231,12 +1237,18 @@
         var node = Array.prototype.find.call(body.querySelectorAll('[data-project-input]'), function (n) { return n.dataset.projectInput === focusKey; });
         if (node && !node.disabled) {
           node.focus();
-          try { node.setSelectionRange(selectionStart, selectionEnd); } catch (_) { /* Number inputs do not support text selection. */ }
+          try { node.setSelectionRange(selectionStart, selectionEnd); } catch { /* Number inputs do not support text selection. */ }
         }
       }
     }
     function updateActions(s, p, d, busy) {
       if (!s || !p) return;
+      var pathField = body.querySelector('[data-project-add-path]');
+      if (pathField) pathField.disabled = busy;
+      ['.project-add', '.project-reset', '.project-delete'].forEach(function (selector) {
+        var action = body.querySelector(selector);
+        if (action) action.disabled = busy;
+      });
       var dirty = body.querySelector('.project-dirty');
       if (dirty) dirty.textContent = s.isClean(p.id) ? '已同步' : '未保存';
       var save = body.querySelector('.project-save'), apply = body.querySelector('.project-apply');
