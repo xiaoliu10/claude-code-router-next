@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.3.2441] - 2026-11-27
+
+### English
+
+CCR Desktop 0.1.5 and the Codex 1.0.17 plugin add a confirmed usage reset on the Codex subscription card. The desktop usage panel recovers historical totals and daily charts and keeps the horizontal scroll control visible for call records. Web usage charts support daily and model views, calendar-day filters, and model rankings of up to 50 entries.
+
+### 中文
+
+CCR Desktop 0.1.5 和 Codex 插件 1.0.17 支持在 Codex 订阅卡片确认重置用量。桌面用量面板恢复历史汇总与每日图表，调用记录支持浮动横向滚动条。网页用量页支持每日与按模型切换、自然日筛选，以及最多 50 项的模型排行。
+
 ## [2.3.2440] - 2026-11-27
 
 ### English
