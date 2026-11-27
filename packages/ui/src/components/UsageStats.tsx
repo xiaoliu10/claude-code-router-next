@@ -468,7 +468,6 @@ export function UsageStats() {
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
                 <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal.value, estimated || displayedTotal.estimated)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
-                {displayedTotal.estimated && <div className="text-xs text-gray-500">{t("usage.window_total_estimate")}</div>}
               </div>
               <div className="rounded-lg border bg-emerald-50 p-2 text-center">
                 <div className="text-lg font-bold text-emerald-600">{formatTokens(summary.totalCacheReadInputTokens || 0)}</div>

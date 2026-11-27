@@ -532,7 +532,6 @@
   "usage": {
     "title": "用量统计",
     "recorded_model_ranking": "按缓存读取 + 输出排名（历史记录的完整输入未知）",
-    "window_total_estimate": "所选时段估算：原始输入 + 缓存读写 + 输出。旧输入可能已含缓存，会重复计数。",
     "covered_dates": "可核算日期：{{dates}}",
     "covered_requests": "可核算请求：{{count}} / {{total}}",
     "token_accounting": "可核算的总 Token = 未命中输入 + 缓存读 + 输出。≈ 表示估算。",
