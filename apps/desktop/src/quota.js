@@ -2419,9 +2419,8 @@
       status.textContent = editing ? '已更新供应商' : '供应商已添加。';
       onSaved(saved.name);
     });
-    // A tray window can be hidden and reused without unloading its document.
-    window.addEventListener('blur', function () { fields.apiKey.value = ''; });
-    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') close(false); });
+    // Keep the draft in this document while the user switches windows. Explicit
+    // dismissal and a confirmed save clear the fields through close().
     return {
       close: close,
       edit: edit,
