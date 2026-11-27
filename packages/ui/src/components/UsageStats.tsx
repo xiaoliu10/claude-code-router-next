@@ -475,12 +475,11 @@ export function UsageStats() {
                 <div className="text-lg font-bold text-teal-600">{formatTokens(summary.totalCacheCreationInputTokens || 0)}</div>
                 <div className="text-xs text-gray-500">{t("usage.cache_creation")}</div>
               </div>
-              <div className="rounded-lg border bg-cyan-50 p-2 text-center">
+              <div className="rounded-lg border bg-cyan-50 p-2 text-center" title={coverage || undefined}>
                 <div className="text-lg font-bold text-cyan-600">
                   {displayedRate === null ? "—" : (displayedRate * 100).toFixed(2) + "%"}
                 </div>
                 <div className="text-xs text-gray-500">{t("usage.cache_hit_rate")}</div>
-                {coverage && <div className="text-xs text-gray-500">{coverage}</div>}
               </div>
               <div className="rounded-lg border bg-purple-50 p-2 text-center">
                 <div className="text-lg font-bold text-purple-600">{formatMs(summary.avgTtft)}</div>
