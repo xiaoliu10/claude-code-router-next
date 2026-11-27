@@ -124,7 +124,9 @@ fn daily_inputs(
     let mut rows = stmt.query([start, end])?;
     let mut matched = HashMap::new();
     while let Some(row) = rows.next()? {
-        let day: String = row.get(0)?;
+        let Some(day) = row.get::<_, Option<String>>(0)? else {
+            continue;
+        };
         let Some(counters) = expected.get(&day) else {
             continue;
         };
@@ -157,24 +159,32 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE usage_records(timestamp TEXT,status TEXT,input_tokens INTEGER,cache_read_input_tokens INTEGER,cache_creation_input_tokens INTEGER,output_tokens INTEGER,effective_input_tokens INTEGER);
           INSERT INTO usage_records VALUES ('2026-11-22T12:00:00Z','success',999,100,0,1,NULL),
-            ('2026-11-23T12:00:00Z','success',110,100,8,2,110),('2026-11-23T12:00:00Z','success',3,60,7,5,NULL),
-            ('2026-11-23T12:00:00Z','error',500,300,40,20,NULL),('2026-11-24T12:00:00Z','success',1000,0,0,0,NULL);").unwrap();
+            ('2026-11-23T12:00:30Z','success',110,100,8,2,110),('2026-11-23T12:00:30Z','success',3,60,7,5,NULL),
+            ('2026-11-23T12:00:30Z','error',500,300,40,20,NULL),('2026-11-24T12:00:30Z','success',1000,0,0,0,NULL),
+            ('2026-11-23Tbad','success',2,2,0,0,NULL),('2026-11-23T12:00:31Z','success',1,1,0,0,NULL),
+            ('2026-11-23T12:00:29Z','success',1,1,0,0,NULL);").unwrap();
         let day = |timestamp: &str| {
             db.query_row("SELECT date(?1,'localtime')", [timestamp], |row| {
                 row.get::<_, String>(0)
             })
             .unwrap()
         };
-        let valid_day = day("2026-11-23T12:00:00Z");
-        let invalid_day = day("2026-11-24T12:00:00Z");
+        let valid_day = day("2026-11-23T12:00:30Z");
+        let invalid_day = day("2026-11-24T12:00:30Z");
         let mut expected = HashMap::from([
-            (valid_day.clone(), [3, 113, 160, 15, 7]),
+            (valid_day.clone(), [5, 115, 162, 15, 7]),
             (invalid_day, [1, 1000, 0, 0, 0]),
         ]);
         let start = "2026-11-23T00:00:00Z";
         let end = "2026-11-25T00:00:00Z";
         assert_eq!(
             daily_inputs(&db, start, end, &expected).unwrap(),
+            HashMap::from([(valid_day.clone(), 184)])
+        );
+        let boundary = "2026-11-23T12:00:30Z";
+        let at_boundary = HashMap::from([(valid_day.clone(), [3, 113, 160, 15, 7])]);
+        assert_eq!(
+            daily_inputs(&db, boundary, boundary, &at_boundary).unwrap(),
             HashMap::from([(valid_day.clone(), 180)])
         );
         expected.get_mut(&valid_day).unwrap()[0] = 2;
