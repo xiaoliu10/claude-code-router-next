@@ -2090,12 +2090,84 @@
       params.appendChild(pair);
       key.focus();
     }
+    var nextPickerId = 0;
     function addRow(name) {
       var row = el('div', 'transformer-row');
-      var field = names.length && (!name || names.includes(name))
-        ? select('转换器名称', 'transformer-name', names) : input('转换器名称', 'transformer-name');
+      var field = input('转换器名称', 'transformer-name');
       field.value = name || names[0] || '';
-      row.appendChild(field);
+      if (names.length && (!name || names.includes(name))) {
+        var picker = el('div', 'transformer-picker');
+        var list = el('div', 'transformer-options');
+        var id = 'transformer-options-' + (++nextPickerId);
+        list.id = id;
+        list.setAttribute('role', 'listbox');
+        list.setAttribute('aria-label', '匹配的转换器');
+        list.hidden = true;
+        field.setAttribute('role', 'combobox');
+        field.setAttribute('autocomplete', 'off');
+        field.setAttribute('aria-autocomplete', 'list');
+        field.setAttribute('aria-controls', id);
+        field.setAttribute('aria-expanded', 'false');
+        var selected = field.value, matches = [], active = -1;
+        function closeList() {
+          list.hidden = true;
+          field.value = selected;
+          field.setAttribute('aria-expanded', 'false');
+          field.removeAttribute('aria-activedescendant');
+          syncParameterButton();
+        }
+        function highlight(index) {
+          active = index;
+          Array.from(list.children).forEach(function (opt, i) {
+            opt.setAttribute('aria-selected', String(i === active));
+          });
+          if (active < 0) { field.removeAttribute('aria-activedescendant'); return; }
+          var opt = list.children[active];
+          field.setAttribute('aria-activedescendant', opt.id);
+          if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+        }
+        function showList(query) {
+          matches = names.filter(function (n) { return n.toLowerCase().includes(query.trim().toLowerCase()); });
+          list.textContent = '';
+          matches.forEach(function (n, i) {
+            var opt = el('div', 'transformer-option', n);
+            opt.id = id + '-' + i;
+            opt.setAttribute('role', 'option');
+            opt.addEventListener('mousedown', function (event) { event.preventDefault(); });
+            opt.addEventListener('click', function () { selected = n; closeList(); });
+            list.appendChild(opt);
+          });
+          if (!matches.length) list.appendChild(el('div', 'hint', '没有匹配的转换器'));
+          list.hidden = false;
+          field.setAttribute('aria-expanded', 'true');
+          highlight(query ? (matches.length ? 0 : -1) : matches.indexOf(selected));
+        }
+        function openList() {
+          if (!list.hidden) return;
+          showList('');
+          field.setSelectionRange(0, field.value.length);
+        }
+        field.addEventListener('focus', openList);
+        field.addEventListener('click', openList);
+        field.addEventListener('input', function () { showList(field.value); });
+        field.addEventListener('blur', closeList);
+        field.addEventListener('keydown', function (event) {
+          if (event.isComposing || event.keyCode === 229) return;
+          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            event.preventDefault();
+            if (list.hidden) { openList(); return; }
+            if (matches.length) highlight((active + (event.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length);
+          } else if (!list.hidden && (event.key === 'Enter' || event.key === 'Escape')) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.key === 'Enter' && active >= 0) selected = matches[active];
+            closeList();
+          }
+        });
+        picker.appendChild(field);
+        picker.appendChild(list);
+        row.appendChild(picker);
+      } else row.appendChild(field);
       row.appendChild(mkBtn('移除', '移除转换器', function () { row.remove(); }));
       var params = el('div', 'transformer-params');
       row.appendChild(params);
@@ -2157,6 +2229,9 @@
       for (var row of rows.children) {
         var field = row.querySelector('.transformer-name');
         var name = field.value.trim();
+        if (field.getAttribute('role') === 'combobox' && field.getAttribute('aria-expanded') === 'true') {
+          return invalid(field, '请先选择转换器。');
+        }
         if (!name) return invalid(field, '请输入转换器名称。');
         var params = Object.create(null);
         var pairs = row.querySelectorAll('.transformer-param');
@@ -3765,7 +3840,7 @@
     els.openUi.addEventListener('click', function () { safeCommand('quota_open_ui'); });
     els.quit.addEventListener('click', function () { safeCommand('quota_quit'); });
     window.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape' && !event.isComposing && !event.defaultPrevented) {
+      if (event.key === 'Escape' && !event.isComposing && event.keyCode !== 229 && !event.defaultPrevented) {
         if ((codexReset && codexReset.cancel(true)) || providerForm.escape() || (activeTab === 'plugins' && pluginsPanel.cancel(true))) event.preventDefault();
         else safeCommand('quota_hide');
       }

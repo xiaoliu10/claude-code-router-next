@@ -28,11 +28,23 @@ test('add serializes ordered transformer names and tuples with text and JSON par
   h.id('provider-add-open').click(); await flush();
   assert.equal(rows(h).length, 0);
   const add = h.id('provider-transformer-add'); add.click(); add.click();
-  const field = rows(h)[0].querySelector('select');
-  assert.deepEqual(field.children.map(o => o.value), ['first', 'second']);
+  const field = rows(h)[0].querySelector('.transformer-name');
+  field.fire('focus');
+  assert.deepEqual(rows(h)[0].querySelectorAll('.transformer-option').map(o => o.textContent), ['first', 'second']);
+  field.fire('blur');
   const row = rows(h)[1]; const name = row.querySelector('.transformer-name');
   assert.equal(button(row, '添加参数').disabled, true);
-  name.value = 'second'; name.fire('change');
+  name.value = 'CON'; name.fire('input');
+  assert.deepEqual(row.querySelectorAll('.transformer-option').map(o => o.textContent), ['second']);
+  name.fire('keydown', { key: 'Enter', isComposing: true });
+  assert.equal(name.value, 'CON');
+  const imeEscape = { key: 'Escape', keyCode: 229, isComposing: false, preventDefault() {} };
+  name.fire('keydown', imeEscape);
+  h.windowEvents.keydown(imeEscape);
+  assert.equal(h.id('provider-add-form').hidden, false);
+  assert.equal(name.value, 'CON');
+  name.fire('keydown', { key: 'Enter', stopPropagation() {} });
+  assert.equal(name.value, 'second');
   for (const [name, value, type] of [['mode', '123', '文本'], ['flags', '[true,42]', 'JSON']]) {
     button(row, '添加参数').click();
     const param = row.querySelectorAll('.transformer-param').at(-1);
@@ -51,7 +63,7 @@ test('add serializes ordered transformer names and tuples with text and JSON par
 test('edit prefills known and foreign names, removes rows and sends null for an empty chain', async () => {
   const h = transformerHarness({ transformer: { use: ['first', 'custom'] }, transformerProtected: false });
   await edit(h);
-  assert.equal(rows(h)[0].querySelector('select').value, 'first');
+  assert.equal(rows(h)[0].querySelector('.transformer-name').value, 'first');
   assert.equal(rows(h)[1].querySelector('input').value, 'custom');
   while (rows(h).length) button(rows(h)[0], '移除').click();
   submit(h); await flush();
@@ -70,7 +82,8 @@ test('switching to an instance-only transformer blocks a tuple until its paramet
   const h = transformerHarness({ transformer: { use: ['second'] } }); await edit(h);
   const row = rows(h)[0], name = row.querySelector('.transformer-name');
   button(row, '添加参数').click();
-  name.value = 'first'; name.fire('change');
+  name.value = 'irs'; name.fire('input');
+  row.querySelector('.transformer-option').click();
   assert.equal(button(row, '添加参数').disabled, true);
   submit(h); await flush();
   assert.match(h.id('provider-add-error').textContent, /不支持参数/);
