@@ -3112,10 +3112,9 @@
       }
       var totals = days.map(function (d) { return rowTotalTokens(d); });
       var max = Math.max.apply(null, totals.map(function (v) { return v === null ? 0 : v; }));
-      var scroll = el('div', compact ? 'usage-days-compact' : 'usage-days-scroll');
-      if (!compact) scroll.tabIndex = 0;
-      scroll.setAttribute('role', 'region');
-      scroll.setAttribute('aria-label', compact ? '每日用量，全部历史' : '每日用量，日期较多时可横向滚动');
+      var chart = el('div', compact ? 'usage-days-compact' : 'usage-days-fit');
+      chart.setAttribute('role', 'region');
+      chart.setAttribute('aria-label', compact ? '每日用量，全部历史' : '每日用量');
       var bars = el('div', 'usage-bars');
       days.forEach(function (d, i) {
         var v = totals[i];
@@ -3138,17 +3137,22 @@
         track.appendChild(bar);
         col.appendChild(track);
         col.title = bar.title;
-        if (!compact) col.appendChild(el('div', 'usage-day-date', String(d.name)));
+        if (!compact) {
+          var date = el('time', 'usage-day-date', String(d.name).slice(5));
+          date.dateTime = d.name;
+          date.title = d.name;
+          col.appendChild(date);
+        }
         bars.appendChild(col);
       });
-      scroll.appendChild(bars);
+      chart.appendChild(bars);
       if (compact) {
         var axis = el('div', 'usage-day-range');
         axis.appendChild(el('span', 'usage-day-date', days[0].name));
         axis.appendChild(el('span', 'usage-day-date', days[days.length - 1].name));
-        scroll.appendChild(axis);
+        chart.appendChild(axis);
       }
-      card.appendChild(scroll);
+      card.appendChild(chart);
       return card;
     }
 

@@ -297,16 +297,15 @@ body {
 .usage-day-summary { padding: 8px 2px 6px; }
 .usage-day-total { margin: 4px 0; font-size: 24px; font-weight: 650; color: var(--text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .usage-day-caption { font-size: 11px; color: var(--text-2); }
-.usage-days-scroll { min-width: 0; max-width: 100%; overflow-x: auto; padding: 4px 0; }
-.usage-days-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.usage-bars { display: flex; align-items: stretch; gap: 12px; min-width: 100%; width: max-content; }
-.usage-bar-col { flex: 1 0 76px; min-width: 76px; text-align: center; }
-.usage-day-value { height: 22px; font-size: 12px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
-.usage-day-track { height: 96px; display: flex; align-items: flex-end; justify-content: center; border-bottom: 1px solid var(--border-strong); }
+.usage-days-fit { min-width: 0; padding: 4px 0; }
+.usage-days-fit .usage-bars { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 48px), 1fr)); gap: 6px 2px; }
+.usage-bar-col { min-width: 0; text-align: center; }
+.usage-day-value { line-height: 16px; font-size: 11px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.usage-day-track { height: 48px; display: flex; align-items: flex-end; justify-content: center; border-bottom: 1px solid var(--border-strong); }
 .usage-bar { width: 32px; max-width: 100%; background: var(--accent); border-radius: 3px 3px 0 0; opacity: 0.85; }
 .usage-bar:hover { opacity: 1; }
 /* All-history tracks share one viewport, even when individual days are subpixel. */
-.usage-days-compact .usage-bars { width: 100%; gap: 0; }
+.usage-days-compact .usage-bars { display: flex; width: 100%; }
 .usage-days-compact .usage-bar-col { flex: 1 1 0; min-width: 0; }
 .usage-days-compact .usage-day-track { height: 56px; }
 .usage-days-compact .usage-bar { width: 84%; max-width: 32px; }
