@@ -355,6 +355,23 @@ impl ControlService {
         );
         let summary = self.client()?.get_json(&path).await?;
         let mut snapshot = usage_snapshot_from(&summary, period)?;
+        let days = historical_usage::unknown_days(&summary);
+        if !days.is_empty() {
+            let end_bound = end.clone();
+            if let Some(inputs) = tokio::task::spawn_blocking(move || {
+                historical_usage::local_daily_inputs(start, end_bound, days)
+            })
+            .await
+            .ok()
+            .flatten()
+            {
+                for day in &mut snapshot.by_day {
+                    if day.effective_input_tokens.is_none() {
+                        day.effective_input_tokens = inputs.get(&day.name).copied();
+                    }
+                }
+            }
+        }
         // Anchor chart labels to the instant queried, even across local midnight.
         snapshot.updated_at = end;
         Ok(snapshot)
@@ -1244,6 +1261,24 @@ fn project_clients(response: &Value) -> ClientSnapshot {
 mod tests {
     use super::*;
     use crate::api::mock::{response, Mock};
+
+    #[tokio::test]
+    #[ignore = "reads the configured local gateway and its usage database"]
+    async fn verify_local_daily_chart_metrics() {
+        let settings = crate::settings::ConnectionSettings::from_environment().unwrap();
+        let service = ControlService::new(Some(AdminClient::new(settings).unwrap()));
+        let trend = service.usage_trend_snapshot("7d").await.unwrap();
+        for day in trend.by_day.iter().rev().take(7) {
+            println!(
+                "{} {}",
+                day.name,
+                day.effective_input_tokens
+                    .expect("expected local historical fixture")
+                    + day.output_tokens
+            );
+        }
+        assert!(trend.by_day.len() >= 7);
+    }
 
     #[tokio::test]
     #[ignore = "reads the configured local gateway and its usage database"]
