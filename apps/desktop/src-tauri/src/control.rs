@@ -7,6 +7,7 @@
 //! rejects stale snapshots; desktop writers share one lock. External full-config
 //! writers still require server-side concurrency support for atomic protection.
 
+mod historical_usage;
 use crate::api::AdminClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -304,14 +305,42 @@ impl ControlService {
     }
 
     pub(crate) async fn usage_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
-        let query = usage_date_query(period)?;
+        let window = if period == "all" {
+            None
+        } else {
+            Some(usage_window(period)?)
+        };
+        let query = window
+            .as_ref()
+            .map(|(start, end)| {
+                format!(
+                    "startDate={}&endDate={}",
+                    encode_query(start),
+                    encode_query(end)
+                )
+            })
+            .unwrap_or_default();
         let path = if query.is_empty() {
             "/api/usage/summary".to_string()
         } else {
             format!("/api/usage/summary?{query}")
         };
         let summary = self.client()?.get_json(&path).await?;
-        usage_snapshot_from(&summary, period)
+        let mut snapshot = usage_snapshot_from(&summary, period)?;
+        if snapshot.effective_input_tokens.is_none()
+            && summary.get("totalEffectiveInputTokens") == Some(&Value::Null)
+        {
+            if let Some(expected) = historical_usage::Counters::from_summary(&summary) {
+                let input = tokio::task::spawn_blocking(move || {
+                    historical_usage::local_input(window, expected)
+                })
+                .await
+                .ok()
+                .flatten();
+                snapshot.effective_input_tokens = input;
+            }
+        }
+        Ok(snapshot)
     }
 
     async fn usage_trend_snapshot(&self, period: &str) -> Result<UsageSnapshot, String> {
@@ -1211,6 +1240,23 @@ fn project_clients(response: &Value) -> ClientSnapshot {
 mod tests {
     use super::*;
     use crate::api::mock::{response, Mock};
+
+    #[tokio::test]
+    #[ignore = "reads the configured local gateway and its usage database"]
+    async fn verify_local_seven_day_usage_metrics() {
+        let settings = crate::settings::ConnectionSettings::from_environment().unwrap();
+        let service = ControlService::new(Some(AdminClient::new(settings).unwrap()));
+        let snapshot = service.usage_snapshot("7d").await.unwrap();
+        let input = snapshot.effective_input_tokens.unwrap();
+        assert!(input > 0 && input >= snapshot.cache_read_tokens);
+        println!(
+            "success={} total={} missed_input={} hit_rate={:.1}%",
+            snapshot.success_count,
+            input + snapshot.output_tokens,
+            input - snapshot.cache_read_tokens,
+            100.0 * snapshot.cache_read_tokens as f64 / input as f64
+        );
+    }
 
     fn config() -> Value {
         json!({
