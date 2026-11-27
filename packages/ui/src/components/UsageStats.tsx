@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { usageDateRange, type UsageRange } from "@/utils/usageDateRange";
-import { historicalWindowTotal, partialSummary, usageTokens } from "@/utils/usageTokens";
+import { displayedUsageTotal, partialSummary, usageTokens } from "@/utils/usageTokens";
 import { api } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -428,17 +428,17 @@ export function UsageStats() {
           {loadFailed && <p role="alert" className="mb-2 text-sm text-red-600">{t("usage.fetch_failed")}</p>}
           {/* Summary Cards */}
           {summary && (() => {
-            const tokens = usageTokens({
+            const counts = {
               inputTokens: summary.totalInputTokens,
               effectiveInputTokens: summary.totalEffectiveInputTokens,
               cacheReadInputTokens: summary.totalCacheReadInputTokens,
               cacheCreationInputTokens: summary.totalCacheCreationInputTokens,
               outputTokens: summary.totalOutputTokens,
-            });
+            };
+            const tokens = usageTokens(counts);
             const estimated = (summary.estimatedCount ?? 0) > 0;
             const partial = tokens.total === null ? partialSummary(summary) : null;
-            const displayedTotal = tokens.total ?? historicalWindowTotal(summary.totalInputTokens,
-              summary.totalCacheReadInputTokens, summary.totalCacheCreationInputTokens, summary.totalOutputTokens);
+            const displayedTotal = displayedUsageTotal(counts);
             const displayedRate = partial ? partial.hitRate : tokens.hitRate;
             const markedEstimate = partial ? partial.estimated : estimated;
             const coverage = partial && (partial.requests !== null
@@ -466,9 +466,9 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.total_output_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
-                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal, estimated || tokens.total === null)}</div>
+                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal.value, estimated || displayedTotal.estimated)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
-                {tokens.total === null && displayedTotal !== null && <div className="text-xs text-gray-500">{t("usage.window_total_estimate")}</div>}
+                {displayedTotal.estimated && <div className="text-xs text-gray-500">{t("usage.window_total_estimate")}</div>}
               </div>
               <div className="rounded-lg border bg-emerald-50 p-2 text-center">
                 <div className="text-lg font-bold text-emerald-600">{formatTokens(summary.totalCacheReadInputTokens || 0)}</div>
@@ -516,6 +516,7 @@ export function UsageStats() {
               <div className="flex items-end gap-1 h-14">
                 {dailyData.map(([day, data]) => {
                   const { cacheMissInput, total } = usageTokens(data);
+                  const shown = displayedUsageTotal(data);
                   const amount = dailyUsesOutput ? data.outputTokens : total!;
                   const height = amount > 0 ? Math.max(4, (amount / maxDailyTokens) * 100) : 0;
                   return (
@@ -530,7 +531,7 @@ export function UsageStats() {
                         <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
                         <div>{t("usage.cache_read")}: {formatTokens(data.cacheReadInputTokens ?? 0)}</div>
                         <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
-                        <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(total)}</div>
+                        <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(shown.value, shown.estimated)}</div>
                       </TooltipContent>
                     </Tooltip>
                   );
@@ -551,7 +552,8 @@ export function UsageStats() {
               <h2 className="mb-2 text-sm font-semibold text-gray-700">{t(modelUsesRecorded ? "usage.recorded_model_ranking" : "usage.total_tokens")}</h2>
               {modelData.length > 0 ? (
                 <div className="space-y-2">
-                  {modelData.map(({ model, data, cacheMissInput, total, chartTokens }) => {
+                  {modelData.map(({ model, data, cacheMissInput, chartTokens }) => {
+                    const shown = displayedUsageTotal(data);
                     const width = chartTokens > 0 ? (chartTokens / maxModelTokens) * 100 : 0;
                     const displayModel = model.length > 30 ? model.slice(0, 30) + '...' : model;
                     return (
@@ -578,7 +580,7 @@ export function UsageStats() {
                           <div>{t("usage.input_tokens")}: {formatTokens(cacheMissInput)}</div>
                           <div>{t("usage.cache_read")}: {formatTokens(data.cacheReadInputTokens ?? 0)}</div>
                           <div>{t("usage.output_tokens")}: {formatTokens(data.outputTokens)}</div>
-                          <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(total)}</div>
+                          <div className="font-medium border-t mt-1 pt-1">{t("usage.total_tokens")}: {formatTokens(shown.value, shown.estimated)}</div>
                         </TooltipContent>
                       </Tooltip>
                     );

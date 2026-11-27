@@ -40,6 +40,14 @@ export function historicalWindowTotal(raw: number, read: number, write: number, 
   return Number.isSafeInteger(sum) ? sum : null;
 }
 
+export function displayedUsageTotal(row: UsageTokenCounts) {
+  const { total } = usageTokens(row);
+  if (total !== null) return { value: total, estimated: false };
+  const value = row.cacheReadInputTokens == null || row.cacheCreationInputTokens == null
+    ? null : historicalWindowTotal(row.inputTokens, row.cacheReadInputTokens, row.cacheCreationInputTokens, row.outputTokens);
+  return { value, estimated: value !== null };
+}
+
 // Legacy gateways only expose a normalized sum for fully accounted day buckets.
 // Use the same subset for output, cache reads and the hit-rate denominator.
 export function partialSummary(s: SummaryCoverage) {

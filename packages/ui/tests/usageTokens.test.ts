@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { historicalWindowTotal, partialSummary, usageTokens } from "../src/utils/usageTokens.ts";
+import { displayedUsageTotal, historicalWindowTotal, partialSummary, usageTokens } from "../src/utils/usageTokens.ts";
 
 const row = { inputTokens: 100, cacheReadInputTokens: 40, cacheCreationInputTokens: 60, outputTokens: 10 };
 
@@ -34,6 +34,13 @@ test("historical totals include the entire selected period even when the same da
   assert.equal(historicalWindowTotal(150, 500, 9, 45), 704);
   assert.equal(historicalWindowTotal(0, 0, 0, 0), 0);
   assert.equal(historicalWindowTotal(NaN, 0, 0, 0), null);
+});
+
+test("tooltip totals use the bucket's own counters and mark only historical fallbacks", () => {
+  assert.deepEqual(displayedUsageTotal(row), { value: 210, estimated: true });
+  assert.deepEqual(displayedUsageTotal({ ...row, effectiveInputTokens: 100 }), { value: 110, estimated: false });
+  assert.deepEqual(displayedUsageTotal({ ...row, effectiveInputTokens: 0, outputTokens: 0 }), { value: 0, estimated: false });
+  assert.deepEqual(displayedUsageTotal({ ...row, cacheCreationInputTokens: undefined }), { value: null, estimated: false });
 });
 
 test("mixed summaries use only matched request or date counters", () => {
