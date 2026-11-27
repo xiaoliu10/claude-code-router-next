@@ -868,6 +868,9 @@
     var s = r && typeof r === 'object' ? r : {};
     return {
       period: toStr(s.period),
+      ...(s.covered && Number.isSafeInteger(s.covered.requests) && s.covered.requests > 0 && s.covered.requests < s.successCount
+        && ['inputTokens', 'outputTokens', 'cacheReadTokens'].every(function (key) { return Number.isSafeInteger(s.covered[key]) && s.covered[key] >= 0; })
+        ? { covered: { estimated: s.covered.estimated === true, requests: s.covered.requests, inputTokens: s.covered.inputTokens, outputTokens: s.covered.outputTokens, cacheReadTokens: s.covered.cacheReadTokens } } : {}),
       totalRequests: toNum(s.totalRequests),
       successCount: toNum(s.successCount),
       errorCount: toNum(s.errorCount),
@@ -3017,26 +3020,37 @@
       var input = cacheMissInputTokens(u);
       var inclusive = inclusiveInputTokens(u);
       var totalTokens = rowTotalTokens(u);
+      var covered = inclusive === null ? u.covered : null;
+      var scope = covered ? '（部分记录）' : '';
+      var cacheRead = covered ? covered.cacheReadTokens : u.cacheReadTokens;
+      if (covered) {
+        inclusive = covered.inputTokens;
+        totalTokens = inclusive + covered.outputTokens;
+        input = inclusive >= cacheRead ? inclusive - cacheRead : null;
+      }
       var estimated = u.estimatedCount > 0;
-      function summaryTokenCell(metric, label, count) {
-        var cell = recordsTokenCell(count, estimated);
+      var inputEstimated = covered ? covered.estimated : estimated;
+      function summaryTokenCell(metric, label, count, isEstimated) {
+        var cell = recordsTokenCell(count, isEstimated);
         return usageNumCell(metric, label, cell.text, cell.title);
       }
-      grid.appendChild(summaryTokenCell('total', '总 tokens', totalTokens));
-      grid.appendChild(summaryTokenCell('input', '输入（未命中）', input));
-      grid.appendChild(summaryTokenCell('output', '输出 tokens', u.outputTokens));
+      grid.appendChild(summaryTokenCell('total', '总 tokens' + scope, totalTokens, inputEstimated));
+      grid.appendChild(summaryTokenCell('input', '输入（未命中）' + scope, input, inputEstimated));
+      grid.appendChild(summaryTokenCell('output', '输出 tokens', u.outputTokens, estimated));
       grid.appendChild(usageNumCell('cache-read', '缓存读', formatCompact(u.cacheReadTokens), formatInt(u.cacheReadTokens)));
       grid.appendChild(usageNumCell('cache-write', '缓存写', formatCompact(u.cacheWriteTokens), formatInt(u.cacheWriteTokens)));
-      var hitRate = inclusive > 0 && u.cacheReadTokens !== null
-        ? (estimated ? '≈' : '') + (u.cacheReadTokens / inclusive * 100).toFixed(1) + '%' : null;
-      var cacheHitCell = usageNumCell('cache-hit', '缓存命中率', hitRate);
+      var hitRate = inclusive > 0 && cacheRead !== null && cacheRead <= inclusive
+        ? (inputEstimated ? '≈' : '') + (cacheRead / inclusive * 100).toFixed(1) + '%' : null;
+      var cacheHitCell = usageNumCell('cache-hit', '缓存命中率' + scope, hitRate);
       cacheHitCell.title = '缓存读取 tokens ÷ 有效输入 tokens';
       grid.appendChild(cacheHitCell);
       grid.appendChild(usageNumCell('ttft', '平均 TTFT', formatMs(u.avgTtftMs)));
       grid.appendChild(usageNumCell('speed', '生成速度', formatSpeed(u.avgTokensPerSecond)));
       totals.appendChild(grid);
       body.appendChild(totals);
-      totals.appendChild(noteEl('总 tokens = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。'));
+      totals.appendChild(noteEl(covered
+        ? '部分记录覆盖 ' + formatInt(covered.requests) + ' / ' + formatInt(u.successCount) + ' 次成功请求。输出、缓存读和缓存写覆盖全部成功请求。'
+        : '总 tokens = 未命中输入 + 缓存读 + 输出。旧记录的缓存口径未知时显示 —。'));
       if (s.trend) {
         body.appendChild(buildUsageTrend(s.trend));
       } else {

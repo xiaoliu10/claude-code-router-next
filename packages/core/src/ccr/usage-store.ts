@@ -84,7 +84,15 @@ export interface UsageRecord {
 
 type UsageRecordInput = Omit<UsageRecord, "effectiveInputTokens"> & { effectiveInputTokens?: number | null };
 
-export interface UsageSummary {
+interface CoveredUsage {
+  coveredRequests: number;
+  coveredEstimatedCount: number;
+  coveredInputTokens: number;
+  coveredOutputTokens: number;
+  coveredCacheReadTokens: number;
+}
+
+export interface UsageSummary extends CoveredUsage {
   estimatedCount: number;
   totalRequests: number;
   successCount: number;
@@ -578,6 +586,12 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
     .prepare(`
       SELECT
         COUNT(*) AS totalRequests,
+        COUNT(CASE WHEN status = 'success' THEN effective_input_tokens END) AS coveredRequests,
+        COUNT(CASE WHEN status = 'success' AND effective_input_tokens IS NOT NULL
+          AND (usage_estimated = 1 OR effective_input_estimated = 1) THEN 1 END) AS coveredEstimatedCount,
+        COALESCE(SUM(CASE WHEN status = 'success' THEN effective_input_tokens END), 0) AS coveredInputTokens,
+        COALESCE(SUM(CASE WHEN status = 'success' AND effective_input_tokens IS NOT NULL THEN output_tokens END), 0) AS coveredOutputTokens,
+        COALESCE(SUM(CASE WHEN status = 'success' AND effective_input_tokens IS NOT NULL THEN cache_read_input_tokens END), 0) AS coveredCacheReadTokens,
         ${EFFECTIVE_INPUT_SUM_SQL} AS totalEffectiveInputTokens,
         COALESCE(SUM(usage_estimated), 0) AS estimatedCount,
         COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS successCount,
@@ -589,7 +603,7 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
         AVG(CASE WHEN status = 'success' AND tokens_per_second IS NOT NULL THEN tokens_per_second END) AS avgTokensPerSecond
       FROM usage_records ${where.sql}
     `)
-    .get(...where.params) as {
+    .get(...where.params) as CoveredUsage & {
     estimatedCount: number;
     totalRequests: number;
     successCount: number;
@@ -603,6 +617,11 @@ function computeSummarySQL(db: SqliteDatabase, filters: UsageQueryFilters): Usag
   };
 
   return {
+    coveredRequests: totals.coveredRequests,
+    coveredEstimatedCount: totals.coveredEstimatedCount,
+    coveredInputTokens: totals.coveredInputTokens,
+    coveredOutputTokens: totals.coveredOutputTokens,
+    coveredCacheReadTokens: totals.coveredCacheReadTokens,
     estimatedCount: totals.estimatedCount,
     totalEffectiveInputTokens: totals.totalEffectiveInputTokens,
     totalRequests: totals.totalRequests,
