@@ -463,7 +463,7 @@ export function UsageStats() {
                 <div className="text-xs text-gray-500">{t("usage.total_output_tokens")}</div>
               </div>
               <div className="rounded-lg border bg-indigo-50 p-2 text-center">
-                <div className="text-lg font-bold text-indigo-600">{displayedTotal === null ? "—" : (markedEstimate ? "≈" : "") + displayedTotal.toLocaleString()}</div>
+                <div className="text-lg font-bold text-indigo-600">{formatTokens(displayedTotal, markedEstimate)}</div>
                 <div className="text-xs text-gray-500">{t("usage.total_tokens")}</div>
                 {coverage && <div className="text-xs text-gray-500">{coverage}</div>}
               </div>
