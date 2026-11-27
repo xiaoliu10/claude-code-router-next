@@ -2797,6 +2797,10 @@
 
     function scopeButtons() { return Array.prototype.slice.call(els.routingScopes.querySelectorAll('.scope-btn')); }
 
+    var routeModelChoices = [];
+    function routePicker(field, commit) {
+      return globalThis.RouteModelPicker.mount(field, function () { return routeModelChoices; }, commit);
+    }
     function updateChoices(snapshot) {
       var seen = {}, out = [];
       ((snapshot && snapshot.providers) || []).forEach(function (p) {
@@ -2805,6 +2809,9 @@
           if (!seen[v]) { seen[v] = true; out.push(v); }
         });
       });
+      routeModelChoices = out;
+      globalThis.RouteModelPicker.refresh(els.routingBody);
+      globalThis.RouteModelPicker.refresh(els.aliasAdd);
       els.routeChoices.textContent = '';
       out.forEach(function (v) {
         var o = document.createElement('option');
@@ -2839,7 +2846,7 @@
       var root = a.closest ? a.closest('.route') : null;
       if (!root || !root.dataset.key) return;
       var kind = null;
-      if (a === root.querySelector('.route-target > .route-input')) kind = 'target';
+      if (a === root.querySelector('.route-input')) kind = 'target';
       else if (a.closest && a.closest('.fallback-add') && a.tagName === 'INPUT') kind = 'add';
       if (!kind) return;
       restoreFocus = { key: root.dataset.key, kind: kind, start: a.selectionStart, end: a.selectionEnd };
@@ -2928,12 +2935,12 @@
       var target = document.createElement('input');
       target.type = 'text';
       target.className = 'route-input';
-      target.setAttribute('list', 'route-choices');
+
       target.placeholder = '提供方,模型（留空清除）';
       target.setAttribute('aria-label', SCOPE_LABELS[parts.scope] + ' · ' + labelText + ' 目标');
       var clearBtn = mkBtn('✕', '清除 ' + labelText + '（保存后生效）', function () { routingCtrl.setTarget(key, ''); });
       clearBtn.className = 'btn btn-icon route-clear';
-      targetWrap.appendChild(target);
+      targetWrap.appendChild(routePicker(target, function (v) { routingCtrl.setTarget(key, v); }));
       targetWrap.appendChild(clearBtn);
       root.appendChild(targetWrap);
 
@@ -2945,11 +2952,14 @@
       var addInput = document.createElement('input');
       addInput.type = 'text';
       addInput.className = 'route-input';
-      addInput.setAttribute('list', 'route-choices');
+
       addInput.placeholder = '添加回退，如 provider,model';
       addInput.setAttribute('aria-label', labelText + ' 添加回退');
       var addBtn = mkBtn('添加', '添加 ' + labelText + ' 回退', submitAdd);
-      fbAdd.appendChild(addInput);
+      fbAdd.appendChild(routePicker(addInput, function () {
+        addInput.removeAttribute('aria-invalid');
+        addInput.title = '';
+      }));
       fbAdd.appendChild(addBtn);
       fb.appendChild(fbAdd);
       root.appendChild(fb);
@@ -2983,7 +2993,7 @@
       // Typing only updates the draft; controller emits refresh status bits,
       // never the input values themselves.
       target.addEventListener('input', function () { routingCtrl.setTarget(key, target.value); });
-      addInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); submitAdd(); } });
+      addInput.addEventListener('keydown', function (e) { if (!e.defaultPrevented && !e.isComposing && e.keyCode !== 229 && e.key === 'Enter') { e.preventDefault(); submitAdd(); } });
       addInput.addEventListener('input', function () { addInput.removeAttribute('aria-invalid'); addInput.title = ''; });
 
       var refs = { root: root, target: target, unset: unset, fbList: fbList, addInput: addInput, resetBtn: resetBtn, saveBtn: saveBtn, msg: msg, lastChips: null };
@@ -3776,6 +3786,8 @@
     });
     els.routingRefresh.addEventListener('click', function () { if (routingCtrl) routingCtrl.refresh(); });
     els.routingSaveGroups.addEventListener('click', function () { if (routingCtrl) routingCtrl.saveGroups(); });
+    var aliasParent = els.aliasTarget.parentNode;
+    aliasParent.insertBefore(routePicker(els.aliasTarget, function () {}), els.aliasAddBtn);
     els.aliasAddBtn.addEventListener('click', function () {
       if (!routingCtrl) return;
       var r = routingCtrl.createAlias(els.aliasName.value, els.aliasTarget.value);
@@ -3789,7 +3801,7 @@
     });
     [els.aliasName, els.aliasTarget].forEach(function (input) {
       input.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') { e.preventDefault(); els.aliasAddBtn.click(); }
+        if (!e.defaultPrevented && !e.isComposing && e.keyCode !== 229 && e.key === 'Enter') { e.preventDefault(); els.aliasAddBtn.click(); }
       });
     });
     Array.prototype.slice.call(els.usagePeriods.querySelectorAll('.period-btn')).forEach(function (b) {

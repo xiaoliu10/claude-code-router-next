@@ -153,11 +153,32 @@ test('projects interaction: restore global and takeover each require their expli
   assert.equal(h.calls.find(c => c.cmd === 'projects_takeover').args.id, 'b');
 });
 
+test('project refresh preserves an open model search and updates its matches', async () => {
+  const state = fixture(); let pending, reads = 0;
+  const { h } = await start({ projects_snapshot: () => ++reads === 1 ? structuredClone(state) : new Promise(resolve => { pending = resolve; }) });
+  toggle(h, '使用全局路由', false);
+  h.id('projects-refresh').click(); await flush();
+  const field = byLabel(h, '默认 目标'); field.click();
+  const wrapper = field.parentNode, search = wrapper.querySelector('.model-picker-panel').querySelector('input');
+  search.value = 'ALPHA'; search.fire('input');
+  state.providers[0].models = ['three']; pending(structuredClone(state)); await flush();
+  assert.equal(byLabel(h, '默认 目标'), field);
+  assert.equal(h.doc.activeElement, search);
+  assert.equal(search.value, 'ALPHA');
+  assert.deepEqual(wrapper.querySelectorAll('.model-picker-option').map(n => n.textContent), ['alpha,three']);
+});
+
 test('projects interaction: fallback ordering, family thresholds and deletion confirmation', async () => {
   const state = fixture();
   const { h } = await start({ projects_delete: args => { state.projects = state.projects.filter(p => p.id !== args.id); return structuredClone(state); } });
   toggle(h, '使用全局路由', false);
-  type(h, '默认 添加回退', 'alpha,one').fire('keydown', { key: 'Enter' });
+  const target = byLabel(h, '默认 添加回退');
+  target.click();
+  const picker = target.parentNode, search = picker.querySelector('.model-picker-panel').querySelector('input');
+  search.value = 'ONE'; search.fire('input');
+  assert.deepEqual(picker.querySelectorAll('.model-picker-option').map(n => n.textContent), ['alpha,one']);
+  picker.querySelector('.model-picker-option').click();
+  target.closest('.fallback-add').querySelector('button').click();
   let first = h.id('projects-body').querySelector('.route');
   first.querySelectorAll('.fallback-item')[1].querySelector('button').click();
   first = h.id('projects-body').querySelector('.route'); assert.match(first.querySelector('.fallback-item').textContent, /alpha,one/);
