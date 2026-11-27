@@ -711,7 +711,7 @@ test('interaction: summary gains ttft/speed/success cells and css charts sort, f
   assert.equal(bars[2].title.startsWith('2026-11-18'), true);
   assert.equal(bars[2].style.height, '12%', 'smaller days scale relative to the max');
   assert.equal(bars[3].style.height, '0%', 'unknown totals have no filled bar');
-  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19', '2026-11-20', '2026-11-21', '2026-11-22']);
+  assert.deepEqual(dayCard.querySelectorAll('.usage-day-date').map(n => n.textContent), ['11-16', '11-17', '11-18', '11-19', '11-20', '11-21', '11-22']);
   assert.deepEqual(dayCard.querySelectorAll('.usage-day-value').map(n => n.textContent), ['1.3K', '0', '150', '—', '0', '0', '0']);
   // Model chart: ranked by effective (cache-aware) input+output desc, capped at 10, exact values in title.
   const modelCard = body.querySelectorAll('.usage-card').find(c => c.textContent.includes('模型 Top 10'));
@@ -741,7 +741,7 @@ test('interaction: Today uses the same seven calendar dates and values as 7d whi
   await openUsage(h);
   const body = h.id('usage-body');
   const trend = () => body.querySelectorAll('.usage-bar-col').map(col => [
-    col.querySelector('.usage-day-date').textContent, col.querySelector('.usage-day-value').textContent,
+    col.querySelector('.usage-day-date').dateTime, col.querySelector('.usage-day-value').textContent,
   ]);
   const week = [
     ['2026-10-27', '71'], ['2026-10-28', '0'], ['2026-10-29', '99'], ['2026-10-30', '0'],
