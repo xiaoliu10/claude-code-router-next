@@ -703,11 +703,13 @@ const RESET_CREDIT_TITLES: Record<string, string> = {
   codex_rate_limits: "Full reset",
 };
 
-function parseResetCredit(raw: any): CodexResetCredit | null {
+function parseResetCredit(raw: any, confirmedCreditId?: string): CodexResetCredit | null {
   if (!raw || typeof raw !== "object") return null;
   if (!isCodexResetCreditId(raw.id)) return null;
   if (typeof raw.status !== "string" || !raw.status || raw.status.length > 32) return null;
-  const expires = typeof raw.expires_at === "string" && raw.expires_at ? Date.parse(raw.expires_at) : NaN;
+  const expires = typeof raw.expires_at === "string" ? Date.parse(raw.expires_at) : NaN;
+  // The display listing may omit malformed dates. Only absent/null is undated for a confirmed spend.
+  if (raw.id === confirmedCreditId && raw.expires_at != null && !Number.isFinite(expires)) return null;
   const title = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim().slice(0, 200)
     : RESET_CREDIT_TITLES[typeof raw.reset_type === "string" ? raw.reset_type : ""];
   const description = typeof raw.description === "string" && raw.description.trim() ? raw.description.trim().slice(0, 300) : undefined;
@@ -721,7 +723,7 @@ function parseResetCredit(raw: any): CodexResetCredit | null {
 }
 
 /** Fail-closed listing parser: unknown shapes yield null ("no reset surface"). */
-export function parseCodexResetCredits(raw: unknown): CodexResetCredits | null {
+export function parseCodexResetCredits(raw: unknown, confirmedCreditId?: string): CodexResetCredits | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as any;
   const availableCount = typeof r.available_count === "number" && Number.isFinite(r.available_count)
@@ -731,7 +733,7 @@ export function parseCodexResetCredits(raw: unknown): CodexResetCredits | null {
   if (Array.isArray(r.credits)) {
     if (r.credits.length > 256) return null;
     for (const item of r.credits) {
-      const credit = parseResetCredit(item);
+      const credit = parseResetCredit(item, confirmedCreditId);
       if (!credit) return null;
       credits.push(credit);
     }
@@ -769,6 +771,7 @@ async function resetCreditsFetch(params: {
 
 /** List available reset credits. Null = surface absent/unreadable, never fatal. */
 export async function fetchCodexResetCredits(params: {
+  confirmedCreditId?: string;
   accessToken: string;
   accountId?: string;
   fetchImpl: CodexFetch;
@@ -780,7 +783,7 @@ export async function fetchCodexResetCredits(params: {
     accessToken: params.accessToken, accountId: params.accountId, fetchImpl: params.fetchImpl,
   });
   if (!res.ok) return null;
-  return parseCodexResetCredits(res.json);
+  return parseCodexResetCredits(res.json, params.confirmedCreditId);
 }
 
 /**

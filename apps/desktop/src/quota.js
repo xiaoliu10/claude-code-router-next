@@ -1954,11 +1954,12 @@
           return;
         }
         count = list.availableCount;
-        // Same ordering as the Web card: first expiring available credit, undated last.
+        // Prefer the soonest unexpired credit, with undated credits last.
+        var now = Date.now();
         if (count > 0) list.credits.forEach(function (credit) {
           if (!credit || credit.status !== 'available' || !toStr(credit.id) || !credit.id.trim()) return;
           var expiry = toNum(credit.expiresAt);
-          if (!(expiry > 0 && Number.isFinite(new Date(expiry).getTime()))) expiry = null;
+          if (credit.expiresAt != null && (expiry === null || expiry <= now || !Number.isFinite(new Date(expiry).getTime()))) return;
           if (!target || (expiry !== null && (target.expiresAt === null || expiry < target.expiresAt))) {
             target = { creditId: credit.id, accountRevision: list.accountRevision, expiresAt: expiry };
           }

@@ -69,7 +69,7 @@ describe("reset credits — protocol", () => {
     expect(parseCodexResetCredits({ available_count: -1, credits: [] })).toEqual({ availableCount: 0, credits: [] });
     expect(parseCodexResetCredits({ available_count: 1, credits: [{ status: "available" }] })).toBeNull();
     expect(parseCodexResetCredits({ available_count: 1, credits: Array(257).fill({ id: "x", status: "available" }) })).toBeNull();
-    // Unparseable expiry is dropped, never NaN.
+    // Legacy display listings omit an unparseable expiry.
     const weird = parseCodexResetCredits({ available_count: 1, credits: [{ id: "x", status: "available", expires_at: "not-a-date" }] });
     expect(weird!.credits[0].expiresAt).toBeUndefined();
   });
@@ -510,6 +510,40 @@ describe("consumeConfirmedResetCredit", () => {
     await expect(h.service.consumeConfirmedResetCredit("credit-old", display.accountRevision)).rejects.toMatchObject({ code: "codex_reset_no_credit" });
     expect(h.consumeCalls()).toHaveLength(0);
     expect((await h.service.getResetCredits())?.credits.map(c => c.id)).toEqual(["credit-new"]);
+  });
+
+  it.each(["not-a-date", "", "   ", 123, false])("rejects malformed expires_at %j on the fresh listing without a consume POST", async expires_at => {
+    let validating = false;
+    const h = await connected({ now: () => beforeExpiry, listing: () => json(validating
+      ? { ...LISTING, credits: [{ ...LISTING.credits[0], expires_at }, LISTING.credits[1]] }
+      : LISTING) });
+    const revision = (await h.service.getResetCredits())!.accountRevision;
+    validating = true;
+    await expect(h.service.consumeConfirmedResetCredit("credit-old", revision)).rejects.toMatchObject({ code: "codex_reset_unavailable" });
+    expect(h.listingReads()).toBe(2);
+    expect(h.consumeCalls()).toHaveLength(0);
+  });
+
+  it("preserves the legacy consume route and recount with a malformed expiry", async () => {
+    const h = await connected({ listing: () => json({ ...LISTING, credits: [{ ...LISTING.credits[0], expires_at: "not-a-date" }] }) });
+    const app = Fastify();
+    registerCodexAdminRoutes(app, { getService: () => h.service, serviceTier: { tier: "follow", set: vi.fn() } });
+    try {
+      const response = await app.inject({ method: "POST", url: "/api/codex/reset-credits/consume", headers: { host: "localhost:3456" }, payload: {} });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ outcome: "reset", availableCount: LISTING.available_count });
+      expect(h.calls.map(c => c.method)).toEqual(["POST", "GET"]);
+      expect(h.consumeCalls()[0].body).toEqual({ redeem_request_id: expect.any(String) });
+    } finally { await app.close(); }
+  });
+
+  it.each([undefined, null])("accepts an undated selection with expires_at %j alongside a malformed expiry", async expires_at => {
+    const h = await connected({ now: () => beforeExpiry, listing: () => json({ ...LISTING, credits: [
+      { ...LISTING.credits[0], expires_at }, { ...LISTING.credits[1], expires_at: "not-a-date" },
+    ] }) });
+    const revision = (await h.service.getResetCredits())!.accountRevision;
+    expect((await h.service.consumeConfirmedResetCredit("credit-old", revision)).outcome).toBe("reset");
+    expect(h.consumeCalls().map(call => call.body.credit_id)).toEqual(["credit-old"]);
   });
 
   it("rereads upstream even within the 60s display TTL and rejects an expired selection", async () => {
